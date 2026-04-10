@@ -2,13 +2,13 @@
 
 ## Package Manager
 
-Use `pnpm` for all package management commands (not npm or yarn).
+Use `bun` for all package management commands (not pnpm, npm, or yarn).
 
 Exception: End-user install instructions should use `npm install -g` (global) or `npm install -D` (project dev dependency) since npm is universal.
 
 ## Dependencies
 
-Always check for the latest npm version when adding dependencies. Use `pnpm add <package>` (without version) to get the latest, or verify with `npm view <package> version` first.
+Always check for the latest npm version when adding dependencies. Use `bun add <package>` (without version) to get the latest, or verify with `npm view <package> version` first.
 
 ## No Emojis
 
@@ -98,7 +98,7 @@ Stop the instance when done (avoids cost):
 **PowerShell uses `;` not `&&`.** The `run.sh` wrapper executes PowerShell, which does not support `&&` as a command separator. Use `;` instead:
 
 ```bash
-./scripts/windows-debug/run.sh "cd C:\portless; pnpm test"
+./scripts/windows-debug/run.sh "cd C:\portless; bun run test"
 ```
 
 **OpenSSL may not be at the expected path.** The bootstrap installs OpenSSL to `C:\Program Files\OpenSSL-Win64\bin`, but this can fail silently. Git bundles its own OpenSSL at `C:\Program Files\Git\mingw64\bin`. If `openssl` is not found, add Git's path:
@@ -114,13 +114,13 @@ Stop the instance when done (avoids cost):
 Run unit tests on Windows:
 
 ```bash
-./scripts/windows-debug/run.sh "cd C:\portless; pnpm test"
+./scripts/windows-debug/run.sh "cd C:\portless; bun run test"
 ```
 
 Run e2e tests on Windows:
 
 ```bash
-./scripts/windows-debug/run.sh "cd C:\portless; pnpm test:e2e"
+./scripts/windows-debug/run.sh "cd C:\portless; bun run test:e2e"
 ```
 
 Check bootstrap progress (first boot only):
@@ -129,7 +129,7 @@ Check bootstrap progress (first boot only):
 ./scripts/windows-debug/run.sh "Get-Content C:\bootstrap.log"
 ```
 
-The repo lives at `C:\portless` on the instance. Node.js 20, pnpm, Git, and OpenSSL are pre-installed. The `run.sh` wrapper automatically adds these tools to PATH.
+The repo lives at `C:\portless` on the instance. Node.js 20, Bun, Git, and OpenSSL are pre-installed. The `run.sh` wrapper automatically adds these tools to PATH.
 
 <!-- opensrc:start -->
 

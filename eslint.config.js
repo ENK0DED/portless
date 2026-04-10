@@ -10,7 +10,6 @@ export default tseslint.config(
     ignores: [
       "**/dist/",
       "**/node_modules/",
-      ".pnpm-store/",
       "**/.next/",
       "**/next-env.d.ts",
       "**/.react-router/",

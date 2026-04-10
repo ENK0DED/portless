@@ -22,7 +22,7 @@ echo "Branch synced. Installing dependencies and rebuilding..."
 
 "$RUN" "
 cd C:\portless
-pnpm install
-pnpm build
+bun install
+bun run build
 Write-Host 'Build complete.'
 "

@@ -5,11 +5,11 @@ description: Configure OAuth providers (Google, Apple, Microsoft, Facebook, GitH
 
 # OAuth with Portless
 
-OAuth providers validate redirect URIs against domain rules. `.localhost` subdomains fail on most providers because they are not in the Public Suffix List or are explicitly blocked. Portless fixes this with `--tld` to serve apps on real, valid domains.
+OAuth providers validate redirect URIs against domain rules. `.localhost` subdomains fail on most providers because they are not in the Public Suffix List or are explicitly blocked. Portless fixes this with `--suffix` to serve apps on real, valid domains. `--tld` still works as a compatibility alias.
 
 ## The Problem
 
-When portless uses the default `.localhost` TLD, OAuth providers reject redirect URIs like `http://myapp.localhost:1355/callback`:
+When portless uses the default `.localhost` domain suffix, OAuth providers reject redirect URIs like `http://myapp.localhost:1355/callback`:
 
 | Provider  | `localhost` | `.localhost` subdomains | Reason                         |
 | --------- | ----------- | ----------------------- | ------------------------------ |
@@ -23,22 +23,22 @@ Google and Apple are the strictest. Microsoft and GitHub are more lenient with l
 
 ## The Fix
 
-Use a valid TLD so the redirect URI passes provider validation:
+Use a valid domain suffix so the redirect URI passes provider validation:
 
 ```bash
-portless proxy start --tld dev
+portless proxy start --suffix dev
 portless myapp next dev
 # -> https://myapp.dev
 ```
 
-Any TLD in the Public Suffix List works: `.dev`, `.app`, `.com`, `.io`, etc.
+Any public suffix in the Public Suffix List works: `.dev`, `.app`, `.com`, `.io`, etc.
 
 ### Use a domain you own
 
-Bare TLDs like `.dev` mean `myapp.dev` could collide with a real domain. Use a subdomain of a domain you control:
+Bare suffixes like `.dev` mean `myapp.dev` could collide with a real domain. Use a subdomain of a domain you control:
 
 ```bash
-portless proxy start --tld dev
+portless proxy start --suffix dev
 portless myapp.local.yourcompany next dev
 # -> https://myapp.local.yourcompany.dev
 ```
@@ -54,7 +54,7 @@ This ensures no outbound traffic reaches something you don't own. For teams, set
 3. Add the portless domain to **Authorized JavaScript origins**: `https://myapp.dev`
 4. Add the callback to **Authorized redirect URIs**: `https://myapp.dev/api/auth/callback/google`
 
-Google validates domains against the Public Suffix List. The domain must end with a recognized TLD. `.localhost` subdomains fail this check; `.dev`, `.app`, `.com`, etc. all pass.
+Google validates domains against the Public Suffix List. The domain must end with a recognized public suffix. `.localhost` subdomains fail this check; `.dev`, `.app`, `.com`, etc. all pass.
 
 HTTPS is required for `.dev` and `.app` (HSTS-preloaded). Portless handles this automatically with `--https`.
 
@@ -74,7 +74,7 @@ The domain must be a real, publicly-resolvable domain name. Since portless maps 
 2. Create or edit an app registration
 3. Under **Authentication**, add a **Web** redirect URI: `https://myapp.dev/api/auth/callback/azure-ad`
 
-Microsoft allows `http://localhost` with any port for development. It also accepts `.localhost` subdomains in most cases. Using a custom TLD with portless is still recommended for consistency across providers.
+Microsoft allows `http://localhost` with any port for development. It also accepts `.localhost` subdomains in most cases. Using a custom domain suffix with portless is still recommended for consistency across providers.
 
 ### Facebook (Meta)
 
@@ -88,7 +88,7 @@ Facebook requires each redirect URI to be registered exactly (no wildcards). Str
 1. Go to [GitHub Developer Settings > OAuth Apps](https://github.com/settings/developers)
 2. Set **Authorization callback URL**: `https://myapp.dev/api/auth/callback/github`
 
-GitHub is permissive with localhost and subdomains. A custom TLD is not strictly required but keeps the setup consistent.
+GitHub is permissive with localhost and subdomains. A custom domain suffix is not strictly required but keeps the setup consistent.
 
 ## Auth Library Configuration
 
@@ -133,14 +133,14 @@ The redirect URI sent during the OAuth flow doesn't match what's registered with
 
 1. The provider's registered redirect URI matches the portless domain exactly (protocol, host, path)
 2. `NEXTAUTH_URL` or equivalent is set to the portless URL (not `localhost`)
-3. The proxy is running with the correct TLD (`portless list` to verify)
+3. The proxy is running with the correct domain suffix (`portless list` to verify)
 
 ### Provider requires HTTPS
 
-`.dev` and `.app` TLDs are HSTS-preloaded, so browsers force HTTPS. Start the proxy:
+`.dev` and `.app` suffixes are HSTS-preloaded, so browsers force HTTPS. Start the proxy:
 
 ```bash
-portless proxy start --tld dev
+portless proxy start --suffix dev
 ```
 
 Portless defaults to HTTPS on port 443 (auto-elevates with sudo). Run `portless trust` to add the local CA to your system trust store and eliminate browser warnings.
@@ -165,4 +165,4 @@ The auth library is constructing the callback URL from `localhost` instead of th
 
 ## Example
 
-See [`examples/google-oauth`](../../examples/google-oauth) for a complete working example with Next.js + NextAuth + Google OAuth using `--tld dev`.
+See [`examples/google-oauth`](../../examples/google-oauth) for a complete working example with Next.js + NextAuth + Google OAuth using `--suffix dev`.

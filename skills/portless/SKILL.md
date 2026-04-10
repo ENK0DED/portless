@@ -118,17 +118,18 @@ Override with the `PORTLESS_STATE_DIR` environment variable.
 
 ### Environment variables
 
-| Variable              | Description                                                           |
-| --------------------- | --------------------------------------------------------------------- |
-| `PORTLESS_PORT`       | Override the default proxy port (default: 443 with HTTPS, 80 without) |
-| `PORTLESS_APP_PORT`   | Use a fixed port for the app (skip auto-assignment)                   |
-| `PORTLESS_HTTPS`      | HTTPS on by default; set to `0` to disable (same as `--no-tls`)       |
-| `PORTLESS_LAN`        | Set to `1` to always enable LAN mode (auto-detects LAN IP)            |
-| `PORTLESS_TLD`        | Use a custom TLD instead of localhost (e.g. test)                     |
-| `PORTLESS_WILDCARD`   | Set to `1` to allow unregistered subdomains to fall back to parent    |
-| `PORTLESS_SYNC_HOSTS` | Set to `0` to disable auto-sync of /etc/hosts (on by default)         |
-| `PORTLESS_STATE_DIR`  | Override the state directory                                          |
-| `PORTLESS=0`          | Bypass the proxy, run the command directly                            |
+| Variable                 | Description                                                           |
+| ------------------------ | --------------------------------------------------------------------- |
+| `PORTLESS_PORT`          | Override the default proxy port (default: 443 with HTTPS, 80 without) |
+| `PORTLESS_APP_PORT`      | Use a fixed port for the app (skip auto-assignment)                   |
+| `PORTLESS_HTTPS`         | HTTPS on by default; set to `0` to disable (same as `--no-tls`)       |
+| `PORTLESS_LAN`           | Set to `1` to always enable LAN mode (auto-detects LAN IP)            |
+| `PORTLESS_DOMAIN_SUFFIX` | Use a custom domain suffix instead of localhost (e.g. test, acme.com) |
+| `PORTLESS_TLD`           | Compatibility alias for `PORTLESS_DOMAIN_SUFFIX`                      |
+| `PORTLESS_WILDCARD`      | Set to `1` to allow unregistered subdomains to fall back to parent    |
+| `PORTLESS_SYNC_HOSTS`    | Set to `0` to disable auto-sync of /etc/hosts (on by default)         |
+| `PORTLESS_STATE_DIR`     | Override the state directory                                          |
+| `PORTLESS=0`             | Bypass the proxy, run the command directly                            |
 
 ### HTTP/2 + HTTPS
 
@@ -152,7 +153,7 @@ portless proxy start --lan --ip 192.168.1.42
 
 `--lan` advertises `<name>.local` hostnames over mDNS so any device on the same Wi-Fi can reach your apps. Portless auto-detects your LAN IP and follows network changes automatically, but you can pin a specific address with `--ip <address>` or the `PORTLESS_LAN_IP` environment variable. Set `PORTLESS_LAN=1` to default to LAN mode every time the proxy starts.
 
-Portless remembers LAN mode via `proxy.lan`, so if you stop a LAN proxy and start again, it stays in LAN mode. Other proxy settings still follow the current flags and env vars. Use `PORTLESS_LAN=0` for one start to switch back to `.localhost` mode. If a proxy is already running with different explicit LAN/TLS/TLD settings, portless warns and asks you to stop it first.
+Portless remembers LAN mode via `proxy.lan`, so if you stop a LAN proxy and start again, it stays in LAN mode. Other proxy settings still follow the current flags and env vars. Use `PORTLESS_LAN=0` for one start to switch back to `.localhost` mode. If a proxy is already running with different explicit LAN/TLS/domain suffix settings, portless warns and asks you to stop it first.
 
 LAN mode depends on the system mDNS helpers that portless launches: macOS includes `dns-sd`, while Linux uses `avahi-publish-address` from `avahi-utils` (install via `sudo apt install avahi-utils` or your distro’s tooling).
 
@@ -169,36 +170,37 @@ LAN mode depends on the system mDNS helpers that portless launches: macOS includ
 
 ## CLI Reference
 
-| Command                                | Description                                                    |
-| -------------------------------------- | -------------------------------------------------------------- |
-| `portless run <cmd> [args...]`         | Infer name from project, run through proxy (auto-starts)       |
-| `portless run --name <name> <cmd>`     | Override inferred base name (worktree prefix still applies)    |
-| `portless <name> <cmd> [args...]`      | Run app at `https://<name>.localhost` (auto-starts proxy)      |
-| `portless get <name>`                  | Print URL for a service (for cross-service wiring)             |
-| `portless get <name> --no-worktree`    | Print URL without worktree prefix                              |
-| `portless list`                        | Show active routes                                             |
-| `portless trust`                       | Add local CA to system trust store (for HTTPS)                 |
-| `portless clean`                       | Remove state, CA trust entry, and /etc/hosts block             |
-| `portless proxy start`                 | Start HTTPS proxy as a daemon (port 443, auto-elevates)        |
-| `portless proxy start --no-tls`        | Start without HTTPS (plain HTTP on port 80)                    |
-| `portless proxy start --lan`           | Start in LAN mode (mDNS `.local`, auto-follows LAN IP changes) |
-| `portless proxy start -p <number>`     | Start the proxy on a custom port                               |
-| `portless proxy start --tld test`      | Use .test instead of .localhost                                |
-| `portless proxy start --foreground`    | Start the proxy in foreground (for debugging)                  |
-| `portless proxy start --wildcard`      | Allow unregistered subdomains to fall back to parent route     |
-| `portless proxy stop`                  | Stop the proxy                                                 |
-| `portless alias <name> <port>`         | Register a static route (e.g. for Docker containers)           |
-| `portless alias <name> <port> --force` | Overwrite an existing route                                    |
-| `portless alias --remove <name>`       | Remove a static route                                          |
-| `portless hosts sync`                  | Add routes to /etc/hosts (fixes Safari)                        |
-| `portless hosts clean`                 | Remove portless entries from /etc/hosts                        |
-| `portless <name> --app-port <n> <cmd>` | Use a fixed port for the app instead of auto-assignment        |
-| `portless <name> --force <cmd>`        | Kill the existing process and take over its route              |
-| `portless --name <name> <cmd>`         | Force `<name>` as app name (bypasses subcommand dispatch)      |
-| `portless <name> -- <cmd> [args...]`   | Stop flag parsing; everything after `--` is passed to child    |
-| `portless --help` / `-h`               | Show help                                                      |
-| `portless run --help`                  | Show help for a subcommand (also: alias, hosts, clean)         |
-| `portless --version` / `-v`            | Show version                                                   |
+| Command                                  | Description                                                    |
+| ---------------------------------------- | -------------------------------------------------------------- |
+| `portless run <cmd> [args...]`           | Infer name from project, run through proxy (auto-starts)       |
+| `portless run --name <name> <cmd>`       | Override inferred base name (worktree prefix still applies)    |
+| `portless <name> <cmd> [args...]`        | Run app at `https://<name>.localhost` (auto-starts proxy)      |
+| `portless get <name>`                    | Print URL for a service (for cross-service wiring)             |
+| `portless get <name> --no-worktree`      | Print URL without worktree prefix                              |
+| `portless list`                          | Show active routes                                             |
+| `portless trust`                         | Add local CA to system trust store (for HTTPS)                 |
+| `portless clean`                         | Remove state, CA trust entry, and /etc/hosts block             |
+| `portless proxy start`                   | Start HTTPS proxy as a daemon (port 443, auto-elevates)        |
+| `portless proxy start --no-tls`          | Start without HTTPS (plain HTTP on port 80)                    |
+| `portless proxy start --lan`             | Start in LAN mode (mDNS `.local`, auto-follows LAN IP changes) |
+| `portless proxy start -p <number>`       | Start the proxy on a custom port                               |
+| `portless proxy start --suffix test`     | Use .test instead of .localhost                                |
+| `portless proxy start --suffix acme.com` | Use .acme.com instead of .localhost                            |
+| `portless proxy start --foreground`      | Start the proxy in foreground (for debugging)                  |
+| `portless proxy start --wildcard`        | Allow unregistered subdomains to fall back to parent route     |
+| `portless proxy stop`                    | Stop the proxy                                                 |
+| `portless alias <name> <port>`           | Register a static route (e.g. for Docker containers)           |
+| `portless alias <name> <port> --force`   | Overwrite an existing route                                    |
+| `portless alias --remove <name>`         | Remove a static route                                          |
+| `portless hosts sync`                    | Add routes to /etc/hosts (fixes Safari)                        |
+| `portless hosts clean`                   | Remove portless entries from /etc/hosts                        |
+| `portless <name> --app-port <n> <cmd>`   | Use a fixed port for the app instead of auto-assignment        |
+| `portless <name> --force <cmd>`          | Kill the existing process and take over its route              |
+| `portless --name <name> <cmd>`           | Force `<name>` as app name (bypasses subcommand dispatch)      |
+| `portless <name> -- <cmd> [args...]`     | Stop flag parsing; everything after `--` is passed to child    |
+| `portless --help` / `-h`                 | Show help                                                      |
+| `portless run --help`                    | Show help for a subcommand (also: alias, hosts, clean)         |
+| `portless --version` / `-v`              | Show version                                                   |
 
 **Reserved names:** `run`, `get`, `alias`, `hosts`, `list`, `trust`, `clean`, and `proxy` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name, or `portless --name <name> <cmd>` to force any name including reserved ones.
 

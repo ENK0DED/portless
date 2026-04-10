@@ -3,7 +3,6 @@ dist/
 coverage/
 *.log
 .DS_Store
-.pnpm-store/
 .turbo
 .next/
 next-env.d.ts
