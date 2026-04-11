@@ -13,7 +13,7 @@
       "dependsOn": ["build"]
     },
     "test:e2e": {
-      "dependsOn": ["portless#build"],
+      "dependsOn": ["@enk0ded/portless#build"],
       "cache": false
     },
     "test:coverage": {
