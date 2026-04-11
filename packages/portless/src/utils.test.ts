@@ -170,7 +170,7 @@ describe("parseHostname", () => {
       expect(parseHostname("myapp.localhost", "test")).toBe("myapp.test");
     });
 
-    it("strips .localhost subdomain suffix when using a different TLD", () => {
+    it("strips .localhost subsuffix when using a different TLD", () => {
       expect(parseHostname("api.myapp.localhost", "test")).toBe("api.myapp.test");
     });
 
@@ -192,6 +192,19 @@ describe("parseHostname", () => {
 
     it("works with dev TLD", () => {
       expect(parseHostname("myapp", "dev")).toBe("myapp.dev");
+    });
+
+    it("supports dotted suffixes", () => {
+      expect(parseHostname("myapp", "acme.com")).toBe("myapp.acme.com");
+      expect(parseHostname("myapp.acme.com", "acme.com")).toBe("myapp.acme.com");
+    });
+
+    it("supports multi-label suffixes", () => {
+      expect(parseHostname("api.myapp", "server01.acme.com")).toBe("api.myapp.server01.acme.com");
+    });
+
+    it("treats a bare dotted suffix as empty input", () => {
+      expect(() => parseHostname(".acme.com", "acme.com")).toThrow("Hostname cannot be empty");
     });
   });
 });

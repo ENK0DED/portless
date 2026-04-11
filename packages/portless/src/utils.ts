@@ -54,7 +54,7 @@ export function formatUrl(hostname: string, proxyPort: number, tls = false): str
 
 /**
  * Parse and normalize a hostname input for use as a subdomain of the
- * configured domain suffix. Strips protocol prefixes, validates characters,
+ * configured suffix. Strips protocol prefixes, validates characters,
  * and appends the suffix if needed.
  */
 export function parseHostname(input: string, tld = "localhost"): string {

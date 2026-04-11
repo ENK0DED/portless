@@ -27,6 +27,9 @@ import {
   findPidOnPort,
   getDefaultPort,
   getDefaultTld,
+  getConfiguredTldEnv,
+  getRiskyTld,
+  hasConfiguredTldEnv,
   injectFrameworkFlags,
   isHttpsEnvDisabled,
   isPortListening,
@@ -508,7 +511,7 @@ function startProxyServer(
     writeLanMarker(store.dir, activeLanIp);
     fixOwnership(store.dir, store.pidPath, store.portFilePath);
     const proto = isTls ? "HTTPS/2" : "HTTP";
-    const tldLabel = tld !== DEFAULT_TLD ? ` (TLD: .${tld})` : "";
+    const tldLabel = tld !== DEFAULT_TLD ? ` (suffix: .${tld})` : "";
     const modeLabel = strict === false ? " (wildcard)" : "";
     console.log(
       colors.green(`${proto} proxy listening on port ${proxyPort}${tldLabel}${modeLabel}`)
@@ -758,7 +761,7 @@ async function runApp(
     customCert: false,
     lanMode: process.env.PORTLESS_LAN !== undefined,
     lanIp: process.env.PORTLESS_LAN_IP !== undefined,
-    tld: process.env.PORTLESS_TLD !== undefined,
+    tld: hasConfiguredTldEnv(),
     useWildcard: process.env.PORTLESS_WILDCARD !== undefined,
   };
   const desiredConfig = resolveProxyConfig({
@@ -888,10 +891,11 @@ async function runApp(
   // (e.g. --lan changes tld from "localhost" to "local")
   const hostname = parseHostname(name, tld);
 
-  if (envTld !== DEFAULT_TLD && envTld !== tld) {
+  const configuredTldEnv = getConfiguredTldEnv();
+  if (configuredTldEnv && envTld !== DEFAULT_TLD && envTld !== tld) {
     console.warn(
       chalk.yellow(
-        `Warning: PORTLESS_TLD=${envTld} but the running proxy uses .${tld}. Using .${tld}.`
+        `Warning: ${configuredTldEnv.source}=${envTld} but the running proxy uses .${tld}. Using .${tld}.`
       )
     );
   }
@@ -1231,7 +1235,7 @@ ${colors.bold("LAN mode:")}
   Stopped LAN proxies keep LAN mode for the next start via proxy.lan.
   Other proxy settings still follow the current flags and env vars.
   Use PORTLESS_LAN=0 for one start to switch back to .localhost mode.
-  If a proxy is already running with different explicit LAN/TLS/TLD settings,
+  If a proxy is already running with different explicit LAN/TLS/suffix settings,
   stop it first.
   ${colors.cyan("portless proxy start --lan")}
   ${colors.cyan("portless proxy start --lan --https")}
@@ -1249,7 +1253,8 @@ ${colors.bold("Options:")}
   --cert <path>                 Use a custom TLS certificate
   --key <path>                  Use a custom TLS private key
   --foreground                  Run proxy in foreground (for debugging)
-  --tld <tld>                   Use a custom TLD instead of .localhost (e.g. test, dev)
+  --suffix <suffix>             Use a custom suffix instead of .localhost (e.g. test, acme.com, server01.acme.com)
+  --tld <tld>                   Compatibility alias for --suffix
   --wildcard                    Allow unregistered subdomains to fall back to parent route
   --app-port <number>           Use a fixed port for the app (skip auto-assignment)
   --force                       Kill the existing process and take over its route
@@ -1261,7 +1266,8 @@ ${colors.bold("Environment variables:")}
   PORTLESS_APP_PORT=<number>    Use a fixed port for the app (same as --app-port)
   PORTLESS_HTTPS=0              Disable HTTPS (same as --no-tls)
   PORTLESS_LAN=1                Enable LAN mode when set to 1 (set in .bashrc / .zshrc)
-  PORTLESS_TLD=<tld>            Use a custom TLD (e.g. test, dev; default: localhost)
+  PORTLESS_SUFFIX=<suffix> Use a custom suffix (e.g. test, acme.com; default: localhost)
+  PORTLESS_TLD=<tld>            Compatibility alias for PORTLESS_SUFFIX
   PORTLESS_WILDCARD=1           Allow unregistered subdomains to fall back to parent route
   PORTLESS_SYNC_HOSTS=0         Disable auto-sync of ${HOSTS_DISPLAY} (on by default)
   PORTLESS_STATE_DIR=<path>     Override the state directory
@@ -1277,7 +1283,7 @@ ${colors.bold("Safari / DNS:")}
   .localhost subdomains auto-resolve in Chrome, Firefox, and Edge.
   Safari relies on the system DNS resolver, which may not handle them.
   Auto-syncs ${HOSTS_DISPLAY} for route hostnames by default (including .localhost,
-  custom TLDs, and LAN .local). Set PORTLESS_SYNC_HOSTS=0 to disable. To manually sync:
+  custom suffixes, and LAN .local). Set PORTLESS_SYNC_HOSTS=0 to disable. To manually sync:
     ${colors.cyan("portless hosts sync")}
   Clean up later with:
     ${colors.cyan("portless hosts clean")}
@@ -1712,14 +1718,15 @@ async function handleProxy(args: string[]): Promise<void> {
 ${colors.bold("portless proxy")} - Manage the portless proxy server.
 
 ${colors.bold("Usage:")}
-  ${colors.cyan("portless proxy start")}                Start the HTTPS proxy on port 443 (daemon)
-  ${colors.cyan("portless proxy start --no-tls")}       Start without HTTPS (port 80)
-  ${colors.cyan("portless proxy start --lan")}          Enable LAN mode (mDNS, .local TLD)
-  ${colors.cyan("portless proxy start --foreground")}   Start in foreground (for debugging)
-  ${colors.cyan("portless proxy start -p 1355")}        Start on a custom port (no sudo)
-  ${colors.cyan("portless proxy start --tld test")}     Use .test instead of .localhost
-  ${colors.cyan("portless proxy start --wildcard")}     Allow unregistered subdomains to fall back to parent
-  ${colors.cyan("portless proxy stop")}                 Stop the proxy
+  ${colors.cyan("portless proxy start")}                   Start the HTTPS proxy on port 443 (daemon)
+  ${colors.cyan("portless proxy start --no-tls")}          Start without HTTPS (port 80)
+  ${colors.cyan("portless proxy start --lan")}             Enable LAN mode (mDNS, .local suffix)
+  ${colors.cyan("portless proxy start --foreground")}      Start in foreground (for debugging)
+  ${colors.cyan("portless proxy start -p 1355")}           Start on a custom port (no sudo)
+  ${colors.cyan("portless proxy start --suffix test")}     Use .test instead of .localhost
+  ${colors.cyan("portless proxy start --suffix acme.com")} Use .acme.com instead of .localhost
+  ${colors.cyan("portless proxy start --wildcard")}        Allow unregistered subdomains to fall back to parent
+  ${colors.cyan("portless proxy stop")}                    Stop the proxy
 
 ${colors.bold("LAN mode (--lan):")}
   Makes services accessible from other devices on the same WiFi network
@@ -1789,7 +1796,7 @@ ${colors.bold("LAN mode (--lan):")}
     hasExplicitPort = true;
   }
 
-  // Parse --tld flag
+  // Parse --suffix / --tld flag
   let tld: string;
   try {
     tld = getDefaultTld();
@@ -1797,11 +1804,18 @@ ${colors.bold("LAN mode (--lan):")}
     console.error(colors.red(`Error: ${(err as Error).message}`));
     process.exit(1);
   }
+  const suffixIdx = args.indexOf("--suffix");
   const tldIdx = args.indexOf("--tld");
-  if (tldIdx !== -1) {
-    const tldValue = args[tldIdx + 1];
+  const suffixFlag = suffixIdx !== -1 ? "--suffix" : "--tld";
+  const suffixOrTldIdx = suffixIdx !== -1 ? suffixIdx : tldIdx;
+  if (suffixOrTldIdx !== -1) {
+    const tldValue = args[suffixOrTldIdx + 1];
     if (!tldValue || tldValue.startsWith("-")) {
-      console.error(colors.red("Error: --tld requires a TLD value (e.g. test, localhost)."));
+      console.error(
+        colors.red(
+          "Error: --suffix / --tld requires a suffix value (e.g. test, acme.com, localhost)."
+        )
+      );
       process.exit(1);
     }
     tld = tldValue.trim().toLowerCase();
@@ -1824,7 +1838,7 @@ ${colors.bold("LAN mode (--lan):")}
     customCert: customCertPath !== null || customKeyPath !== null,
     lanMode: process.env.PORTLESS_LAN !== undefined,
     lanIp: process.env.PORTLESS_LAN_IP !== undefined,
-    tld: tldIdx !== -1 || process.env.PORTLESS_TLD !== undefined,
+    tld: suffixOrTldIdx !== -1 || hasConfiguredTldEnv(),
     useWildcard: args.includes("--wildcard") || process.env.PORTLESS_WILDCARD !== undefined,
   };
 
@@ -1869,18 +1883,18 @@ ${colors.bold("LAN mode (--lan):")}
     stateDir = resolveStateDir(proxyPort);
   }
 
-  if (lanMode && tldIdx !== -1) {
-    const userTld = args[tldIdx + 1];
+  if (lanMode && suffixOrTldIdx !== -1) {
+    const userTld = args[suffixOrTldIdx + 1];
     if (userTld && userTld !== "local") {
       console.warn(
         chalk.yellow(
-          `Warning: --lan forces .local TLD (mDNS requirement). Ignoring --tld ${userTld}.`
+          `Warning: --lan forces .local suffix (mDNS requirement). Ignoring ${suffixFlag} ${userTld}.`
         )
       );
     }
   }
 
-  const riskyReason = RISKY_TLDS.get(tld);
+  const riskyReason = RISKY_TLDS.get(getRiskyTld(tld) ?? "");
   if (riskyReason && !lanMode) {
     console.warn(colors.yellow(`Warning: .${tld}: ${riskyReason}`));
   }

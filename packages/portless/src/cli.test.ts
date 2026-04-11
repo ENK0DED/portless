@@ -11,12 +11,15 @@ const CLI_PATH = path.resolve(__dirname, "../dist/cli.js");
 
 /** Run the CLI with the given args and optional env overrides. */
 function run(args: string[], options?: { env?: Record<string, string | undefined> }) {
-  const env: Record<string, string | undefined> = {
-    ...process.env,
-    ...options?.env,
-    NO_COLOR: "1",
-  };
-  // Vitest runs under pnpm; strip parent-only vars so the CLI child does not look like pnpm dlx / npx.
+  const env: Record<string, string | undefined> = { ...process.env, NO_COLOR: "1" };
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("PORTLESS")) {
+      delete env[key];
+    }
+  }
+  Object.assign(env, options?.env);
+  // Test runners may set package-manager env vars; strip the pnpm/npm ones so
+  // the CLI child does not look like pnpm dlx or npx.
   delete env.PNPM_SCRIPT_SRC_DIR;
   if (env.npm_command === "exec") {
     delete env.npm_command;
@@ -86,7 +89,9 @@ async function getFreePort(): Promise<number> {
 describe("CLI", () => {
   beforeAll(() => {
     if (!fs.existsSync(CLI_PATH)) {
-      throw new Error(`Built CLI not found at ${CLI_PATH}. Run 'pnpm build' before running tests.`);
+      throw new Error(
+        `Built CLI not found at ${CLI_PATH}. Run 'bun run build' before running tests.`
+      );
     }
   });
 
@@ -104,7 +109,9 @@ describe("CLI", () => {
       expect(stdout).toContain("--port");
       expect(stdout).toContain("-p");
       expect(stdout).toContain("--foreground");
+      expect(stdout).toContain("--suffix");
       expect(stdout).toContain("PORTLESS_STATE_DIR");
+      expect(stdout).toContain("PORTLESS_SUFFIX");
       expect(stdout).toContain("PORTLESS_URL");
       expect(stdout).toContain("portless clean");
     });
@@ -611,12 +618,31 @@ describe("CLI", () => {
           }
         );
         expect(status).toBe(1);
-        expect(stderr).toContain("--lan forces .local TLD");
+        expect(stderr).toContain("--lan forces .local suffix");
         expect(stderr).toContain("Ignoring --tld test");
       } finally {
         fs.rmSync(emptyPath, { recursive: true, force: true });
       }
     });
+
+    it.skipIf(process.platform === "win32")(
+      "warns when --lan and --suffix are both provided",
+      () => {
+        const emptyPath = fs.mkdtempSync(path.join(os.tmpdir(), "portless-empty-path-"));
+        try {
+          const { status, stderr } = run(
+            ["proxy", "start", "--lan", "--suffix", "test", "--ip", "192.168.1.42"],
+            { env: { PATH: emptyPath, PORTLESS_STATE_DIR: tmpDir, PORTLESS_PORT: "19876" } }
+          );
+
+          expect(status).toBe(1);
+          expect(stderr).toContain("--lan forces .local suffix");
+          expect(stderr).toContain("Ignoring --suffix test");
+        } finally {
+          fs.rmSync(emptyPath, { recursive: true, force: true });
+        }
+      }
+    );
 
     it.skipIf(process.platform === "win32")(
       "fails early when the mDNS publisher binary is missing",
@@ -743,6 +769,14 @@ describe("CLI", () => {
       const { status, stdout } = run(["get", "api.backend"], { env: getEnv() });
       expect(status).toBe(0);
       expect(stdout.trim()).toMatch(/^https?:\/\/api\.backend\.localhost(:\d+)?$/);
+    });
+
+    it("uses PORTLESS_SUFFIX when set", () => {
+      const { status, stdout } = run(["get", "backend"], {
+        env: { ...getEnv(), PORTLESS_SUFFIX: "acme.com" },
+      });
+      expect(status).toBe(0);
+      expect(stdout.trim()).toMatch(/^https?:\/\/backend\.acme\.com(:\d+)?$/);
     });
 
     it("rejects unknown flags", () => {

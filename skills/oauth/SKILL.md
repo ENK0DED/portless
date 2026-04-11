@@ -9,7 +9,7 @@ OAuth providers validate redirect URIs against domain rules. `.localhost` subdom
 
 ## The Problem
 
-When portless uses the default `.localhost` domain suffix, OAuth providers reject redirect URIs like `http://myapp.localhost:1355/callback`:
+When portless uses the default `.localhost` suffix, OAuth providers reject redirect URIs like `http://myapp.localhost:1355/callback`:
 
 | Provider  | `localhost` | `.localhost` subdomains | Reason                         |
 | --------- | ----------- | ----------------------- | ------------------------------ |
@@ -23,7 +23,7 @@ Google and Apple are the strictest. Microsoft and GitHub are more lenient with l
 
 ## The Fix
 
-Use a valid domain suffix so the redirect URI passes provider validation:
+Use a valid suffix so the redirect URI passes provider validation:
 
 ```bash
 portless proxy start --suffix dev
@@ -74,7 +74,7 @@ The domain must be a real, publicly-resolvable domain name. Since portless maps 
 2. Create or edit an app registration
 3. Under **Authentication**, add a **Web** redirect URI: `https://myapp.dev/api/auth/callback/azure-ad`
 
-Microsoft allows `http://localhost` with any port for development. It also accepts `.localhost` subdomains in most cases. Using a custom domain suffix with portless is still recommended for consistency across providers.
+Microsoft allows `http://localhost` with any port for development. It also accepts `.localhost` subdomains in most cases. Using a custom suffix with portless is still recommended for consistency across providers.
 
 ### Facebook (Meta)
 
@@ -88,7 +88,7 @@ Facebook requires each redirect URI to be registered exactly (no wildcards). Str
 1. Go to [GitHub Developer Settings > OAuth Apps](https://github.com/settings/developers)
 2. Set **Authorization callback URL**: `https://myapp.dev/api/auth/callback/github`
 
-GitHub is permissive with localhost and subdomains. A custom domain suffix is not strictly required but keeps the setup consistent.
+GitHub is permissive with localhost and subdomains. A custom suffix is not strictly required but keeps the setup consistent.
 
 ## Auth Library Configuration
 
@@ -133,7 +133,7 @@ The redirect URI sent during the OAuth flow doesn't match what's registered with
 
 1. The provider's registered redirect URI matches the portless domain exactly (protocol, host, path)
 2. `NEXTAUTH_URL` or equivalent is set to the portless URL (not `localhost`)
-3. The proxy is running with the correct domain suffix (`portless list` to verify)
+3. The proxy is running with the correct suffix (`portless list` to verify)
 
 ### Provider requires HTTPS
 

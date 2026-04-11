@@ -1,6 +1,6 @@
 # Google OAuth with portless
 
-Google OAuth rejects `.localhost` subdomains as redirect URIs. This example shows how to use portless with a custom domain suffix to get a domain that Google accepts.
+Google OAuth rejects `.localhost` subdomains as redirect URIs. This example shows how to use portless with a custom suffix to get a domain that Google accepts.
 
 ## Why `.localhost` fails
 
@@ -11,9 +11,9 @@ Google's OAuth credentials page validates redirect URIs against a bundled copy o
 
 Plain `localhost` works because Google hardcodes it in a whitelist, but subdomains do not.
 
-## The fix: use any valid domain suffix
+## The fix: use any valid suffix
 
-Any public suffix in the Public Suffix List works. Portless lets you set a custom domain suffix with `--suffix`:
+Any public suffix in the Public Suffix List works. Portless lets you set a custom suffix with `--suffix`:
 
 ```bash
 portless proxy start --suffix dev
@@ -97,7 +97,7 @@ Open https://oauth-test.dev in your browser and click "Continue with Google".
 
 ## Alternative: plain localhost for the callback
 
-If you only need Google OAuth and don't want to change domain suffixes, you can add `http://localhost:3000/api/auth/callback/google` as an additional redirect URI. Google allows plain `localhost` with any port. Configure NextAuth to use it:
+If you only need Google OAuth and don't want to change suffixes, you can add `http://localhost:3000/api/auth/callback/google` as an additional redirect URI. Google allows plain `localhost` with any port. Configure NextAuth to use it:
 
 ```
 NEXTAUTH_URL=http://localhost:3000

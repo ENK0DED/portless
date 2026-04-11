@@ -10,8 +10,10 @@ import {
   DEFAULT_TLD,
   FALLBACK_PROXY_PORT,
   INTERNAL_LAN_IP_FLAG,
+  LEGACY_TLD_ENV,
   PRIVILEGED_PORT_THRESHOLD,
   RISKY_TLDS,
+  SUFFIX_ENV,
   SYSTEM_STATE_DIR,
   USER_STATE_DIR,
   discoverState,
@@ -726,28 +728,47 @@ describe("getDefaultTld", () => {
     }
   });
 
-  it("returns DEFAULT_TLD when PORTLESS_TLD is not set", () => {
-    delete process.env.PORTLESS_TLD;
+  it("returns DEFAULT_TLD when no suffix env vars are set", () => {
+    delete process.env[LEGACY_TLD_ENV];
+    delete process.env[SUFFIX_ENV];
     expect(getDefaultTld()).toBe(DEFAULT_TLD);
   });
 
-  it("returns PORTLESS_TLD when set", () => {
-    process.env.PORTLESS_TLD = "test";
+  it("returns PORTLESS_SUFFIX when set", () => {
+    process.env[SUFFIX_ENV] = "test";
     expect(getDefaultTld()).toBe("test");
   });
 
+  it("accepts dotted suffixes", () => {
+    process.env[SUFFIX_ENV] = "server01.acme.com";
+    expect(getDefaultTld()).toBe("server01.acme.com");
+  });
+
   it("lowercases the value", () => {
-    process.env.PORTLESS_TLD = "TEST";
+    process.env[SUFFIX_ENV] = "TEST";
     expect(getDefaultTld()).toBe("test");
   });
 
   it("trims whitespace", () => {
-    process.env.PORTLESS_TLD = "  test  ";
+    process.env[SUFFIX_ENV] = "  test  ";
     expect(getDefaultTld()).toBe("test");
   });
 
-  it("returns DEFAULT_TLD when PORTLESS_TLD is empty", () => {
-    process.env.PORTLESS_TLD = "";
+  it("falls back to legacy PORTLESS_TLD when the new env var is unset", () => {
+    delete process.env[SUFFIX_ENV];
+    process.env[LEGACY_TLD_ENV] = "legacy.test";
+    expect(getDefaultTld()).toBe("legacy.test");
+  });
+
+  it("prefers PORTLESS_SUFFIX over PORTLESS_TLD", () => {
+    process.env[SUFFIX_ENV] = "preferred.test";
+    process.env[LEGACY_TLD_ENV] = "legacy.test";
+    expect(getDefaultTld()).toBe("preferred.test");
+  });
+
+  it("returns DEFAULT_TLD when both env vars are empty", () => {
+    process.env[SUFFIX_ENV] = "";
+    process.env[LEGACY_TLD_ENV] = "";
     expect(getDefaultTld()).toBe(DEFAULT_TLD);
   });
 });
@@ -801,11 +822,11 @@ describe("buildProxyStartConfig", () => {
       buildProxyStartConfig({
         useHttps: false,
         lanMode: false,
-        tld: "test",
+        tld: "server01.acme.com",
       })
     ).toEqual({
-      effectiveTld: "test",
-      args: ["--no-tls", "--tld", "test"],
+      effectiveTld: "server01.acme.com",
+      args: ["--no-tls", "--suffix", "server01.acme.com"],
     });
   });
 });
@@ -896,21 +917,39 @@ describe("readTldFromDir / writeTldFile", () => {
 });
 
 describe("validateTld", () => {
-  it("returns null for valid TLDs", () => {
+  it("returns null for valid TLDs and suffixes", () => {
     expect(validateTld("localhost")).toBeNull();
     expect(validateTld("test")).toBeNull();
     expect(validateTld("internal")).toBeNull();
+    expect(validateTld("acme.com")).toBeNull();
+    expect(validateTld("server01.acme.com")).toBeNull();
+    expect(validateTld("my-dev.internal")).toBeNull();
   });
 
   it("rejects empty string", () => {
-    expect(validateTld("")).toMatch(/cannot be empty/);
+    expect(validateTld("")).toMatch(/suffix cannot be empty/);
   });
 
-  it("rejects TLDs with invalid characters", () => {
-    expect(validateTld("my-tld")).toMatch(/must contain only/);
-    expect(validateTld("my.tld")).toMatch(/must contain only/);
+  it("rejects suffixes with invalid characters", () => {
     expect(validateTld("MY_TLD")).toMatch(/must contain only/);
     expect(validateTld("tld!")).toMatch(/must contain only/);
+  });
+
+  it("rejects labels that start or end with hyphens", () => {
+    expect(validateTld("-acme.com")).toMatch(/start and end/);
+    expect(validateTld("acme-.com")).toMatch(/start and end/);
+    expect(validateTld("server01.-acme.com")).toMatch(/start and end/);
+  });
+
+  it("rejects leading, trailing, or consecutive dots", () => {
+    expect(validateTld(".acme.com")).toMatch(/must not start or end with a dot/);
+    expect(validateTld("acme.com.")).toMatch(/must not start or end with a dot/);
+    expect(validateTld("acme..com")).toMatch(/consecutive dots/);
+  });
+
+  it("rejects labels longer than 63 characters", () => {
+    const longLabel = "a".repeat(64);
+    expect(validateTld(`${longLabel}.com`)).toMatch(/63 characters or less/);
   });
 
   it("allows public TLDs (they produce warnings elsewhere)", () => {

@@ -202,10 +202,16 @@ export function writeLanMarker(dir: string, ip: string | null): void {
   }
 }
 
-/** Default TLD when PORTLESS_TLD is not set. */
+/** Default suffix when PORTLESS_TLD is not set. */
 export const DEFAULT_TLD = "localhost";
 
-/** TLDs that work but have known pitfalls worth warning about. */
+/** Preferred environment variable for configuring a custom suffix. */
+export const SUFFIX_ENV = "PORTLESS_SUFFIX";
+
+/** Backward-compatible environment variable for configuring a custom suffix. */
+export const LEGACY_TLD_ENV = "PORTLESS_TLD";
+
+/** Public suffixes that work but have known pitfalls worth warning about. */
 export const RISKY_TLDS = new Map<string, string>([
   ["local", "conflicts with mDNS/Bonjour on macOS"],
   ["dev", "Google-owned; browsers force HTTPS via preloaded HSTS"],
@@ -220,16 +226,49 @@ export const RISKY_TLDS = new Map<string, string>([
   ["int", "public TLD; DNS requests will leak to the internet"],
 ]);
 
-/**
- * Validate a TLD string. Returns an error message if invalid, or null if OK.
- * Does not check for risky TLDs (those produce warnings, not errors).
- */
-export function validateTld(tld: string): string | null {
-  if (!tld) return "TLD cannot be empty";
-  if (!/^[a-z0-9]+$/.test(tld)) {
-    return `Invalid TLD "${tld}": must contain only lowercase letters and digits`;
+function validateDomainLabel(label: string): string | null {
+  if (!/^[a-z0-9-]+$/.test(label)) {
+    return "must contain only lowercase letters, digits, and hyphens";
+  }
+  if (!/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label)) {
+    return "labels must start and end with a letter or digit";
+  }
+  if (label.length > 63) {
+    return "labels must be 63 characters or less";
   }
   return null;
+}
+
+/**
+ * Validate a configured suffix. Returns an error message if invalid, or
+ * null if OK. Accepts single-label values like "test" and dotted values like
+ * "acme.com" or "server01.acme.com".
+ *
+ * Does not check for risky public suffixes (those produce warnings, not errors).
+ */
+export function validateTld(tld: string): string | null {
+  if (!tld) return "suffix cannot be empty";
+  if (tld.startsWith(".") || tld.endsWith(".")) {
+    return `Invalid suffix "${tld}": must not start or end with a dot`;
+  }
+  if (tld.includes("..")) {
+    return `Invalid suffix "${tld}": consecutive dots are not allowed`;
+  }
+
+  const labels = tld.split(".");
+  for (const label of labels) {
+    const labelError = validateDomainLabel(label);
+    if (labelError) {
+      return `Invalid suffix "${tld}": ${labelError}`;
+    }
+  }
+
+  return null;
+}
+
+/** Return the terminal public suffix label of a configured suffix. */
+export function getRiskyTld(tld: string): string | undefined {
+  return tld.split(".").at(-1);
 }
 
 /** Name of the file that stores the proxy's active TLD. */
@@ -259,16 +298,38 @@ export function writeTldFile(dir: string, tld: string): void {
   }
 }
 
+export function getConfiguredTldEnv(): {
+  value: string;
+  source: typeof SUFFIX_ENV | typeof LEGACY_TLD_ENV;
+} | null {
+  const preferred = process.env[SUFFIX_ENV]?.trim().toLowerCase();
+  if (preferred) {
+    return { value: preferred, source: SUFFIX_ENV };
+  }
+
+  const legacy = process.env[LEGACY_TLD_ENV]?.trim().toLowerCase();
+  if (legacy) {
+    return { value: legacy, source: LEGACY_TLD_ENV };
+  }
+
+  return null;
+}
+
+export function hasConfiguredTldEnv(): boolean {
+  return process.env[SUFFIX_ENV] !== undefined || process.env[LEGACY_TLD_ENV] !== undefined;
+}
+
 /**
- * Return the effective TLD. Reads the PORTLESS_TLD env var first,
- * falling back to DEFAULT_TLD ("localhost"). Throws on invalid values.
+ * Return the effective suffix. Reads PORTLESS_SUFFIX first, then
+ * PORTLESS_TLD for backward compatibility, falling back to DEFAULT_TLD
+ * ("localhost"). Throws on invalid values.
  */
 export function getDefaultTld(): string {
-  const val = process.env.PORTLESS_TLD?.trim().toLowerCase();
-  if (!val) return DEFAULT_TLD;
-  const err = validateTld(val);
-  if (err) throw new Error(`PORTLESS_TLD: ${err}`);
-  return val;
+  const configured = getConfiguredTldEnv();
+  if (!configured) return DEFAULT_TLD;
+  const err = validateTld(configured.value);
+  if (err) throw new Error(`${configured.source}: ${err}`);
+  return configured.value;
 }
 
 /**
@@ -350,7 +411,7 @@ export function buildProxyStartConfig(options: {
       }
     }
   } else if (effectiveTld !== DEFAULT_TLD) {
-    args.push("--tld", effectiveTld);
+    args.push("--suffix", effectiveTld);
   }
 
   if (options.useWildcard) {
@@ -389,7 +450,7 @@ export async function discoverState(): Promise<{
       dir,
       port,
       tls: readTlsMarker(dir),
-      tld: readTldFromDir(dir),
+      tld: getConfiguredTldEnv() ? getDefaultTld() : readTldFromDir(dir),
       lanMode: lanIp !== null,
       lanIp: null,
     };

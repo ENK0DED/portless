@@ -167,7 +167,7 @@ function openssl(args: string[], options?: { input?: string }): string {
     });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
-    throw new Error(`openssl failed: ${message}\n\n${opensslErrorMessage()}`);
+    throw new Error(`openssl failed: ${message}\n\n${opensslErrorMessage()}`, { cause: err });
   }
 }
 
@@ -191,7 +191,7 @@ async function opensslAsync(args: string[]): Promise<string> {
     return stdout;
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
-    throw new Error(`openssl failed: ${message}\n\n${opensslErrorMessage()}`);
+    throw new Error(`openssl failed: ${message}\n\n${opensslErrorMessage()}`, { cause: err });
   }
 }
 

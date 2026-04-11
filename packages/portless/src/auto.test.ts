@@ -345,7 +345,7 @@ describe("detectWorktreePrefix (git CLI path)", { timeout: 15_000 }, () => {
   }
 
   function runGit(cwd: string, args: string[]): string {
-    return execFileSync("git", args, {
+    return execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", ...args], {
       cwd,
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "ignore"],

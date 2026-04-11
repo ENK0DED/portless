@@ -118,18 +118,18 @@ Override with the `PORTLESS_STATE_DIR` environment variable.
 
 ### Environment variables
 
-| Variable                 | Description                                                           |
-| ------------------------ | --------------------------------------------------------------------- |
-| `PORTLESS_PORT`          | Override the default proxy port (default: 443 with HTTPS, 80 without) |
-| `PORTLESS_APP_PORT`      | Use a fixed port for the app (skip auto-assignment)                   |
-| `PORTLESS_HTTPS`         | HTTPS on by default; set to `0` to disable (same as `--no-tls`)       |
-| `PORTLESS_LAN`           | Set to `1` to always enable LAN mode (auto-detects LAN IP)            |
-| `PORTLESS_DOMAIN_SUFFIX` | Use a custom domain suffix instead of localhost (e.g. test, acme.com) |
-| `PORTLESS_TLD`           | Compatibility alias for `PORTLESS_DOMAIN_SUFFIX`                      |
-| `PORTLESS_WILDCARD`      | Set to `1` to allow unregistered subdomains to fall back to parent    |
-| `PORTLESS_SYNC_HOSTS`    | Set to `0` to disable auto-sync of /etc/hosts (on by default)         |
-| `PORTLESS_STATE_DIR`     | Override the state directory                                          |
-| `PORTLESS=0`             | Bypass the proxy, run the command directly                            |
+| Variable              | Description                                                           |
+| --------------------- | --------------------------------------------------------------------- |
+| `PORTLESS_PORT`       | Override the default proxy port (default: 443 with HTTPS, 80 without) |
+| `PORTLESS_APP_PORT`   | Use a fixed port for the app (skip auto-assignment)                   |
+| `PORTLESS_HTTPS`      | HTTPS on by default; set to `0` to disable (same as `--no-tls`)       |
+| `PORTLESS_LAN`        | Set to `1` to always enable LAN mode (auto-detects LAN IP)            |
+| `PORTLESS_SUFFIX`     | Use a custom suffix instead of localhost (e.g. test, acme.com)        |
+| `PORTLESS_TLD`        | Compatibility alias for `PORTLESS_SUFFIX`                             |
+| `PORTLESS_WILDCARD`   | Set to `1` to allow unregistered subdomains to fall back to parent    |
+| `PORTLESS_SYNC_HOSTS` | Set to `0` to disable auto-sync of /etc/hosts (on by default)         |
+| `PORTLESS_STATE_DIR`  | Override the state directory                                          |
+| `PORTLESS=0`          | Bypass the proxy, run the command directly                            |
 
 ### HTTP/2 + HTTPS
 
@@ -153,7 +153,7 @@ portless proxy start --lan --ip 192.168.1.42
 
 `--lan` advertises `<name>.local` hostnames over mDNS so any device on the same Wi-Fi can reach your apps. Portless auto-detects your LAN IP and follows network changes automatically, but you can pin a specific address with `--ip <address>` or the `PORTLESS_LAN_IP` environment variable. Set `PORTLESS_LAN=1` to default to LAN mode every time the proxy starts.
 
-Portless remembers LAN mode via `proxy.lan`, so if you stop a LAN proxy and start again, it stays in LAN mode. Other proxy settings still follow the current flags and env vars. Use `PORTLESS_LAN=0` for one start to switch back to `.localhost` mode. If a proxy is already running with different explicit LAN/TLS/domain suffix settings, portless warns and asks you to stop it first.
+Portless remembers LAN mode via `proxy.lan`, so if you stop a LAN proxy and start again, it stays in LAN mode. Other proxy settings still follow the current flags and env vars. Use `PORTLESS_LAN=0` for one start to switch back to `.localhost` mode. If a proxy is already running with different explicit LAN/TLS/suffix settings, portless warns and asks you to stop it first.
 
 LAN mode depends on the system mDNS helpers that portless launches: macOS includes `dns-sd`, while Linux uses `avahi-publish-address` from `avahi-utils` (install via `sudo apt install avahi-utils` or your distro’s tooling).
 

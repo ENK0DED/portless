@@ -780,6 +780,32 @@ describe("createProxyServer", () => {
       expect(res.status).toBe(200);
       expect(res.body).toBe("custom tld hit");
     });
+
+    it("supports dotted suffixes", async () => {
+      const backend = trackServer(
+        http.createServer((_req, res) => {
+          res.writeHead(200, { "Content-Type": "text/plain" });
+          res.end("custom domain hit");
+        })
+      );
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const routes: RouteInfo[] = [{ hostname: "myapp.server01.acme.com", port: backendAddr.port }];
+      const server = trackServer(
+        createProxyServer({
+          getRoutes: () => routes,
+          proxyPort: TEST_PROXY_PORT,
+          tld: "server01.acme.com",
+        })
+      );
+      await listen(server);
+
+      const res = await request(server, { host: "myapp.server01.acme.com" });
+      expect(res.status).toBe(200);
+      expect(res.body).toBe("custom domain hit");
+    });
   });
 
   describe("XSS safety", () => {
