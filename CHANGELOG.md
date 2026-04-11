@@ -1,8 +1,20 @@
 # Changelog
 
-## 0.10.2
+## 0.10.3
 
 <!-- release:start -->
+
+### Improvements
+
+- **Trusted npm publishing**: The GitHub release workflow now uses npm Trusted Publishing with OIDC provenance instead of an npm token, matching the package's stricter publishing access settings.
+
+### Contributors
+
+- @enk0ded
+
+<!-- release:end -->
+
+## 0.10.2
 
 ### Improvements
 
@@ -12,8 +24,6 @@
 ### Contributors
 
 - @enk0ded
-
-<!-- release:end -->
 
 ## 0.10.1
 
