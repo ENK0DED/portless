@@ -109,6 +109,7 @@ export async function POST(req: Request) {
     system: SYSTEM_PROMPT,
     messages: await convertToModelMessages(messages),
     stopWhen: stepCountIs(5),
+    // @ts-expect-error - the types are not compatible with the bash-tool package
     tools: { bash, readFile: readFileTool },
     prepareStep: ({ messages: stepMessages }) => ({
       messages: addCacheControl(stepMessages),

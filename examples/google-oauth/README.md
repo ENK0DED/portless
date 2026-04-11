@@ -1,6 +1,6 @@
 # Google OAuth with portless
 
-Google OAuth rejects `.localhost` subdomains as redirect URIs. This example shows how to use portless with a custom TLD to get a domain that Google accepts.
+Google OAuth rejects `.localhost` subdomains as redirect URIs. This example shows how to use portless with a custom domain suffix to get a domain that Google accepts.
 
 ## Why `.localhost` fails
 
@@ -11,12 +11,12 @@ Google's OAuth credentials page validates redirect URIs against a bundled copy o
 
 Plain `localhost` works because Google hardcodes it in a whitelist, but subdomains do not.
 
-## The fix: use any valid TLD
+## The fix: use any valid domain suffix
 
-Any TLD in the Public Suffix List works. portless lets you set a custom TLD with `--tld`:
+Any public suffix in the Public Suffix List works. Portless lets you set a custom domain suffix with `--suffix`:
 
 ```bash
-portless proxy start --tld dev
+portless proxy start --suffix dev
 portless oauth-test next dev
 # -> https://oauth-test.dev
 ```
@@ -25,10 +25,10 @@ portless oauth-test next dev
 
 ## Recommended: use a domain you own
 
-Using a bare TLD like `.dev` means your local domain (`oauth-test.dev`) could collide with a real domain someone else owns. For safer local development, use a subdomain of a domain you control:
+Using a bare suffix like `.dev` means your local domain (`oauth-test.dev`) could collide with a real domain someone else owns. For safer local development, use a subdomain of a domain you control:
 
 ```bash
-portless proxy start --tld dev
+portless proxy start --suffix dev
 portless oauth-test.local.ctate next dev
 # -> https://oauth-test.local.ctate.dev
 ```
@@ -46,7 +46,7 @@ npm install -g portless
 ### 2. Start the proxy
 
 ```bash
-portless proxy start --tld dev
+portless proxy start --suffix dev
 ```
 
 Portless defaults to HTTPS on port 443 (auto-elevates with sudo), so URLs don't need a port number.
@@ -86,7 +86,7 @@ openssl rand -base64 32
 
 ```bash
 pnpm install
-pnpm dev
+pnpm run dev
 ```
 
 This runs `portless oauth-test next dev`, which serves the app at `https://oauth-test.dev`.
@@ -97,7 +97,7 @@ Open https://oauth-test.dev in your browser and click "Continue with Google".
 
 ## Alternative: plain localhost for the callback
 
-If you only need Google OAuth and don't want to change TLDs, you can add `http://localhost:3000/api/auth/callback/google` as an additional redirect URI. Google allows plain `localhost` with any port. Configure NextAuth to use it:
+If you only need Google OAuth and don't want to change domain suffixes, you can add `http://localhost:3000/api/auth/callback/google` as an additional redirect URI. Google allows plain `localhost` with any port. Configure NextAuth to use it:
 
 ```
 NEXTAUTH_URL=http://localhost:3000

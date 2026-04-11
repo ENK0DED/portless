@@ -78,17 +78,17 @@ portless run --name myapp next dev   # -> https://fix-ui.myapp.localhost
 
 Put `portless run` in your `package.json` once and it works everywhere. The main checkout uses the plain name, each worktree gets a unique subdomain. No collisions, no `--force`.
 
-## Custom TLD
+## Custom Domain Suffix
 
-By default, portless uses `.localhost` which auto-resolves to `127.0.0.1` in most browsers. If you prefer a different TLD (e.g. `.test`), use `--tld`:
+By default, portless uses `.localhost` which auto-resolves to `127.0.0.1` in most browsers. If you prefer a different suffix, use `--suffix`. It accepts either a single label such as `test` or a full dotted domain suffix such as `acme.com` or `server01.acme.com`. `--tld` still works as a compatibility alias.
 
 ```bash
-portless proxy start --tld test
+portless proxy start --suffix test
 portless myapp next dev
 # -> https://myapp.test
 ```
 
-The proxy auto-syncs `/etc/hosts` for route hostnames (including `.test`), so those domains resolve on your machine.
+The proxy auto-syncs `/etc/hosts` for route hostnames, so custom domains such as `.test`, `.acme.com`, and `.server01.acme.com` resolve on your machine.
 
 Recommended: `.test` (IANA-reserved, no collision risk). Avoid `.local` (conflicts with mDNS/Bonjour) and `.dev` (Google-owned, forces HTTPS via HSTS).
 
@@ -139,7 +139,7 @@ portless proxy start --lan --ip 192.168.1.42
 
 `--lan` switches the proxy to mDNS discovery: services are advertised as `<name>.local` and reachable from any device on the same network. Portless auto-detects your LAN IP and follows Wi-Fi/IP changes automatically, but you can pin another address with `--ip <address>` or by exporting `PORTLESS_LAN_IP`. Set `PORTLESS_LAN=1` in your shell (0/1 boolean) to make LAN mode the default whenever the proxy starts.
 
-Portless remembers LAN mode via `proxy.lan`, so if you stop a LAN proxy and start it again, it stays in LAN mode. Other proxy settings still follow the current flags and env vars. Use `PORTLESS_LAN=0` for one start to switch back to `.localhost` mode. If a proxy is already running with different explicit LAN/TLS/TLD settings, portless warns and asks you to stop it first.
+Portless remembers LAN mode via `proxy.lan`, so if you stop a LAN proxy and start it again, it stays in LAN mode. Other proxy settings still follow the current flags and env vars. Use `PORTLESS_LAN=0` for one start to switch back to `.localhost` mode. If a proxy is already running with different explicit LAN/TLS/domain suffix settings, portless warns and asks you to stop it first.
 
 LAN mode depends on the system mDNS tools that portless already spawns: macOS ships with `dns-sd`, while Linux uses `avahi-publish-address` from `avahi-utils` (install via `sudo apt install avahi-utils` or your distro’s equivalent). If the command is missing or your network isn’t reachable, `portless proxy start --lan` prints the relevant error and exits.
 
@@ -194,7 +194,8 @@ portless proxy stop              # Stop the proxy
 --cert <path>                    Use a custom TLS certificate
 --key <path>                     Use a custom TLS private key
 --foreground                     Run proxy in foreground instead of daemon
---tld <tld>                      Use a custom TLD instead of .localhost (e.g. test)
+--suffix <suffix>                Use a custom domain suffix instead of .localhost (e.g. test, acme.com, server01.acme.com)
+--tld <tld>                      Compatibility alias for --suffix
 --wildcard                       Allow unregistered subdomains to fall back to parent route
 --app-port <number>              Use a fixed port for the app (skip auto-assignment)
 --force                          Kill the existing process and take over its route
@@ -209,7 +210,8 @@ PORTLESS_PORT=<number>           Override the default proxy port
 PORTLESS_APP_PORT=<number>       Use a fixed port for the app (same as --app-port)
 PORTLESS_HTTPS=0                 Disable HTTPS (same as --no-tls)
 PORTLESS_LAN=1                   Enable LAN mode when set to 1 (auto-detects LAN IP)
-PORTLESS_TLD=<tld>               Use a custom TLD (e.g. test; default: localhost)
+PORTLESS_DOMAIN_SUFFIX=<suffix>  Use a custom domain suffix (e.g. test, acme.com; default: localhost)
+PORTLESS_TLD=<tld>               Compatibility alias for PORTLESS_DOMAIN_SUFFIX
 PORTLESS_WILDCARD=1              Allow unregistered subdomains to fall back to parent route
 PORTLESS_SYNC_HOSTS=0            Disable auto-sync of /etc/hosts (on by default)
 PORTLESS_STATE_DIR=<path>        Override the state directory
@@ -243,7 +245,7 @@ portless hosts sync    # Add current routes to /etc/hosts
 portless hosts clean   # Clean up later
 ```
 
-Auto-syncs `/etc/hosts` for route hostnames by default (`.localhost`, custom TLDs, LAN `.local`). Set `PORTLESS_SYNC_HOSTS=0` to disable.
+Auto-syncs `/etc/hosts` for route hostnames by default (`.localhost`, custom domain suffixes, LAN `.local`). Set `PORTLESS_SYNC_HOSTS=0` to disable.
 
 ## Proxying Between Portless Apps
 
@@ -281,16 +283,16 @@ Portless detects this misconfiguration and responds with `508 Loop Detected` alo
 
 ## Development
 
-This repo is a pnpm workspace monorepo using [Turborepo](https://turbo.build). The publishable package lives in `packages/portless/`.
+This repo is a Bun workspace monorepo using [Turborepo](https://turbo.build). The publishable package lives in `packages/portless/`.
 
 ```bash
-pnpm install          # Install all dependencies
-pnpm build            # Build all packages
-pnpm test             # Run tests
-pnpm test:coverage    # Run tests with coverage
-pnpm lint             # Lint all packages
-pnpm type-check       # Type-check all packages
-pnpm format           # Format all files with Prettier
+bun install           # Install all dependencies
+bun run build         # Build all packages
+bun run test          # Run tests
+bun run test:coverage # Run tests with coverage
+bun run lint          # Lint all packages
+bun run type-check    # Type-check all packages
+bun run format        # Format all files with Prettier
 ```
 
 ## Requirements

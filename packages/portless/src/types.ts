@@ -9,7 +9,7 @@ export interface ProxyServerOptions {
   getRoutes: () => RouteInfo[];
   /** The port the proxy is listening on (used to build correct URLs). */
   proxyPort: number;
-  /** TLD suffix used for hostnames (default: "localhost"). */
+  /** Domain suffix used for hostnames (default: "localhost"). */
   tld?: string;
   /**
    * When true, only exact hostname matches are used. Unregistered subdomain

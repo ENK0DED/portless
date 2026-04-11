@@ -76,17 +76,18 @@ Use `--name` to override the inferred base name while keeping the worktree prefi
 portless run --name myapp next dev   # -> https://fix-ui.myapp.localhost
 ```
 
-## Custom TLD
+## Custom Domain Suffix
 
-By default, portless uses `.localhost` which auto-resolves to `127.0.0.1` in most browsers. If you prefer a different TLD (e.g. `.test`), use `--tld`:
+By default, portless uses `.localhost` which auto-resolves to `127.0.0.1` in most browsers. If you prefer a different domain suffix, use `--suffix`. 
+It accepts either a single label such as `test` or a full dotted suffix such as `acme.com`. `--tld` still works as a compatibility alias:
 
 ```bash
-portless proxy start --tld test
+portless proxy start --suffix test
 portless myapp next dev
 # -> https://myapp.test
 ```
 
-The proxy auto-syncs `/etc/hosts` for route hostnames, so `.test` and other dev hostnames resolve on your machine.
+The proxy auto-syncs `/etc/hosts` for route hostnames, so `.test`, `.acme.com`, and other dev hostnames resolve on your machine.
 
 Recommended: `.test` (IANA-reserved, no collision risk). Avoid `.local` (conflicts with mDNS/Bonjour) and `.dev` (Google-owned, forces HTTPS via HSTS).
 
