@@ -68,7 +68,7 @@ jobs:
         run: bun run build
 
       - name: Publish to npm
-        run: NPM_CONFIG_PROVENANCE=false npm publish --access public
+        run: npm publish --access public --provenance
         working-directory: packages/portless
 
   github-release:

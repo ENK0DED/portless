@@ -1,8 +1,20 @@
 # Changelog
 
-## 0.10.5
+## 0.10.6
 
 <!-- release:start -->
+
+### Improvements
+
+- **Provenance retry**: Re-enable npm provenance generation in the release workflow to verify whether the canonical `repository.url` metadata is now sufficient for Trusted Publishing validation.
+
+### Contributors
+
+- @enk0ded
+
+<!-- release:end -->
+
+## 0.10.5
 
 ### Improvements
 
@@ -11,8 +23,6 @@
 ### Contributors
 
 - @enk0ded
-
-<!-- release:end -->
 
 ## 0.10.4
 
