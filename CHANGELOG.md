@@ -1,8 +1,20 @@
 # Changelog
 
-## 0.10.3
+## 0.10.4
 
 <!-- release:start -->
+
+### Improvements
+
+- **Trusted npm publishing compatibility**: The release workflow now runs on Node.js 24 so npm Trusted Publishing uses a compatible npm CLI when publishing `@enk0ded/portless` with OIDC provenance.
+
+### Contributors
+
+- @enk0ded
+
+<!-- release:end -->
+
+## 0.10.3
 
 ### Improvements
 
@@ -11,8 +23,6 @@
 ### Contributors
 
 - @enk0ded
-
-<!-- release:end -->
 
 ## 0.10.2
 
