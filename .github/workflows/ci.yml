@@ -12,7 +12,7 @@ jobs:
 
     strategy:
       matrix:
-        node-version: [20, 22]
+        node-version: [22, 24]
 
     steps:
       - uses: actions/checkout@v5
@@ -39,15 +39,14 @@ jobs:
 
       - run: bun run test
 
-      - if: ${{ matrix.node-version != 20 }}
-        run: bun run test:e2e
+      - run: bun run test:e2e
 
   ci-windows:
     runs-on: windows-latest
 
     strategy:
       matrix:
-        node-version: [20, 22]
+        node-version: [22, 24]
 
     steps:
       - uses: actions/checkout@v5
