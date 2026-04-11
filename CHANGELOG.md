@@ -1,8 +1,21 @@
 # Changelog
 
-## 0.10.1
+## 0.10.2
 
 <!-- release:start -->
+
+### Improvements
+
+- **Scoped npm package**: portless now publishes to npm as `@enk0ded/portless` while keeping the `portless` CLI command. Installation instructions and CLI help now point to the scoped package name.
+- **Repository references updated**: Docs, GitHub links, Windows debug scripts, and release automation now point to `enk0ded/portless` and check the scoped npm package before publishing.
+
+### Contributors
+
+- @enk0ded
+
+<!-- release:end -->
+
+## 0.10.1
 
 ### New Features
 
@@ -15,7 +28,6 @@
 ### Contributors
 
 - @ctate
-<!-- release:end -->
 
 ## 0.10.0
 
@@ -90,7 +102,7 @@
 
 ### New Features
 
-- **Project dev dependency install**: portless can now be installed as a project dev dependency (`npm install -D portless`) in addition to the global install. The `npx`/`dlx` guard now only blocks one-off downloads, not locally installed packages. (#179)
+- **Project dev dependency install**: portless can now be installed as a project dev dependency (`npm install -D @enk0ded/portless`) in addition to the global install. The `npx`/`dlx` guard now only blocks one-off downloads, not locally installed packages. (#179)
 
 ### Bug Fixes
 

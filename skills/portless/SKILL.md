@@ -25,10 +25,10 @@ Install globally (recommended) or as a project dev dependency. Do NOT use `npx` 
 
 ```bash
 # Global (available everywhere)
-npm install -g portless
+npm install -g @enk0ded/portless
 
 # Or per-project dev dependency
-npm install -D portless
+npm install -D @enk0ded/portless
 ```
 
 When installed per-project, invoke via package.json scripts or `npx portless` (since the package is local, npx will not download anything).
@@ -37,7 +37,7 @@ When installed per-project, invoke via package.json scripts or `npx portless` (s
 
 ```bash
 # Install globally (or add -D to a project)
-npm install -g portless
+npm install -g @enk0ded/portless
 
 # Run your app (auto-starts the HTTPS proxy on port 443)
 portless run next dev

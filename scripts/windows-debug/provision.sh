@@ -170,7 +170,7 @@ Log "OpenSSL installed: $(openssl version)"
 
 # Clone repo
 Log "Cloning portless..."
-git clone https://github.com/vercel-labs/portless.git C:\portless
+git clone https://github.com/enk0ded/portless.git C:\portless
 Set-Location C:\portless
 Log "Repo cloned."
 

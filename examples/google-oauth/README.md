@@ -40,7 +40,7 @@ Since you own `ctate.dev`, nothing under `local.ctate.dev` will conflict with re
 ### 1. Install portless
 
 ```bash
-npm install -g portless
+npm install -g @enk0ded/portless
 ```
 
 ### 2. Start the proxy

@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RUN="$SCRIPT_DIR/run.sh"
 
 BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
-REMOTE_URL=$(git remote get-url origin 2>/dev/null || echo "https://github.com/vercel-labs/portless.git")
+REMOTE_URL=$(git remote get-url origin 2>/dev/null || echo "https://github.com/enk0ded/portless.git")
 
 echo "Syncing branch '$BRANCH' on Windows instance..."
 
