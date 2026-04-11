@@ -78,7 +78,7 @@
     },
     "packages/portless": {
       "name": "@enk0ded/portless",
-      "version": "0.10.4",
+      "version": "0.10.5",
       "bin": {
         "portless": "./dist/cli.js",
       },

@@ -1,8 +1,20 @@
 # Changelog
 
-## 0.10.4
+## 0.10.5
 
 <!-- release:start -->
+
+### Improvements
+
+- **Trusted npm publishing fallback**: The release workflow still uses npm Trusted Publishing with OIDC, but now disables provenance generation to avoid npm's current repository URL verification failure for this package.
+
+### Contributors
+
+- @enk0ded
+
+<!-- release:end -->
+
+## 0.10.4
 
 ### Improvements
 
@@ -11,8 +23,6 @@
 ### Contributors
 
 - @enk0ded
-
-<!-- release:end -->
 
 ## 0.10.3
 
