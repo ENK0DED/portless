@@ -23,31 +23,43 @@ export interface PortlessConfig extends AppConfig {
 export interface LoadedConfig {
   config: PortlessConfig;
   configDir: string;
+  sourcePath: string;
 }
 
 const CONFIG_FILENAME = "portless.json";
+const CONFIG_PATHS = [CONFIG_FILENAME, path.join(".config", CONFIG_FILENAME)] as const;
 
 /**
- * Load portless config from `cwd`. Checks `portless.json` first, then
- * falls back to a `"portless"` key in `package.json`. Does not walk up
- * to parent directories.
+ * Load portless config from a JSON file. Returns null when the file is absent.
  */
-export function loadConfig(cwd: string = process.cwd()): LoadedConfig | null {
-  const configPath = path.join(cwd, CONFIG_FILENAME);
+function loadConfigFromFile(configPath: string, configDir: string): LoadedConfig | null {
   try {
     const raw = fs.readFileSync(configPath, "utf-8");
     const parsed = JSON.parse(raw);
     validateConfig(parsed, configPath);
-    return { config: parsed, configDir: cwd };
+    return { config: parsed, configDir, sourcePath: configPath };
   } catch (err) {
     if (isErrnoException(err) && err.code === "ENOENT") {
-      return loadConfigFromPackageJson(cwd);
+      return null;
     }
     if (err instanceof SyntaxError) {
       throw new ConfigValidationError(`Invalid JSON in ${configPath}`);
     }
     throw err;
   }
+}
+
+/**
+ * Load portless config from `cwd`. Checks `portless.json`, then
+ * `.config/portless.json`, then falls back to a `"portless"` key in
+ * `package.json`. Does not walk up to parent directories.
+ */
+export function loadConfig(cwd: string = process.cwd()): LoadedConfig | null {
+  for (const relativePath of CONFIG_PATHS) {
+    const loaded = loadConfigFromFile(path.join(cwd, relativePath), cwd);
+    if (loaded) return loaded;
+  }
+  return loadConfigFromPackageJson(cwd);
 }
 
 /** Normalize the raw `"portless"` value: a string is shorthand for `{ name }`. */
@@ -67,7 +79,7 @@ function loadConfigFromPackageJson(dir: string): LoadedConfig | null {
       const config = normalizePortlessValue(pkg.portless);
       if (config === null) return null;
       validateConfig(config, `${pkgPath} "portless"`);
-      return { config: config as PortlessConfig, configDir: dir };
+      return { config: config as PortlessConfig, configDir: dir, sourcePath: pkgPath };
     }
   } catch (err) {
     if (isErrnoException(err) && err.code === "ENOENT") return null;
