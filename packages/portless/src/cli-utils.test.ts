@@ -5,6 +5,7 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+  augmentedPath,
   buildSudoEnvArgs,
   buildProxyStartConfig,
   BLOCKED_PORTS,
@@ -438,6 +439,20 @@ describe("injectFrameworkFlags", () => {
     const args = ["vp", "dev"];
     injectFrameworkFlags(args, 4567);
     expect(args).toEqual(["vp", "dev", "--port", "4567", "--strictPort", "--host", "127.0.0.1"]);
+  });
+
+  it("injects --port, --strictPort, and --host for vitepress command", () => {
+    const args = ["vitepress", "dev"];
+    injectFrameworkFlags(args, 4567);
+    expect(args).toEqual([
+      "vitepress",
+      "dev",
+      "--port",
+      "4567",
+      "--strictPort",
+      "--host",
+      "127.0.0.1",
+    ]);
   });
 
   it("injects for react-router with --strictPort", () => {
@@ -1195,6 +1210,26 @@ describe("readPersistedProxyState", () => {
       useWildcard: true,
     });
   });
+});
+
+describe("augmentedPath", () => {
+  it.skipIf(process.platform === "win32")(
+    "does not prepend portless's own Node directory on Unix",
+    () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-augmented-path-"));
+      try {
+        const binDir = path.join(tmpDir, "node_modules", ".bin");
+        fs.mkdirSync(binDir, { recursive: true });
+
+        const result = augmentedPath({ PATH: "/usr/bin" }, tmpDir).split(path.delimiter);
+
+        expect(result[0]).toBe(binDir);
+        expect(result).not.toContain(path.dirname(process.execPath));
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }
+  );
 });
 
 describe("resolveWindowsExecutable", () => {

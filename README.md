@@ -34,7 +34,7 @@ portless myapp next dev
 
 HTTPS with HTTP/2 is enabled by default. On first run, portless generates a local CA, trusts it, and binds port 443 (auto-elevates with sudo on macOS/Linux). Use `--no-tls` for plain HTTP.
 
-The proxy auto-starts when you run an app. A random port in the 4000 to 4999 range that is free on `127.0.0.1` is assigned via the `PORT` environment variable. Most frameworks (Next.js, Express, Nuxt, etc.) respect this automatically. For frameworks that ignore `PORT` (Vite, VitePlus, Astro, React Router, Angular, Laravel, Expo, React Native, Wrangler), portless auto-injects the right `--port` flag and, when needed, a matching `--host` flag or Wrangler's `--ip` flag.
+The proxy auto-starts when you run an app. A random port in the 4000 to 4999 range that is free on `127.0.0.1` is assigned via the `PORT` environment variable. Most frameworks (Next.js, Express, Nuxt, etc.) respect this automatically. For frameworks that ignore `PORT` (Vite, VitePlus, VitePress, Astro, React Router, Angular, Laravel, Expo, React Native, Wrangler), portless auto-injects the right `--port` flag and, when needed, a matching `--host` flag or Wrangler's `--ip` flag.
 
 When auto-starting, portless reuses the configuration (port, TLS, suffix) from the most recent proxy run, so a restart or reboot does not silently revert to defaults. Explicit env vars (`PORTLESS_PORT`, `PORTLESS_HTTPS`, etc.) always take priority.
 
@@ -184,7 +184,7 @@ portless docs.myapp next dev
 # -> https://docs.myapp.localhost
 ```
 
-By default, only explicitly registered subdomains are routed (strict mode). Use `--wildcard` when starting the proxy to allow any subdomain of a registered route to fall back to that app (e.g. `tenant1.myapp.localhost` routes to the `myapp` app without extra registration). To change wildcard mode for a running proxy, stop it and start it again with the desired mode.
+By default, only explicitly registered subdomains are routed (strict mode). Use `--wildcard` when starting the proxy to allow any subdomain of a registered route to fall back to that app (e.g. `tenant1.myapp.localhost` routes to the `myapp` app without extra registration). Wildcard routing is local proxy behavior only; mDNS LAN mode cannot resolve wildcard subdomains on other devices. To change wildcard mode for a running proxy, stop it and start it again with the desired mode.
 
 ## Git Worktrees
 
@@ -354,7 +354,7 @@ Tailscale HTTPS certificates must be enabled before `--tailscale` or `--funnel` 
 
 Set `PORTLESS_TAILSCALE=1` in your shell profile or `.env` to share every app by default. `portless list` shows both local and tailnet URLs. Tailscale serve registrations are cleaned up automatically when the app exits.
 
-Requires the Tailscale CLI to be installed and connected (`tailscale up`), with Tailscale HTTPS certificates enabled.
+Requires the Tailscale CLI to be installed and connected (`tailscale up`), with MagicDNS and Tailscale HTTPS certificates enabled on the active tailnet.
 
 ## ngrok sharing
 
@@ -431,7 +431,7 @@ portless service uninstall       # Remove the startup service
 --foreground                     Run proxy in foreground instead of daemon
 --suffix <suffix>                Use a custom suffix instead of .localhost
 --tld <tld>                      Compatibility alias for --suffix
---wildcard                       Allow unregistered subdomains to fall back to parent route
+--wildcard                       Allow unregistered subdomains to fall back to parent route locally
                                  Proxy-level only; restart proxy to change this mode
 --state-dir <path>               Use a custom state directory with service install
 --script <name>                  Run a specific package.json script (default: dev)

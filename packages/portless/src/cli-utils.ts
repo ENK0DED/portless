@@ -872,11 +872,12 @@ export function augmentedPath(env: NodeJS.ProcessEnv | undefined, cwd?: string):
   // process.env but case-sensitive in plain objects created via spread).
   const base = source.PATH ?? source.Path ?? "";
   const bins = collectBinPaths(cwd ?? process.cwd());
-  // Ensure node's own directory is in PATH so .cmd wrappers in node_modules/.bin
-  // can locate the node executable (fixes Windows "node not recognized" errors).
-  const nodeBin = path.dirname(process.execPath);
-  const allBins = [...bins, nodeBin];
-  return allBins.join(path.delimiter) + path.delimiter + base;
+  // Windows .cmd wrappers in node_modules/.bin need node.exe to be discoverable.
+  // On Unix, do not shadow the user's version-manager-selected Node binary.
+  if (isWindows) {
+    bins.push(path.dirname(process.execPath));
+  }
+  return bins.join(path.delimiter) + path.delimiter + base;
 }
 
 export function resolveWindowsExecutable(cmd: string, pathStr: string): string | null {
@@ -1042,6 +1043,7 @@ export function spawnCommand(
 const FRAMEWORKS_NEEDING_PORT: Record<string, { strictPort: boolean; hostFlag?: string }> = {
   vite: { strictPort: true },
   vp: { strictPort: true },
+  vitepress: { strictPort: true },
   "react-router": { strictPort: true },
   rsbuild: { strictPort: false },
   astro: { strictPort: false },

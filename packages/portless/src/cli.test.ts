@@ -1431,6 +1431,29 @@ describe("CLI", () => {
       expect(start2.stderr).toContain("wildcard");
     });
 
+    it.skipIf(process.platform === "win32")(
+      "warns when LAN mode and wildcard mode are both requested",
+      () => {
+        const emptyPath = fs.mkdtempSync(path.join(os.tmpdir(), "portless-empty-path-"));
+        try {
+          const { status, stderr } = run(
+            ["proxy", "start", "--lan", "--wildcard", "--ip", "192.168.1.42"],
+            {
+              env: {
+                PATH: emptyPath,
+                PORTLESS_STATE_DIR: tmpDir,
+                PORTLESS_PORT: String(testPort),
+              },
+            }
+          );
+          expect(status).toBe(1);
+          expect(stderr).toContain("--wildcard has no effect in LAN mode");
+        } finally {
+          fs.rmSync(emptyPath, { recursive: true, force: true });
+        }
+      }
+    );
+
     it("stops proxy using explicit -p flag instead of env var", () => {
       const start = run(["proxy", "start"], { env: proxyEnv() });
       expect(start.status).toBe(0);
@@ -1830,6 +1853,8 @@ describe("CLI", () => {
       expect(stdout).toContain("--tailscale");
       expect(stdout).toContain("--funnel");
       expect(stdout).toContain("PORTLESS_TAILSCALE");
+      expect(stdout).toContain("MagicDNS");
+      expect(stdout).toContain("HTTPS certificates");
     });
 
     it("fails with actionable message when tailscale is not installed", () => {

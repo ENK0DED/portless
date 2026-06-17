@@ -81,6 +81,8 @@ portless myapp --funnel next dev
 portless myapp --ngrok next dev
 ```
 
+Tailscale sharing requires the Tailscale CLI to be connected with MagicDNS and HTTPS certificates enabled on the active tailnet. Funnel also requires Funnel to be enabled for the tailnet and node.
+
 ## Get a service URL
 
 ```bash
@@ -208,6 +210,10 @@ portless proxy start
     <tr>
       <td>`--ip <address>`</td>
       <td>Override auto-detected LAN IP (use with `--lan`)</td>
+    </tr>
+    <tr>
+      <td>`--wildcard`</td>
+      <td>Allow unregistered subdomains to fall back to a parent route locally. mDNS LAN mode cannot resolve wildcard subdomains on other devices.</td>
     </tr>
     <tr>
       <td>`--suffix <suffix>`</td>

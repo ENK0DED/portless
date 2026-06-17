@@ -131,7 +131,7 @@ portless api.myapp bun start    # https://api.myapp.localhost
 portless docs.myapp next dev     # https://docs.myapp.localhost
 ```
 
-By default, only explicitly registered subdomains are routed (strict mode). Start the proxy with `--wildcard` to allow any subdomain of a registered route to fall back to that app (e.g. `tenant1.myapp.localhost` routes to the `myapp` app). Exact matches always take priority over wildcards. To change wildcard mode for a running proxy, stop it and start it again with the desired mode.
+By default, only explicitly registered subdomains are routed (strict mode). Start the proxy with `--wildcard` to allow any subdomain of a registered route to fall back to that app (e.g. `tenant1.myapp.localhost` routes to the `myapp` app). Exact matches always take priority over wildcards. Wildcard routing is local proxy behavior only; mDNS LAN mode cannot resolve wildcard subdomains on other devices. To change wildcard mode for a running proxy, stop it and start it again with the desired mode.
 
 ### Git worktrees
 
@@ -163,7 +163,7 @@ PORTLESS=0 bun dev    # Bypasses proxy, uses default port
 
 `.localhost` domains resolve to `127.0.0.1` natively in Chrome, Firefox, and Edge. Safari relies on the system DNS resolver, which may not handle `.localhost` subdomains on all configurations. Run `portless hosts sync` to add entries to `/etc/hosts` if needed.
 
-Most frameworks (Next.js, Express, Nuxt, etc.) respect the `PORT` env var automatically. For frameworks that ignore `PORT` (Vite, VitePlus, Astro, React Router, Angular, Laravel, Expo, React Native, Wrangler), portless auto-injects the correct `--port` flag and, when needed, a matching `--host` CLI flag or Wrangler's `--ip` flag.
+Most frameworks (Next.js, Express, Nuxt, etc.) respect the `PORT` env var automatically. For frameworks that ignore `PORT` (Vite, VitePlus, VitePress, Astro, React Router, Angular, Laravel, Expo, React Native, Wrangler), portless auto-injects the correct `--port` flag and, when needed, a matching `--host` CLI flag or Wrangler's `--ip` flag.
 
 ### State directory
 
@@ -252,9 +252,9 @@ portless myapp --funnel next dev
 # -> https://devbox.yourteam.ts.net    (public internet)
 ```
 
-Tailscale HTTPS certificates must be enabled before `--tailscale` or `--funnel` can register HTTPS URLs. Funnel must also be enabled for the tailnet and node before `--funnel` can register the public URL. If either setting is missing, portless exits before starting the child process.
+MagicDNS and Tailscale HTTPS certificates must be enabled before `--tailscale` or `--funnel` can register HTTPS URLs. Funnel must also be enabled for the tailnet and node before `--funnel` can register the public URL. If either setting is missing, portless exits before starting the child process.
 
-Each `--tailscale` app is root-mounted on its own Tailscale HTTPS port (443, then 8443, 8444, etc.) so no framework `basePath` configuration is needed. Set `PORTLESS_TAILSCALE=1` to share every app by default. `portless list` shows both local and tailnet URLs. Tailscale serve registrations are cleaned up when the app exits. Requires `tailscale` CLI installed and connected, with Tailscale HTTPS certificates enabled.
+Each `--tailscale` app is root-mounted on its own Tailscale HTTPS port (443, then 8443, 8444, etc.) so no framework `basePath` configuration is needed. Set `PORTLESS_TAILSCALE=1` to share every app by default. `portless list` shows both local and tailnet URLs. Tailscale serve registrations are cleaned up when the app exits. Requires `tailscale` CLI installed and connected, with MagicDNS and Tailscale HTTPS certificates enabled on the active tailnet.
 
 ### ngrok sharing
 
@@ -314,7 +314,7 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 | `portless proxy start --suffix test`   | Use .test instead of .localhost                                |
 | `portless proxy start --tld test`      | Compatibility alias for `--suffix`                             |
 | `portless proxy start --foreground`    | Start the proxy in foreground (for debugging)                  |
-| `portless proxy start --wildcard`      | Allow unregistered subdomains to fall back to parent route     |
+| `portless proxy start --wildcard`      | Allow unregistered subdomains to fall back locally             |
 | `portless proxy stop`                  | Stop the proxy                                                 |
 | `portless service install`             | Start the HTTPS proxy when the OS starts                       |
 | `portless service install --lan`       | Start the service in LAN mode                                  |
@@ -418,7 +418,7 @@ portless proxy start -p 8080
 
 ### Framework not respecting PORT
 
-Portless auto-injects the right `--port` flag and, when needed, a matching `--host` flag for frameworks that ignore the `PORT` env var: **Vite**, **VitePlus** (`vp`), **Astro**, **React Router**, **Angular**, **Laravel**, **Expo**, **React Native**, and **Wrangler**. Wrangler gets `--ip` because its `--host` flag means route hostname. SvelteKit uses Vite internally and is handled automatically.
+Portless auto-injects the right `--port` flag and, when needed, a matching `--host` flag for frameworks that ignore the `PORT` env var: **Vite**, **VitePlus** (`vp`), **VitePress**, **Astro**, **React Router**, **Angular**, **Laravel**, **Expo**, **React Native**, and **Wrangler**. Wrangler gets `--ip` because its `--host` flag means route hostname. SvelteKit uses Vite internally and is handled automatically.
 
 For other frameworks that don't read `PORT`, pass the port manually:
 
@@ -494,7 +494,7 @@ tailscale status     # Check if connected
 tailscale up         # Connect to your tailnet
 ```
 
-Requires the Tailscale CLI to be installed (https://tailscale.com/download) and on PATH.
+Requires the Tailscale CLI to be installed (https://tailscale.com/download) and on PATH, with MagicDNS and Tailscale HTTPS certificates enabled on the active tailnet.
 
 ### ngrok not working
 

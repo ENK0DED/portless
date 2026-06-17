@@ -1762,8 +1762,8 @@ ${colors.bold("How it works:")}
      (apps get a random port in the 4000 to 4999 range that is free on 127.0.0.1 via PORT)
   3. Access via https://<name>.localhost
   4. .localhost domains auto-resolve to 127.0.0.1
-  5. Frameworks that ignore PORT (Vite, VitePlus, Astro, React Router, Angular,
-     Laravel, Expo, React Native, Wrangler) get --port and, when needed,
+  5. Frameworks that ignore PORT (Vite, VitePlus, VitePress, Astro,
+     React Router, Angular, Laravel, Expo, React Native, Wrangler) get --port and, when needed,
      --host or --ip flags injected automatically
 
 ${colors.bold("HTTP/2 + HTTPS (default):")}
@@ -1793,8 +1793,8 @@ ${colors.bold("Tailscale sharing:")}
   8444, etc.) so no basePath configuration is needed.
   Use --funnel to expose your dev server to the public internet via
   Tailscale Funnel. Requires Tailscale CLI to be installed and connected,
-  with Tailscale HTTPS certificates enabled. Funnel must also be enabled
-  on your tailnet.
+  with MagicDNS and Tailscale HTTPS certificates enabled on the active tailnet.
+  Funnel must also be enabled on your tailnet.
   ${colors.cyan("portless myapp --tailscale next dev")}
   ${colors.cyan("portless myapp --funnel next dev")}
 
@@ -1819,6 +1819,7 @@ ${colors.bold("Options:")}
   --suffix <suffix>             Use a custom suffix instead of .localhost (e.g. test, acme.com)
   --tld <tld>                   Compatibility alias for --suffix
   --wildcard                    Allow unregistered subdomains to fall back to parent route
+                                Local proxy mode only; mDNS LAN mode cannot resolve wildcards
                                 Proxy-level only; restart proxy to change this mode
   --state-dir <path>            Use a custom state directory with service install
   --app-port <number>           Use a fixed port for the app (skip auto-assignment)
@@ -1838,6 +1839,7 @@ ${colors.bold("Environment variables:")}
   PORTLESS_SUFFIX=<suffix>      Use a custom suffix (e.g. test, acme.com; default: localhost)
   PORTLESS_TLD=<tld>            Compatibility alias for PORTLESS_SUFFIX
   PORTLESS_WILDCARD=1           Allow unregistered subdomains to fall back to parent route
+                                Local proxy mode only; mDNS LAN mode cannot resolve wildcards
   PORTLESS_SYNC_HOSTS=0         Disable auto-sync of ${HOSTS_DISPLAY} (on by default)
   PORTLESS_TAILSCALE=1          Share apps on your Tailscale network (same as --tailscale)
   PORTLESS_FUNNEL=1             Share apps publicly via Tailscale Funnel (same as --funnel)
@@ -2475,7 +2477,7 @@ ${colors.bold("Usage:")}
   ${colors.cyan("portless proxy start -p 1355")}        Start on a custom port (no sudo)
   ${colors.cyan("portless proxy start --suffix test")}  Use .test instead of .localhost
   ${colors.cyan("portless proxy start --tld test")}     Compatibility alias for --suffix
-  ${colors.cyan("portless proxy start --wildcard")}     Allow unregistered subdomains to fall back to parent
+  ${colors.cyan("portless proxy start --wildcard")}     Allow unregistered subdomains to fall back to parent (local only)
   ${colors.cyan("portless proxy stop")}                 Stop the proxy
 
 ${colors.bold("LAN mode (--lan):")}
@@ -2485,6 +2487,8 @@ ${colors.bold("LAN mode (--lan):")}
   --ip to pin one.
   Stopped LAN proxies keep LAN mode for the next start via proxy.lan.
   Use PORTLESS_LAN=0 for one start to switch back to .localhost mode.
+  Note: --wildcard is not supported in LAN mode. mDNS does not resolve
+  wildcard subdomains, so only explicitly registered routes work on other devices.
 `);
     process.exit(isProxyHelp || !args[1] ? 0 : 1);
   }
@@ -2642,6 +2646,15 @@ ${colors.bold("LAN mode (--lan):")}
         )
       );
     }
+  }
+
+  if (lanMode && desiredWildcard) {
+    console.warn(
+      chalk.yellow(
+        "Warning: --wildcard has no effect in LAN mode. mDNS does not support wildcard records, " +
+          "so only explicitly registered routes resolve on other devices."
+      )
+    );
   }
 
   const riskyReason = RISKY_TLDS.get(tld);
