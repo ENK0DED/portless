@@ -24,11 +24,13 @@ import {
   getProtocolPort,
   isHttpsEnvDisabled,
   injectFrameworkFlags,
+  isPortListening,
   isProxyRunning,
   parsePidFromNetstat,
   readLanMarker,
   readPersistedProxyState,
   readTldFromDir,
+  resolveWindowsExecutable,
   resolveStateDir,
   validateTld,
   writeLanMarker,
@@ -138,6 +140,44 @@ describe("isProxyRunning", () => {
 
     const result = await isProxyRunning(port);
     expect(result).toBe(false);
+  });
+});
+
+describe("isPortListening", () => {
+  const servers: net.Server[] = [];
+
+  afterEach(async () => {
+    for (const s of servers) {
+      await new Promise<void>((resolve) => s.close(() => resolve()));
+    }
+    servers.length = 0;
+  });
+
+  function listenOn(host: string): Promise<number> {
+    const server = net.createServer();
+    servers.push(server);
+    return new Promise<number>((resolve) => {
+      server.listen(0, host, () => {
+        const addr = server.address();
+        if (addr && typeof addr !== "string") {
+          resolve(addr.port);
+        }
+      });
+    });
+  }
+
+  it("returns false when nothing is listening", async () => {
+    expect(await isPortListening(19877)).toBe(false);
+  });
+
+  it("detects a listener on IPv4 loopback", async () => {
+    const port = await listenOn("127.0.0.1");
+    expect(await isPortListening(port)).toBe(true);
+  });
+
+  it("detects a listener on IPv6 loopback only", async () => {
+    const port = await listenOn("::1");
+    expect(await isPortListening(port)).toBe(true);
   });
 });
 
@@ -1106,5 +1146,105 @@ describe("readPersistedProxyState", () => {
       tld: "local",
       lanMode: true,
     });
+  });
+});
+
+describe("resolveWindowsExecutable", () => {
+  let tmpDir: string;
+  let prevPathext: string | undefined;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-resolve-test-"));
+    prevPathext = process.env.PATHEXT;
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    if (prevPathext === undefined) {
+      delete process.env.PATHEXT;
+    } else {
+      process.env.PATHEXT = prevPathext;
+    }
+  });
+
+  it("returns the absolute path of an existing absolute path input", () => {
+    const file = path.join(tmpDir, "tool.exe");
+    fs.writeFileSync(file, "");
+    expect(resolveWindowsExecutable(file, "")).toBe(path.resolve(file));
+  });
+
+  it("returns null for an absolute path that does not exist", () => {
+    const missing = path.join(tmpDir, "nope.exe");
+    expect(resolveWindowsExecutable(missing, "")).toBeNull();
+  });
+
+  it("walks PATH and matches with PATHEXT extensions", () => {
+    process.env.PATHEXT = ".COM;.EXE;.BAT;.CMD";
+    const dirA = path.join(tmpDir, "a");
+    const dirB = path.join(tmpDir, "b");
+    fs.mkdirSync(dirA);
+    fs.mkdirSync(dirB);
+    const target = path.join(dirB, "tool.cmd");
+    fs.writeFileSync(target, "");
+
+    expect(resolveWindowsExecutable("tool", [dirA, dirB].join(path.delimiter))).toBe(target);
+  });
+
+  it("returns the first PATH match", () => {
+    process.env.PATHEXT = ".COM;.EXE;.BAT;.CMD";
+    const dirA = path.join(tmpDir, "a");
+    const dirB = path.join(tmpDir, "b");
+    fs.mkdirSync(dirA);
+    fs.mkdirSync(dirB);
+    const first = path.join(dirA, "tool.exe");
+    fs.writeFileSync(first, "");
+    fs.writeFileSync(path.join(dirB, "tool.exe"), "");
+
+    expect(resolveWindowsExecutable("tool", [dirA, dirB].join(path.delimiter))).toBe(first);
+  });
+
+  it("respects PATHEXT priority within one directory", () => {
+    process.env.PATHEXT = ".COM;.EXE;.BAT;.CMD";
+    const dir = path.join(tmpDir, "bin");
+    fs.mkdirSync(dir);
+    const exe = path.join(dir, "tool.exe");
+    fs.writeFileSync(exe, "");
+    fs.writeFileSync(path.join(dir, "tool.cmd"), "");
+
+    expect(resolveWindowsExecutable("tool", dir)).toBe(exe);
+  });
+
+  it("falls back to default PATHEXT when PATHEXT is unset", () => {
+    delete process.env.PATHEXT;
+    const dir = path.join(tmpDir, "bin");
+    fs.mkdirSync(dir);
+    const target = path.join(dir, "tool.bat");
+    fs.writeFileSync(target, "");
+
+    expect(resolveWindowsExecutable("tool", dir)).toBe(target);
+  });
+
+  it("returns literal names before extension-appended candidates", () => {
+    process.env.PATHEXT = ".COM;.EXE;.BAT;.CMD";
+    const dir = path.join(tmpDir, "bin");
+    fs.mkdirSync(dir);
+    const literal = path.join(dir, "mytool");
+    fs.writeFileSync(literal, "");
+    fs.writeFileSync(path.join(dir, "mytool.exe"), "");
+
+    expect(resolveWindowsExecutable("mytool", dir)).toBe(literal);
+  });
+
+  it("returns null when no PATH entry contains the command", () => {
+    process.env.PATHEXT = ".COM;.EXE;.BAT;.CMD";
+    const dir = path.join(tmpDir, "bin");
+    fs.mkdirSync(dir);
+
+    expect(resolveWindowsExecutable("missing", dir)).toBeNull();
+  });
+
+  it("treats slash-containing input as path-like", () => {
+    expect(resolveWindowsExecutable("./bin/missing", "")).toBeNull();
+    expect(resolveWindowsExecutable(".\\bin\\missing", "")).toBeNull();
   });
 });

@@ -9,6 +9,27 @@ import { ARROW_SVG, renderPage } from "./pages.js";
 export const PORTLESS_HEADER = "X-Portless";
 
 /**
+ * Upstream app connections stay on loopback, but support both IPv4 and IPv6.
+ * Some dev servers bind localhost as ::1 only, while older portless builds
+ * dialed only 127.0.0.1.
+ */
+export const LOOPBACK_DIAL_OPTIONS = {
+  hostname: "localhost",
+  host: "localhost",
+  autoSelectFamily: true,
+  lookup: ((_hostname, _options, callback) => {
+    callback(null, [
+      { address: "127.0.0.1", family: 4 },
+      { address: "::1", family: 6 },
+    ]);
+  }) as net.LookupFunction,
+} as const;
+
+function dialErrorMessage(err: NodeJS.ErrnoException): string {
+  return err.message || err.code || "connection failed";
+}
+
+/**
  * HTTP/1.1 hop-by-hop headers that are forbidden in HTTP/2 responses.
  * These must be stripped when proxying an HTTP/1.1 backend response
  * back to an HTTP/2 client.
@@ -198,7 +219,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
 
     const proxyReq = http.request(
       {
-        hostname: "127.0.0.1",
+        ...LOOPBACK_DIAL_OPTIONS,
         port: route.port,
         path: req.url,
         method: req.method,
@@ -228,7 +249,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     );
 
     proxyReq.on("error", (err) => {
-      onError(`Proxy error for ${getRequestHost(req)}: ${err.message}`);
+      onError(`Proxy error for ${getRequestHost(req)}: ${dialErrorMessage(err)}`);
       if (!res.headersSent) {
         const errWithCode = err as NodeJS.ErrnoException;
         const detail =
@@ -311,7 +332,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     }
 
     const proxyReq = http.request({
-      hostname: "127.0.0.1",
+      ...LOOPBACK_DIAL_OPTIONS,
       port: route.port,
       path: req.url,
       method: req.method,
@@ -349,7 +370,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     });
 
     proxyReq.on("error", (err) => {
-      onError(`WebSocket proxy error for ${getRequestHost(req)}: ${err.message}`);
+      onError(`WebSocket proxy error for ${getRequestHost(req)}: ${dialErrorMessage(err)}`);
       socket.destroy();
     });
 

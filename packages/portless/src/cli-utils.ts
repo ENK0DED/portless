@@ -6,7 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
 import { execSync, spawn } from "node:child_process";
-import { PORTLESS_HEADER } from "./proxy.js";
+import { LOOPBACK_DIAL_OPTIONS, PORTLESS_HEADER } from "./proxy.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -689,10 +689,10 @@ export function isProxyRunning(port: number, tls = false): Promise<boolean> {
   });
 }
 
-/** Check whether any process is listening on the given port at 127.0.0.1. */
+/** Check whether any process is listening on the given port on loopback. */
 export function isPortListening(port: number): Promise<boolean> {
   return new Promise((resolve) => {
-    const socket = net.createConnection({ host: "127.0.0.1", port });
+    const socket = net.createConnection({ ...LOOPBACK_DIAL_OPTIONS, port });
     let settled = false;
 
     const finish = (result: boolean) => {
@@ -851,11 +851,41 @@ export function augmentedPath(env: NodeJS.ProcessEnv | undefined, cwd?: string):
   return allBins.join(path.delimiter) + path.delimiter + base;
 }
 
+export function resolveWindowsExecutable(cmd: string, pathStr: string): string | null {
+  if (path.isAbsolute(cmd) || cmd.includes("\\") || cmd.includes("/")) {
+    return fs.existsSync(cmd) ? path.resolve(cmd) : null;
+  }
+
+  const pathext = process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD";
+  const exts = pathext
+    .split(";")
+    .map((ext) => ext.toLowerCase())
+    .filter(Boolean);
+
+  for (const dir of pathStr.split(path.delimiter)) {
+    if (!dir) continue;
+
+    const literal = path.join(dir, cmd);
+    if (fs.existsSync(literal)) return literal;
+
+    for (const ext of exts) {
+      const candidate = path.join(dir, cmd + ext);
+      if (fs.existsSync(candidate)) return candidate;
+    }
+  }
+
+  return null;
+}
+
+function quoteWindowsCmdArg(arg: string): string {
+  if (!/[\s"&|<>^()%!]/.test(arg)) return arg;
+  return `"${arg.replace(/"/g, '\\"')}"`;
+}
+
 /**
  * Spawn a command with proper signal forwarding, error handling, and exit
- * code propagation. Uses /bin/sh (Unix) or cmd.exe (Windows) so that shell
- * scripts and version manager shims are resolved. Prepends node_modules/.bin
- * to PATH so local project binaries (e.g. next, vite) are found.
+ * code propagation. Prepends node_modules/.bin to PATH so local project
+ * binaries are found.
  */
 export function spawnCommand(
   commandArgs: string[],
@@ -864,6 +894,11 @@ export function spawnCommand(
     onCleanup?: () => void;
   }
 ): void {
+  if (commandArgs.length === 0) {
+    console.error("spawnCommand called with empty commandArgs");
+    process.exit(1);
+  }
+
   const env: Record<string, string | undefined> = {
     ...(options?.env ?? process.env),
     PATH: augmentedPath(options?.env),
@@ -885,16 +920,36 @@ export function spawnCommand(
   // On Unix, spawn detached so the child gets its own process group. This
   // lets us kill the entire tree (shell + grandchild dev server) with a
   // single process.kill(-pid, signal) instead of only the immediate child.
-  const child = isWindows
-    ? spawn("cmd.exe", ["/d", "/s", "/c", commandArgs.join(" ")], {
+  let child: ReturnType<typeof spawn>;
+  if (isWindows) {
+    const resolved = resolveWindowsExecutable(commandArgs[0]!, env.PATH ?? "");
+    if (resolved === null) {
+      console.error(`Failed to run command: "${commandArgs[0]}" not found in PATH`);
+      console.error(`Is "${commandArgs[0]}" installed and in your PATH?`);
+      process.exit(1);
+    }
+
+    const ext = path.extname(resolved).toLowerCase();
+    if (ext === ".cmd" || ext === ".bat") {
+      const cmdline = [resolved, ...commandArgs.slice(1)].map(quoteWindowsCmdArg).join(" ");
+      child = spawn("cmd.exe", ["/d", "/s", "/c", cmdline], {
         stdio: "inherit",
         env,
-      })
-    : spawn("/bin/sh", ["-c", commandArgs.map(shellEscape).join(" ")], {
-        stdio: "inherit",
-        env,
-        detached: true,
+        windowsVerbatimArguments: true,
       });
+    } else {
+      child = spawn(resolved, commandArgs.slice(1), {
+        stdio: "inherit",
+        env,
+      });
+    }
+  } else {
+    child = spawn("/bin/sh", ["-c", commandArgs.map(shellEscape).join(" ")], {
+      stdio: "inherit",
+      env,
+      detached: true,
+    });
+  }
 
   let exiting = false;
 
