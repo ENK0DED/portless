@@ -696,6 +696,7 @@ function startProxyServer(
     setTimeout(() => process.exit(0), EXIT_TIMEOUT_MS).unref();
   };
 
+  process.on("SIGHUP", cleanup);
   process.on("SIGINT", cleanup);
   process.on("SIGTERM", cleanup);
 
@@ -1758,7 +1759,7 @@ ${colors.bold("In package.json:")}
 ${colors.bold("How it works:")}
   1. Start the proxy once (HTTPS on port 443 by default, auto-elevates with sudo)
   2. Run your apps - they auto-start the proxy and register automatically
-     (apps get a random port in the 4000-4999 range via PORT)
+     (apps get a random port in the 4000 to 4999 range that is free on 127.0.0.1 via PORT)
   3. Access via https://<name>.localhost
   4. .localhost domains auto-resolve to 127.0.0.1
   5. Frameworks that ignore PORT (Vite, VitePlus, Astro, React Router, Angular,
@@ -3498,6 +3499,7 @@ async function runWithTurbo(
     removeManifest();
   };
 
+  process.on("SIGHUP", cleanup);
   process.on("SIGINT", cleanup);
   process.on("SIGTERM", cleanup);
 
@@ -3584,6 +3586,7 @@ async function runWithDirectSpawn(
     }
   };
 
+  process.on("SIGHUP", cleanup);
   process.on("SIGINT", cleanup);
   process.on("SIGTERM", cleanup);
 

@@ -149,6 +149,7 @@ async function startCliApp(
     ...process.env,
     PORTLESS_PORT: PROXY_PORT.toString(),
     PORTLESS_HTTPS: "0",
+    PORTLESS_SUFFIX: "localhost",
     PORTLESS_STATE_DIR: state.stateDir,
     NO_COLOR: "1",
   };
@@ -240,6 +241,24 @@ describe("zombie process prevention", () => {
     // grandchild survives because child.kill() only kills /bin/sh.
     const survivors = findPidsOnPort(appPort);
     expect(survivors).toEqual([]);
+  });
+
+  it("SIGHUP kills the dev server and removes the route", async () => {
+    if (isWindows) return;
+
+    // SIGHUP is delivered when the controlling terminal goes away. Without an
+    // explicit handler, Node exits before route and child-process cleanup runs.
+    const { hostname, appPort } = await startCliApp("zombie-sighup", state, "wrapper.js");
+
+    state.cliChild!.kill("SIGHUP");
+    await sleep(2000);
+
+    const survivors = findPidsOnPort(appPort);
+    expect(survivors).toEqual([]);
+
+    const routesPath = path.join(state.stateDir!, "routes.json");
+    const routes: Array<{ hostname: string }> = JSON.parse(fs.readFileSync(routesPath, "utf-8"));
+    expect(routes.find((r) => r.hostname === hostname)).toBeUndefined();
   });
 
   it("SIGKILL leaves orphan, portless prune cleans it up", async () => {

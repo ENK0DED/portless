@@ -658,7 +658,7 @@ export async function findFreePort(
   const tryPort = (port: number): Promise<boolean> => {
     return new Promise((resolve) => {
       const server = net.createServer();
-      server.listen(port, () => {
+      server.listen(port, "127.0.0.1", () => {
         server.close(() => resolve(true));
       });
       server.on("error", () => resolve(false));
@@ -982,6 +982,7 @@ export function spawnCommand(
   let exiting = false;
 
   const cleanup = () => {
+    process.removeListener("SIGHUP", onSigHup);
     process.removeListener("SIGINT", onSigInt);
     process.removeListener("SIGTERM", onSigTerm);
     options?.onCleanup?.();
@@ -995,9 +996,11 @@ export function spawnCommand(
     process.exit(128 + (SIGNAL_CODES[signal] || 15));
   };
 
+  const onSigHup = () => handleSignal("SIGHUP");
   const onSigInt = () => handleSignal("SIGINT");
   const onSigTerm = () => handleSignal("SIGTERM");
 
+  process.on("SIGHUP", onSigHup);
   process.on("SIGINT", onSigInt);
   process.on("SIGTERM", onSigTerm);
 
