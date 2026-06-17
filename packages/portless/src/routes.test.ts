@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 import { RouteStore, RouteConflictError } from "./routes.js";
 
@@ -286,22 +287,217 @@ describe("RouteStore", () => {
       expect(routes).toHaveLength(1);
       expect(routes[0].hostname).toBe("app2.localhost");
     });
+
+    it("removes the route when the caller still owns it", () => {
+      store.addRoute("myapp.localhost", 4001, process.pid);
+      store.removeRoute("myapp.localhost", process.pid);
+      expect(store.loadRoutes()).toHaveLength(0);
+    });
+
+    it("does not remove a route the caller no longer owns (post --force takeover)", () => {
+      // Simulate the state right after a --force takeover: the route is owned
+      // by another live process. The killed process's exit cleanup (passing
+      // its own pid) must not deregister the new owner's route.
+      const newOwnerPid = process.ppid;
+      store.addRoute("myapp.localhost", 4002, newOwnerPid);
+      store.removeRoute("myapp.localhost", process.pid);
+      const routes = store.loadRoutes();
+      expect(routes).toHaveLength(1);
+      expect(routes[0].pid).toBe(newOwnerPid);
+    });
   });
 
   describe("locking (via concurrent addRoute)", () => {
     it("handles stale lock by recovering and completing the operation", () => {
       store.ensureDir();
       const lockPath = path.join(tmpDir, "routes.lock");
-      // Create a stale lock directory manually
       fs.mkdirSync(lockPath);
-      // Backdate mtime to 11 seconds ago
       const staleTime = new Date(Date.now() - 11_000);
       fs.utimesSync(lockPath, staleTime, staleTime);
-      // addRoute should recover from the stale lock
       expect(() => store.addRoute("test.localhost", 4001, process.pid)).not.toThrow();
       const routes = store.loadRoutes();
       expect(routes).toHaveLength(1);
       expect(routes[0].hostname).toBe("test.localhost");
+    });
+
+    it("handles many parallel addRoute calls without lock errors", async () => {
+      const count = 20;
+      const scriptPath = path.join(tmpDir, "worker.mjs");
+      const pkgDir = path.resolve(import.meta.dirname, "..");
+      const importUrl = pathToFileURL(path.join(pkgDir, "dist", "index.js")).href;
+      fs.writeFileSync(
+        scriptPath,
+        [
+          `import { RouteStore } from ${JSON.stringify(importUrl)};`,
+          `const [dir, hostname, port] = process.argv.slice(2);`,
+          `const store = new RouteStore(dir);`,
+          `try { store.addRoute(hostname, Number(port), process.pid); console.log("ok"); }`,
+          `catch (e) { console.log("error:" + e.message); process.exit(1); }`,
+          `process.stdin.resume();`,
+        ].join("\n")
+      );
+
+      const children: ReturnType<typeof spawn>[] = [];
+      const ready: Promise<{ code: number | null; stdout: string }>[] = [];
+      for (let i = 0; i < count; i++) {
+        const child = spawn(
+          process.execPath,
+          [scriptPath, tmpDir, `app${i}.localhost`, String(4000 + i)],
+          { stdio: ["pipe", "pipe", "pipe"] }
+        );
+        children.push(child);
+        ready.push(
+          new Promise((resolve) => {
+            let stdout = "";
+            child.stdout!.on("data", (d: Buffer) => {
+              stdout += d.toString();
+              if (stdout.includes("ok") || stdout.includes("error:")) {
+                resolve({ code: null, stdout: stdout.trim() });
+              }
+            });
+            child.on("close", (code) => resolve({ code, stdout: stdout.trim() }));
+          })
+        );
+      }
+
+      const outcomes = await Promise.all(ready);
+      const failures = outcomes.filter((o) => !o.stdout.startsWith("ok"));
+
+      for (const child of children) {
+        child.stdin!.end();
+      }
+
+      expect(failures).toHaveLength(0);
+
+      const raw = JSON.parse(fs.readFileSync(store.getRoutesPath(), "utf-8"));
+      expect(raw).toHaveLength(count);
+
+      const hostnames = raw.map((r: { hostname: string }) => r.hostname).sort();
+      const expected = Array.from({ length: count }, (_, i) => `app${i}.localhost`).sort();
+      expect(hostnames).toEqual(expected);
+    }, 15_000);
+
+    it("survives sustained lock contention that defeats a naive retry strategy", async () => {
+      store.ensureDir();
+      const lockPath = path.join(tmpDir, "routes.lock");
+
+      // A child process holds the lock for 1.5s, simulating a slow writer on
+      // a loaded machine. The old strategy (20 retries * 50ms = 1s budget)
+      // would time out; exponential backoff with a 5s budget survives.
+      const holdMs = 1500;
+      const holder = spawn(
+        process.execPath,
+        [
+          "-e",
+          [
+            `const fs = require("fs");`,
+            `const lockPath = ${JSON.stringify(lockPath)};`,
+            `fs.mkdirSync(lockPath, { recursive: true });`,
+            `console.log("holding");`,
+            `setTimeout(() => { try { fs.rmSync(lockPath, { recursive: true }); } catch {} console.log("released"); }, ${holdMs});`,
+          ].join("\n"),
+        ],
+        { stdio: ["ignore", "pipe", "pipe"] }
+      );
+
+      // Wait for the holder to acquire the lock
+      await new Promise<void>((resolve) => {
+        holder.stdout!.on("data", (d: Buffer) => {
+          if (d.toString().includes("holding")) resolve();
+        });
+      });
+
+      // addRoute must wait for the lock to be released (>1.5s)
+      expect(() => store.addRoute("contended.localhost", 5000, process.pid)).not.toThrow();
+
+      holder.kill("SIGTERM");
+
+      const routes = store.loadRoutes();
+      expect(routes).toHaveLength(1);
+      expect(routes[0].hostname).toBe("contended.localhost");
+    }, 10_000);
+  });
+
+  describe("tailscale metadata", () => {
+    it("persists and loads tailscale fields via updateRoute", () => {
+      store.addRoute("myapp.localhost", 4123, process.pid);
+      store.updateRoute("myapp.localhost", {
+        tailscaleUrl: "https://devbox.example.ts.net",
+        tailscaleHttpsPort: 443,
+      });
+      const routes = store.loadRoutes();
+      expect(routes).toHaveLength(1);
+      expect(routes[0].tailscaleUrl).toBe("https://devbox.example.ts.net");
+      expect(routes[0].tailscaleHttpsPort).toBe(443);
+      expect(routes[0].tailscaleFunnel).toBeUndefined();
+    });
+
+    it("persists funnel flag via updateRoute", () => {
+      store.addRoute("api.localhost", 4456, process.pid);
+      store.updateRoute("api.localhost", {
+        tailscaleUrl: "https://devbox.example.ts.net:8443",
+        tailscaleHttpsPort: 8443,
+        tailscaleFunnel: true,
+      });
+      const routes = store.loadRoutes();
+      expect(routes).toHaveLength(1);
+      expect(routes[0].tailscaleFunnel).toBe(true);
+    });
+
+    it("loads routes without tailscale fields (backward compat)", () => {
+      store.addRoute("legacy.localhost", 4000, process.pid);
+      const routes = store.loadRoutes();
+      expect(routes).toHaveLength(1);
+      expect(routes[0].tailscaleUrl).toBeUndefined();
+      expect(routes[0].tailscaleHttpsPort).toBeUndefined();
+    });
+
+    it("updateRoute is a no-op for nonexistent hostname", () => {
+      store.addRoute("myapp.localhost", 4123, process.pid);
+      store.updateRoute("noexist.localhost", {
+        tailscaleUrl: "https://devbox.example.ts.net",
+      });
+      const routes = store.loadRoutes();
+      expect(routes).toHaveLength(1);
+      expect(routes[0].tailscaleUrl).toBeUndefined();
+    });
+  });
+
+  describe("ngrok metadata", () => {
+    it("persists and loads ngrok fields via updateRoute", () => {
+      store.addRoute("myapp.localhost", 4123, process.pid);
+      store.updateRoute("myapp.localhost", {
+        ngrokUrl: "https://abc123.ngrok.app",
+        ngrokPid: 12345,
+      });
+      const routes = store.loadRoutes();
+      expect(routes).toHaveLength(1);
+      expect(routes[0].ngrokUrl).toBe("https://abc123.ngrok.app");
+      expect(routes[0].ngrokPid).toBe(12345);
+    });
+
+    it("clears ngrok fields via updateRoute", () => {
+      store.addRoute("myapp.localhost", 4123, process.pid);
+      store.updateRoute("myapp.localhost", {
+        ngrokUrl: "https://abc123.ngrok.app",
+        ngrokPid: 12345,
+      });
+      store.updateRoute("myapp.localhost", {
+        ngrokUrl: null,
+        ngrokPid: null,
+      });
+      const routes = store.loadRoutes();
+      expect(routes).toHaveLength(1);
+      expect(routes[0].ngrokUrl).toBeUndefined();
+      expect(routes[0].ngrokPid).toBeUndefined();
+    });
+
+    it("loads routes without ngrok fields", () => {
+      store.addRoute("legacy.localhost", 4000, process.pid);
+      const routes = store.loadRoutes();
+      expect(routes).toHaveLength(1);
+      expect(routes[0].ngrokUrl).toBeUndefined();
+      expect(routes[0].ngrokPid).toBeUndefined();
     });
   });
 });

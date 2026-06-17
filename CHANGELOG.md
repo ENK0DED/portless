@@ -1,59 +1,160 @@
 # Changelog
 
-## 0.10.6
+## 0.14.1000
 
 <!-- release:start -->
 
-### Improvements
+### Fork Sync
 
-- **Provenance retry**: Re-enable npm provenance generation in the release workflow to verify whether the canonical `repository.url` metadata is now sufficient for Trusted Publishing validation.
+- **Upstream 0.14.0 merge**: Pulls in upstream changes through `e4f65fa`, including ngrok sharing, startup services, Tailscale sharing, config file support, multi-app orchestration, and recent HTTP/2 and takeover fixes.
+- **Fork package identity**: Keeps npm publishing under `@enk0ded/portless` while preserving the `portless` CLI command.
+- **Fork versioning**: Maps upstream `0.14.0` to fork version `0.14.1000`, reserving `0.14.1001` through `0.14.1999` for local-only fork releases before upstream `0.14.1` maps to `0.14.2000`.
+- **Bun workspace policy**: Keeps Bun as the repository package manager and removes upstream pnpm workspace files from the fork.
 
 ### Contributors
 
+- @ctate
 - @enk0ded
 
 <!-- release:end -->
 
-## 0.10.5
+## 0.14.0
+
+### New Features
+
+- **ngrok sharing**: New `--ngrok` flag exposes portless apps publicly through ngrok while keeping the local `.localhost` URL. Also configurable with `PORTLESS_NGROK=1`; child processes receive `PORTLESS_NGROK_URL`, and `portless list` shows active ngrok URLs. (#323)
 
 ### Improvements
 
-- **Trusted npm publishing fallback**: The release workflow still uses npm Trusted Publishing with OIDC, but now disables provenance generation to avoid npm's current repository URL verification failure for this package.
+- **ngrok tunnel lifecycle**: Portless now checks for the ngrok CLI before starting an app, surfaces install and authentication guidance, removes stopped ngrok URLs from route state, and terminates tunnel processes during app cleanup. (#323)
 
 ### Contributors
 
-- @enk0ded
+- @ctate
 
-## 0.10.4
+## 0.13.1
+
+### New Features
+
+- **Configurable startup services**: `portless service install` now persists proxy options such as `--port`, `--no-tls`, `--lan`, `--ip`, `--tld`, `--wildcard`, `--cert`, `--key`, and `--state-dir` into launchd, systemd, and Task Scheduler. `portless service status` now reports the installed service port, HTTPS mode, TLD, LAN mode, wildcard mode, and state directory.
+
+### Bug Fixes
+
+- **Service reinstall port changes**: Reinstalling the startup service with a different port now stops any existing proxy on the previous port before starting the new service.
+- **Service install validation**: LAN service installs now fail early on platforms that cannot publish mDNS records, and service paths such as `~` are normalized before writing native service files.
+
+### Requirements
+
+- **Node.js 24**: The published package now requires Node.js 24 or newer, and fork repository development uses Bun. (#307)
+
+### Contributors
+
+- @ctate
+- @skaldebane
+- @ItalianScallian
+- @neefrehman
+
+## 0.13.0
+
+### New Features
+
+- **OS startup service**: New `portless service install`, `portless service status`, and `portless service uninstall` commands manage a native startup service for the HTTPS proxy across macOS launchd, Linux systemd, and Windows Task Scheduler. The service starts clean `.localhost` URLs after reboot, and `portless clean` removes it during cleanup. (#289)
+
+### Bug Fixes
+
+- **Tailscale readiness preflight**: `--tailscale` and `--funnel` now check Tailscale HTTPS and Funnel prerequisites before starting the child process, surfacing actionable errors instead of hanging during registration. (#282)
+
+### Contributors
+
+- @ctate
+- @Anshuman71
+
+## 0.12.0
+
+### New Features
+
+- **Tailscale sharing**: New `--tailscale` flag shares any portless app over your Tailscale network with zero framework config. Each app is root-mounted on its own Tailscale HTTPS port (443, 8443, 8444, ...) so no `basePath` configuration is needed. Works as a global flag, per-app flag (`portless myapp --tailscale next dev`), or env var (`PORTLESS_TAILSCALE=1`). (#262)
+- **Tailscale Funnel**: New `--funnel` flag exposes apps to the public internet through Tailscale Funnel. Implies `--tailscale`. Also configurable via `PORTLESS_FUNNEL=1`. (#262)
+- **`PORTLESS_TAILSCALE_URL` env var**: Child processes receive `PORTLESS_TAILSCALE_URL` containing the Tailscale HTTPS URL so apps can reference their public address. (#262)
+- **Tailscale URLs in `portless list`**: The list command now shows tailnet URLs alongside local URLs when Tailscale sharing is active. (#262)
 
 ### Improvements
 
-- **Trusted npm publishing compatibility**: The release workflow now runs on Node.js 24 so npm Trusted Publishing uses a compatible npm CLI when publishing `@enk0ded/portless` with OIDC provenance.
+- **`portless prune` cleans stale Tailscale registrations**: Prune now removes orphaned `tailscale serve` entries left behind by dead CLI sessions. (#262)
+- **`portless clean` removes Tailscale serve state**: Clean now tears down any Tailscale serve/funnel registrations alongside the usual CA and hosts file cleanup. (#262)
 
 ### Contributors
 
-- @enk0ded
+- @ctate
+
+## 0.11.1
+
+### New Features
+
+- **`portless prune` command**: Safety net to find and kill orphaned dev servers left behind by dead CLI sessions. Reads stale route entries, checks if something is still listening on each port, and terminates the orphan.
+
+### Bug Fixes
+
+- **Zombie process orphaning on CLI crash**: Spawn child processes with `detached:true` on Unix so they get their own process group. Signal handlers now kill the entire group instead of just the immediate child, preventing orphaned dev servers from surviving CLI crashes or `kill -9`.
+
+### Contributors
+
+- @ctate
+
+## 0.11.0
+
+### New Features
+
+- **Zero-arg mode**: Run bare `portless` from any project directory to auto-discover the dev script from `package.json` and start it through the proxy. No arguments, no config required. (#251)
+- **Multi-app orchestration**: In monorepos, bare `portless` auto-discovers workspace packages (pnpm, npm, yarn, bun) and starts all dev scripts concurrently through the proxy. Each package gets a subdomain derived from its npm scope (e.g. `@acme/docs` becomes `docs.acme.localhost`). (#251)
+- **Turborepo integration**: When `turbo.json` is present, portless delegates to `turbo run <script>` instead of spawning each app individually. Per-app `PORT`, `HOST`, and `PORTLESS_URL` are injected via a lightweight `--require` loader so turbo retains dependency ordering and task graph awareness. Set `turbo: false` in config to opt out. (#251)
+- **`portless.json` config file**: Configure app name, script, port, and turbo settings without embedding portless in `package.json` scripts. Also supports a `"portless"` key in `package.json` as an inline alternative. (#251)
+- **`--script` flag**: Override the default `"dev"` script for a single invocation (e.g. `portless --script start`). (#251)
+- **Rsbuild support**: Auto-inject `--port` and `--host` CLI flags for Rsbuild dev server (#250)
+
+### Bug Fixes
+
+- **State directory moved to `~/.portless`**: All proxy state now lives in `~/.portless` instead of `/tmp/portless`, fixing repeated CA trust prompts on macOS (where `/tmp` is periodically cleaned) and a symlink local privilege escalation vulnerability (#251)
+- **Duplicate macOS CA certificates**: Fix `security delete-certificate` failing with "is ambiguous" when multiple portless CA entries had accumulated in the keychain (#251)
+- **CA trust marker caching**: Cache the CA fingerprint after a successful trust so subsequent proxy starts skip the OS security check and avoid re-triggering the macOS authentication dialog (#251)
+
+### Improvements
+
+- **Auto-trust CA on proxy auto-start**: When the proxy is auto-started and the CA is not yet trusted, portless automatically runs trust with proper sudo elevation (#251)
+- **Package manager delegation**: Detects pnpm, yarn, bun, or npm and delegates script execution to the correct package manager (#251)
+- **Non-server script detection**: Build-only tools (tsup, tsc, esbuild, etc.) are auto-detected and run without a proxy route. Use `proxy: false` in config for explicit control. (#251)
+- **Monochrome CLI output**: Bold for headers and errors, dim for warnings and muted text, no color codes (#251)
+
+### Contributors
+
+- @ctate
 
 ## 0.10.3
 
-### Improvements
+### Bug Fixes
 
-- **Trusted npm publishing**: The GitHub release workflow now uses npm Trusted Publishing with OIDC provenance instead of an npm token, matching the package's stricter publishing access settings.
+- **Stale TLD persisting across proxy restart**: Fix the proxy reverting to a stale TLD (e.g. `.local`) after restart because transient state markers were not cleaned up on stop (#235)
 
 ### Contributors
 
-- @enk0ded
+- @ctate
 
 ## 0.10.2
 
-### Improvements
+### New Features
 
-- **Scoped npm package**: portless now publishes to npm as `@enk0ded/portless` while keeping the `portless` CLI command. Installation instructions and CLI help now point to the scoped package name.
-- **Repository references updated**: Docs, GitHub links, Windows debug scripts, and release automation now point to `enk0ded/portless` and check the scoped npm package before publishing.
+- **Auto-inject `NODE_EXTRA_CA_CERTS`**: Child processes spawned by `portless run` now automatically receive `NODE_EXTRA_CA_CERTS` pointing to the portless CA certificate, so Node.js subprocesses trust the local CA without manual configuration (#220)
+
+### Bug Fixes
+
+- **Proxy startup on slow macOS `security` command**: Fix the proxy failing to start when the macOS `security` command takes longer than expected to verify CA trust (#229)
+- **Lock contention with parallel commands**: Fix lock contention that could cause failures when multiple `portless` commands run simultaneously (#230)
+- **`ERR_HTTP2_PROTOCOL_ERROR` during HMR**: Fix HTTP/2 stream reset flood during hot module replacement causing protocol errors (#231)
+- **Proxy auto-start in non-interactive terminals**: Fix auto-start failing in non-interactive terminals (e.g. IDE task runners) and when previous proxy config exists (#232)
 
 ### Contributors
 
-- @enk0ded
+- @ctate
 
 ## 0.10.1
 

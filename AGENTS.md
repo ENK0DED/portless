@@ -129,7 +129,7 @@ Check bootstrap progress (first boot only):
 ./scripts/windows-debug/run.sh "Get-Content C:\bootstrap.log"
 ```
 
-The repo lives at `C:\portless` on the instance. Node.js 20, Bun, Git, and OpenSSL are pre-installed. The `run.sh` wrapper automatically adds these tools to PATH.
+The repo lives at `C:\portless` on the instance. Node.js 24, Bun, Git, and OpenSSL are pre-installed. The `run.sh` wrapper automatically adds these tools to PATH.
 
 <!-- opensrc:start -->
 

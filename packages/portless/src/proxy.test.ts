@@ -1148,6 +1148,59 @@ describe("createProxyServer with TLS (HTTP/2)", () => {
     expect(result.protocol).toBe("h2");
   });
 
+  it("forwards the :authority hostname as Host to the backend (h2 -> HTTP/1.1)", async () => {
+    let receivedHost = "";
+    const backend = trackServer(
+      http.createServer((req, res) => {
+        receivedHost = req.headers.host || "";
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end("ok");
+      })
+    );
+    await listen(backend);
+    const backendAddr = backend.address();
+    if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+    const routes: RouteInfo[] = [{ hostname: "myapp.localhost", port: backendAddr.port }];
+    const server = trackServer(
+      createProxyServer({
+        getRoutes: () => routes,
+        proxyPort: TEST_PROXY_PORT,
+        tls: { cert: tlsCert, key: tlsKey },
+      })
+    );
+    await listen(server);
+
+    const addr = server.address();
+    if (!addr || typeof addr === "string") throw new Error("no addr");
+
+    const status = await new Promise<number>((resolve, reject) => {
+      const client = http2.connect(`https://127.0.0.1:${addr.port}`, {
+        rejectUnauthorized: false,
+      });
+      client.on("error", reject);
+      // Real h2 clients (browsers, curl) send only :authority — no Host header.
+      const req = client.request({
+        ":method": "GET",
+        ":path": "/",
+        ":authority": "myapp.localhost",
+      });
+      req.on("response", (headers) => {
+        const s = headers[":status"] as number;
+        req.resume();
+        req.on("end", () => {
+          client.close();
+          resolve(s);
+        });
+      });
+      req.on("error", reject);
+      req.end();
+    });
+
+    expect(status).toBe(200);
+    expect(receivedHost).toBe("myapp.localhost");
+  });
+
   it("still accepts HTTP/1.1 connections over TLS (allowHTTP1)", async () => {
     const routes: RouteInfo[] = [];
     const server = trackServer(
@@ -1401,4 +1454,98 @@ describe("createProxyServer with TLS (HTTP/2)", () => {
     expect(result.headers["x-custom"]).toBe("preserved");
     expect(result.body).toBe("ok");
   });
+
+  // streamResetBurst/streamResetRate server options require Node 22.11+;
+  // on older versions they are silently ignored and GOAWAY fires at ~1000 resets.
+  // Also skipped on Windows where the rapid burst overwhelms the test backend.
+  const [nodeMajor, nodeMinor] = process.versions.node.split(".").map(Number);
+  it.skipIf(nodeMajor < 22 || (nodeMajor === 22 && nodeMinor < 11) || process.platform === "win32")(
+    "session survives sustained stream cancellation (issues #217, #221)",
+    async () => {
+      const backend = trackServer(
+        http.createServer((_req, res) => {
+          res.writeHead(200, { "Content-Type": "text/plain" });
+          res.end("ok");
+        })
+      );
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const routes: RouteInfo[] = [{ hostname: "h2burst.localhost", port: backendAddr.port }];
+      const server = trackServer(
+        createProxyServer({
+          getRoutes: () => routes,
+          proxyPort: TEST_PROXY_PORT,
+          tls: { cert: tlsCert, key: tlsKey },
+        })
+      );
+      await listen(server);
+
+      const addr = server.address();
+      if (!addr || typeof addr === "string") throw new Error("no addr");
+
+      // Simulate Vite/Nuxt HMR: sustained bursts of stream cancellations.
+      // Without streamResetBurst/streamResetRate tuning, Node sends GOAWAY
+      // INTERNAL_ERROR (code 2) after ~1000 cumulative resets, killing the
+      // HTTP/2 session and causing ERR_HTTP2_PROTOCOL_ERROR in Chrome.
+      const client = http2.connect(`https://127.0.0.1:${addr.port}`, {
+        rejectUnauthorized: false,
+      });
+
+      let gotGoaway = false;
+      client.on("goaway", () => {
+        gotGoaway = true;
+      });
+      client.on("error", () => {});
+
+      // Send 1500 resets in rapid batches (exceeds the ~1000 threshold that
+      // triggers GOAWAY on an untuned server).
+      const TOTAL = 1500;
+      const BATCH = 100;
+      let sent = 0;
+      await new Promise<void>((resolve) => {
+        const timer = setInterval(() => {
+          if (gotGoaway || sent >= TOTAL) {
+            clearInterval(timer);
+            resolve();
+            return;
+          }
+          for (let i = 0; i < BATCH && sent < TOTAL; i++) {
+            const req = client.request({
+              ":method": "GET",
+              ":path": `/${sent}`,
+              host: "h2burst.localhost",
+            });
+            req.on("error", () => {});
+            req.close(http2.constants.NGHTTP2_CANCEL);
+            sent++;
+          }
+        }, 10);
+      });
+
+      // Verify the session is still alive with a real request
+      let finalStatus = 0;
+      if (!client.destroyed && !client.closed) {
+        finalStatus = await new Promise<number>((resolve, reject) => {
+          const req = client.request({
+            ":method": "GET",
+            ":path": "/final",
+            host: "h2burst.localhost",
+          });
+          req.on("response", (headers) => {
+            req.close();
+            resolve(headers[":status"] as number);
+          });
+          req.on("error", reject);
+          req.end();
+        });
+      }
+
+      client.close();
+      expect(gotGoaway).toBe(false);
+      expect(finalStatus).toBe(200);
+    },
+    15_000
+  );
 });

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Portless Fork Sync"
+  short_description: "Sync the ENK0DED portless fork with upstream safely"
+  default_prompt: "Sync this portless fork with upstream while preserving the fork invariants."

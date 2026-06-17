@@ -141,10 +141,11 @@ $env:PATH = "C:\Program Files\Git\cmd;$env:PATH"
 [Environment]::SetEnvironmentVariable("PATH", "C:\Program Files\Git\cmd;$([Environment]::GetEnvironmentVariable('PATH', 'Machine'))", "Machine")
 Log "Git installed: $(git --version)"
 
-# Install Node.js LTS (v20)
+# Install Node.js 24
 Log "Installing Node.js..."
+$nodeVersion = "24.15.0"
 $nodeInstaller = "$env:TEMP\node-installer.msi"
-Invoke-WebRequest -Uri "https://nodejs.org/dist/v20.19.0/node-v20.19.0-x64.msi" -OutFile $nodeInstaller
+Invoke-WebRequest -Uri "https://nodejs.org/dist/v$nodeVersion/node-v$nodeVersion-x64.msi" -OutFile $nodeInstaller
 Start-Process msiexec.exe -ArgumentList "/i `"$nodeInstaller`" /quiet /norestart" -Wait
 $env:PATH = "C:\Program Files\nodejs;$env:PATH"
 [Environment]::SetEnvironmentVariable("PATH", "C:\Program Files\nodejs;$([Environment]::GetEnvironmentVariable('PATH', 'Machine'))", "Machine")
@@ -170,7 +171,7 @@ Log "OpenSSL installed: $(openssl version)"
 
 # Clone repo
 Log "Cloning portless..."
-git clone https://github.com/enk0ded/portless.git C:\portless
+git clone https://github.com/ENK0DED/portless.git C:\portless
 Set-Location C:\portless
 Log "Repo cloned."
 

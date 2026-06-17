@@ -2,32 +2,41 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { RouteInfo } from "./types.js";
 import { fixOwnership, isErrnoException } from "./utils.js";
-import { SYSTEM_STATE_DIR } from "./cli-utils.js";
 
 /** How long (ms) before a lock directory is considered stale and forcibly removed. */
 const STALE_LOCK_THRESHOLD_MS = 10_000;
 
-/** Default maximum number of retries when acquiring the file lock. */
-const LOCK_MAX_RETRIES = 20;
+/** Total time budget (ms) for acquiring the file lock before giving up. */
+const LOCK_TIMEOUT_MS = 5_000;
 
-/** Delay (ms) between lock acquisition retries. */
-const LOCK_RETRY_DELAY_MS = 50;
+/** Initial delay (ms) between lock acquisition retries (doubles each attempt). */
+const LOCK_RETRY_BASE_MS = 10;
+
+/** Maximum delay (ms) between lock acquisition retries. */
+const LOCK_RETRY_CAP_MS = 500;
 
 /** File permission mode for route and state files. */
 export const FILE_MODE = 0o644;
 
-/** Directory permission mode for the user state directory. */
+/** Directory permission mode for the state directory. */
 export const DIR_MODE = 0o755;
-
-/** Directory permission mode for the system state directory (world-writable with sticky bit). */
-export const SYSTEM_DIR_MODE = 0o1777;
-
-/** File permission mode for shared state files in the system state directory. */
-export const SYSTEM_FILE_MODE = 0o666;
 
 export interface RouteMapping extends RouteInfo {
   pid: number;
+  tailscaleUrl?: string;
+  tailscaleHttpsPort?: number;
+  tailscaleFunnel?: boolean;
+  ngrokUrl?: string;
+  ngrokPid?: number;
 }
+
+type RouteMetadataPatch = {
+  tailscaleUrl?: string | null;
+  tailscaleHttpsPort?: number | null;
+  tailscaleFunnel?: boolean | null;
+  ngrokUrl?: string | null;
+  ngrokPid?: number | null;
+};
 
 /** Runtime check that a parsed JSON value is a valid RouteMapping. */
 function isValidRoute(value: unknown): value is RouteMapping {
@@ -81,26 +90,14 @@ export class RouteStore {
     this.onWarning = options?.onWarning;
   }
 
-  private isSystemDir(): boolean {
-    return this.dir === SYSTEM_STATE_DIR;
-  }
-
-  private get dirMode(): number {
-    return this.isSystemDir() ? SYSTEM_DIR_MODE : DIR_MODE;
-  }
-
-  private get fileMode(): number {
-    return this.isSystemDir() ? SYSTEM_FILE_MODE : FILE_MODE;
-  }
-
   ensureDir(): void {
     if (!fs.existsSync(this.dir)) {
-      fs.mkdirSync(this.dir, { recursive: true, mode: this.dirMode });
+      fs.mkdirSync(this.dir, { recursive: true, mode: DIR_MODE });
     }
     try {
-      fs.chmodSync(this.dir, this.dirMode);
+      fs.chmodSync(this.dir, DIR_MODE);
     } catch {
-      // May fail if directory is owned by another user (e.g. root); non-fatal
+      // May fail if directory is owned by another user; non-fatal
     }
     fixOwnership(this.dir);
   }
@@ -118,14 +115,16 @@ export class RouteStore {
     Atomics.wait(RouteStore.sleepBuffer, 0, 0, ms);
   }
 
-  private acquireLock(maxRetries = LOCK_MAX_RETRIES, retryDelayMs = LOCK_RETRY_DELAY_MS): boolean {
-    for (let i = 0; i < maxRetries; i++) {
+  private acquireLock(): boolean {
+    const deadline = Date.now() + LOCK_TIMEOUT_MS;
+    let delay = LOCK_RETRY_BASE_MS;
+
+    while (Date.now() < deadline) {
       try {
         fs.mkdirSync(this.lockPath);
         return true;
       } catch (err: unknown) {
         if (isErrnoException(err) && err.code === "EEXIST") {
-          // Check for stale lock
           try {
             const stat = fs.statSync(this.lockPath);
             if (Date.now() - stat.mtimeMs > STALE_LOCK_THRESHOLD_MS) {
@@ -133,18 +132,16 @@ export class RouteStore {
               continue;
             }
           } catch {
-            // Lock dir gone already; retry
             continue;
           }
-          // Wait and retry
-          this.syncSleep(retryDelayMs);
+          const jitter = Math.floor(Math.random() * delay);
+          this.syncSleep(delay + jitter);
+          delay = Math.min(delay * 2, LOCK_RETRY_CAP_MS);
         } else {
-          // Unexpected error (e.g. missing parent dir); cannot acquire lock
           return false;
         }
       }
     }
-    // Timed out waiting for lock
     return false;
   }
 
@@ -199,7 +196,7 @@ export class RouteStore {
         // Only safe when caller holds the lock.
         try {
           fs.writeFileSync(this.routesPath, JSON.stringify(alive, null, 2), {
-            mode: this.fileMode,
+            mode: FILE_MODE,
           });
         } catch {
           // Write may fail (permissions); non-fatal
@@ -212,7 +209,7 @@ export class RouteStore {
   }
 
   private saveRoutes(routes: RouteMapping[]): void {
-    fs.writeFileSync(this.routesPath, JSON.stringify(routes, null, 2), { mode: this.fileMode });
+    fs.writeFileSync(this.routesPath, JSON.stringify(routes, null, 2), { mode: FILE_MODE });
     fixOwnership(this.routesPath);
   }
 
@@ -244,7 +241,8 @@ export class RouteStore {
         }
       }
       const filtered = routes.filter((r) => r.hostname !== hostname);
-      filtered.push({ hostname, port, pid });
+      const entry: RouteMapping = { hostname, port, pid };
+      filtered.push(entry);
       this.saveRoutes(filtered);
     } finally {
       this.releaseLock();
@@ -252,13 +250,117 @@ export class RouteStore {
     return killedPid;
   }
 
-  removeRoute(hostname: string): void {
+  /**
+   * Load all routes from disk without filtering out dead PIDs. Used by
+   * `portless prune` to discover stale entries whose owning CLI is gone
+   * but whose dev server may still be holding a port.
+   */
+  loadRoutesRaw(): RouteMapping[] {
+    if (!fs.existsSync(this.routesPath)) {
+      return [];
+    }
+    try {
+      const raw = fs.readFileSync(this.routesPath, "utf-8");
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        return [];
+      }
+      if (!Array.isArray(parsed)) {
+        return [];
+      }
+      return parsed.filter(isValidRoute);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Remove all route entries whose owning process is dead and persist the
+   * result. Returns the removed stale entries so the caller can act on them.
+   */
+  pruneStaleRoutes(): RouteMapping[] {
     this.ensureDir();
     if (!this.acquireLock()) {
       throw new Error("Failed to acquire route lock");
     }
     try {
-      const routes = this.loadRoutes(true).filter((r) => r.hostname !== hostname);
+      const all = this.loadRoutesRaw();
+      const alive: RouteMapping[] = [];
+      const stale: RouteMapping[] = [];
+      for (const r of all) {
+        if (r.pid === 0 || this.isProcessAlive(r.pid)) {
+          alive.push(r);
+        } else {
+          stale.push(r);
+        }
+      }
+      if (stale.length > 0) {
+        this.saveRoutes(alive);
+      }
+      return stale;
+    } finally {
+      this.releaseLock();
+    }
+  }
+
+  /**
+   * Update metadata on an existing route entry. Only provided fields are
+   * merged; the route must already exist (matched by hostname).
+   */
+  updateRoute(hostname: string, fields: RouteMetadataPatch): void {
+    this.ensureDir();
+    if (!this.acquireLock()) {
+      throw new Error("Failed to acquire route lock");
+    }
+    try {
+      const routes = this.loadRoutes(true);
+      const route = routes.find((r) => r.hostname === hostname);
+      if (!route) return;
+      if ("tailscaleUrl" in fields) {
+        if (fields.tailscaleUrl === null) delete route.tailscaleUrl;
+        else if (fields.tailscaleUrl !== undefined) route.tailscaleUrl = fields.tailscaleUrl;
+      }
+      if ("tailscaleHttpsPort" in fields) {
+        if (fields.tailscaleHttpsPort === null) delete route.tailscaleHttpsPort;
+        else if (fields.tailscaleHttpsPort !== undefined)
+          route.tailscaleHttpsPort = fields.tailscaleHttpsPort;
+      }
+      if ("tailscaleFunnel" in fields) {
+        if (fields.tailscaleFunnel === null) delete route.tailscaleFunnel;
+        else if (fields.tailscaleFunnel !== undefined)
+          route.tailscaleFunnel = fields.tailscaleFunnel;
+      }
+      if ("ngrokUrl" in fields) {
+        if (fields.ngrokUrl === null) delete route.ngrokUrl;
+        else if (fields.ngrokUrl !== undefined) route.ngrokUrl = fields.ngrokUrl;
+      }
+      if ("ngrokPid" in fields) {
+        if (fields.ngrokPid === null) delete route.ngrokPid;
+        else if (fields.ngrokPid !== undefined) route.ngrokPid = fields.ngrokPid;
+      }
+      this.saveRoutes(routes);
+    } finally {
+      this.releaseLock();
+    }
+  }
+
+  /**
+   * Remove a route by hostname. When `ownerPid` is provided, the entry is
+   * only removed while it is still owned by that pid. Exit cleanups must
+   * pass their own pid: after a `--force` takeover the killed process would
+   * otherwise deregister the route the new owner just registered.
+   */
+  removeRoute(hostname: string, ownerPid?: number): void {
+    this.ensureDir();
+    if (!this.acquireLock()) {
+      throw new Error("Failed to acquire route lock");
+    }
+    try {
+      const routes = this.loadRoutes(true).filter(
+        (r) => r.hostname !== hostname || (ownerPid !== undefined && r.pid !== ownerPid)
+      );
       this.saveRoutes(routes);
     } finally {
       this.releaseLock();

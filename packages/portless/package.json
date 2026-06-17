@@ -1,6 +1,6 @@
 {
   "name": "@enk0ded/portless",
-  "version": "0.10.6",
+  "version": "0.14.1000",
   "description": "Replace port numbers with stable, named .localhost URLs. For humans and agents.",
   "type": "module",
   "main": "./dist/index.js",
@@ -21,7 +21,7 @@
     "dist"
   ],
   "engines": {
-    "node": ">=20"
+    "node": ">=24"
   },
   "os": [
     "darwin",

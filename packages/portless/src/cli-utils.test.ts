@@ -11,10 +11,10 @@ import {
   FALLBACK_PROXY_PORT,
   INTERNAL_LAN_IP_FLAG,
   LEGACY_TLD_ENV,
+  LEGACY_SYSTEM_STATE_DIR,
   PRIVILEGED_PORT_THRESHOLD,
   RISKY_TLDS,
   SUFFIX_ENV,
-  SYSTEM_STATE_DIR,
   USER_STATE_DIR,
   discoverState,
   findFreePort,
@@ -26,11 +26,13 @@ import {
   isProxyRunning,
   parsePidFromNetstat,
   readLanMarker,
+  readPersistedProxyState,
   readTldFromDir,
   resolveStateDir,
   validateTld,
   writeLanMarker,
   writeTldFile,
+  writeTlsMarker,
 } from "./cli-utils.js";
 
 describe("findFreePort", () => {
@@ -139,13 +141,10 @@ describe("isProxyRunning", () => {
 });
 
 describe("resolveStateDir", () => {
-  it.skipIf(process.platform === "win32")("returns system dir for privileged ports", () => {
-    expect(resolveStateDir(80)).toBe(SYSTEM_STATE_DIR);
-    expect(resolveStateDir(443)).toBe(SYSTEM_STATE_DIR);
-    expect(resolveStateDir(1023)).toBe(SYSTEM_STATE_DIR);
-  });
-
-  it("returns user dir for non-privileged ports", () => {
+  it("returns user dir for all ports", () => {
+    expect(resolveStateDir(80)).toBe(USER_STATE_DIR);
+    expect(resolveStateDir(443)).toBe(USER_STATE_DIR);
+    expect(resolveStateDir(1023)).toBe(USER_STATE_DIR);
     expect(resolveStateDir(1024)).toBe(USER_STATE_DIR);
     expect(resolveStateDir(8080)).toBe(USER_STATE_DIR);
     expect(resolveStateDir(3000)).toBe(USER_STATE_DIR);
@@ -161,11 +160,11 @@ describe("constants", () => {
     expect(PRIVILEGED_PORT_THRESHOLD).toBe(1024);
   });
 
-  it("SYSTEM_STATE_DIR is /tmp/portless on Unix, os.tmpdir() on Windows", () => {
+  it("LEGACY_SYSTEM_STATE_DIR is /tmp/portless on Unix, os.tmpdir() on Windows", () => {
     if (process.platform === "win32") {
-      expect(SYSTEM_STATE_DIR).toBe(path.join(os.tmpdir(), "portless"));
+      expect(LEGACY_SYSTEM_STATE_DIR).toBe(path.join(os.tmpdir(), "portless"));
     } else {
-      expect(SYSTEM_STATE_DIR).toBe("/tmp/portless");
+      expect(LEGACY_SYSTEM_STATE_DIR).toBe("/tmp/portless");
     }
   });
 
@@ -394,6 +393,12 @@ describe("injectFrameworkFlags", () => {
     ]);
   });
 
+  it("injects for rsbuild without --strictPort", () => {
+    const args = ["rsbuild", "dev"];
+    injectFrameworkFlags(args, 4567);
+    expect(args).toEqual(["rsbuild", "dev", "--port", "4567", "--host", "127.0.0.1"]);
+  });
+
   it("injects for astro without --strictPort", () => {
     const args = ["astro", "dev"];
     injectFrameworkFlags(args, 4567);
@@ -588,6 +593,12 @@ describe("injectFrameworkFlags", () => {
     expect(args).toEqual(["pnpm", "exec", "astro", "dev", "--port", "4567", "--host", "127.0.0.1"]);
   });
 
+  it("injects flags for npx rsbuild dev", () => {
+    const args = ["npx", "rsbuild", "dev"];
+    injectFrameworkFlags(args, 4567);
+    expect(args).toEqual(["npx", "rsbuild", "dev", "--port", "4567", "--host", "127.0.0.1"]);
+  });
+
   // Implicit bin (yarn <framework>)
 
   it("injects flags for yarn vite (implicit bin)", () => {
@@ -714,17 +725,24 @@ describe("DEFAULT_TLD", () => {
 });
 
 describe("getDefaultTld", () => {
-  let originalEnv: string | undefined;
+  let originalLegacyEnv: string | undefined;
+  let originalSuffixEnv: string | undefined;
 
   beforeEach(() => {
-    originalEnv = process.env.PORTLESS_TLD;
+    originalLegacyEnv = process.env[LEGACY_TLD_ENV];
+    originalSuffixEnv = process.env[SUFFIX_ENV];
   });
 
   afterEach(() => {
-    if (originalEnv === undefined) {
-      delete process.env.PORTLESS_TLD;
+    if (originalLegacyEnv === undefined) {
+      delete process.env[LEGACY_TLD_ENV];
     } else {
-      process.env.PORTLESS_TLD = originalEnv;
+      process.env[LEGACY_TLD_ENV] = originalLegacyEnv;
+    }
+    if (originalSuffixEnv === undefined) {
+      delete process.env[SUFFIX_ENV];
+    } else {
+      process.env[SUFFIX_ENV] = originalSuffixEnv;
     }
   });
 
@@ -737,11 +755,6 @@ describe("getDefaultTld", () => {
   it("returns PORTLESS_SUFFIX when set", () => {
     process.env[SUFFIX_ENV] = "test";
     expect(getDefaultTld()).toBe("test");
-  });
-
-  it("accepts dotted suffixes", () => {
-    process.env[SUFFIX_ENV] = "server01.acme.com";
-    expect(getDefaultTld()).toBe("server01.acme.com");
   });
 
   it("lowercases the value", () => {
@@ -817,16 +830,16 @@ describe("buildProxyStartConfig", () => {
     });
   });
 
-  it("keeps custom TLDs outside LAN mode", () => {
+  it("keeps custom suffixes outside LAN mode", () => {
     expect(
       buildProxyStartConfig({
         useHttps: false,
         lanMode: false,
-        tld: "server01.acme.com",
+        tld: "test",
       })
     ).toEqual({
-      effectiveTld: "server01.acme.com",
-      args: ["--no-tls", "--suffix", "server01.acme.com"],
+      effectiveTld: "test",
+      args: ["--no-tls", "--suffix", "test"],
     });
   });
 });
@@ -858,11 +871,15 @@ describe("readLanMarker / writeLanMarker", () => {
 
   it("uses the LAN marker to remember LAN mode when the proxy is stopped", async () => {
     const prevStateDir = process.env.PORTLESS_STATE_DIR;
+    const prevSuffix = process.env[SUFFIX_ENV];
+    const prevLegacyTld = process.env[LEGACY_TLD_ENV];
     try {
       fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
       writeTldFile(tmpDir, "local");
       writeLanMarker(tmpDir, "192.168.1.42");
       process.env.PORTLESS_STATE_DIR = tmpDir;
+      delete process.env[SUFFIX_ENV];
+      delete process.env[LEGACY_TLD_ENV];
 
       await expect(discoverState()).resolves.toMatchObject({
         dir: tmpDir,
@@ -876,6 +893,16 @@ describe("readLanMarker / writeLanMarker", () => {
         delete process.env.PORTLESS_STATE_DIR;
       } else {
         process.env.PORTLESS_STATE_DIR = prevStateDir;
+      }
+      if (prevSuffix === undefined) {
+        delete process.env[SUFFIX_ENV];
+      } else {
+        process.env[SUFFIX_ENV] = prevSuffix;
+      }
+      if (prevLegacyTld === undefined) {
+        delete process.env[LEGACY_TLD_ENV];
+      } else {
+        process.env[LEGACY_TLD_ENV] = prevLegacyTld;
       }
     }
   });
@@ -917,39 +944,27 @@ describe("readTldFromDir / writeTldFile", () => {
 });
 
 describe("validateTld", () => {
-  it("returns null for valid TLDs and suffixes", () => {
+  it("returns null for valid suffixes", () => {
     expect(validateTld("localhost")).toBeNull();
     expect(validateTld("test")).toBeNull();
     expect(validateTld("internal")).toBeNull();
-    expect(validateTld("acme.com")).toBeNull();
+    expect(validateTld("my-tld")).toBeNull();
+    expect(validateTld("my.tld")).toBeNull();
     expect(validateTld("server01.acme.com")).toBeNull();
-    expect(validateTld("my-dev.internal")).toBeNull();
   });
 
   it("rejects empty string", () => {
-    expect(validateTld("")).toMatch(/suffix cannot be empty/);
+    expect(validateTld("")).toMatch(/cannot be empty/);
   });
 
-  it("rejects suffixes with invalid characters", () => {
+  it("rejects suffixes with invalid labels", () => {
+    expect(validateTld(".test")).toMatch(/must not start or end with a dot/);
+    expect(validateTld("test.")).toMatch(/must not start or end with a dot/);
+    expect(validateTld("my..tld")).toMatch(/consecutive dots/);
     expect(validateTld("MY_TLD")).toMatch(/must contain only/);
     expect(validateTld("tld!")).toMatch(/must contain only/);
-  });
-
-  it("rejects labels that start or end with hyphens", () => {
-    expect(validateTld("-acme.com")).toMatch(/start and end/);
-    expect(validateTld("acme-.com")).toMatch(/start and end/);
-    expect(validateTld("server01.-acme.com")).toMatch(/start and end/);
-  });
-
-  it("rejects leading, trailing, or consecutive dots", () => {
-    expect(validateTld(".acme.com")).toMatch(/must not start or end with a dot/);
-    expect(validateTld("acme.com.")).toMatch(/must not start or end with a dot/);
-    expect(validateTld("acme..com")).toMatch(/consecutive dots/);
-  });
-
-  it("rejects labels longer than 63 characters", () => {
-    const longLabel = "a".repeat(64);
-    expect(validateTld(`${longLabel}.com`)).toMatch(/63 characters or less/);
+    expect(validateTld("-test")).toMatch(/start and end/);
+    expect(validateTld("test-")).toMatch(/start and end/);
   });
 
   it("allows public TLDs (they produce warnings elsewhere)", () => {
@@ -964,5 +979,74 @@ describe("validateTld", () => {
       expect(validateTld(tld)).toBeNull();
       expect(RISKY_TLDS.has(tld)).toBe(true);
     }
+  });
+});
+
+describe("readPersistedProxyState", () => {
+  let tmpDir: string;
+  let prevStateDir: string | undefined;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-persist-test-"));
+    prevStateDir = process.env.PORTLESS_STATE_DIR;
+    process.env.PORTLESS_STATE_DIR = tmpDir;
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    if (prevStateDir === undefined) {
+      delete process.env.PORTLESS_STATE_DIR;
+    } else {
+      process.env.PORTLESS_STATE_DIR = prevStateDir;
+    }
+  });
+
+  it("returns null when no state files exist", () => {
+    expect(readPersistedProxyState()).toBeNull();
+  });
+
+  it("reads port from persisted state", () => {
+    fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
+    const state = readPersistedProxyState();
+    expect(state).not.toBeNull();
+    expect(state!.port).toBe(1355);
+  });
+
+  it("reads TLS marker from persisted state", () => {
+    fs.writeFileSync(path.join(tmpDir, "proxy.port"), "443");
+    writeTlsMarker(tmpDir, true);
+    const state = readPersistedProxyState();
+    expect(state).not.toBeNull();
+    expect(state!.tls).toBe(true);
+  });
+
+  it("reads TLD from persisted state", () => {
+    fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
+    writeTldFile(tmpDir, "test");
+    const state = readPersistedProxyState();
+    expect(state).not.toBeNull();
+    expect(state!.tld).toBe("test");
+  });
+
+  it("reads LAN mode from persisted state", () => {
+    fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
+    writeLanMarker(tmpDir, "192.168.1.10");
+    const state = readPersistedProxyState();
+    expect(state).not.toBeNull();
+    expect(state!.lanMode).toBe(true);
+  });
+
+  it("returns full previous config for a custom proxy setup", () => {
+    fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
+    writeTlsMarker(tmpDir, true);
+    writeTldFile(tmpDir, "local");
+    writeLanMarker(tmpDir, "192.168.1.42");
+    const state = readPersistedProxyState();
+    expect(state).toEqual({
+      port: 1355,
+      tls: true,
+      tld: "local",
+      lanMode: true,
+    });
   });
 });
