@@ -227,6 +227,32 @@ export function writeLanMarker(dir: string, ip: string | null): void {
   }
 }
 
+/** Name of the marker file that indicates wildcard routing is enabled. */
+const WILDCARD_MARKER_FILE = "proxy.wildcard";
+
+/** Read whether wildcard routing is enabled in a state directory. */
+export function readWildcardMarker(dir: string): boolean {
+  try {
+    return fs.existsSync(path.join(dir, WILDCARD_MARKER_FILE));
+  } catch {
+    return false;
+  }
+}
+
+/** Write or remove the wildcard routing marker in the state directory. */
+export function writeWildcardMarker(dir: string, enabled: boolean): void {
+  const markerPath = path.join(dir, WILDCARD_MARKER_FILE);
+  if (enabled) {
+    fs.writeFileSync(markerPath, "1", { mode: 0o644 });
+  } else {
+    try {
+      fs.unlinkSync(markerPath);
+    } catch {
+      // Marker may already be absent; non-fatal
+    }
+  }
+}
+
 /** Default suffix when PORTLESS_TLD is not set. */
 export const DEFAULT_TLD = "localhost";
 
@@ -405,6 +431,7 @@ export function readPersistedProxyState(): {
   tls: boolean;
   tld: string;
   lanMode: boolean;
+  useWildcard: boolean;
 } | null {
   const dir = process.env.PORTLESS_STATE_DIR || USER_STATE_DIR;
   const port = readPortFromDir(dir);
@@ -412,7 +439,8 @@ export function readPersistedProxyState(): {
     const tls = readTlsMarker(dir);
     const tld = readTldFromDir(dir);
     const lanIp = readLanMarker(dir);
-    return { port, tls, tld, lanMode: lanIp !== null || tld === "local" };
+    const useWildcard = readWildcardMarker(dir);
+    return { port, tls, tld, lanMode: lanIp !== null || tld === "local", useWildcard };
   }
 
   return null;

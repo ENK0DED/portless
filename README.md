@@ -178,7 +178,7 @@ portless docs.myapp next dev
 # -> https://docs.myapp.localhost
 ```
 
-By default, only explicitly registered subdomains are routed (strict mode). Use `--wildcard` when starting the proxy to allow any subdomain of a registered route to fall back to that app (e.g. `tenant1.myapp.localhost` routes to the `myapp` app without extra registration).
+By default, only explicitly registered subdomains are routed (strict mode). Use `--wildcard` when starting the proxy to allow any subdomain of a registered route to fall back to that app (e.g. `tenant1.myapp.localhost` routes to the `myapp` app without extra registration). To change wildcard mode for a running proxy, stop it and start it again with the desired mode.
 
 ## Git Worktrees
 
@@ -374,7 +374,11 @@ portless <name> <cmd> [args...]  # Run app at https://<name>.localhost
 portless alias <name> <port>     # Register a static route (e.g. for Docker)
 portless alias <name> <port> --force  # Overwrite an existing route
 portless alias --remove <name>   # Remove a static route
+portless get <name>              # Print URL for a service
+portless url <name>              # Alias for portless get
 portless list                    # Show active routes
+portless ls                      # Alias for portless list
+portless status                  # Alias for portless list
 portless trust                   # Add local CA to system trust store
 portless clean                   # Remove state, CA trust entry, and hosts block
 portless prune                   # Kill orphaned dev servers from crashed sessions
@@ -383,6 +387,9 @@ portless hosts clean             # Remove portless entries from /etc/hosts
 
 # Disable portless (run command directly)
 PORTLESS=0 bun dev               # Bypasses proxy, uses default port
+
+# Child env assignments
+portless myapp API_URL=1 next dev # Pass API_URL only to the child command
 
 # Proxy control
 portless proxy start             # Start the HTTPS proxy (port 443, daemon)
@@ -417,6 +424,7 @@ portless service uninstall       # Remove the startup service
 --suffix <suffix>                Use a custom suffix instead of .localhost
 --tld <tld>                      Compatibility alias for --suffix
 --wildcard                       Allow unregistered subdomains to fall back to parent route
+                                 Proxy-level only; restart proxy to change this mode
 --state-dir <path>               Use a custom state directory with service install
 --script <name>                  Run a specific package.json script (default: dev)
 --app-port <number>              Use a fixed port for the app (skip auto-assignment)
@@ -446,6 +454,7 @@ PORTLESS_NGROK=1                 Share apps publicly via ngrok (same as --ngrok)
 PORTLESS_STATE_DIR=<path>        Override the state directory
 
 # Injected into child processes
+KEY=value before <cmd>            Adds an env var only to the child command
 PORT                             Ephemeral port the child should listen on
 HOST                             Usually 127.0.0.1 (omitted for Expo in LAN mode)
 PORTLESS_URL                     Public URL (e.g. https://myapp.localhost)
@@ -456,7 +465,7 @@ NODE_EXTRA_CA_CERTS              Path to the portless CA (when HTTPS is active)
 
 Prefer `PORTLESS_SUFFIX` for new configuration. It accepts single-label suffixes such as `test` and dotted suffixes such as `acme.com` or `server01.acme.com`. `PORTLESS_TLD` is only a compatibility alias and is ignored when `PORTLESS_SUFFIX` is set.
 
-> **Reserved names:** `run`, `get`, `alias`, `hosts`, `list`, `trust`, `clean`, `prune`, `proxy`, and `service` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name from your project, or `portless --name <name> <cmd>` to force any name including reserved ones.
+> **Reserved names:** `run`, `get`, `url`, `alias`, `hosts`, `list`, `ls`, `status`, `trust`, `clean`, `prune`, `proxy`, and `service` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name from your project, or `portless --name <name> <cmd>` to force any name including reserved ones.
 
 ## Uninstall / reset
 

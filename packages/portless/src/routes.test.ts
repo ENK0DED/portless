@@ -4,7 +4,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
-import { RouteStore, RouteConflictError } from "./routes.js";
+import { RouteStore, RouteConflictError, isRetryableLockError } from "./routes.js";
 
 describe("RouteStore", () => {
   let tmpDir: string;
@@ -308,6 +308,17 @@ describe("RouteStore", () => {
   });
 
   describe("locking (via concurrent addRoute)", () => {
+    it("treats common lock directory races as retryable", () => {
+      for (const code of ["EEXIST", "EPERM", "EACCES"]) {
+        const err = Object.assign(new Error(code), { code });
+        expect(isRetryableLockError(err)).toBe(true);
+      }
+
+      const enoent = Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      expect(isRetryableLockError(enoent)).toBe(false);
+      expect(isRetryableLockError(new Error("unknown"))).toBe(false);
+    });
+
     it("handles stale lock by recovering and completing the operation", () => {
       store.ensureDir();
       const lockPath = path.join(tmpDir, "routes.lock");

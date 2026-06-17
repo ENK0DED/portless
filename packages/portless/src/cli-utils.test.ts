@@ -30,12 +30,14 @@ import {
   readLanMarker,
   readPersistedProxyState,
   readTldFromDir,
+  readWildcardMarker,
   resolveWindowsExecutable,
   resolveStateDir,
   validateTld,
   writeLanMarker,
   writeTldFile,
   writeTlsMarker,
+  writeWildcardMarker,
 } from "./cli-utils.js";
 
 describe("findFreePort", () => {
@@ -1006,6 +1008,32 @@ describe("readLanMarker / writeLanMarker", () => {
   });
 });
 
+describe("readWildcardMarker / writeWildcardMarker", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-wildcard-test-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("writes and reads wildcard mode", () => {
+    writeWildcardMarker(tmpDir, true);
+    expect(readWildcardMarker(tmpDir)).toBe(true);
+  });
+
+  it("removes the marker when wildcard mode is disabled", () => {
+    writeWildcardMarker(tmpDir, true);
+    expect(fs.existsSync(path.join(tmpDir, "proxy.wildcard"))).toBe(true);
+
+    writeWildcardMarker(tmpDir, false);
+    expect(readWildcardMarker(tmpDir)).toBe(false);
+    expect(fs.existsSync(path.join(tmpDir, "proxy.wildcard"))).toBe(false);
+  });
+});
+
 describe("readTldFromDir / writeTldFile", () => {
   let tmpDir: string;
 
@@ -1139,12 +1167,14 @@ describe("readPersistedProxyState", () => {
     writeTlsMarker(tmpDir, true);
     writeTldFile(tmpDir, "local");
     writeLanMarker(tmpDir, "192.168.1.42");
+    writeWildcardMarker(tmpDir, true);
     const state = readPersistedProxyState();
     expect(state).toEqual({
       port: 1355,
       tls: true,
       tld: "local",
       lanMode: true,
+      useWildcard: true,
     });
   });
 });

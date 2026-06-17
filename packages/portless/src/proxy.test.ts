@@ -18,12 +18,16 @@ type AnyServer = http.Server | ProxyServer;
 
 function request(
   server: AnyServer,
-  options: { host?: string; path?: string; method?: string }
+  options: { host?: string; path?: string; method?: string; accept?: string | null }
 ): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }> {
   return new Promise((resolve, reject) => {
     const addr = server.address();
     if (!addr || typeof addr === "string") {
       return reject(new Error("Server not listening"));
+    }
+    const headers: Record<string, string> = { host: options.host || "" };
+    if (options.accept !== null) {
+      headers.accept = options.accept ?? "text/html";
     }
     const req = http.request(
       {
@@ -31,7 +35,7 @@ function request(
         port: addr.port,
         path: options.path || "/",
         method: options.method || "GET",
-        headers: { host: options.host || "" },
+        headers,
       },
       (res) => {
         let body = "";
@@ -91,6 +95,26 @@ describe("createProxyServer", () => {
       expect(res.body).toContain("Not Found");
       expect(res.body).toContain("unknown.localhost");
       expect(res.body).toContain("No apps running.");
+    });
+
+    it("returns plain-text 404 for non-browser clients", async () => {
+      const routes: RouteInfo[] = [
+        { hostname: "myapp.localhost", port: 4001 },
+        { hostname: "api.localhost", port: 4002 },
+      ];
+      const server = trackServer(
+        createProxyServer({ getRoutes: () => routes, proxyPort: TEST_PROXY_PORT })
+      );
+      await listen(server);
+
+      const res = await request(server, { host: "other.localhost", accept: null });
+      expect(res.status).toBe(404);
+      expect(res.headers["content-type"]).toBe("text/plain");
+      expect(res.body).toContain("No app registered for other.localhost");
+      expect(res.body).toContain("Active apps:");
+      expect(res.body).toContain("myapp.localhost");
+      expect(res.body).toContain("api.localhost");
+      expect(res.body).toContain("portless other your-command");
     });
 
     it("shows active routes in 404 page when routes exist", async () => {
@@ -409,6 +433,28 @@ describe("createProxyServer", () => {
       expect(errors.length).toBeGreaterThan(0);
       expect(errors[0]).toContain("dead.localhost");
     });
+
+    it("returns plain-text 502 with target port for non-browser clients", async () => {
+      const unusedPort = await new Promise<number>((resolve) => {
+        const probe = net.createServer();
+        probe.listen(0, "127.0.0.1", () => {
+          const addr = probe.address();
+          if (!addr || typeof addr === "string") throw new Error("no addr");
+          probe.close(() => resolve(addr.port));
+        });
+      });
+      const routes: RouteInfo[] = [{ hostname: "dead.localhost", port: unusedPort }];
+      const server = trackServer(
+        createProxyServer({ getRoutes: () => routes, proxyPort: TEST_PROXY_PORT })
+      );
+      await listen(server);
+
+      const res = await request(server, { host: "dead.localhost", accept: "application/json" });
+      expect(res.status).toBe(502);
+      expect(res.headers["content-type"]).toBe("text/plain");
+      expect(res.body).toContain(`127.0.0.1:${unusedPort}`);
+      expect(res.body).toContain("portless list");
+    });
   });
 
   describe("X-Portless header", () => {
@@ -470,6 +516,7 @@ describe("createProxyServer", () => {
             method: "GET",
             headers: {
               host: "app.localhost",
+              accept: "text/html",
               "x-portless-hops": "5",
             },
           },
@@ -764,6 +811,7 @@ describe("createProxyServer", () => {
             method: "GET",
             headers: {
               host: "app.test",
+              accept: "text/html",
               "x-portless-hops": "5",
             },
           },
@@ -1045,12 +1093,16 @@ describe("createProxyServer with TLS (HTTP/2)", () => {
 
   function httpsRequest(
     server: AnyServer,
-    options: { host?: string; path?: string; method?: string }
+    options: { host?: string; path?: string; method?: string; accept?: string | null }
   ): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }> {
     return new Promise((resolve, reject) => {
       const addr = server.address();
       if (!addr || typeof addr === "string") {
         return reject(new Error("Server not listening"));
+      }
+      const headers: Record<string, string> = { host: options.host || "" };
+      if (options.accept !== null) {
+        headers.accept = options.accept ?? "text/html";
       }
       const req = https.request(
         {
@@ -1058,7 +1110,7 @@ describe("createProxyServer with TLS (HTTP/2)", () => {
           port: addr.port,
           path: options.path || "/",
           method: options.method || "GET",
-          headers: { host: options.host || "" },
+          headers,
           rejectUnauthorized: false,
         },
         (res) => {

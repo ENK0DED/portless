@@ -131,7 +131,7 @@ portless api.myapp bun start    # https://api.myapp.localhost
 portless docs.myapp next dev     # https://docs.myapp.localhost
 ```
 
-By default, only explicitly registered subdomains are routed (strict mode). Start the proxy with `--wildcard` to allow any subdomain of a registered route to fall back to that app (e.g. `tenant1.myapp.localhost` routes to the `myapp` app). Exact matches always take priority over wildcards.
+By default, only explicitly registered subdomains are routed (strict mode). Start the proxy with `--wildcard` to allow any subdomain of a registered route to fall back to that app (e.g. `tenant1.myapp.localhost` routes to the `myapp` app). Exact matches always take priority over wildcards. To change wildcard mode for a running proxy, stop it and start it again with the desired mode.
 
 ### Git worktrees
 
@@ -296,8 +296,11 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 | `portless run --name <name> <cmd>`     | Override inferred base name (worktree prefix still applies)    |
 | `portless <name> <cmd> [args...]`      | Run app at `https://<name>.localhost` (auto-starts proxy)      |
 | `portless get <name>`                  | Print URL for a service (for cross-service wiring)             |
+| `portless url <name>`                  | Alias for `portless get <name>`                                |
 | `portless get <name> --no-worktree`    | Print URL without worktree prefix                              |
 | `portless list`                        | Show active routes                                             |
+| `portless ls`                          | Alias for `portless list`                                      |
+| `portless status`                      | Alias for `portless list`                                      |
 | `portless trust`                       | Add local CA to system trust store (for HTTPS)                 |
 | `portless clean`                       | Remove state, CA trust entry, and /etc/hosts block             |
 | `portless prune`                       | Kill orphaned dev servers from crashed sessions                |
@@ -327,12 +330,13 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 | `portless <name> --ngrok <cmd>`        | Share the app publicly via ngrok                               |
 | `portless <name> --force <cmd>`        | Kill the existing process and take over its route              |
 | `portless --name <name> <cmd>`         | Force `<name>` as app name (bypasses subcommand dispatch)      |
+| `portless <name> KEY=value <cmd>`      | Pass `KEY` only to the child command                           |
 | `portless <name> -- <cmd> [args...]`   | Stop flag parsing; everything after `--` is passed to child    |
 | `portless --help` / `-h`               | Show help                                                      |
 | `portless run --help`                  | Show help for a subcommand (also: alias, hosts, clean)         |
 | `portless --version` / `-v`            | Show version                                                   |
 
-**Reserved names:** `run`, `get`, `alias`, `hosts`, `list`, `trust`, `clean`, `prune`, `proxy`, and `service` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name, or `portless --name <name> <cmd>` to force any name including reserved ones.
+**Reserved names:** `run`, `get`, `url`, `alias`, `hosts`, `list`, `ls`, `status`, `trust`, `clean`, `prune`, `proxy`, and `service` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name, or `portless --name <name> <cmd>` to force any name including reserved ones.
 
 ## portless.json
 

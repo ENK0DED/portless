@@ -183,6 +183,22 @@ describe("CLI", () => {
       const { status } = run(["list"]);
       expect(status).toBe(0);
     });
+
+    it.each(["ls", "status"])("supports %s as a list alias", (cmd) => {
+      const { status } = run([cmd]);
+      expect(status).toBe(0);
+    });
+
+    it.each(["ls", "status"])("preserves %s as an app name when followed by a command", (cmd) => {
+      const { status, stdout } = run(
+        [cmd, process.execPath, "-e", `console.log(${JSON.stringify(`app-named-${cmd}`)})`],
+        {
+          env: { PORTLESS: "0" },
+        }
+      );
+      expect(status).toBe(0);
+      expect(stdout.trim()).toBe(`app-named-${cmd}`);
+    });
   });
 
   describe("proxy", () => {
@@ -268,6 +284,31 @@ describe("CLI", () => {
       });
       expect(status).toBe(42);
     });
+
+    it("hoists leading child env assignments in named mode", () => {
+      const { status, stdout } = run(
+        ["myapp", "GREETING=hi", process.execPath, "-e", "console.log(process.env.GREETING)"],
+        { env: { PORTLESS: "0" } }
+      );
+      expect(status).toBe(0);
+      expect(stdout.trim()).toBe("hi");
+    });
+
+    it("hoists multiple leading child env assignments", () => {
+      const { status, stdout } = run(
+        [
+          "myapp",
+          "A=one",
+          "B=two",
+          process.execPath,
+          "-e",
+          "console.log(`${process.env.A}:${process.env.B}`)",
+        ],
+        { env: { PORTLESS: "0" } }
+      );
+      expect(status).toBe(0);
+      expect(stdout.trim()).toBe("one:two");
+    });
   });
 
   describe("PORTLESS=0 bypass with run subcommand", () => {
@@ -293,6 +334,29 @@ describe("CLI", () => {
       });
       expect(status).toBe(0);
       expect(stdout.trim()).toBe("hello");
+    });
+
+    it("hoists leading child env assignments in run mode", () => {
+      const { status, stdout } = run(
+        ["run", "GREETING=hi", process.execPath, "-e", "console.log(process.env.GREETING)"],
+        {
+          env: { PORTLESS: "0" },
+        }
+      );
+      expect(status).toBe(0);
+      expect(stdout.trim()).toBe("hi");
+    });
+
+    it("does not hoist env assignments after an explicit separator", () => {
+      const { status, stdout, stderr } = run(
+        ["run", "--", "GREETING=hi", process.execPath, "-e", "console.log(process.env.GREETING)"],
+        {
+          env: { PORTLESS: "0" },
+        }
+      );
+      expect(status).not.toBe(0);
+      expect(stdout.trim()).toBe("");
+      expect(stderr).toContain("GREETING=hi");
     });
   });
 
@@ -327,6 +391,20 @@ describe("CLI", () => {
       const { status, stderr } = run(["--forec", "myapp", "echo", "test"]);
       expect(status).toBe(1);
       expect(stderr).toContain("Unknown flag");
+    });
+
+    it("explains that --wildcard belongs to proxy start in run mode", () => {
+      const { status, stderr } = run(["run", "--wildcard", "echo", "test"]);
+      expect(status).toBe(1);
+      expect(stderr).toContain("--wildcard is a proxy-level flag");
+      expect(stderr).toContain("portless proxy stop && portless proxy start --wildcard");
+    });
+
+    it("explains that --wildcard belongs to proxy start in named mode", () => {
+      const { status, stderr } = run(["myapp", "--wildcard", "echo", "test"]);
+      expect(status).toBe(1);
+      expect(stderr).toContain("--wildcard is a proxy-level flag");
+      expect(stderr).toContain("portless proxy stop && portless proxy start --wildcard");
     });
   });
 
@@ -958,6 +1036,49 @@ describe("CLI", () => {
       expect(status).toBe(0);
       expect(capture.NODE_EXTRA_CA_CERTS).toBe(userCaPath);
     });
+
+    it("does not apply child PORTLESS env assignments to portless itself", async () => {
+      const server = http.createServer((_req, res) => {
+        res.setHeader("X-Portless", "1");
+        res.end("ok");
+      });
+
+      try {
+        const proxyPort = await new Promise<number>((resolve) => {
+          server.listen(0, "127.0.0.1", () => {
+            const addr = server.address();
+            if (addr && typeof addr !== "string") {
+              resolve(addr.port);
+            }
+          });
+        });
+
+        fs.writeFileSync(path.join(tmpDir, "proxy.port"), proxyPort.toString());
+
+        const { status, stdout, stderr } = run(
+          [
+            "myapp",
+            "PORTLESS_TAILSCALE=1",
+            process.execPath,
+            "-e",
+            "console.log(process.env.PORTLESS_TAILSCALE)",
+          ],
+          {
+            env: {
+              PORTLESS_STATE_DIR: tmpDir,
+              PORTLESS_HTTPS: "0",
+              PATH: "/tmp/portless-no-ts-path",
+            },
+          }
+        );
+
+        expect(status).toBe(0);
+        expect(stdout).toContain("\n1\n");
+        expect(stderr).not.toContain("Tailscale");
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    });
   });
 
   describe("get subcommand", () => {
@@ -986,8 +1107,21 @@ describe("CLI", () => {
       expect(stdout).toContain("portless get");
     });
 
+    it("prints help through the url alias", () => {
+      const { status, stdout } = run(["url", "--help"]);
+      expect(status).toBe(0);
+      expect(stdout).toContain("portless get");
+      expect(stdout).toContain("--no-worktree");
+    });
+
     it("exits 1 with usage when no name given", () => {
       const { status, stderr } = run(["get"]);
+      expect(status).toBe(1);
+      expect(stderr).toContain("Missing service name");
+    });
+
+    it("exits 1 with usage when no name is given through the url alias", () => {
+      const { status, stderr } = run(["url"]);
       expect(status).toBe(1);
       expect(stderr).toContain("Missing service name");
     });
@@ -1004,6 +1138,23 @@ describe("CLI", () => {
       expect(stdout.trim()).toMatch(/^https?:\/\/api\.backend\.localhost(:\d+)?$/);
     });
 
+    it("prints URL through the url alias", () => {
+      const { status, stdout } = run(["url", "backend"], { env: getEnv() });
+      expect(status).toBe(0);
+      expect(stdout.trim()).toMatch(/^https?:\/\/backend\.localhost(:\d+)?$/);
+    });
+
+    it("preserves url as an app name when followed by a command", () => {
+      const { status, stdout } = run(
+        ["url", process.execPath, "-e", "console.log('app-named-url')"],
+        {
+          env: { PORTLESS: "0" },
+        }
+      );
+      expect(status).toBe(0);
+      expect(stdout.trim()).toBe("app-named-url");
+    });
+
     it("rejects unknown flags", () => {
       const { status, stderr } = run(["get", "--typo", "backend"]);
       expect(status).toBe(1);
@@ -1012,6 +1163,18 @@ describe("CLI", () => {
 
     it("accepts --no-worktree flag", () => {
       const { status, stdout } = run(["get", "--no-worktree", "backend"], { env: getEnv() });
+      expect(status).toBe(0);
+      expect(stdout.trim()).toMatch(/^https?:\/\/backend\.localhost(:\d+)?$/);
+    });
+
+    it("accepts --no-worktree before the name through the url alias", () => {
+      const { status, stdout } = run(["url", "--no-worktree", "backend"], { env: getEnv() });
+      expect(status).toBe(0);
+      expect(stdout.trim()).toMatch(/^https?:\/\/backend\.localhost(:\d+)?$/);
+    });
+
+    it("accepts --no-worktree after the name through the url alias", () => {
+      const { status, stdout } = run(["url", "backend", "--no-worktree"], { env: getEnv() });
       expect(status).toBe(0);
       expect(stdout.trim()).toMatch(/^https?:\/\/backend\.localhost(:\d+)?$/);
     });
@@ -1147,6 +1310,25 @@ describe("CLI", () => {
       expect(start2.stdout).toContain("already running");
     });
 
+    it("does not report a config mismatch when an already-running proxy uses wildcard mode", () => {
+      const start1 = run(["proxy", "start", "--wildcard"], { env: proxyEnv() });
+      expect(start1.status).toBe(0);
+
+      const start2 = run(["proxy", "start", "--wildcard"], { env: proxyEnv() });
+      expect(start2.stdout).toContain("already running");
+      expect(start2.stderr).not.toContain("different config");
+    });
+
+    it("rejects widening a running strict proxy to wildcard mode without restart", () => {
+      const start1 = run(["proxy", "start"], { env: proxyEnv() });
+      expect(start1.status).toBe(0);
+
+      const start2 = run(["proxy", "start", "--wildcard"], { env: proxyEnv() });
+      expect(start2.status).toBe(1);
+      expect(start2.stderr).toContain("different config");
+      expect(start2.stderr).toContain("wildcard");
+    });
+
     it("stops proxy using explicit -p flag instead of env var", () => {
       const start = run(["proxy", "start"], { env: proxyEnv() });
       expect(start.status).toBe(0);
@@ -1166,6 +1348,16 @@ describe("CLI", () => {
       expect(fs.readFileSync(path.join(tmpDir, "proxy.tld"), "utf-8").trim()).toBe(
         "server01.acme.com"
       );
+    });
+
+    it("persists wildcard mode while the proxy runs and clears it on stop", () => {
+      const start = run(["proxy", "start", "--wildcard"], { env: proxyEnv() });
+      expect(start.status).toBe(0);
+      expect(fs.existsSync(path.join(tmpDir, "proxy.wildcard"))).toBe(true);
+
+      const stop = run(["proxy", "stop"], { env: proxyEnv() });
+      expect(stop.status).toBe(0);
+      expect(fs.existsSync(path.join(tmpDir, "proxy.wildcard"))).toBe(false);
     });
   });
 

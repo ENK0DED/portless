@@ -21,6 +21,13 @@ export const FILE_MODE = 0o644;
 /** Directory permission mode for the state directory. */
 export const DIR_MODE = 0o755;
 
+export function isRetryableLockError(err: unknown): boolean {
+  return (
+    isErrnoException(err) &&
+    (err.code === "EEXIST" || err.code === "EPERM" || err.code === "EACCES")
+  );
+}
+
 export interface RouteMapping extends RouteInfo {
   pid: number;
   tailscaleUrl?: string;
@@ -124,15 +131,15 @@ export class RouteStore {
         fs.mkdirSync(this.lockPath);
         return true;
       } catch (err: unknown) {
-        if (isErrnoException(err) && err.code === "EEXIST") {
+        if (isRetryableLockError(err)) {
           try {
             const stat = fs.statSync(this.lockPath);
             if (Date.now() - stat.mtimeMs > STALE_LOCK_THRESHOLD_MS) {
-              fs.rmSync(this.lockPath, { recursive: true });
+              fs.rmSync(this.lockPath, { recursive: true, force: true });
               continue;
             }
           } catch {
-            continue;
+            // The lock may have disappeared or be temporarily inaccessible.
           }
           const jitter = Math.floor(Math.random() * delay);
           this.syncSleep(delay + jitter);
@@ -147,7 +154,7 @@ export class RouteStore {
 
   private releaseLock(): void {
     try {
-      fs.rmSync(this.lockPath, { recursive: true });
+      fs.rmSync(this.lockPath, { recursive: true, force: true });
     } catch {
       // Lock may already be removed; non-fatal
     }
