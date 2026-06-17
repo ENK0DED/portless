@@ -518,7 +518,7 @@ Portless detects this misconfiguration and responds with `508 Loop Detected` alo
 
 This repo is a Bun workspace monorepo using [Turborepo](https://turbo.build). The publishable package lives in `packages/portless/`.
 
-Use Node.js 24+ and Bun 1.3.11+ for repository development. The `.node-version` file pins the Node major for version managers.
+Use Node.js 24+ and Bun 1.3.14+ for repository development. The `.node-version` file pins the Node major for version managers.
 
 ```bash
 bun install          # Install all dependencies

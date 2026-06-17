@@ -1,8 +1,26 @@
 # Changelog
 
-## 0.14.1000
+## 0.14.1001
 
 <!-- release:start -->
+
+### Bug Fixes
+
+- **Privileged proxy config**: Auto-elevated proxy starts and stops now pass the resolved `PORTLESS_STATE_DIR` through `sudo`, so passwordless sudo keeps the invoking user's suffix, port, TLS, and state configuration instead of falling back to root defaults.
+- **Proxy suffix flag**: `portless proxy start --suffix <suffix>` now works directly, while `--tld` remains supported as a compatibility alias.
+
+### Maintenance
+
+- **Dependency refresh**: Updates the repository Bun baseline to `1.3.14` and refreshes workspace dependencies and `bun.lock`.
+- **Fork documentation**: Expands `README.md`, `FORK.md`, and `skills/portless/SKILL.md` coverage for suffix behavior and privileged proxy state handoff.
+
+### Contributors
+
+- @enk0ded
+
+<!-- release:end -->
+
+## 0.14.1000
 
 ### Fork Sync
 
@@ -15,8 +33,6 @@
 
 - @ctate
 - @enk0ded
-
-<!-- release:end -->
 
 ## 0.14.0
 

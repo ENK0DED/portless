@@ -27,6 +27,7 @@ Current fork-owned commits and what they protect:
 | `2cf517c` | Updated CI to current Node 22 and 24 coverage.                                                                                                                                                     |
 | `974f5dc` | Prepared fork release `0.10.6`, the pre-sync fork tip preserved by `backup/pre-upstream-sync-20260617`.                                                                                            |
 | `f9b13e1` | Merged upstream `main` into the fork while preserving package identity, version mapping, Bun, suffix behavior, docs, tests, release workflow, Windows debugging, and the fork sync skill.          |
+| `275a42a` | Fixed privileged proxy state handoff, added first-class proxy `--suffix` parsing, and documented the protected fork behavior.                                                                      |
 
 ## Fork-Owned Invariants
 
@@ -63,13 +64,13 @@ Examples:
 
 This avoids prerelease semantics and keeps room for local-only releases between upstream syncs.
 
-The current fork release `0.14.1000` tracks upstream `0.14.0` plus fork changes. If upstream publishes `0.14.1`, the first synced fork release should be `0.14.2000`. If the fork ships another local-only change before the next upstream patch, use `0.14.1001`.
+The current fork release `0.14.1001` tracks upstream `0.14.0` plus local fork fixes and maintenance updates. If upstream publishes `0.14.1`, the first synced fork release should be `0.14.2000`. If the fork ships another local-only change before the next upstream patch, use `0.14.1002`.
 
 ### Package Manager
 
 This fork uses Bun for repository development.
 
-- Keep `packageManager` set to `bun@1.3.11` or newer in `package.json`
+- Keep `packageManager` set to `bun@1.3.14` or newer in `package.json`
 - Keep `engines.bun` aligned with the required Bun version
 - Keep root `workspaces` in `package.json`
 - Keep `bun.lock`
