@@ -1059,6 +1059,8 @@ const PACKAGE_RUNNERS: Record<string, string[]> = {
   npm: ["exec"],
   npx: [],
   bunx: [],
+  // `bun <bin>` and `bun run <bin>` can both execute framework CLIs.
+  bun: ["run"],
   pnpx: [],
   yarn: ["dlx", "exec"],
   pnpm: ["dlx", "exec"],

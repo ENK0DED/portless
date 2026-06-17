@@ -534,7 +534,66 @@ describe("injectFrameworkFlags", () => {
 
   // Package runner support (issue #146: bunx --bun vite dev gives 502)
 
-  // Simple runners (npx, bunx, pnpx)
+  // Simple runners (npx, bunx, bun, pnpx)
+
+  it("injects flags for bun vite dev", () => {
+    const args = ["bun", "vite", "dev"];
+    injectFrameworkFlags(args, 4567);
+    expect(args).toEqual([
+      "bun",
+      "vite",
+      "dev",
+      "--port",
+      "4567",
+      "--strictPort",
+      "--host",
+      "127.0.0.1",
+    ]);
+  });
+
+  it("injects flags for bun --bun vite dev", () => {
+    const args = ["bun", "--bun", "vite", "dev"];
+    injectFrameworkFlags(args, 4567);
+    expect(args).toEqual([
+      "bun",
+      "--bun",
+      "vite",
+      "dev",
+      "--port",
+      "4567",
+      "--strictPort",
+      "--host",
+      "127.0.0.1",
+    ]);
+  });
+
+  it("injects flags for bun run vite dev", () => {
+    const args = ["bun", "run", "vite", "dev"];
+    injectFrameworkFlags(args, 4567);
+    expect(args).toEqual([
+      "bun",
+      "run",
+      "vite",
+      "dev",
+      "--port",
+      "4567",
+      "--strictPort",
+      "--host",
+      "127.0.0.1",
+    ]);
+  });
+
+  it("does not inject for bun --bun next dev", () => {
+    const args = ["bun", "--bun", "next", "dev"];
+    injectFrameworkFlags(args, 4567);
+    expect(args).toEqual(["bun", "--bun", "next", "dev"]);
+  });
+
+  it("does not inject for bun run with a non-framework script", () => {
+    const args = ["bun", "run", "dev"];
+    injectFrameworkFlags(args, 4567);
+    expect(args).toEqual(["bun", "run", "dev"]);
+  });
 
   it("injects flags for bunx vite dev", () => {
     const args = ["bunx", "vite", "dev"];

@@ -1315,10 +1315,13 @@ async function runApp(
   // Child servers always bind to localhost; the proxy handles cross-device LAN access.
   // Exception: Expo in LAN mode — Metro defaults to LAN and setting HOST=127.0.0.1
   // conflicts with its internal networking, causing HMR WebSocket degradation.
+  // Exception: bun --bun — Bun's native runtime uses HOST for WebSocket origin
+  // validation, which breaks Next.js fast refresh behind the proxy hostname.
   const basename = path.basename(commandArgs[0]);
   const isExpo = basename === "expo";
   const isExpoLan = isExpo && (lanMode || isLanEnvEnabled());
-  const hostBind = isExpoLan ? undefined : "127.0.0.1";
+  const isBunNativeRuntime = basename === "bun" && commandArgs.includes("--bun");
+  const hostBind = isExpoLan || isBunNativeRuntime ? undefined : "127.0.0.1";
 
   // Ensure PORTLESS_LAN is propagated to child processes when the proxy
   // was started with --lan separately and discovered from the state marker,
@@ -1723,6 +1726,7 @@ ${colors.bold("Usage:")}
 ${colors.bold("Examples:")}
   portless                            # Run dev script through proxy
   portless                            # From monorepo root: start all apps
+  portless                            # in worktree -> https://<worktree>.<app>.<project>.localhost
   portless --script start             # Run "start" script instead of "dev"
   portless myapp next dev             # -> https://myapp.localhost
   portless run next dev               # -> https://<project>.localhost
@@ -3302,6 +3306,7 @@ async function handleDefaultMulti(
     }
   }
 
+  const worktree = detectWorktreePrefix(wsRoot);
   const apps: MultiAppEntry[] = [];
 
   for (const pkg of packages) {
@@ -3339,10 +3344,11 @@ async function handleDefaultMulti(
     let name: string;
     let label: string;
     if (appOverride.name) {
-      name = appOverride.name
+      const baseName = appOverride.name
         .split(".")
         .map((l) => truncateLabel(l))
         .join(".");
+      name = worktree ? `${worktree.prefix}.${baseName}` : baseName;
       label = appOverride.name;
     } else {
       let pkgLabel: string;
@@ -3352,7 +3358,8 @@ async function handleDefaultMulti(
       } else {
         pkgLabel = rel.replace(/\//g, "-");
       }
-      name = pkgLabel === projectName ? projectName : `${pkgLabel}.${projectName}`;
+      const baseName = pkgLabel === projectName ? projectName : `${pkgLabel}.${projectName}`;
+      name = worktree ? `${worktree.prefix}.${baseName}` : baseName;
       label = pkg.scope ? `@${pkg.scope}/${pkg.name}` : (pkg.name ?? rel);
     }
 

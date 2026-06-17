@@ -95,6 +95,8 @@ portless run next dev   # -> https://fix-ui.myapp.localhost
 
 Put `portless run` in your `package.json` once and it works everywhere. The main checkout uses the plain name, each worktree gets a unique subdomain. No collisions, no `--force`.
 
+Monorepo workspace apps use the same prefixing rule, including names set through the root `apps` map.
+
 Use `--name` to override the inferred base name while keeping the worktree prefix:
 
 ```bash

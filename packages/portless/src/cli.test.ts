@@ -8,6 +8,15 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLI_PATH = path.resolve(__dirname, "../dist/cli.js");
+const GIT_AVAILABLE = (() => {
+  if (spawnSync("git", ["--version"], { stdio: "ignore" }).status !== 0) return false;
+  const probe = fs.mkdtempSync(path.join(os.tmpdir(), "portless-git-probe-"));
+  try {
+    return spawnSync("git", ["init"], { cwd: probe, stdio: "ignore" }).status === 0;
+  } finally {
+    fs.rmSync(probe, { recursive: true, force: true });
+  }
+})();
 const TEST_CA_PEM = `-----BEGIN CERTIFICATE-----
 MIIDFzCCAf+gAwIBAgIUEVh0YNawusstUaCfwLYo2qUO7D8wDQYJKoZIhvcNAQEL
 BQAwGzEZMBcGA1UEAwwQcG9ydGxlc3MtdGVzdC1jYTAeFw0yNjA1MjAyMTIzNDBa
@@ -58,6 +67,22 @@ function run(args: string[], options?: { env?: Record<string, string | undefined
     stdout: result.stdout,
     stderr: result.stderr,
   };
+}
+
+function runGit(cwd: string, args: string[]): void {
+  const result = spawnSync("git", ["-c", "commit.gpgsign=false", ...args], {
+    cwd,
+    encoding: "utf-8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (result.status !== 0) {
+    throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
+  }
+}
+
+function writeJson(filePath: string, value: unknown): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, JSON.stringify(value, null, 2) + "\n");
 }
 
 function writeExpoShim(dir: string): void {
@@ -1661,6 +1686,172 @@ describe("CLI", () => {
           HOST: "127.0.0.1",
           PORTLESS_URL: `http://test-app.localhost:${proxyPort}`,
         });
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        fs.rmSync(shimDir, { recursive: true, force: true });
+      }
+    });
+
+    it("omits HOST for bun --bun commands so Next.js fast refresh can validate proxy origins", async () => {
+      const server = http.createServer((_req, res) => {
+        res.setHeader("X-Portless", "1");
+        res.end("ok");
+      });
+      const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-bun-native-shim-"));
+      const capturePath = path.join(shimDir, "capture.json");
+
+      try {
+        const proxyPort = await new Promise<number>((resolve) => {
+          server.listen(0, "127.0.0.1", () => {
+            const addr = server.address();
+            if (addr && typeof addr !== "string") {
+              resolve(addr.port);
+            }
+          });
+        });
+
+        fs.writeFileSync(path.join(tmpDir, "proxy.port"), proxyPort.toString());
+
+        const captureScriptPath = path.join(shimDir, "capture-bun-native.js");
+        fs.writeFileSync(
+          captureScriptPath,
+          [
+            'const fs = require("node:fs");',
+            "const capturePath = process.env.PORTLESS_TEST_CAPTURE_FILE;",
+            "const payload = {",
+            "  args: process.argv.slice(2),",
+            "  env: {",
+            "    PORT: process.env.PORT,",
+            "    HOST: process.env.HOST,",
+            "    PORTLESS_URL: process.env.PORTLESS_URL,",
+            "  },",
+            "};",
+            "fs.writeFileSync(capturePath, JSON.stringify(payload));",
+          ].join("\n") + "\n"
+        );
+
+        if (process.platform === "win32") {
+          fs.writeFileSync(
+            path.join(shimDir, "bun.cmd"),
+            `@echo off\r\n"${process.execPath}" "${captureScriptPath}" %*\r\n`
+          );
+        } else {
+          const shimPath = path.join(shimDir, "bun");
+          fs.writeFileSync(
+            shimPath,
+            `#!/bin/sh\n"${process.execPath}" "${captureScriptPath}" "$@"\n`
+          );
+          fs.chmodSync(shimPath, 0o755);
+        }
+
+        const { status } = run(
+          ["run", "--name", "web", "--app-port", "4567", "bun", "--bun", "next", "dev"],
+          {
+            cwd: tmpDir,
+            env: {
+              PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ""}`,
+              PORTLESS_STATE_DIR: tmpDir,
+              PORTLESS_TEST_CAPTURE_FILE: capturePath,
+              PORTLESS_HTTPS: "0",
+            },
+          }
+        );
+
+        expect(status).toBe(0);
+
+        const capture = JSON.parse(fs.readFileSync(capturePath, "utf-8")) as {
+          args: string[];
+          env: Record<string, string>;
+        };
+
+        expect(capture.args).toEqual(["--bun", "next", "dev"]);
+        expect(capture.env).toMatchObject({
+          PORT: "4567",
+          PORTLESS_URL: `http://web.localhost:${proxyPort}`,
+        });
+        expect(capture.env.HOST).toBeUndefined();
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        fs.rmSync(shimDir, { recursive: true, force: true });
+      }
+    });
+
+    it.skipIf(!GIT_AVAILABLE)("prefixes workspace app URLs in linked git worktrees", async () => {
+      const server = http.createServer((_req, res) => {
+        res.setHeader("X-Portless", "1");
+        res.end("ok");
+      });
+      const repoDir = path.join(tmpDir, "repo");
+      const worktreeDir = path.join(tmpDir, "feature-auth-worktree");
+      const stateDir = path.join(tmpDir, "state");
+      const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-pnpm-shim-"));
+
+      try {
+        fs.mkdirSync(repoDir, { recursive: true });
+        writeJson(path.join(repoDir, "package.json"), {
+          private: true,
+          name: "sound-lab",
+          packageManager: "pnpm@11.1.3",
+          workspaces: ["apps/*"],
+        });
+        writeJson(path.join(repoDir, "portless.json"), {
+          name: "custom",
+          turbo: false,
+          apps: {
+            "apps/api": { name: "api.custom" },
+          },
+        });
+        writeJson(path.join(repoDir, "apps", "api", "package.json"), {
+          name: "@sound-lab/api",
+          scripts: { dev: 'node -e "process.exit(0)"' },
+        });
+        writeJson(path.join(repoDir, "apps", "web", "package.json"), {
+          name: "@sound-lab/web",
+          scripts: { dev: 'node -e "process.exit(0)"' },
+        });
+
+        runGit(repoDir, ["init"]);
+        runGit(repoDir, ["config", "user.name", "Portless Test"]);
+        runGit(repoDir, ["config", "user.email", "portless-test@example.com"]);
+        runGit(repoDir, ["branch", "-M", "main"]);
+        runGit(repoDir, ["add", "."]);
+        runGit(repoDir, ["commit", "-m", "init"]);
+        runGit(repoDir, ["worktree", "add", "-b", "feature-auth", worktreeDir]);
+
+        const proxyPort = await new Promise<number>((resolve) => {
+          server.listen(0, "127.0.0.1", () => {
+            const addr = server.address();
+            if (addr && typeof addr !== "string") {
+              resolve(addr.port);
+            }
+          });
+        });
+        fs.mkdirSync(stateDir, { recursive: true });
+        fs.writeFileSync(path.join(stateDir, "proxy.port"), proxyPort.toString());
+
+        if (process.platform === "win32") {
+          fs.writeFileSync(path.join(shimDir, "pnpm.cmd"), "@echo off\r\nexit /b 0\r\n");
+        } else {
+          const shimPath = path.join(shimDir, "pnpm");
+          fs.writeFileSync(shimPath, "#!/bin/sh\nexit 0\n");
+          fs.chmodSync(shimPath, 0o755);
+        }
+
+        const { status, stdout, stderr } = run([], {
+          cwd: worktreeDir,
+          env: {
+            PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ""}`,
+            PORTLESS_STATE_DIR: stateDir,
+            PORTLESS_HTTPS: "0",
+          },
+        });
+
+        expect(stderr).toBe("");
+        expect(status).toBe(0);
+        expect(stdout).toContain(`http://feature-auth.api.custom.localhost:${proxyPort}`);
+        expect(stdout).toContain(`http://feature-auth.web.custom.localhost:${proxyPort}`);
+        expect(stdout).not.toContain(`http://api.custom.localhost:${proxyPort}`);
+        expect(stdout).not.toContain(`http://web.custom.localhost:${proxyPort}`);
       } finally {
         await new Promise<void>((resolve) => server.close(() => resolve()));
         fs.rmSync(shimDir, { recursive: true, force: true });
