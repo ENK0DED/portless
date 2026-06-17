@@ -2,6 +2,32 @@
 
 This repository is the ENK0DED fork of upstream `vercel-labs/portless`. Keep this file current whenever the fork adds behavior, release policy, package identity, or agent workflow that upstream does not own.
 
+## Fork-Only Commit Ledger
+
+Regenerate the current fork-only history with:
+
+```bash
+git log --oneline --no-merges upstream/main..HEAD
+```
+
+Current fork-owned commits and what they protect:
+
+| Commit    | Purpose                                                                                                                                                                                            |
+| --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `e4fb52d` | Switched repository development from pnpm to Bun, replaced lockfiles, updated CI/release scripts, Windows debug bootstrap, package scripts, and agent docs.                                        |
+| `293a6cd` | Introduced suffix terminology in docs and comments so custom hostname endings are not described only as top-level domains.                                                                         |
+| `7cc4b70` | Centralized TypeScript config, refined CLI and test behavior, added `PORTLESS_SUFFIX`, added dotted suffix validation, added suffix precedence tests, and updated package manager examples to Bun. |
+| `9ef7bdf` | Prepared fork release `0.10.2`.                                                                                                                                                                    |
+| `e3bf8af` | Fixed the fork release workflow's npm authentication path.                                                                                                                                         |
+| `ce44bb0` | Prepared fork release `0.10.3`.                                                                                                                                                                    |
+| `73a8c35` | Prepared fork release `0.10.4`.                                                                                                                                                                    |
+| `038a893` | Prepared fork release `0.10.5`.                                                                                                                                                                    |
+| `c613379` | Fixed workflow compatibility and changed Turbo package references from `portless#build` to `@enk0ded/portless#build`.                                                                              |
+| `9b84042` | Adjusted CI e2e coverage for the fork's Node matrix.                                                                                                                                               |
+| `2cf517c` | Updated CI to current Node 22 and 24 coverage.                                                                                                                                                     |
+| `974f5dc` | Prepared fork release `0.10.6`, the pre-sync fork tip preserved by `backup/pre-upstream-sync-20260617`.                                                                                            |
+| `f9b13e1` | Merged upstream `main` into the fork while preserving package identity, version mapping, Bun, suffix behavior, docs, tests, release workflow, Windows debugging, and the fork sync skill.          |
+
 ## Fork-Owned Invariants
 
 ### Package Identity
@@ -9,8 +35,11 @@ This repository is the ENK0DED fork of upstream `vercel-labs/portless`. Keep thi
 - npm package: `@enk0ded/portless`
 - CLI command: `portless`
 - Repository: `https://github.com/ENK0DED/portless`
+- package metadata author: `Eloy Rodriguez <officialenkoded@gmail.com>`
 - Release workflow registry check: `npm view @enk0ded/portless version`
 - Install docs must use `npm install -g @enk0ded/portless` and `npm install -D @enk0ded/portless`
+- Runtime local-install detection must check `node_modules/@enk0ded/portless`, not `node_modules/portless`
+- Turbo task references must use `@enk0ded/portless#build`
 
 After every upstream sync, search for upstream package install strings:
 
@@ -34,14 +63,22 @@ Examples:
 
 This avoids prerelease semantics and keeps room for local-only releases between upstream syncs.
 
+The current fork release `0.14.1000` tracks upstream `0.14.0` plus fork changes. If upstream publishes `0.14.1`, the first synced fork release should be `0.14.2000`. If the fork ships another local-only change before the next upstream patch, use `0.14.1001`.
+
 ### Package Manager
 
 This fork uses Bun for repository development.
 
 - Keep `packageManager` set to `bun@1.3.11` or newer in `package.json`
+- Keep `engines.bun` aligned with the required Bun version
+- Keep root `workspaces` in `package.json`
 - Keep `bun.lock`
 - Do not keep `pnpm-lock.yaml` or `pnpm-workspace.yaml`
 - CI, release workflows, Windows debug scripts, README, and `skills/portless/SKILL.md` must use `bun install` and `bun run ...`
+- The pre-commit hook uses `bunx lint-staged`
+- `.prettierignore` ignores `bun.lock`
+- `.gitignore` and ESLint ignore rules should not reference `.pnpm-store`
+- Windows debug bootstrap installs Bun, adds `C:\.bun\bin` to PATH, clones `https://github.com/ENK0DED/portless.git`, and rebuilds with `bun install` plus `bun run build`
 
 Portless can still support pnpm as a child command or workspace format. Do not remove product support for pnpm just because this fork uses Bun.
 
@@ -49,15 +86,98 @@ Portless can still support pnpm as a child command or workspace format. Do not r
 
 This fork documents `PORTLESS_SUFFIX` as the preferred environment variable for custom suffixes. `PORTLESS_TLD` remains a compatibility alias.
 
+Behavior to preserve:
+
+- `PORTLESS_SUFFIX` is read before `PORTLESS_TLD`
+- if both env vars are set, `PORTLESS_SUFFIX` wins
+- empty values fall back to the default suffix `localhost`
+- values are trimmed and lowercased
+- single-label suffixes such as `test` are valid
+- dotted suffixes such as `acme.com` and `server01.acme.com` are valid
+- labels may contain lowercase letters, digits, and hyphens
+- labels must start and end with a letter or digit
+- labels must be 63 characters or less
+- leading dots, trailing dots, and consecutive dots are invalid
+- risky suffix warnings should inspect the terminal public suffix label, so `local.example.dev` warns because the final label is `dev`
+- host parsing and proxy routing must support dotted suffixes
+- service installs should write `PORTLESS_SUFFIX`, not `PORTLESS_TLD`, into native service environment
+- `portless service install --suffix <suffix>` is the preferred service flag
+- `portless service install --tld <tld>` remains a compatibility alias
+- `portless proxy start --suffix <suffix>` is the preferred proxy flag
+- `portless proxy start --tld <tld>` remains a compatibility alias
+- the state marker file is still `proxy.tld` for compatibility with upstream and older local installs
+
 Coverage:
 
 - `packages/portless/src/cli-utils.test.ts` covers `PORTLESS_SUFFIX`, `PORTLESS_TLD`, and precedence
+- `packages/portless/src/cli-utils.test.ts` covers dotted suffix validation
+- `packages/portless/src/cli.test.ts` covers the proxy `--suffix` parser
+- `packages/portless/src/utils.test.ts` covers hostname parsing with dotted suffixes
+- `packages/portless/src/proxy.test.ts` covers routing with dotted suffixes
+- `packages/portless/src/service.test.ts` covers service persistence through `PORTLESS_SUFFIX` and `--suffix`
 - `packages/portless/src/cli.ts` help output documents `PORTLESS_SUFFIX` first
 - `README.md` and `skills/portless/SKILL.md` document `PORTLESS_SUFFIX` first
+
+Do not let an upstream merge restore a single-label-only validator or replace fork docs with only `PORTLESS_TLD`.
+
+### Privileged Proxy State Handoff
+
+This fork keeps all proxy state in the invoking user's state directory by default. That must continue to hold even when the proxy needs sudo for ports 80 or 443.
+
+Behavior to preserve:
+
+- `resolveStateDir()` returns `~/.portless` unless `PORTLESS_STATE_DIR` is set
+- sudo proxy starts must run through `sudo env` and pass the resolved `PORTLESS_STATE_DIR`
+- sudo proxy stops must also pass the resolved `PORTLESS_STATE_DIR`
+- `buildSudoEnvArgs()` should preserve existing `PORTLESS_*` values, preserve `HOME`, and allow explicit overrides
+- passwordless sudo must not make the proxy fall back to root's default config when the user has configured `PORTLESS_SUFFIX`, `PORTLESS_PORT`, `PORTLESS_HTTPS`, or another `PORTLESS_*` value
+
+Coverage:
+
+- `packages/portless/src/cli-utils.test.ts` covers sudo environment argument construction
+- `packages/portless/src/cli.test.ts` covers `proxy start --suffix` writing the persisted suffix state
 
 ### Boolean Environment Variable Docs
 
 Docs and CLI help only document boolean environment variables with `0` and `1`. Code may accept additional internal values when already supported, but do not add those alternatives to user-facing docs.
+
+### TypeScript and Dependency Baseline
+
+This fork uses a shared root `tsconfig.json` as the baseline for packages, apps, examples, and e2e tests. Preserve the centralized compiler defaults unless upstream introduces a stricter equivalent.
+
+Current baseline:
+
+- `target`: `ESNext`
+- `module`: `ESNext`
+- `moduleResolution`: `bundler`
+- `strict`: `true`
+- `skipLibCheck`: `true`
+- `resolveJsonModule`: `true`
+
+The fork also keeps dependency versions current through Bun. When upstream changes dependencies, refresh with `bun install` and keep `bun.lock` as the source of truth.
+
+### Runtime Diagnostics
+
+The fork preserves original error causes when OpenSSL certificate generation fails:
+
+- `packages/portless/src/certs.ts` wraps failed OpenSSL calls with `{ cause: err }`
+- `packages/portless/src/service.ts` wraps startup-service certificate preparation failures with `{ cause: err }`
+
+This improves debugging without changing the user-facing message. Keep this when upstream rewrites certificate or service startup code.
+
+### Docs, Skills, and Agent Workflow
+
+Fork-specific docs live in more than one place and should be kept consistent:
+
+- `README.md`: user-facing install, suffix, Bun development, and fork maintenance notes
+- `FORK.md`: fork invariants, version mapping, and sync checklist
+- `skills/portless/SKILL.md`: agent-facing usage guide for this package
+- `skills/oauth/SKILL.md`: OAuth guidance should use suffix terminology
+- `apps/docs/src/app/*`: docs site content should use `@enk0ded/portless` and suffix terminology
+- `apps/docs/src/app/api/docs-chat/route.ts`: docs chat system prompt should identify the ENK0DED repo and `@enk0ded/portless`
+- `skills/portless-fork-sync/SKILL.md`: local agentic process for repeating upstream syncs
+
+The fork sync skill is part of the repository on purpose. Do not remove it during upstream syncs. Update it whenever the sync process changes.
 
 ## Sync Checklist
 
@@ -68,8 +188,9 @@ Docs and CLI help only document boolean environment variables with `0` and `1`. 
 5. Remove upstream pnpm workspace files if they return.
 6. Run the package-name search above and fix every hit unless it is intentionally testing compatibility.
 7. Run `bun install` to refresh `bun.lock`.
-8. Run focused tests for any fork invariant touched by the merge.
-9. Run full verification before pushing.
+8. Review `git log --oneline --no-merges upstream/main..HEAD` and update this ledger when the fork adds or removes fork-only commits.
+9. Run focused tests for any fork invariant touched by the merge.
+10. Run full verification before pushing.
 
 ## Verification Commands
 
@@ -85,3 +206,16 @@ bun run test
 ```
 
 Run `bun run test:e2e` when source changes affect proxy lifecycle, framework flag injection, multi-app orchestration, sharing, or route cleanup.
+
+Focused checks for fork invariants:
+
+```bash
+bun run test packages/portless/src/cli-utils.test.ts
+bun run test packages/portless/src/utils.test.ts
+bun run test packages/portless/src/proxy.test.ts
+bun run test packages/portless/src/service.test.ts
+rg 'npm install -g [p]ortless|npm install -D [p]ortless|npm view [p]ortless|"name": "[p]ortless"|github.com/vercel-labs/[p]ortless|node_modules/[p]ortless'
+rg 'PORTLESS_TLD' README.md skills/portless/SKILL.md apps/docs/src/app
+```
+
+The final `PORTLESS_TLD` search is expected to find only compatibility-alias language.

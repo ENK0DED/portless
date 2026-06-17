@@ -418,6 +418,32 @@ export function readPersistedProxyState(): {
   return null;
 }
 
+export function buildSudoEnvArgs(
+  env: NodeJS.ProcessEnv | Record<string, string | undefined>,
+  overrides: Record<string, string | undefined> = {}
+): string[] {
+  const values = new Map<string, string>();
+
+  for (const key of Object.keys(env)) {
+    const value = env[key];
+    if (key.startsWith("PORTLESS_") && value) {
+      values.set(key, value);
+    }
+  }
+
+  if (env.HOME) {
+    values.set("HOME", env.HOME);
+  }
+
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value) {
+      values.set(key, value);
+    }
+  }
+
+  return [...values.entries()].map(([key, value]) => `${key}=${value}`);
+}
+
 export function buildProxyStartConfig(options: {
   useHttps: boolean;
   customCertPath?: string | null;

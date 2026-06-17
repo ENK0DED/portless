@@ -676,7 +676,7 @@ describe("CLI", () => {
           }
         );
         expect(status).toBe(1);
-        expect(stderr).toContain("--lan forces .local TLD");
+        expect(stderr).toContain("--lan forces .local suffix");
         expect(stderr).toContain("Ignoring --tld test");
       } finally {
         fs.rmSync(emptyPath, { recursive: true, force: true });
@@ -1157,6 +1157,15 @@ describe("CLI", () => {
       });
       expect(stop.status).toBe(0);
       expect(stop.stdout).toContain("Proxy stopped");
+    });
+
+    it("accepts --suffix for proxy start", () => {
+      const start = run(["proxy", "start", "--suffix", "server01.acme.com"], { env: proxyEnv() });
+      expect(start.status).toBe(0);
+      expect(start.stdout).toContain(`proxy started on port ${testPort}`);
+      expect(fs.readFileSync(path.join(tmpDir, "proxy.tld"), "utf-8").trim()).toBe(
+        "server01.acme.com"
+      );
     });
   });
 

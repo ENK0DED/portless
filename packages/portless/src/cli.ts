@@ -30,6 +30,7 @@ import {
 } from "./auto.js";
 import {
   buildProxyStartConfig,
+  buildSudoEnvArgs,
   DEFAULT_TLD,
   FALLBACK_PROXY_PORT,
   INTERNAL_LAN_IP_ENV,
@@ -352,17 +353,11 @@ function isLocallyInstalled(): boolean {
 }
 
 /**
- * Collect PORTLESS_* env vars as KEY=VALUE strings suitable for
+ * Collect env vars that must survive sudo as KEY=VALUE strings suitable for
  * `sudo env KEY=VAL ...` invocations (sudo may strip the environment).
  */
 function collectPortlessEnvArgs(): string[] {
-  const envArgs: string[] = [];
-  for (const key of Object.keys(process.env)) {
-    if (key.startsWith("PORTLESS_") && process.env[key]) {
-      envArgs.push(`${key}=${process.env[key]}`);
-    }
-  }
-  return envArgs;
+  return buildSudoEnvArgs(process.env);
 }
 
 /**
@@ -371,26 +366,26 @@ function collectPortlessEnvArgs(): string[] {
 function sudoStop(port: number): boolean {
   const stopArgs = [process.execPath, getEntryScript(), "proxy", "stop", "-p", String(port)];
   console.log(colors.yellow("Proxy is running as root. Elevating with sudo to stop it..."));
-  const result = spawnSync("sudo", ["env", ...collectPortlessEnvArgs(), ...stopArgs], {
-    stdio: "inherit",
-    timeout: SUDO_SPAWN_TIMEOUT_MS,
-  });
+  const result = spawnSync(
+    "sudo",
+    [
+      "env",
+      ...buildSudoEnvArgs(process.env, { PORTLESS_STATE_DIR: resolveStateDir(port) }),
+      ...stopArgs,
+    ],
+    {
+      stdio: "inherit",
+      timeout: SUDO_SPAWN_TIMEOUT_MS,
+    }
+  );
   return result.status === 0;
 }
 
 function runCleanWithSudo(reason: string): boolean {
   console.log(colors.yellow(`${reason} Requesting sudo...`));
-  const home = process.env.HOME;
   const result = spawnSync(
     "sudo",
-    [
-      "env",
-      ...collectPortlessEnvArgs(),
-      ...(home ? [`HOME=${home}`] : []),
-      process.execPath,
-      getEntryScript(),
-      "clean",
-    ],
+    ["env", ...collectPortlessEnvArgs(), process.execPath, getEntryScript(), "clean"],
     {
       stdio: "inherit",
       timeout: SUDO_SPAWN_TIMEOUT_MS,
@@ -592,7 +587,7 @@ function startProxyServer(
     writeLanMarker(store.dir, activeLanIp);
     fixOwnership(store.dir, store.pidPath, store.portFilePath);
     const proto = isTls ? "HTTPS/2" : "HTTP";
-    const tldLabel = tld !== DEFAULT_TLD ? ` (TLD: .${tld})` : "";
+    const tldLabel = tld !== DEFAULT_TLD ? ` (suffix: .${tld})` : "";
     const modeLabel = strict === false ? " (wildcard)" : "";
     console.log(
       colors.green(`${proto} proxy listening on port ${proxyPort}${tldLabel}${modeLabel}`)
@@ -1647,7 +1642,7 @@ ${colors.bold("LAN mode:")}
   All proxy settings are persisted and reused on auto-start unless
   overridden by explicit flags or env vars.
   Use PORTLESS_LAN=0 for one start to switch back to .localhost mode.
-  If a proxy is already running with different explicit LAN/TLS/TLD settings,
+  If a proxy is already running with different explicit LAN/TLS/suffix settings,
   stop it first.
   ${colors.cyan("portless proxy start --lan")}
   ${colors.cyan("portless proxy start --lan --https")}
@@ -1682,7 +1677,8 @@ ${colors.bold("Options:")}
   --cert <path>                 Use a custom TLS certificate
   --key <path>                  Use a custom TLS private key
   --foreground                  Run proxy in foreground (for debugging)
-  --tld <tld>                   Use a custom TLD instead of .localhost (e.g. test, dev)
+  --suffix <suffix>             Use a custom suffix instead of .localhost (e.g. test, acme.com)
+  --tld <tld>                   Compatibility alias for --suffix
   --wildcard                    Allow unregistered subdomains to fall back to parent route
   --state-dir <path>            Use a custom state directory with service install
   --app-port <number>           Use a fixed port for the app (skip auto-assignment)
@@ -1722,7 +1718,7 @@ ${colors.bold("Safari / DNS:")}
   .localhost subdomains auto-resolve in Chrome, Firefox, and Edge.
   Safari relies on the system DNS resolver, which may not handle them.
   Auto-syncs ${HOSTS_DISPLAY} for route hostnames by default (including .localhost,
-  custom TLDs, and LAN .local). Set PORTLESS_SYNC_HOSTS=0 to disable. To manually sync:
+  custom suffixes, and LAN .local). Set PORTLESS_SYNC_HOSTS=0 to disable. To manually sync:
     ${colors.cyan("portless hosts sync")}
   Clean up later with:
     ${colors.cyan("portless hosts clean")}
@@ -2265,10 +2261,11 @@ ${colors.bold("portless proxy")} - Manage the portless proxy server.
 ${colors.bold("Usage:")}
   ${colors.cyan("portless proxy start")}                Start the HTTPS proxy on port 443 (daemon)
   ${colors.cyan("portless proxy start --no-tls")}       Start without HTTPS (port 80)
-  ${colors.cyan("portless proxy start --lan")}          Enable LAN mode (mDNS, .local TLD)
+  ${colors.cyan("portless proxy start --lan")}          Enable LAN mode (mDNS, .local suffix)
   ${colors.cyan("portless proxy start --foreground")}   Start in foreground (for debugging)
   ${colors.cyan("portless proxy start -p 1355")}        Start on a custom port (no sudo)
-  ${colors.cyan("portless proxy start --tld test")}     Use .test instead of .localhost
+  ${colors.cyan("portless proxy start --suffix test")}  Use .test instead of .localhost
+  ${colors.cyan("portless proxy start --tld test")}     Compatibility alias for --suffix
   ${colors.cyan("portless proxy start --wildcard")}     Allow unregistered subdomains to fall back to parent
   ${colors.cyan("portless proxy stop")}                 Stop the proxy
 
@@ -2341,7 +2338,7 @@ ${colors.bold("LAN mode (--lan):")}
     hasExplicitPort = true;
   }
 
-  // Parse --tld flag
+  // Parse --suffix / --tld flag
   let tld: string;
   try {
     tld = getDefaultTld();
@@ -2349,11 +2346,16 @@ ${colors.bold("LAN mode (--lan):")}
     console.error(colors.red(`Error: ${(err as Error).message}`));
     process.exit(1);
   }
-  const tldIdx = args.indexOf("--tld");
+  const suffixIdx = args.indexOf("--suffix");
+  const legacyTldIdx = args.indexOf("--tld");
+  const tldIdx = suffixIdx !== -1 ? suffixIdx : legacyTldIdx;
+  const tldFlag = suffixIdx !== -1 ? "--suffix" : "--tld";
   if (tldIdx !== -1) {
     const tldValue = args[tldIdx + 1];
     if (!tldValue || tldValue.startsWith("-")) {
-      console.error(colors.red("Error: --tld requires a TLD value (e.g. test, localhost)."));
+      console.error(
+        colors.red(`Error: ${tldFlag} requires a suffix value (e.g. test, localhost).`)
+      );
       process.exit(1);
     }
     tld = tldValue.trim().toLowerCase();
@@ -2426,7 +2428,7 @@ ${colors.bold("LAN mode (--lan):")}
     if (userTld && userTld !== "local") {
       console.warn(
         chalk.yellow(
-          `Warning: --lan forces .local TLD (mDNS requirement). Ignoring --tld ${userTld}.`
+          `Warning: --lan forces .local suffix (mDNS requirement). Ignoring ${tldFlag} ${userTld}.`
         )
       );
     }
@@ -2550,10 +2552,14 @@ ${colors.bold("LAN mode (--lan):")}
     if (!hasExplicitPort) {
       console.log(colors.gray(`(To skip sudo, use an unprivileged port: ${fallbackCommand})`));
     }
-    const result = spawnSync("sudo", ["env", ...collectPortlessEnvArgs(), ...startArgs], {
-      stdio: "inherit",
-      timeout: SUDO_SPAWN_TIMEOUT_MS,
-    });
+    const result = spawnSync(
+      "sudo",
+      ["env", ...buildSudoEnvArgs(process.env, { PORTLESS_STATE_DIR: stateDir }), ...startArgs],
+      {
+        stdio: "inherit",
+        timeout: SUDO_SPAWN_TIMEOUT_MS,
+      }
+    );
 
     if (result.status === 0) {
       if (!isForeground) {

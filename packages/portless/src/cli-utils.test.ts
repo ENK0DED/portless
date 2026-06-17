@@ -5,6 +5,7 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+  buildSudoEnvArgs,
   buildProxyStartConfig,
   BLOCKED_PORTS,
   DEFAULT_TLD,
@@ -841,6 +842,30 @@ describe("buildProxyStartConfig", () => {
       effectiveTld: "test",
       args: ["--no-tls", "--suffix", "test"],
     });
+  });
+});
+
+describe("buildSudoEnvArgs", () => {
+  it("preserves portless env, preserves HOME, and applies overrides", () => {
+    expect(
+      buildSudoEnvArgs(
+        {
+          HOME: "/home/alice",
+          PATH: "/usr/bin",
+          PORTLESS_SUFFIX: "server01.acme.com",
+          PORTLESS_STATE_DIR: "/old/state",
+        },
+        {
+          PORTLESS_STATE_DIR: "/home/alice/.portless",
+        }
+      ).sort()
+    ).toEqual(
+      [
+        "HOME=/home/alice",
+        "PORTLESS_STATE_DIR=/home/alice/.portless",
+        "PORTLESS_SUFFIX=server01.acme.com",
+      ].sort()
+    );
   });
 });
 

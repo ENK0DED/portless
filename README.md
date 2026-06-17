@@ -1,4 +1,4 @@
-# portless
+# @enk0ded/portless
 
 Replace port numbers with stable, named .localhost URLs for local development. For humans and agents.
 
@@ -22,6 +22,8 @@ npm install -D @enk0ded/portless
 ```
 
 > portless is pre-1.0. When installed per-project, different contributors may run different versions. The state directory format may change between releases, which can require re-running `portless trust`.
+
+This README describes the ENK0DED fork published as `@enk0ded/portless`. The CLI command is still `portless`, but install, release, and local dependency checks use the scoped package name.
 
 ## Run your app
 
@@ -198,19 +200,43 @@ portless run --name myapp next dev   # -> https://fix-ui.myapp.localhost
 
 Put `portless run` in your `package.json` once and it works everywhere. The main checkout uses the plain name, each worktree gets a unique subdomain. No collisions, no `--force`.
 
-## Custom TLD
+## Custom Suffixes
 
-By default, portless uses `.localhost` which auto-resolves to `127.0.0.1` in most browsers. If you prefer a different TLD (e.g. `.test`), use `--tld`:
+By default, portless uses the `localhost` suffix, which produces URLs like `https://myapp.localhost` and auto-resolves to `127.0.0.1` in most browsers. This fork uses "suffix" terminology because the value can be more than a single top-level label.
+
+For one-off proxy starts, prefer `--suffix`:
 
 ```bash
-portless proxy start --tld test
+portless proxy start --suffix test
 portless myapp next dev
 # -> https://myapp.test
 ```
 
-The proxy auto-syncs `/etc/hosts` for route hostnames (including `.test`), so those domains resolve on your machine.
+For shell or service configuration, prefer `PORTLESS_SUFFIX`:
 
-Recommended: `.test` (IANA-reserved, no collision risk). Avoid `.local` (conflicts with mDNS/Bonjour) and `.dev` (Google-owned, forces HTTPS via HSTS).
+```bash
+PORTLESS_SUFFIX=test portless proxy start
+portless myapp next dev
+# -> https://myapp.test
+```
+
+`PORTLESS_SUFFIX` accepts a single label such as `test` and dotted suffixes such as `server01.acme.com`:
+
+```bash
+PORTLESS_SUFFIX=server01.acme.com portless proxy start
+portless myapp next dev
+# -> https://myapp.server01.acme.com
+```
+
+`PORTLESS_SUFFIX` is read before the legacy `PORTLESS_TLD` variable. If both are set, `PORTLESS_SUFFIX` wins. `PORTLESS_TLD` and `--tld` remain supported so existing upstream-style environments and scripts keep working.
+
+Suffix values are lowercased and validated as DNS labels: each label may contain lowercase letters, digits, and hyphens, must start and end with a letter or digit, and must be 63 characters or less. Leading dots, trailing dots, and consecutive dots are rejected.
+
+Auto-elevated proxy starts pass the resolved `PORTLESS_STATE_DIR` through `sudo`, so a root-owned proxy uses the same per-user state and suffix settings as the command that started it. Set `PORTLESS_STATE_DIR` explicitly before running portless if you want a separate proxy state directory.
+
+The proxy auto-syncs `/etc/hosts` for route hostnames, so `.test`, `.server01.acme.com`, and other configured suffixes resolve on your machine.
+
+Recommended: `.test` for throwaway local names because it is IANA-reserved. Use a subdomain you control, such as `local.example.com`, when OAuth providers or other external systems require a public suffix. Avoid `.local` outside LAN mode because it conflicts with mDNS/Bonjour. Avoid bare public suffixes like `.dev` unless you understand the collision and HSTS implications.
 
 ## How it works
 
@@ -262,9 +288,9 @@ portless service status
 portless service uninstall
 ```
 
-The service uses portless defaults unless install options or `PORTLESS_*` environment variables are provided: HTTPS on port 443 with `.localhost` names. `service install` accepts the proxy options you would use with `proxy start`, including `--port`, `--no-tls`, `--lan`, `--ip`, `--tld`, `--wildcard`, `--cert`, and `--key`. Use `--state-dir <path>` or `PORTLESS_STATE_DIR=<path>` to choose where service state and logs are written.
+The service uses portless defaults unless install options or `PORTLESS_*` environment variables are provided: HTTPS on port 443 with `.localhost` names. `service install` accepts the proxy options you would use with `proxy start`, including `--port`, `--no-tls`, `--lan`, `--ip`, `--suffix`, `--tld`, `--wildcard`, `--cert`, and `--key`. Use `--state-dir <path>` or `PORTLESS_STATE_DIR=<path>` to choose where service state and logs are written.
 
-The chosen service configuration is written into launchd, systemd, or Task Scheduler and reused after reboot. `portless service status` reports the installed port, HTTPS mode, TLD, LAN mode, wildcard mode, and state directory. macOS and Linux install a root-owned service so port 443 can bind at boot. Windows installs a Task Scheduler startup task that runs as SYSTEM. Installation and removal may require administrator privileges. `portless clean` automatically removes the service.
+The chosen service configuration is written into launchd, systemd, or Task Scheduler and reused after reboot. Custom service suffixes are persisted as `PORTLESS_SUFFIX`; `--tld` remains accepted as a compatibility alias. `portless service status` reports the installed port, HTTPS mode, configured suffix, LAN mode, wildcard mode, and state directory. macOS and Linux install a root-owned service so port 443 can bind at boot. Windows installs a Task Scheduler startup task that runs as SYSTEM. Installation and removal may require administrator privileges. `portless clean` automatically removes the service.
 
 ## LAN mode
 
@@ -276,7 +302,7 @@ portless proxy start --lan --ip 192.168.1.42
 
 `--lan` switches the proxy to mDNS discovery: services are advertised as `<name>.local` and reachable from any device on the same network. Portless auto-detects your LAN IP and follows Wi-Fi/IP changes automatically, but you can pin another address with `--ip <address>` or by exporting `PORTLESS_LAN_IP`. Set `PORTLESS_LAN=1` in your shell (0/1 boolean) to make LAN mode the default whenever the proxy starts.
 
-Portless remembers LAN mode via `proxy.lan`, so if you stop a LAN proxy and start it again, it stays in LAN mode. All proxy settings (port, TLS, TLD, LAN) are persisted and reused on auto-start unless overridden by explicit flags or env vars. Use `PORTLESS_LAN=0` for one start to switch back to `.localhost` mode. If a proxy is already running with different explicit LAN/TLS/TLD settings, portless warns and asks you to stop it first.
+Portless remembers LAN mode via `proxy.lan`, so if you stop a LAN proxy and start it again, it stays in LAN mode. All proxy settings (port, TLS, suffix, LAN) are persisted and reused on auto-start unless overridden by explicit flags or env vars. Use `PORTLESS_LAN=0` for one start to switch back to `.localhost` mode. If a proxy is already running with different explicit LAN, TLS, or suffix settings, portless warns and asks you to stop it first.
 
 LAN mode depends on the system mDNS tools that portless already spawns: macOS ships with `dns-sd`, while Linux uses `avahi-publish-address` from `avahi-utils` (install via `sudo apt install avahi-utils` or your distro’s equivalent). If the command is missing or your network isn’t reachable, `portless proxy start --lan` prints the relevant error and exits.
 
@@ -362,7 +388,9 @@ portless proxy start             # Start the HTTPS proxy (port 443, daemon)
 portless proxy start --no-tls    # Start without HTTPS (port 80)
 portless proxy start --lan       # Start in LAN mode (mDNS .local for devices)
 portless proxy start -p 1355     # Start on a custom port (no sudo)
-portless proxy start --foreground  # Start in foreground (for debugging)
+portless proxy start --suffix test  # Use .test instead of .localhost
+portless proxy start --tld test  # Compatibility alias for --suffix
+portless proxy start --foreground  # Start in foreground for debugging
 portless proxy start --wildcard  # Allow unregistered subdomains to fall back to parent
 portless proxy stop              # Stop the proxy
 
@@ -385,7 +413,8 @@ portless service uninstall       # Remove the startup service
 --cert <path>                    Use a custom TLS certificate
 --key <path>                     Use a custom TLS private key
 --foreground                     Run proxy in foreground instead of daemon
---tld <tld>                      Use a custom TLD instead of .localhost (e.g. test)
+--suffix <suffix>                Use a custom suffix instead of .localhost
+--tld <tld>                      Compatibility alias for --suffix
 --wildcard                       Allow unregistered subdomains to fall back to parent route
 --state-dir <path>               Use a custom state directory with service install
 --script <name>                  Run a specific package.json script (default: dev)
@@ -406,7 +435,7 @@ PORTLESS_APP_PORT=<number>       Use a fixed port for the app (same as --app-por
 PORTLESS_HTTPS=0                 Disable HTTPS (same as --no-tls)
 PORTLESS_LAN=1                   Enable LAN mode when set to 1 (auto-detects LAN IP)
 PORTLESS_LAN_IP=<address>        Pin a specific LAN IP for LAN mode
-PORTLESS_SUFFIX=<suffix>         Use a custom suffix (e.g. test; default: localhost)
+PORTLESS_SUFFIX=<suffix>         Use a custom suffix (e.g. test, acme.com; default: localhost)
 PORTLESS_TLD=<tld>               Compatibility alias for PORTLESS_SUFFIX
 PORTLESS_WILDCARD=1              Allow unregistered subdomains to fall back to parent route
 PORTLESS_SYNC_HOSTS=0            Disable auto-sync of /etc/hosts (on by default)
@@ -423,6 +452,8 @@ PORTLESS_TAILSCALE_URL           Tailscale URL of the app (when --tailscale is a
 PORTLESS_NGROK_URL               ngrok URL of the app (when --ngrok is active)
 NODE_EXTRA_CA_CERTS              Path to the portless CA (when HTTPS is active)
 ```
+
+Prefer `PORTLESS_SUFFIX` for new configuration. It accepts single-label suffixes such as `test` and dotted suffixes such as `acme.com` or `server01.acme.com`. `PORTLESS_TLD` is only a compatibility alias and is ignored when `PORTLESS_SUFFIX` is set.
 
 > **Reserved names:** `run`, `get`, `alias`, `hosts`, `list`, `trust`, `clean`, `prune`, `proxy`, and `service` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name from your project, or `portless --name <name> <cmd>` to force any name including reserved ones.
 
@@ -447,7 +478,7 @@ portless hosts sync    # Add current routes to /etc/hosts
 portless hosts clean   # Clean up later
 ```
 
-Auto-syncs `/etc/hosts` for route hostnames by default (`.localhost`, custom TLDs, LAN `.local`). Set `PORTLESS_SYNC_HOSTS=0` to disable.
+Auto-syncs `/etc/hosts` for route hostnames by default (`.localhost`, custom suffixes, LAN `.local`). Set `PORTLESS_SYNC_HOSTS=0` to disable.
 
 ## Proxying Between Portless Apps
 
@@ -498,6 +529,18 @@ bun run lint         # Lint all packages
 bun run type-check   # Type-check all packages
 bun run format       # Format all files with Prettier
 ```
+
+## Fork Maintenance
+
+This fork intentionally differs from upstream in a few areas:
+
+- Published package identity is `@enk0ded/portless`; the command remains `portless`.
+- Fork releases use high patch ranges, such as `0.14.1000`, to stay semver-compatible without colliding with upstream versions.
+- Repository development uses Bun workspaces, `bun.lock`, Bun-powered CI, and Bun-based Windows debugging scripts.
+- Custom domain configuration uses suffix terminology. `PORTLESS_SUFFIX` is the preferred environment variable, dotted suffixes are supported, and `PORTLESS_TLD` remains a compatibility alias.
+- Local dependency detection checks `node_modules/@enk0ded/portless` so one-off `npx` or `pnpm dlx` downloads are still rejected.
+
+See [FORK.md](./FORK.md) for the full list of fork-owned invariants and the upstream sync checklist.
 
 ## Requirements
 

@@ -1168,7 +1168,7 @@ async function printServiceStatus(entryScript: string, runner: CommandRunner): P
     `  Proxy on ${config.proxyPort}: ${status.proxyRunning ? "responding" : "not responding"}`
   );
   console.log(`  HTTPS: ${config.useHttps ? "yes" : "no"}`);
-  console.log(`  TLD: ${config.lanMode ? "local" : config.tld}`);
+  console.log(`  Suffix: ${config.lanMode ? "local" : config.tld}`);
   console.log(`  LAN mode: ${config.lanMode ? "yes" : "no"}`);
   if (config.lanIpExplicit && config.lanIp) {
     console.log(`  LAN IP: ${config.lanIp}`);
