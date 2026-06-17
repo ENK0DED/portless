@@ -298,9 +298,11 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 | `portless get <name>`                  | Print URL for a service (for cross-service wiring)             |
 | `portless url <name>`                  | Alias for `portless get <name>`                                |
 | `portless get <name> --no-worktree`    | Print URL without worktree prefix                              |
+| `portless get <name> --json`           | Print service info as JSON                                     |
 | `portless list`                        | Show active routes                                             |
 | `portless ls`                          | Alias for `portless list`                                      |
 | `portless status`                      | Alias for `portless list`                                      |
+| `portless list --json`                 | Show active routes as JSON                                     |
 | `portless trust`                       | Add local CA to system trust store (for HTTPS)                 |
 | `portless clean`                       | Remove state, CA trust entry, and /etc/hosts block             |
 | `portless prune`                       | Kill orphaned dev servers from crashed sessions                |

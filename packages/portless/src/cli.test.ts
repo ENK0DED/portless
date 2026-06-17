@@ -177,6 +177,16 @@ describe("CLI", () => {
   });
 
   describe("list", () => {
+    let tmpDir: string;
+
+    beforeEach(() => {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-cli-list-"));
+    });
+
+    afterEach(() => {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
     it("shows no active routes message when none registered", () => {
       // Note: the CLI discovers the state dir dynamically. We just verify
       // it doesn't crash and returns 0.
@@ -198,6 +208,64 @@ describe("CLI", () => {
       );
       expect(status).toBe(0);
       expect(stdout.trim()).toBe(`app-named-${cmd}`);
+    });
+
+    it("outputs active routes as JSON", () => {
+      fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
+      fs.writeFileSync(
+        path.join(tmpDir, "routes.json"),
+        JSON.stringify([
+          { hostname: "myapp.localhost", port: 4100, pid: process.pid },
+          { hostname: "redis.localhost", port: 6379, pid: 0 },
+        ])
+      );
+
+      const { status, stdout } = run(["list", "--json"], {
+        env: { PORTLESS_STATE_DIR: tmpDir },
+      });
+
+      expect(status).toBe(0);
+      expect(JSON.parse(stdout)).toEqual([
+        {
+          hostname: "myapp.localhost",
+          url: "http://myapp.localhost:1355",
+          target_port: 4100,
+          pid: process.pid,
+          kind: "app",
+        },
+        {
+          hostname: "redis.localhost",
+          url: "http://redis.localhost:1355",
+          target_port: 6379,
+          pid: 0,
+          kind: "alias",
+        },
+      ]);
+    });
+
+    it.each(["ls", "status"])("outputs JSON through the %s alias", (cmd) => {
+      fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
+      fs.writeFileSync(
+        path.join(tmpDir, "routes.json"),
+        JSON.stringify([{ hostname: "myapp.localhost", port: 4100, pid: process.pid }])
+      );
+
+      const { status, stdout } = run([cmd, "--json"], {
+        env: { PORTLESS_STATE_DIR: tmpDir },
+      });
+
+      expect(status).toBe(0);
+      expect(JSON.parse(stdout)[0]).toMatchObject({
+        hostname: "myapp.localhost",
+        kind: "app",
+      });
+    });
+
+    it("prints list help with --json documented", () => {
+      const { status, stdout } = run(["list", "--help"]);
+      expect(status).toBe(0);
+      expect(stdout).toContain("--json");
+      expect(stdout).toContain("target_port");
     });
   });
 
@@ -1099,6 +1167,7 @@ describe("CLI", () => {
       expect(status).toBe(0);
       expect(stdout).toContain("portless get");
       expect(stdout).toContain("--no-worktree");
+      expect(stdout).toContain("--json");
     });
 
     it("prints help with -h", () => {
@@ -1142,6 +1211,39 @@ describe("CLI", () => {
       const { status, stdout } = run(["url", "backend"], { env: getEnv() });
       expect(status).toBe(0);
       expect(stdout.trim()).toMatch(/^https?:\/\/backend\.localhost(:\d+)?$/);
+    });
+
+    it("prints service info as JSON", () => {
+      fs.writeFileSync(path.join(tmpDir, "proxy.port"), "443");
+      fs.writeFileSync(path.join(tmpDir, "proxy.tls"), "1");
+
+      const { status, stdout } = run(["get", "backend", "--json"], { env: getEnv() });
+
+      expect(status).toBe(0);
+      expect(JSON.parse(stdout)).toEqual({
+        name: "backend",
+        hostname: "backend.localhost",
+        url: "https://backend.localhost",
+        proxy_port: 443,
+        tls: true,
+        tld: "localhost",
+      });
+    });
+
+    it("prints service info as JSON through the url alias", () => {
+      fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
+
+      const { status, stdout } = run(["url", "backend", "--json"], { env: getEnv() });
+
+      expect(status).toBe(0);
+      expect(JSON.parse(stdout)).toMatchObject({
+        name: "backend",
+        hostname: "backend.localhost",
+        url: "http://backend.localhost:1355",
+        proxy_port: 1355,
+        tls: false,
+        tld: "localhost",
+      });
     });
 
     it("preserves url as an app name when followed by a command", () => {
