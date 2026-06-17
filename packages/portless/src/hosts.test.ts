@@ -133,6 +133,18 @@ describe("buildBlock", () => {
     const extracted = extractManagedBlock(block);
     expect(extracted).toEqual(["127.0.0.1 a.localhost", "127.0.0.1 b.localhost"]);
   });
+
+  it("rejects hostnames that could inject extra hosts entries", () => {
+    expect(() => buildBlock(["safe.localhost", "evil.localhost\n1.2.3.4 bank.com"])).toThrow(
+      "Unsafe hostname"
+    );
+  });
+
+  it("rejects malformed DNS labels before writing a hosts block", () => {
+    expect(() => buildBlock(["-bad.localhost"])).toThrow("Unsafe hostname");
+    expect(() => buildBlock(["bad-.localhost"])).toThrow("Unsafe hostname");
+    expect(() => buildBlock(["bad..localhost"])).toThrow("Unsafe hostname");
+  });
 });
 
 // ---------------------------------------------------------------------------

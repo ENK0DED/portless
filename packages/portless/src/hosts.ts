@@ -56,8 +56,34 @@ export function removeBlock(content: string): string {
  */
 export function buildBlock(hostnames: string[]): string {
   if (hostnames.length === 0) return "";
-  const entries = hostnames.map((h) => `127.0.0.1 ${h}`).join("\n");
+  const entries = hostnames.map((h) => `127.0.0.1 ${assertSafeHostsHostname(h)}`).join("\n");
   return `${MARKER_START}\n${entries}\n${MARKER_END}`;
+}
+
+/**
+ * Hosts file writes can run with elevated privileges, so this boundary validates
+ * route hostnames again even though normal CLI paths already call parseHostname.
+ */
+function assertSafeHostsHostname(hostname: string): string {
+  if (hostname.length === 0 || hostname.length > 253) {
+    throw new Error(`Unsafe hostname for hosts file: ${JSON.stringify(hostname)}`);
+  }
+  if (hostname.includes("..")) {
+    throw new Error(`Unsafe hostname for hosts file: ${JSON.stringify(hostname)}`);
+  }
+
+  const labels = hostname.split(".");
+  for (const label of labels) {
+    if (
+      label.length === 0 ||
+      label.length > 63 ||
+      !/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/i.test(label)
+    ) {
+      throw new Error(`Unsafe hostname for hosts file: ${JSON.stringify(hostname)}`);
+    }
+  }
+
+  return hostname;
 }
 
 /**
