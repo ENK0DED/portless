@@ -473,6 +473,27 @@ Prefer `PORTLESS_SUFFIX` for new configuration. It accepts single-label suffixes
 
 > **Reserved names:** `run`, `get`, `url`, `alias`, `hosts`, `list`, `ls`, `status`, `trust`, `clean`, `prune`, `proxy`, and `service` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name from your project, or `portless --name <name> <cmd>` to force any name including reserved ones.
 
+## Programmatic API
+
+For Node-based config files such as Playwright, Vite proxy config, or `next.config.js`, import `getUrl` to resolve service URLs without spawning the CLI:
+
+```ts
+import { getUrl } from "@enk0ded/portless";
+
+const cms = await getUrl("cms");
+// cms.url      -> "https://cms.localhost"
+// cms.hostname -> "cms.localhost"
+// cms.port     -> 443
+// cms.tls      -> true
+
+await fetch(`${cms}/api/health`);
+
+// Skip worktree prefixes for stable callback URLs.
+const stable = await getUrl("cms", { worktree: false });
+```
+
+`getUrl()` uses the same hostname and worktree logic as `portless get`, reading port, TLS, and suffix from the active proxy's persisted state. The returned object JSON-serializes to `{ url, hostname, port, tls, tld }`.
+
 ## Uninstall / reset
 
 To remove portless data from your machine (proxy state under `~/.portless` and the system state directory, the local CA from the OS trust store when portless installed it, and the portless block in `/etc/hosts`):

@@ -155,6 +155,21 @@ For `script`: CLI `--script` flag > package `package.json` `"portless"` key > ro
 
 For `appPort`: CLI `--app-port` flag > `PORTLESS_APP_PORT` env var > package `package.json` `"portless"` key > root config app entry > auto-assigned.
 
+## Programmatic API
+
+Node-based config files can import `getUrl` to resolve service URLs without spawning the CLI:
+
+```ts
+import { getUrl } from "@enk0ded/portless";
+
+const backend = await getUrl("backend");
+await fetch(`${backend}/health`);
+
+const stable = await getUrl("backend", { worktree: false });
+```
+
+`getUrl()` uses the same hostname and worktree logic as `portless get`, reading port, TLS, and suffix from the active proxy's persisted state. The returned object JSON-serializes to `{ url, hostname, port, tls, tld }`.
+
 ## Environment variables
 
 <table>

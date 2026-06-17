@@ -10,6 +10,7 @@ import { StringDecoder } from "node:string_decoder";
 import { createSNICallback, ensureCerts, isCATrusted, trustCA, untrustCA } from "./certs.js";
 import { createHttpRedirectServer, createProxyServer } from "./proxy.js";
 import { fixOwnership, formatUrl, isErrnoException, parseHostname } from "./utils.js";
+import { getUrl } from "./api.js";
 import { syncHostsFile, cleanHostsFile, shouldAutoSyncHosts } from "./hosts.js";
 import { FILE_MODE, RouteConflictError, RouteStore } from "./routes.js";
 import {
@@ -1839,6 +1840,11 @@ ${colors.bold("Child process environment:")}
   PORTLESS_NGROK_URL            ngrok URL of the app (when --ngrok is active)
   NODE_EXTRA_CA_CERTS           Path to the portless CA (set when HTTPS is active)
 
+${colors.bold("Programmatic API:")}
+  import { getUrl } from "@enk0ded/portless"
+  const backend = await getUrl("backend")
+  String(backend)                Same URL string as "portless get backend"
+
 ${colors.bold("Safari / DNS:")}
   .localhost subdomains auto-resolve in Chrome, Firefox, and Edge.
   Safari relies on the system DNS resolver, which may not handle them.
@@ -2167,12 +2173,7 @@ ${colors.bold("Examples:")}
   }
 
   const name = positional[0];
-  const worktree = skipWorktree ? null : detectWorktreePrefix();
-  const effectiveName = worktree ? `${worktree.prefix}.${name}` : name;
-
-  const { port, tls, tld } = await discoverState();
-  const hostname = parseHostname(effectiveName, tld);
-  const url = formatUrl(hostname, port, tls);
+  const { url } = await getUrl(name, { worktree: !skipWorktree });
   // Print bare URL to stdout so it works in $(portless get <name>)
   process.stdout.write(url + "\n");
 }
