@@ -594,6 +594,12 @@ describe("injectFrameworkFlags", () => {
     expect(args).toEqual(["pnpm", "exec", "astro", "dev", "--port", "4567", "--host", "127.0.0.1"]);
   });
 
+  it("injects flags for npm exec astro dev", () => {
+    const args = ["npm", "exec", "astro", "dev"];
+    injectFrameworkFlags(args, 4567);
+    expect(args).toEqual(["npm", "exec", "astro", "dev", "--port", "4567", "--host", "127.0.0.1"]);
+  });
+
   it("injects flags for npx rsbuild dev", () => {
     const args = ["npx", "rsbuild", "dev"];
     injectFrameworkFlags(args, 4567);
@@ -716,6 +722,33 @@ describe("injectFrameworkFlags", () => {
     const args = ["yarn", "--silent"];
     injectFrameworkFlags(args, 4567);
     expect(args).toEqual(["yarn", "--silent"]);
+  });
+
+  it("injects --port and --ip for wrangler dev", () => {
+    const args = ["wrangler", "dev"];
+    injectFrameworkFlags(args, 4567);
+    expect(args).toEqual(["wrangler", "dev", "--port", "4567", "--ip", "127.0.0.1"]);
+  });
+
+  it("does not inject --host for wrangler because it is not the bind flag", () => {
+    const args = ["wrangler", "dev", "--host", "example.com"];
+    injectFrameworkFlags(args, 4567);
+    expect(args).toEqual([
+      "wrangler",
+      "dev",
+      "--host",
+      "example.com",
+      "--port",
+      "4567",
+      "--ip",
+      "127.0.0.1",
+    ]);
+  });
+
+  it("injects flags for Laravel artisan serve", () => {
+    const args = ["php", "artisan", "serve"];
+    injectFrameworkFlags(args, 4567);
+    expect(args).toEqual(["php", "artisan", "serve", "--port", "4567", "--host", "127.0.0.1"]);
   });
 });
 

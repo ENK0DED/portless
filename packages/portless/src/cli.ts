@@ -80,6 +80,7 @@ import {
 import {
   loadConfig,
   resolveAppConfig,
+  resolveScript,
   resolveScriptCommand,
   hasScript,
   isServerCommand,
@@ -985,7 +986,8 @@ async function runApp(
   autoInfo?: { nameSource: string; prefix?: string; prefixSource?: string },
   desiredPort?: number,
   lanMode = false,
-  lanIp?: string | null
+  lanIp?: string | null,
+  scriptContext?: { scriptName: string; packageDir: string }
 ) {
   let store = initialStore;
   console.log(chalk.blue.bold(`\nportless\n`));
@@ -1273,6 +1275,7 @@ async function runApp(
   }
 
   // Inject --port for frameworks that ignore the PORT env var (e.g. Vite)
+  injectPackageScriptFrameworkFlags(commandArgs, port, scriptContext);
   injectFrameworkFlags(commandArgs, port);
 
   // Point Node.js at the portless CA so server-side fetches (e.g. Next.js
@@ -1334,6 +1337,30 @@ async function runApp(
       }
     },
   });
+}
+
+function injectPackageScriptFrameworkFlags(
+  commandArgs: string[],
+  port: number,
+  scriptContext?: { scriptName: string; packageDir: string }
+): void {
+  if (!scriptContext) return;
+
+  const [runner, runSubcommand, scriptName] = commandArgs;
+  if (runSubcommand !== "run" || scriptName !== scriptContext.scriptName) return;
+
+  const rawScript = resolveScript(scriptContext.scriptName, scriptContext.packageDir);
+  if (!rawScript) return;
+
+  const scriptWithInjectedFlags = [...rawScript];
+  injectFrameworkFlags(scriptWithInjectedFlags, port);
+  const forwardedFlags = scriptWithInjectedFlags.slice(rawScript.length);
+  if (forwardedFlags.length === 0) return;
+
+  if (runner === "npm" && !commandArgs.includes("--")) {
+    commandArgs.push("--");
+  }
+  commandArgs.push(...forwardedFlags);
 }
 
 // ---------------------------------------------------------------------------
@@ -1624,8 +1651,8 @@ ${colors.bold("How it works:")}
   3. Access via https://<name>.localhost
   4. .localhost domains auto-resolve to 127.0.0.1
   5. Frameworks that ignore PORT (Vite, VitePlus, Astro, React Router, Angular,
-     Expo, React Native) get --port and, when needed, --host flags
-     injected automatically
+     Laravel, Expo, React Native, Wrangler) get --port and, when needed,
+     --host or --ip flags injected automatically
 
 ${colors.bold("HTTP/2 + HTTPS (default):")}
   HTTPS with HTTP/2 multiplexing is enabled by default (faster page loads).
@@ -2864,7 +2891,8 @@ async function handleDefaultSingle(
     { nameSource, prefix: worktree?.prefix, prefixSource: worktree?.source },
     appConfig?.appPort,
     lanMode,
-    lanIp
+    lanIp,
+    { scriptName, packageDir: cwd }
   );
 }
 
@@ -3401,12 +3429,14 @@ async function handleRunMode(args: string[], globalScript?: string): Promise<voi
   const parsed = parseRunArgs(args);
 
   const appConfig = loadAppConfig();
+  let scriptContext: { scriptName: string; packageDir: string } | undefined;
 
   if (parsed.commandArgs.length === 0) {
     const scriptName = globalScript ?? appConfig?.script ?? "dev";
     const resolved = resolveScriptCommand(scriptName, process.cwd());
     if (resolved) {
       parsed.commandArgs = resolved;
+      scriptContext = { scriptName, packageDir: process.cwd() };
     }
   }
 
@@ -3465,7 +3495,8 @@ async function handleRunMode(args: string[], globalScript?: string): Promise<voi
     { nameSource, prefix: worktree?.prefix, prefixSource: worktree?.source },
     parsed.appPort,
     lanMode,
-    lanIp
+    lanIp,
+    scriptContext
   );
 }
 

@@ -947,24 +947,28 @@ export function spawnCommand(
 /**
  * Frameworks that ignore the `PORT` env var. Maps command basename to the
  * flags needed. `strictPort` indicates whether `--strictPort` is supported
- * (prevents the framework from silently picking a different port).
+ * (prevents the framework from silently picking a different port). `hostFlag`
+ * overrides the bind-address flag when a framework uses another name.
  *
  * SvelteKit is not listed because its dev server is Vite under the hood,
  * so the `vite` entry already covers it.
  */
-const FRAMEWORKS_NEEDING_PORT: Record<string, { strictPort: boolean }> = {
+const FRAMEWORKS_NEEDING_PORT: Record<string, { strictPort: boolean; hostFlag?: string }> = {
   vite: { strictPort: true },
   vp: { strictPort: true },
   "react-router": { strictPort: true },
   rsbuild: { strictPort: false },
   astro: { strictPort: false },
   ng: { strictPort: false },
+  "laravel-artisan": { strictPort: false },
   "react-native": { strictPort: false },
   expo: { strictPort: false },
+  wrangler: { strictPort: false, hostFlag: "--ip" },
 };
 
 /** Known package runners. Values list subcommands that run a package. */
 const PACKAGE_RUNNERS: Record<string, string[]> = {
+  npm: ["exec"],
   npx: [],
   bunx: [],
   pnpx: [],
@@ -980,6 +984,14 @@ function findFrameworkBasename(commandArgs: string[]): string | null {
   if (commandArgs.length === 0) return null;
 
   const first = path.basename(commandArgs[0]);
+  if (
+    first === "php" &&
+    path.basename(commandArgs[1] ?? "") === "artisan" &&
+    commandArgs[2] === "serve"
+  ) {
+    return "laravel-artisan";
+  }
+
   if (FRAMEWORKS_NEEDING_PORT[first]) return first;
 
   const subcommands = PACKAGE_RUNNERS[first];
@@ -1037,13 +1049,14 @@ export function injectFrameworkFlags(commandArgs: string[], port: number): void 
     }
   }
 
-  if (!commandArgs.includes("--host")) {
+  const hostFlag = framework.hostFlag ?? "--host";
+  if (!commandArgs.includes(hostFlag)) {
     // In LAN mode, let Expo use its default (LAN) — injecting --host alongside
     // HOST=127.0.0.1 causes Metro's HMR WebSocket to break after a few reloads.
     const isExpoLan = basename === "expo" && isLanEnvEnabled();
     if (isExpoLan) return;
     const hostValue = basename === "expo" ? "localhost" : "127.0.0.1";
-    commandArgs.push("--host", hostValue);
+    commandArgs.push(hostFlag, hostValue);
   }
 }
 
