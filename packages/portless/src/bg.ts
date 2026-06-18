@@ -505,7 +505,10 @@ async function waitForProcessExit(pid: number, timeoutMs: number): Promise<boole
   return !isProcessAlive(pid);
 }
 
-function findExactRoute(context: BgCommandContext, entry: BgProcessEntry): RouteMapping | undefined {
+function findExactRoute(
+  context: BgCommandContext,
+  entry: BgProcessEntry
+): RouteMapping | undefined {
   return context.routeStore.loadRoutesRaw().find((route) => routeMatchesEntry(route, entry));
 }
 
@@ -574,7 +577,8 @@ function runArgsFromIntent(intent: BgStartIntent, force: boolean): string[] {
   if (intent.sharing.funnel) args.push("--funnel");
   if (intent.sharing.ngrok) args.push("--ngrok");
   if (intent.sharing.netbird) args.push("--netbird");
-  if (intent.sharing.netbirdPassword) args.push("--netbird-password", intent.sharing.netbirdPassword);
+  if (intent.sharing.netbirdPassword)
+    args.push("--netbird-password", intent.sharing.netbirdPassword);
   if (intent.sharing.netbirdPin) args.push("--netbird-pin", intent.sharing.netbirdPin);
   if (intent.sharing.netbirdGroups) args.push("--netbird-groups", intent.sharing.netbirdGroups);
   if (intent.explicitCommand) args.push("--", ...intent.commandArgs);
@@ -928,10 +932,7 @@ function parseRestartArgs(args: string[]): {
   return { name, pathPrefix, force, ...parsedStart };
 }
 
-async function handleBgRestart(
-  args: string[],
-  options: { entryScript: string }
-): Promise<void> {
+async function handleBgRestart(args: string[], options: { entryScript: string }): Promise<void> {
   if (args[2] === "--help" || args[2] === "-h") {
     printBgRestartHelp();
     return;
@@ -1016,9 +1017,7 @@ async function handleBgClean(args: string[]): Promise<void> {
   }
   const context = await createBgContext();
   const entries = refreshEntries(context);
-  const candidates = parsed.all
-    ? entries
-    : [selectEntry(entries, parsed.name, parsed.pathPrefix)];
+  const candidates = parsed.all ? entries : [selectEntry(entries, parsed.name, parsed.pathPrefix)];
   let removed = 0;
   for (const entry of candidates) {
     if (isProcessAlive(entry.pid)) continue;
