@@ -12,6 +12,11 @@ import {
   renderDashboard,
   renderRouteRow,
 } from "./internal-pages.js";
+import {
+  isH2WebSocketConnect,
+  parseWebSocketUpgradeResponse,
+  serializeWebSocketUpgradeRequest,
+} from "./h2-websocket.js";
 
 /** Cookie that remembers which app a multiplexed hostname should route to. */
 const SELECTION_COOKIE = "portless_app";
@@ -415,6 +420,15 @@ function findRoute(
   );
 }
 
+interface H2WebSocketRouteSelection {
+  host: string;
+  authority: string;
+  path: string;
+  hops: number;
+  route?: RouteInfo;
+  rejectReason?: "missing-host" | "internal-host" | "loop" | "missing-route" | "h2c-route";
+}
+
 /** Server type returned by createProxyServer (plain HTTP/1.1 or net.Server TLS wrapper). */
 export type ProxyServer = http.Server | net.Server;
 
@@ -608,6 +622,154 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       return undefined;
     }
     return defaultMember(members);
+  };
+
+  const cookieHeaderValue = (value: http2.IncomingHttpHeaders["cookie"]): string | undefined => {
+    if (Array.isArray(value)) return value.join("; ");
+    return value;
+  };
+
+  const selectH2WebSocketRoute = (
+    headers: http2.IncomingHttpHeaders
+  ): H2WebSocketRouteSelection => {
+    const authority = String(headers[":authority"] || "");
+    const host = authority.split(":")[0];
+    const path = String(headers[":path"] || "/");
+    const hops = parseInt(headers[PORTLESS_HOPS_HEADER] as string, 10) || 0;
+    const base = { host, authority, path, hops };
+
+    if (!host) return { ...base, rejectReason: "missing-host" };
+    if (internalPages && (host === dashboardHost || host === certHost)) {
+      return { ...base, rejectReason: "internal-host" };
+    }
+    if (hops >= MAX_PROXY_HOPS) {
+      onError(
+        `WebSocket loop detected for ${host}: request has passed through portless ${hops} times. ` +
+          `Set changeOrigin: true in your proxy config.`
+      );
+      return { ...base, rejectReason: "loop" };
+    }
+
+    const routes = getRoutes();
+    const tunnelAliases = getTunnelAliases();
+    const members = multiplexMembersFor(routes, host, path);
+    let route: RouteInfo | undefined;
+    if (members.length > 0) {
+      const selected = parseCookieHeader(cookieHeaderValue(headers.cookie))[SELECTION_COOKIE];
+      route =
+        (selected ? members.find((member) => member.label === selected) : undefined) ??
+        defaultMember(members);
+    } else {
+      route = findRoute(routes, tunnelAliases, host, path, strict);
+    }
+
+    if (!route) return { ...base, rejectReason: "missing-route" };
+    if (route.protocol === "h2c") {
+      onError(
+        `WebSocket-over-HTTP/2 to h2c upstream is not supported for ${host}${path}. ` +
+          `Use HTTP/2 request routing for h2c routes instead.`
+      );
+      return { ...base, route, rejectReason: "h2c-route" };
+    }
+
+    return { ...base, route };
+  };
+
+  const handleH2WebSocket = (
+    stream: http2.ServerHttp2Stream,
+    headers: http2.IncomingHttpHeaders
+  ): void => {
+    stream.on("error", () => stream.destroy());
+    try {
+      stream.respond({ ":status": 200 }, { endStream: false });
+    } catch {
+      stream.destroy();
+      return;
+    }
+
+    const selection = selectH2WebSocketRoute(headers);
+    if (!selection.route || selection.rejectReason) {
+      stream.close(http2.constants.NGHTTP2_CANCEL);
+      return;
+    }
+
+    const fakeReq = {
+      socket: stream.session.socket,
+      headers: { ...headers, host: selection.authority },
+    } as unknown as http.IncomingMessage;
+    let serialized: ReturnType<typeof serializeWebSocketUpgradeRequest>;
+    try {
+      serialized = serializeWebSocketUpgradeRequest({
+        authority: selection.authority,
+        path: selection.path,
+        headers,
+        forwardedHeaders: buildForwardedHeaders(fakeReq, true),
+        hops: selection.hops,
+      });
+    } catch (err) {
+      onError(
+        `WebSocket-over-HTTP/2 request rejected for ${selection.host}: ${
+          err instanceof Error ? err.message : "unsafe request"
+        }`
+      );
+      stream.close(http2.constants.NGHTTP2_CANCEL);
+      return;
+    }
+
+    const backendSocket = net.connect({
+      ...LOOPBACK_DIAL_OPTIONS,
+      port: selection.route.port,
+    });
+    let cleaned = false;
+    let bridged = false;
+    let handshakeBuffer = Buffer.alloc(0);
+
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      backendSocket.destroy();
+      if (!stream.destroyed) {
+        try {
+          stream.close(http2.constants.NGHTTP2_CANCEL);
+        } catch {
+          stream.destroy();
+        }
+      }
+    };
+
+    const onBackendData = (chunk: Buffer) => {
+      if (bridged) return;
+      handshakeBuffer = Buffer.concat([handshakeBuffer, chunk]);
+      const parsed = parseWebSocketUpgradeResponse(handshakeBuffer, serialized.expectedAccept);
+      if (!parsed.ok && parsed.reason === "incomplete") return;
+      if (!parsed.ok) {
+        cleanup();
+        return;
+      }
+
+      bridged = true;
+      backendSocket.off("data", onBackendData);
+      if (parsed.remaining.length > 0) {
+        stream.write(parsed.remaining);
+      }
+      backendSocket.pipe(stream);
+      stream.pipe(backendSocket);
+    };
+
+    backendSocket.on("connect", () => {
+      backendSocket.write(serialized.request);
+    });
+    backendSocket.on("data", onBackendData);
+    backendSocket.on("error", (err) => {
+      onError(
+        `WebSocket-over-HTTP/2 backend error for ${selection.host}: ${dialErrorMessage(err)}`
+      );
+      cleanup();
+    });
+    backendSocket.on("close", cleanup);
+    backendSocket.on("end", cleanup);
+    stream.on("close", cleanup);
+    stream.on("aborted", cleanup);
   };
 
   const handleRequest = (req: http.IncomingMessage, res: http.ServerResponse) => {
@@ -956,6 +1118,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       cert: tls.ca ? Buffer.concat([tls.cert, tls.ca]) : tls.cert,
       key: tls.key,
       allowHTTP1: true,
+      settings: { enableConnectProtocol: true },
       // Tolerate high rates of RST_STREAM from browsers during HMR and
       // page navigations. Without this, Node sends GOAWAY INTERNAL_ERROR
       // after ~1000 cumulative stream resets and kills the session,
@@ -969,12 +1132,37 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     // abrupt client disconnects) so they don't crash the proxy.
     h2Server.on("sessionError", () => {});
 
+    h2Server.prependListener(
+      "stream",
+      (stream: http2.ServerHttp2Stream, headers: http2.IncomingHttpHeaders) => {
+        if (!isH2WebSocketConnect(headers)) return;
+        const streamWithNoEnd = stream as unknown as {
+          end: (...args: unknown[]) => http2.ServerHttp2Stream;
+        };
+        streamWithNoEnd.end = function () {
+          return stream;
+        };
+        handleH2WebSocket(stream, headers);
+      }
+    );
+
     // With allowHTTP1, the 'request' event receives objects compatible with
     // http.IncomingMessage / http.ServerResponse. Cast explicitly to satisfy TypeScript.
     h2Server.on("request", (req: http2.Http2ServerRequest, res: http2.Http2ServerResponse) => {
       // Absorb RST_STREAM errors from cancelled requests (browser navigation,
       // HMR) so they don't propagate to the HTTP/2 session.
       req.stream?.on("error", () => {});
+      if (req.method === "CONNECT") {
+        const response = res as unknown as {
+          end: (...args: unknown[]) => http2.Http2ServerResponse;
+          writeHead: (...args: unknown[]) => http2.Http2ServerResponse;
+          write: (...args: unknown[]) => boolean;
+        };
+        response.end = () => res;
+        response.writeHead = () => res;
+        response.write = () => false;
+        return;
+      }
       handleRequest(req as unknown as http.IncomingMessage, res as unknown as http.ServerResponse);
     });
     // WebSocket upgrades arrive over HTTP/1.1 connections (allowHTTP1)
