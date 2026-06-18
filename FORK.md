@@ -7,7 +7,7 @@ This repository is the ENK0DED fork of upstream `vercel-labs/portless`. Keep thi
 Regenerate the current fork-only history with:
 
 ```bash
-git log --oneline --no-merges upstream/main..HEAD
+git log --oneline upstream/main..HEAD
 ```
 
 Current fork-owned commits and what they protect:
@@ -28,6 +28,49 @@ Current fork-owned commits and what they protect:
 | `974f5dc` | Prepared fork release `0.10.6`, the pre-sync fork tip preserved by `backup/pre-upstream-sync-20260617`.                                                                                            |
 | `f9b13e1` | Merged upstream `main` into the fork while preserving package identity, version mapping, Bun, suffix behavior, docs, tests, release workflow, Windows debugging, and the fork sync skill.          |
 | `275a42a` | Fixed privileged proxy state handoff, added first-class proxy `--suffix` parsing, and documented the protected fork behavior.                                                                      |
+| `b0d79c2` | Prepared fork release `0.14.1001` after the upstream `0.14.0` sync.                                                                                                                                |
+| `b929389` | Backported framework port injection coverage for current app runners.                                                                                                                              |
+| `eba7e9a` | Backported loopback upstream dialing and Windows process-spawning fixes.                                                                                                                           |
+| `b018cc9` | Backported CLI ergonomics and clearer proxy text errors.                                                                                                                                           |
+| `347f32c` | Added `.config/portless.json` support for config files.                                                                                                                                            |
+| `514350b` | Exposed the programmatic `getUrl()` API.                                                                                                                                                           |
+| `eb1b33b` | Added JSON output for route and URL inspection commands.                                                                                                                                           |
+| `3c992f9` | Validated hostnames before hosts-file synchronization to preserve command-injection hardening.                                                                                                     |
+| `f795ba3` | Backported loopback port probing and SIGHUP cleanup handling.                                                                                                                                      |
+| `874612a` | Backported small upstream runtime safety fixes.                                                                                                                                                    |
+| `68ca8cf` | Backported Bun runtime and workspace worktree fixes.                                                                                                                                               |
+| `68f1203` | Rejected browser-blocked fixed app ports and preserved safe automatic app-port assignment.                                                                                                         |
+| `ce1eef8` | Generated a missing local CA during the trust helper path.                                                                                                                                         |
+| `6023807` | Rejected redirected proxy health checks so stale or intercepted proxy checks do not look healthy.                                                                                                  |
+| `22da38e` | Preserved request paths in proxy 404 app links.                                                                                                                                                    |
+| `e56911d` | Added exact command placeholders for `{PORT}`, `{HOST}`, and `{PORTLESS_URL}`.                                                                                                                     |
+| `ea60e3b` | Added NetBird sharing with explicit restriction flags, loopback-first child binding, route metadata, and cleanup support.                                                                          |
+| `e989f85` | Added WSL Windows CurrentUser Root CA store integration while keeping fork-owned sudo state handoff behavior.                                                                                      |
+| `5f20c3c` | Added shell completions generated from the current fork command and flag set.                                                                                                                      |
+| `6ab469f` | Reported package config source names using the fork's flexible `sourcePath` model.                                                                                                                 |
+| `3c435b3` | Recorded upstream PR triage decisions for the implementation pass.                                                                                                                                 |
+| `c40774b` | Planned the remaining upstream PR follow-up work before implementation.                                                                                                                            |
+| `89ac0a9` | Marked the UI-focused upstream PRs for dedicated UI-agent handling.                                                                                                                                |
+| `07792ee` | Added Tailscale Service sharing as an explicit mode without implying Funnel or public exposure.                                                                                                    |
+| `516e2a7` | Added explicit h2c upstream route metadata and forwarding.                                                                                                                                         |
+| `8f18de5` | Added explicit path-scoped routes with safe matching semantics.                                                                                                                                    |
+| `260825b` | Added explicit tunnel aliases instead of accepting arbitrary public Host passthrough.                                                                                                              |
+| `c7acb0b` | Planned the fork-specific background app management implementation for upstream PR #333.                                                                                                           |
+| `33546d8` | Added locked background-app registry primitives.                                                                                                                                                   |
+| `500929a` | Added the `portless bg` command surface.                                                                                                                                                           |
+| `88ab929` | Started background apps with readiness tracking.                                                                                                                                                   |
+| `0789278` | Added background status and log commands.                                                                                                                                                          |
+| `9b1d098` | Managed background lifecycle cleanup for stop, restart, clean, and prune flows.                                                                                                                    |
+| `0b00b63` | Documented background app management across user and agent surfaces.                                                                                                                               |
+| `0d5feb2` | Marked upstream open PR coverage complete after the UI and CLI/process passes.                                                                                                                     |
+| `75e3ace` | Added the local dashboard, certificate page, multiplexed routing, and shared internal-page shell.                                                                                                  |
+| `b74f790` | Formatted background lifecycle tests.                                                                                                                                                              |
+| `8043382` | Planned fork-specific HTTP/2 WebSocket compatibility for upstream PR #278.                                                                                                                         |
+| `014b6e2` | Added HTTP/2 WebSocket handshake helpers for RFC 8441 Extended CONNECT.                                                                                                                            |
+| `907ca07` | Supported browser HTTP/2 Extended CONNECT WebSocket traffic through the proxy.                                                                                                                     |
+| `6824fb9` | Covered HTTP/2 WebSocket compatibility paths in tests.                                                                                                                                             |
+| `341b26a` | Guarded HTTP/2 WebSocket session socket access before payload forwarding.                                                                                                                          |
+| `ecf8f4a` | Documented HTTP/2 WebSocket support in the user, agent, and CLI help surfaces.                                                                                                                     |
 
 ## Fork-Owned Invariants
 
@@ -42,10 +85,10 @@ Current fork-owned commits and what they protect:
 - Runtime local-install detection must check `node_modules/@enk0ded/portless`, not `node_modules/portless`
 - Turbo task references must use `@enk0ded/portless#build`
 
-After every upstream sync, search for upstream package install strings:
+After every upstream sync, search for upstream package install strings outside this fork-maintenance ledger and historical PR plans:
 
 ```bash
-rg 'npm install -g [p]ortless|npm install -D [p]ortless|npm view [p]ortless|"name": "[p]ortless"|github.com/vercel-labs/[p]ortless|node_modules/[p]ortless'
+rg --glob '!FORK.md' --glob '!docs/superpowers/plans/**' --glob '!skills/portless-fork-sync/SKILL.md' 'npm install -g [p]ortless|npm install -D [p]ortless|npm view [p]ortless|"name": "[p]ortless"|github.com/vercel-labs/[p]ortless|node_modules/[p]ortless'
 ```
 
 ### Version Mapping
@@ -334,11 +377,12 @@ Rechecked against upstream on 2026-06-18: GitHub reported 48 open PRs, and every
 3. Merge `upstream/main` into local `main`.
 4. Resolve conflicts by taking upstream feature code first, then reapply fork invariants from this file.
 5. Remove upstream pnpm workspace files if they return.
-6. Run the package-name search above and fix every hit unless it is intentionally testing compatibility.
+6. Run the package-name search above and fix every hit outside intentional upstream PR references or compatibility tests.
 7. Run `bun install` to refresh `bun.lock`.
-8. Review `git log --oneline --no-merges upstream/main..HEAD` and update this ledger when the fork adds or removes fork-only commits.
-9. Run focused tests for any fork invariant touched by the merge.
-10. Run full verification before pushing.
+8. Compare the live upstream open PR set with "Full Open Upstream PR State" and update that table when upstream opens or closes PRs.
+9. Review `git log --oneline upstream/main..HEAD` and update this ledger when the fork adds or removes fork-only commits.
+10. Run focused tests for any fork invariant touched by the merge.
+11. Run full verification before pushing.
 
 ## Verification Commands
 
@@ -362,7 +406,7 @@ bun run test packages/portless/src/cli-utils.test.ts
 bun run test packages/portless/src/utils.test.ts
 bun run test packages/portless/src/proxy.test.ts
 bun run test packages/portless/src/service.test.ts
-rg 'npm install -g [p]ortless|npm install -D [p]ortless|npm view [p]ortless|"name": "[p]ortless"|github.com/vercel-labs/[p]ortless|node_modules/[p]ortless'
+rg --glob '!FORK.md' --glob '!docs/superpowers/plans/**' --glob '!skills/portless-fork-sync/SKILL.md' 'npm install -g [p]ortless|npm install -D [p]ortless|npm view [p]ortless|"name": "[p]ortless"|github.com/vercel-labs/[p]ortless|node_modules/[p]ortless'
 rg 'PORTLESS_TLD' README.md skills/portless/SKILL.md apps/docs/src/app
 ```
 

@@ -148,7 +148,7 @@ export async function startApp(opts: StartAppOptions): Promise<E2EContext> {
 
   if (!fs.existsSync(CLI_PATH)) {
     throw new Error(
-      `Built CLI not found at ${CLI_PATH}. Run 'pnpm build' in packages/portless first.`
+      `Built CLI not found at ${CLI_PATH}. Run 'bun run build' in packages/portless first.`
     );
   }
 
@@ -226,7 +226,9 @@ export async function startApp(opts: StartAppOptions): Promise<E2EContext> {
   } catch (err) {
     await cleanup();
     const msg = err instanceof Error ? err.message : String(err);
-    throw new Error(`${msg}\n--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`);
+    throw new Error(`${msg}\n--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`, {
+      cause: err,
+    });
   }
 
   return {

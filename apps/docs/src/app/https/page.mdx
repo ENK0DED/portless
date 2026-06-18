@@ -6,6 +6,8 @@ First run generates a local CA and server certs, then adds the CA to your system
 
 In WSL, portless also installs the CA into the Windows CurrentUser Root store so Windows browsers trust portless HTTPS URLs served from WSL.
 
+Modern browser HMR WebSockets over HTTPS use HTTP/2 Extended CONNECT. Portless supports that path, so Next.js Turbopack, Vite, and similar dev servers can keep hot reloading while HTTPS and HTTP/2 stay enabled.
+
 ## Custom certificates
 
 Use your own certs (e.g., from mkcert):

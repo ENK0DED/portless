@@ -85,8 +85,8 @@ openssl rand -base64 32
 ### 5. Install and run
 
 ```bash
-pnpm install
-pnpm run dev
+bun install
+bun run dev
 ```
 
 This runs `portless oauth-test next dev`, which serves the app at `https://oauth-test.dev`.
