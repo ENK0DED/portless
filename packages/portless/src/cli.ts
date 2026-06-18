@@ -131,6 +131,7 @@ import {
 } from "./turbo.js";
 import type { ManifestEntry } from "./turbo.js";
 import { buildServiceUninstallSudoArgs, handleService, tryUninstallService } from "./service.js";
+import { handleBg } from "./bg.js";
 
 const chalk = colors;
 
@@ -2455,6 +2456,7 @@ const TOP_LEVEL_COMPLETION_COMMANDS: CompletionCommand[] = [
   { name: "clean", description: "Remove portless artifacts from this machine" },
   { name: "prune", description: "Kill orphaned dev servers from crashed sessions" },
   { name: "proxy", description: "Manage proxy lifecycle" },
+  { name: "bg", description: "Manage portless apps running in the background" },
   { name: "service", description: "Manage startup service" },
   { name: "completion", description: "Generate shell completion script" },
 ];
@@ -2572,6 +2574,14 @@ const SERVICE_INSTALL_COMPLETION_FLAGS = GLOBAL_COMPLETION_FLAGS.filter((flag) =
   ].includes(flag.name)
 );
 
+const BG_START_COMPLETION_FLAGS: CompletionFlag[] = [
+  ...RUN_COMPLETION_FLAGS,
+  { name: "--wait", description: "Wait for readiness", value: "seconds" },
+  { name: "--no-wait", description: "Return immediately after spawning" },
+  { name: "--keep", description: "Keep a timed-out child running" },
+  { name: "--json", description: "Print JSON" },
+];
+
 function completionFlagWords(flags: CompletionFlag[]): string {
   return flags.flatMap((flag) => [flag.name, ...(flag.short ? [flag.short] : [])]).join(" ");
 }
@@ -2677,6 +2687,15 @@ _portless_completions() {
         COMPREPLY=( $(compgen -W "--help -h" -- "$cur") )
       fi
       ;;
+    bg)
+      if [[ $COMP_CWORD -eq 2 ]]; then
+        COMPREPLY=( $(compgen -W "start stop restart status list logs clean --help -h" -- "$cur") )
+      elif [[ "$subcmd" == "start" ]]; then
+        COMPREPLY=( $(compgen -W "${completionFlagWords(BG_START_COMPLETION_FLAGS)} --" -- "$cur") )
+      else
+        COMPREPLY=( $(compgen -W "--path --json --tail --all --follow --errors --bg --force --help -h" -- "$cur") )
+      fi
+      ;;
     service)
       if [[ $COMP_CWORD -eq 2 ]]; then
         COMPREPLY=( $(compgen -W "install status uninstall --help -h" -- "$cur") )
@@ -2757,6 +2776,15 @@ _portless() {
             _arguments ${PROXY_START_COMPLETION_FLAGS.map(zshFlag).join(" ")}
           fi
           ;;
+        bg)
+          if (( CURRENT == 3 )); then
+            _values 'bg command' start stop restart status list logs clean
+          elif [[ $words[3] == start ]]; then
+            _arguments ${BG_START_COMPLETION_FLAGS.map(zshFlag).join(" ")}
+          else
+            _arguments '--path[Scope route to path prefix]:prefix' '--json[Print JSON]' '--tail[Number of log lines]:lines' '--all[Apply to all matching entries]' '--follow[Follow logs]' '--errors[Print stderr logs]' '--bg[Print lifecycle logs]' '--force[Force lifecycle action]' '--help[Show help]' '-h[Show help]'
+          fi
+          ;;
         service)
           if (( CURRENT == 3 )); then
             _values 'service command' install status uninstall
@@ -2793,7 +2821,7 @@ ${commandLines}
 
 ${fishFlagLines(GLOBAL_COMPLETION_FLAGS)}
 ${fishFlagLines(RUN_COMPLETION_FLAGS, "__fish_seen_subcommand_from run")}
-${fishFlagLines(APP_COMPLETION_FLAGS, "not __fish_seen_subcommand_from run get url list ls status alias tunnel hosts clean prune proxy service completion")}
+${fishFlagLines(APP_COMPLETION_FLAGS, "not __fish_seen_subcommand_from run get url list ls status alias tunnel hosts clean prune proxy bg service completion")}
 complete -c portless -n "__fish_seen_subcommand_from get url list ls status" -l json -d "Print JSON"
 complete -c portless -n "__fish_seen_subcommand_from get url" -l path -d "Scope URL to path prefix" -r
 complete -c portless -n "__fish_seen_subcommand_from alias" -l remove -d "Remove route"
@@ -2809,6 +2837,13 @@ complete -c portless -n "__fish_seen_subcommand_from prune" -l force -d "Send SI
 complete -c portless -n "__fish_seen_subcommand_from prune" -l help -s h -d "Show help"
 complete -c portless -n "__fish_seen_subcommand_from proxy; and __fish_is_nth_token 2" -a "start stop"
 ${fishFlagLines(PROXY_START_COMPLETION_FLAGS, "__fish_seen_subcommand_from proxy")}
+complete -c portless -n "__fish_seen_subcommand_from bg; and __fish_is_nth_token 2" -a "start stop restart status list logs clean"
+${fishFlagLines(BG_START_COMPLETION_FLAGS, "__fish_seen_subcommand_from bg")}
+complete -c portless -n "__fish_seen_subcommand_from bg" -l tail -d "Number of log lines" -r
+complete -c portless -n "__fish_seen_subcommand_from bg" -l all -d "Apply to all matching entries"
+complete -c portless -n "__fish_seen_subcommand_from bg" -l follow -d "Follow logs"
+complete -c portless -n "__fish_seen_subcommand_from bg" -l errors -d "Print stderr logs"
+complete -c portless -n "__fish_seen_subcommand_from bg" -l bg -d "Print lifecycle logs"
 complete -c portless -n "__fish_seen_subcommand_from service; and __fish_is_nth_token 2" -a "install status uninstall"
 ${fishFlagLines(SERVICE_INSTALL_COMPLETION_FLAGS, "__fish_seen_subcommand_from service")}
 complete -c portless -n "__fish_seen_subcommand_from completion; and __fish_is_nth_token 2" -a "${completionShellWords()}"
@@ -2864,6 +2899,8 @@ ${colors.bold("Usage:")}
   ${colors.cyan("portless proxy start")}             Start the proxy (HTTPS on port 443, daemon); rarely needed since it auto-starts on first run
   ${colors.cyan("portless proxy stop")}              Stop the proxy
   ${colors.cyan("portless service install")}         Start proxy automatically when the OS starts
+  ${colors.cyan("portless bg start")}                Start an app in the background
+  ${colors.cyan("portless bg stop <name>")}          Stop a background app
   ${colors.cyan("portless get <name>")}              Print URL for a service (for cross-service refs)
   ${colors.cyan("portless get <name> --json")}       Print service info as JSON
   ${colors.cyan("portless url <name>")}              Alias for portless get
@@ -3098,7 +3135,7 @@ ${colors.bold("Skip portless:")}
   PORTLESS=0 bun dev            # Runs command directly without proxy
 
 ${colors.bold("Reserved names:")}
-  run, get, url, alias, tunnel, hosts, list, ls, status, trust, clean, prune, proxy, service, completion are subcommands and
+  run, get, url, alias, tunnel, hosts, list, ls, status, trust, clean, prune, proxy, bg, service, completion are subcommands and
   cannot be used as app names directly. Use "portless run" to infer the name,
   or "portless --name <name>" to force any name including reserved ones.
 `);
@@ -5389,7 +5426,7 @@ async function main() {
 
   // --name flag: treat the next arg as an explicit app name, bypassing
   // subcommand dispatch. Useful when the app name collides with a reserved
-  // subcommand (run, alias, tunnel, hosts, list, trust, clean, prune, proxy, service, completion).
+  // subcommand (run, alias, tunnel, hosts, list, trust, clean, prune, proxy, bg, service, completion).
   if (args[0] === "--name") {
     args.shift();
     if (!args[0]) {
@@ -5431,6 +5468,7 @@ async function main() {
       (args.length >= 2 &&
         args[0] !== "proxy" &&
         args[0] !== "clean" &&
+        args[0] !== "bg" &&
         args[0] !== "service" &&
         args[0] !== "tunnel"))
   ) {
@@ -5450,7 +5488,7 @@ async function main() {
     return;
   }
 
-  // Global dispatch: help, version, trust, clean, prune, list, alias, tunnel, hosts, proxy, service, completion
+  // Global dispatch: help, version, trust, clean, prune, list, alias, tunnel, hosts, proxy, bg, service, completion
   // When `run` is used, skip these so args like "list" or "--help" are treated
   // as child-command tokens, not portless subcommands.
   if (!isRunCommand) {
@@ -5514,6 +5552,10 @@ async function main() {
     }
     if (args[0] === "proxy") {
       await handleProxy(args);
+      return;
+    }
+    if (args[0] === "bg") {
+      await handleBg(args, { entryScript: getEntryScript() });
       return;
     }
     if (args[0] === "service") {

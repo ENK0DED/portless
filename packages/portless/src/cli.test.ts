@@ -252,6 +252,7 @@ describe("CLI", () => {
       expect(status).toBe(0);
       expect(stdout).toContain("_portless_completions");
       expect(stdout).toContain("complete -F _portless_completions portless");
+      expect(stdout).toContain("bg");
       expect(stdout).toContain("service");
       expect(stdout).toContain("clean");
       expect(stdout).toContain("prune");
@@ -476,6 +477,30 @@ describe("CLI", () => {
       const { status, stderr } = run(["myapp"]);
       expect(status).toBe(1);
       expect(stderr).toContain("No command provided");
+    });
+  });
+
+  describe("bg", () => {
+    it("prints bg help", () => {
+      const { status, stdout } = run(["bg", "--help"]);
+      expect(status).toBe(0);
+      expect(stdout).toContain("portless bg");
+      expect(stdout).toContain("bg start");
+      expect(stdout).toContain("bg stop");
+    });
+
+    it("still dispatches bg help when PORTLESS=0", () => {
+      const { status, stdout } = run(["bg", "--help"], {
+        env: { PORTLESS: "0" },
+      });
+      expect(status).toBe(0);
+      expect(stdout).toContain("portless bg");
+    });
+
+    it("rejects unknown bg subcommands", () => {
+      const { status, stderr } = run(["bg", "unknown"]);
+      expect(status).toBe(1);
+      expect(stderr).toContain('Unknown bg subcommand "unknown"');
     });
   });
 
