@@ -9,6 +9,13 @@ import { ARROW_SVG, renderPage } from "./pages.js";
 export const PORTLESS_HEADER = "X-Portless";
 
 /**
+ * Response header reporting the actual local TCP port that accepted the
+ * request. This prevents health-check false positives when pf/NAT redirects
+ * another local port to the proxy.
+ */
+export const PORTLESS_LISTENER_PORT_HEADER = "X-Portless-Listener-Port";
+
+/**
  * Upstream app connections stay on loopback, but support both IPv4 and IPv6.
  * Some dev servers bind localhost as ::1 only, while older portless builds
  * dialed only 127.0.0.1.
@@ -62,6 +69,12 @@ function getRequestHost(req: http.IncomingMessage): string {
   const authority = req.headers[":authority"];
   if (typeof authority === "string" && authority) return authority;
   return req.headers.host || "";
+}
+
+/** Return the local TCP port that accepted this request. */
+function getListenerPort(req: http.IncomingMessage, fallbackPort: number): string {
+  const port = req.socket.localPort;
+  return typeof port === "number" && port > 0 ? String(port) : String(fallbackPort);
 }
 
 /**
@@ -155,6 +168,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
   const handleRequest = (req: http.IncomingMessage, res: http.ServerResponse) => {
     const reqTls = isEncrypted(req);
     res.setHeader(PORTLESS_HEADER, "1");
+    res.setHeader(PORTLESS_LISTENER_PORT_HEADER, getListenerPort(req, proxyPort));
 
     const routes = getRoutes();
     const host = getRequestHost(req).split(":")[0];
