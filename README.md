@@ -34,7 +34,7 @@ portless myapp next dev
 
 HTTPS with HTTP/2 is enabled by default. On first run, portless generates a local CA, trusts it, and binds port 443 (auto-elevates with sudo on macOS/Linux). Use `--no-tls` for plain HTTP.
 
-The proxy auto-starts when you run an app. A random port in the 4000 to 4999 range that is free on `127.0.0.1` is assigned via the `PORT` environment variable. Most frameworks (Next.js, Express, Nuxt, etc.) respect this automatically. For frameworks that ignore `PORT` (Vite, VitePlus, VitePress, Astro, React Router, Angular, Laravel, Expo, React Native, Wrangler), portless auto-injects the right `--port` flag and, when needed, a matching `--host` flag or Wrangler's `--ip` flag.
+The proxy auto-starts when you run an app. A random port in the 4000 to 4999 range that is free on `127.0.0.1` is assigned via the `PORT` environment variable. Portless skips browser-blocked ports during auto-assignment and rejects them for fixed app ports. Most frameworks (Next.js, Express, Nuxt, etc.) respect this automatically. For frameworks that ignore `PORT` (Vite, VitePlus, VitePress, Astro, React Router, Angular, Laravel, Expo, React Native, Wrangler), portless auto-injects the right `--port` flag and, when needed, a matching `--host` flag or Wrangler's `--ip` flag.
 
 When auto-starting, portless reuses the configuration (port, TLS, suffix) from the most recent proxy run, so a restart or reboot does not silently revert to defaults. Explicit env vars (`PORTLESS_PORT`, `PORTLESS_HTTPS`, etc.) always take priority.
 
@@ -86,14 +86,14 @@ In linked git worktrees, workspace URLs also get the branch prefix. For example,
 
 ### Config fields
 
-| Field     | Type    | Default  | Description                                               |
-| --------- | ------- | -------- | --------------------------------------------------------- |
-| `name`    | string  | inferred | Base app name. Worktree prefix still applies.             |
-| `script`  | string  | `"dev"`  | Name of a `package.json` script to run.                   |
-| `appPort` | number  | auto     | Fixed port for the child process.                         |
-| `proxy`   | boolean | auto     | Whether to route through the proxy. Auto-detected.        |
-| `apps`    | object  |          | Overrides for workspace packages, keyed by relative path. |
-| `turbo`   | boolean | `true`   | Set `false` to use direct spawning instead of turborepo.  |
+| Field     | Type    | Default  | Description                                                           |
+| --------- | ------- | -------- | --------------------------------------------------------------------- |
+| `name`    | string  | inferred | Base app name. Worktree prefix still applies.                         |
+| `script`  | string  | `"dev"`  | Name of a `package.json` script to run.                               |
+| `appPort` | number  | auto     | Fixed port for the child process. Browser-blocked ports are rejected. |
+| `proxy`   | boolean | auto     | Whether to route through the proxy. Auto-detected.                    |
+| `apps`    | object  |          | Overrides for workspace packages, keyed by relative path.             |
+| `turbo`   | boolean | `true`   | Set `false` to use direct spawning instead of turborepo.              |
 
 ### package.json "portless" key
 
@@ -439,7 +439,7 @@ portless service uninstall       # Remove the startup service
                                  Proxy-level only; restart proxy to change this mode
 --state-dir <path>               Use a custom state directory with service install
 --script <name>                  Run a specific package.json script (default: dev)
---app-port <number>              Use a fixed port for the app (skip auto-assignment)
+--app-port <number>              Use a fixed app port; browser-blocked ports are rejected
 --tailscale                      Share the app on your Tailscale network (tailnet)
 --funnel                         Share the app publicly via Tailscale Funnel
 --ngrok                          Share the app publicly via ngrok
@@ -452,7 +452,7 @@ portless service uninstall       # Remove the startup service
 ```
 # Configuration
 PORTLESS_PORT=<number>           Override the default proxy port
-PORTLESS_APP_PORT=<number>       Use a fixed port for the app (same as --app-port)
+PORTLESS_APP_PORT=<number>       Use a fixed app port (same as --app-port)
 PORTLESS_HTTPS=0                 Disable HTTPS (same as --no-tls)
 PORTLESS_LAN=1                   Enable LAN mode when set to 1 (auto-detects LAN IP)
 PORTLESS_LAN_IP=<address>        Pin a specific LAN IP for LAN mode

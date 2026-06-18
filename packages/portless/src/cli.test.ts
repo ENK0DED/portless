@@ -576,6 +576,14 @@ describe("CLI", () => {
       expect(stderr).toContain("Invalid app port");
     });
 
+    it("rejects browser-blocked --app-port values", () => {
+      const { status, stderr } = run(["run", "--app-port", "4045", "echo", "ok"], {
+        env: { PORTLESS: "0" },
+      });
+      expect(status).toBe(1);
+      expect(stderr).toContain("blocked by browsers");
+    });
+
     it("rejects --app-port without a value", () => {
       const { status, stderr } = run(["run", "--app-port"], {
         env: { PORTLESS: "0" },
@@ -590,6 +598,14 @@ describe("CLI", () => {
       });
       expect(status).toBe(0);
       expect(stdout.trim()).toBe("ok");
+    });
+
+    it("rejects browser-blocked PORTLESS_APP_PORT values", () => {
+      const { status, stderr } = run(["run", "echo", "ok"], {
+        env: { PORTLESS: "0", PORTLESS_APP_PORT: "4045" },
+      });
+      expect(status).toBe(1);
+      expect(stderr).toContain("blocked by browsers");
     });
   });
 

@@ -167,7 +167,7 @@ PORTLESS=0 bun dev    # Bypasses proxy, uses default port
 
 `.localhost` domains resolve to `127.0.0.1` natively in Chrome, Firefox, and Edge. Safari relies on the system DNS resolver, which may not handle `.localhost` subdomains on all configurations. Run `portless hosts sync` to add entries to `/etc/hosts` if needed.
 
-Most frameworks (Next.js, Express, Nuxt, etc.) respect the `PORT` env var automatically. For frameworks that ignore `PORT` (Vite, VitePlus, VitePress, Astro, React Router, Angular, Laravel, Expo, React Native, Wrangler), portless auto-injects the correct `--port` flag and, when needed, a matching `--host` CLI flag or Wrangler's `--ip` flag.
+Most frameworks (Next.js, Express, Nuxt, etc.) respect the `PORT` env var automatically. Portless skips browser-blocked ports during auto-assignment and rejects them for fixed app ports. For frameworks that ignore `PORT` (Vite, VitePlus, VitePress, Astro, React Router, Angular, Laravel, Expo, React Native, Wrangler), portless auto-injects the correct `--port` flag and, when needed, a matching `--host` CLI flag or Wrangler's `--ip` flag.
 
 ### State directory
 
@@ -191,7 +191,7 @@ The suffix may be a single label such as `test` or a dotted suffix such as `serv
 | Variable              | Description                                                                 |
 | --------------------- | --------------------------------------------------------------------------- |
 | `PORTLESS_PORT`       | Override the default proxy port (default: 443 with HTTPS, 80 without)       |
-| `PORTLESS_APP_PORT`   | Use a fixed port for the app (skip auto-assignment)                         |
+| `PORTLESS_APP_PORT`   | Use a fixed app port; browser-blocked ports are rejected                    |
 | `PORTLESS_HTTPS`      | HTTPS on by default; set to `0` to disable (same as `--no-tls`)             |
 | `PORTLESS_LAN`        | Set to `1` to always enable LAN mode (auto-detects LAN IP)                  |
 | `PORTLESS_LAN_IP`     | Pin a specific LAN IP for LAN mode                                          |
@@ -330,7 +330,7 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 | `portless alias --remove <name>`       | Remove a static route                                          |
 | `portless hosts sync`                  | Add routes to /etc/hosts (fixes Safari)                        |
 | `portless hosts clean`                 | Remove portless entries from /etc/hosts                        |
-| `portless <name> --app-port <n> <cmd>` | Use a fixed port for the app instead of auto-assignment        |
+| `portless <name> --app-port <n> <cmd>` | Use a fixed app port; browser-blocked ports are rejected       |
 | `portless <name> --tailscale <cmd>`    | Share the app on your Tailscale network (tailnet)              |
 | `portless <name> --funnel <cmd>`       | Share the app publicly via Tailscale Funnel                    |
 | `portless <name> --ngrok <cmd>`        | Share the app publicly via ngrok                               |
@@ -373,7 +373,7 @@ Optional config file. Portless looks for `portless.json` in the current director
 | --------- | ------- | -------------------------- | -------------------------------------------------------- |
 | `name`    | string  | inferred from package.json | Base app name (worktree prefix still applies)            |
 | `script`  | string  | `"dev"`                    | Name of a package.json script to run                     |
-| `appPort` | number  | auto-assigned              | Fixed port for the child process                         |
+| `appPort` | number  | auto-assigned              | Fixed app port; browser-blocked ports are rejected       |
 | `proxy`   | boolean | auto-detected              | Whether to route through the proxy (`false` for tasks)   |
 | `apps`    | object  |                            | Overrides for workspace packages, keyed by relative path |
 | `turbo`   | boolean | `true`                     | Set `false` to use direct spawning instead of turborepo  |

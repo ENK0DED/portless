@@ -48,7 +48,7 @@ The name is inferred from `package.json` if not set in config. The script defaul
       <td>`appPort`</td>
       <td>number</td>
       <td>auto</td>
-      <td>Fixed port for the child process.</td>
+      <td>Fixed app port. Browser-blocked ports are rejected.</td>
     </tr>
     <tr>
       <td>`proxy`</td>
@@ -153,7 +153,7 @@ For `name`: CLI `--name` flag > package `package.json` `"portless"` key > root c
 
 For `script`: CLI `--script` flag > package `package.json` `"portless"` key > root config app entry > default `"dev"`.
 
-For `appPort`: CLI `--app-port` flag > `PORTLESS_APP_PORT` env var > package `package.json` `"portless"` key > root config app entry > auto-assigned.
+For `appPort`: CLI `--app-port` flag > `PORTLESS_APP_PORT` env var > package `package.json` `"portless"` key > root config app entry > auto-assigned. Browser-blocked ports are rejected for fixed app ports.
 
 ## Programmatic API
 
@@ -206,7 +206,7 @@ const stable = await getUrl("backend", { worktree: false });
     </tr>
     <tr>
       <td>`PORTLESS_APP_PORT`</td>
-      <td>Use a fixed port for the app (skip auto-assignment)</td>
+      <td>Use a fixed app port. Browser-blocked ports are rejected.</td>
       <td>random 4000 to 4999</td>
     </tr>
     <tr>
@@ -285,4 +285,4 @@ Portless stores state (routes, PID file, port file, TLS marker) in `~/.portless`
 
 ## Port assignment
 
-Apps get a random port in the 4000 to 4999 range that is free on `127.0.0.1`. Portless sets `PORT` and usually `HOST` before running your command. Most frameworks respect `PORT` automatically. For frameworks that ignore it (Vite, VitePress, Astro, React Router, Angular, Laravel, Expo, React Native, Wrangler), portless auto-injects the right `--port` flag and, when needed, a matching `--host` flag or Wrangler's `--ip` flag.
+Apps get a random port in the 4000 to 4999 range that is free on `127.0.0.1`. Portless skips browser-blocked ports during auto-assignment and rejects them for fixed app ports. Portless sets `PORT` and usually `HOST` before running your command. Most frameworks respect `PORT` automatically. For frameworks that ignore it (Vite, VitePress, Astro, React Router, Angular, Laravel, Expo, React Native, Wrangler), portless auto-injects the right `--port` flag and, when needed, a matching `--host` flag or Wrangler's `--ip` flag.

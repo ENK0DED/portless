@@ -32,6 +32,7 @@ import {
 import {
   buildProxyStartConfig,
   buildSudoEnvArgs,
+  BLOCKED_PORTS,
   DEFAULT_TLD,
   FALLBACK_PROXY_PORT,
   INTERNAL_LAN_IP_ENV,
@@ -1450,6 +1451,7 @@ function parseAppPort(value: string | undefined): number {
     console.error(colors.red(`Error: Invalid app port "${value}". Must be 1-65535.`));
     process.exit(1);
   }
+  rejectBlockedAppPort(port, "--app-port");
   return port;
 }
 
@@ -1461,7 +1463,17 @@ function appPortFromEnv(): number | undefined {
     console.error(colors.red(`Error: Invalid PORTLESS_APP_PORT="${envVal}". Must be 1-65535.`));
     process.exit(1);
   }
+  rejectBlockedAppPort(port, "PORTLESS_APP_PORT");
   return port;
+}
+
+function rejectBlockedAppPort(port: number, source: string): void {
+  if (!BLOCKED_PORTS.has(port)) return;
+  console.error(
+    colors.red(`Error: ${source} ${port} is blocked by browsers and cannot be used as an app port.`)
+  );
+  console.error(colors.blue("Choose another port or let portless select one automatically."));
+  process.exit(1);
 }
 
 function applySharingFlag(flag: string): boolean {
@@ -1544,7 +1556,7 @@ ${colors.bold("Usage:")}
 ${colors.bold("Options:")}
   --name <name>          Override the inferred base name (worktree prefix still applies)
   --force                Kill the existing process and take over its route
-  --app-port <number>    Use a fixed port for the app (skip auto-assignment)
+  --app-port <number>    Use a fixed app port; browser-blocked ports are rejected
   --tailscale            Share the app on your Tailscale network (tailnet)
   --funnel               Share the app publicly via Tailscale Funnel
   --ngrok                Share the app publicly via ngrok
@@ -1826,7 +1838,7 @@ ${colors.bold("Options:")}
                                 Local proxy mode only; mDNS LAN mode cannot resolve wildcards
                                 Proxy-level only; restart proxy to change this mode
   --state-dir <path>            Use a custom state directory with service install
-  --app-port <number>           Use a fixed port for the app (skip auto-assignment)
+  --app-port <number>           Use a fixed app port; browser-blocked ports are rejected
   --tailscale                   Share the app on your Tailscale network (tailnet)
   --funnel                      Share the app publicly via Tailscale Funnel
   --ngrok                       Share the app publicly via ngrok
@@ -1836,7 +1848,7 @@ ${colors.bold("Options:")}
 
 ${colors.bold("Environment variables:")}
   PORTLESS_PORT=<number>        Override the default proxy port (e.g. in .bashrc)
-  PORTLESS_APP_PORT=<number>    Use a fixed port for the app (same as --app-port)
+  PORTLESS_APP_PORT=<number>    Use a fixed app port (same as --app-port)
   PORTLESS_HTTPS=0              Disable HTTPS (same as --no-tls)
   PORTLESS_LAN=1                Enable LAN mode when set to 1 (set in .bashrc / .zshrc)
   PORTLESS_LAN_IP=<address>     Pin a specific LAN IP for LAN mode
