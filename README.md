@@ -276,6 +276,8 @@ flowchart TD
 
 HTTPS with HTTP/2 is enabled by default. Browsers limit HTTP/1.1 to 6 connections per host, which bottlenecks dev servers that serve many unbundled files (Vite, Nuxt, etc.). HTTP/2 multiplexes all requests over a single connection.
 
+Portless also supports modern browser HMR WebSockets over HTTP/2 using RFC 8441 Extended CONNECT, so Next.js Turbopack, Vite, and similar dev servers can keep hot reloading while HTTPS/HTTP/2 is enabled.
+
 On first run, portless generates a local CA and adds it to your system trust store. No browser warnings. No manual setup.
 
 ```bash

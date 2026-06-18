@@ -258,6 +258,8 @@ The suffix may be a single label such as `test` or a dotted suffix such as `serv
 
 HTTPS with HTTP/2 is enabled by default (faster page loads for dev servers with many files). First run generates a local CA and adds it to the system trust store. After that, no prompts and no browser warnings.
 
+Modern browser HMR WebSockets over HTTPS use HTTP/2 Extended CONNECT. Current portless supports that path. Do not work around HMR failures by disabling TLS first; check route state, proxy logs, and whether the app is actually running before changing TLS settings.
+
 ```bash
 portless proxy start --cert ./c.pem --key ./k.pem  # Use custom certs
 portless proxy start --no-tls                       # Disable HTTPS (plain HTTP)

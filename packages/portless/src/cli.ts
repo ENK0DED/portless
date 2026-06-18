@@ -3093,6 +3093,7 @@ ${colors.bold("Background apps:")}
 
 ${colors.bold("HTTP/2 + HTTPS (default):")}
   HTTPS with HTTP/2 multiplexing is enabled by default (faster page loads).
+  Modern HMR WebSockets over HTTP/2 are supported via Extended CONNECT.
   On first use, portless generates a local CA and adds it to your
   system trust store. In WSL, the CA is also added to the Windows user
   trust store for Windows browsers. No browser warnings. Disable with --no-tls.
