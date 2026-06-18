@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as os from "node:os";
@@ -105,6 +105,43 @@ function readBgRegistry(stateDir: string): TestBgEntry[] {
   } catch {
     return [];
   }
+}
+
+function writeBgRegistry(stateDir: string, entries: Array<Record<string, unknown>>): void {
+  writeJson(path.join(stateDir, "bg", "registry.json"), entries);
+}
+
+function makeBgEntry(
+  overrides: Partial<Record<string, unknown>> & { id: string; label: string; pid: number }
+) {
+  const pathPrefix =
+    typeof overrides.route === "object" &&
+    overrides.route !== null &&
+    "pathPrefix" in overrides.route &&
+    typeof (overrides.route as { pathPrefix?: unknown }).pathPrefix === "string"
+      ? (overrides.route as { pathPrefix: string }).pathPrefix
+      : "/";
+  return {
+    version: 1,
+    cwd: process.cwd(),
+    startedAt: new Date().toISOString(),
+    state: "ready",
+    intent: {
+      cwd: process.cwd(),
+      commandArgs: [process.execPath, "-e", "setInterval(() => {}, 1000)"],
+      explicitCommand: true,
+      force: false,
+      pathPrefix,
+      sharing: {
+        tailscale: false,
+        tailscaleService: false,
+        funnel: false,
+        ngrok: false,
+        netbird: false,
+      },
+    },
+    ...overrides,
+  };
 }
 
 function readRoutesFile(stateDir: string): Array<Record<string, unknown>> {
@@ -968,6 +1005,252 @@ describe("CLI", () => {
         expect(tailZero.stdout).toBe("");
         expect(errors.stdout).toContain("err-one");
         expect(lifecycle.stdout).toContain("ready");
+      });
+
+      it("stops a live background process gracefully", async () => {
+        const appPort = await getFreePort();
+        expect(
+          run(["bg", "start", "--name", "stop-web", "--app-port", String(appPort), ...longRunningCommand()], {
+            env: bgEnv(),
+          }).status
+        ).toBe(0);
+        const [entry] = readBgRegistry(tmpDir);
+
+        const { status, stdout } = run(["bg", "stop", "stop-web"], { env: bgEnv() });
+
+        expect(status).toBe(0);
+        expect(stdout).toContain("Stopped stop-web");
+        await expect(waitForPidGone(entry.pid)).resolves.toBe(true);
+        expect(readBgRegistry(tmpDir)).toEqual([]);
+      });
+
+      it(
+        "keeps the registry entry when graceful stop times out",
+        async () => {
+          const stubborn = spawn(
+            process.execPath,
+            ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"],
+            { detached: true, stdio: "ignore" }
+          );
+          stubborn.unref();
+          const id = "stubborn";
+          writeBgRegistry(tmpDir, [
+            makeBgEntry({
+              id,
+              label: "stubborn",
+              pid: stubborn.pid!,
+              state: "ready",
+            }),
+          ]);
+
+          const { status, stderr } = run(["bg", "stop", "stubborn"], { env: bgEnv() });
+
+          expect(status).toBe(1);
+          expect(stderr).toContain("did not exit");
+          expect(readBgRegistry(tmpDir)).toHaveLength(1);
+          killProcessGroup(stubborn.pid!);
+          try {
+            process.kill(-stubborn.pid!, "SIGKILL");
+          } catch {
+            // Process may already be gone.
+          }
+        },
+        8000
+      );
+
+      it("force stop removes only the exact route owned by the bg pid", async () => {
+        const appPort = await getFreePort();
+        expect(
+          run(
+            [
+              "bg",
+              "start",
+              "--name",
+              "exact",
+              "--path",
+              "/api",
+              "--app-port",
+              String(appPort),
+              ...longRunningCommand(),
+            ],
+            { env: bgEnv() }
+          ).status
+        ).toBe(0);
+        const [entry] = readBgRegistry(tmpDir);
+        writeJson(path.join(tmpDir, "routes.json"), [
+          {
+            hostname: "exact.localhost",
+            pathPrefix: "/api",
+            port: appPort,
+            pid: entry.pid,
+          },
+          {
+            hostname: "other.localhost",
+            port: appPort,
+            pid: 0,
+          },
+        ]);
+
+        expect(run(["bg", "stop", "exact", "--path", "/api", "--force"], { env: bgEnv() }).status).toBe(0);
+
+        expect(readRoutesFile(tmpDir)).toEqual([{ hostname: "other.localhost", port: appPort, pid: 0 }]);
+      });
+
+      it("force stop does not kill unrelated processes on the same port", async () => {
+        const appPort = await getFreePort();
+        const unrelated = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+          detached: true,
+          stdio: "ignore",
+        });
+        unrelated.unref();
+        expect(
+          run(["bg", "start", "--name", "safe-stop", "--app-port", String(appPort), ...longRunningCommand()], {
+            env: bgEnv(),
+          }).status
+        ).toBe(0);
+
+        expect(run(["bg", "stop", "safe-stop", "--force"], { env: bgEnv() }).status).toBe(0);
+
+        expect(isPidAlive(unrelated.pid!)).toBe(true);
+        try {
+          process.kill(-unrelated.pid!, "SIGKILL");
+        } catch {
+          // Process may already be gone.
+        }
+      });
+
+      it("restart preserves cwd and original command intent", async () => {
+        const appDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-bg-restart-"));
+        const appPort = await getFreePort();
+        try {
+          expect(
+            run(
+              [
+                "bg",
+                "start",
+                "--name",
+                "restart-web",
+                "--app-port",
+                String(appPort),
+                ...longRunningCommand(),
+              ],
+              { env: bgEnv(), cwd: appDir }
+            ).status
+          ).toBe(0);
+          const [before] = readBgRegistry(tmpDir);
+
+          const { status } = run(["bg", "restart", "restart-web"], { env: bgEnv() });
+          const [after] = readBgRegistry(tmpDir);
+
+          expect(status).toBe(0);
+          expect(after.cwd).toBe(appDir);
+          expect(after.pid).not.toBe(before.pid);
+        } finally {
+          fs.rmSync(appDir, { recursive: true, force: true });
+        }
+      });
+
+      it("bg clean removes dead entries and their logs", async () => {
+        const appPort = await getFreePort();
+        expect(
+          run(["bg", "start", "--name", "dead-clean", "--app-port", String(appPort), ...longRunningCommand()], {
+            env: bgEnv(),
+          }).status
+        ).toBe(0);
+        const [entry] = readBgRegistry(tmpDir);
+        const logs = getBgLogPaths(tmpDir, entry.id);
+        killProcessGroup(entry.pid);
+        await expect(waitForPidGone(entry.pid)).resolves.toBe(true);
+
+        expect(run(["bg", "clean", "--all"], { env: bgEnv() }).status).toBe(0);
+
+        expect(readBgRegistry(tmpDir)).toEqual([]);
+        expect(fs.existsSync(logs.stdout)).toBe(false);
+      });
+
+      it("bg clean does not stop live entries", async () => {
+        const appPort = await getFreePort();
+        expect(
+          run(["bg", "start", "--name", "live-clean", "--app-port", String(appPort), ...longRunningCommand()], {
+            env: bgEnv(),
+          }).status
+        ).toBe(0);
+        const [entry] = readBgRegistry(tmpDir);
+
+        expect(run(["bg", "clean", "--all"], { env: bgEnv() }).status).toBe(0);
+
+        expect(isPidAlive(entry.pid)).toBe(true);
+        expect(readBgRegistry(tmpDir)).toHaveLength(1);
+      });
+
+      it("portless clean stops bg entries before removing state", async () => {
+        const appPort = await getFreePort();
+        expect(
+          run(["bg", "start", "--name", "clean-all", "--app-port", String(appPort), ...longRunningCommand()], {
+            env: bgEnv(),
+          }).status
+        ).toBe(0);
+        const [entry] = readBgRegistry(tmpDir);
+
+        expect(run(["clean"], { env: bgEnv() }).status).toBe(0);
+
+        await expect(waitForPidGone(entry.pid)).resolves.toBe(true);
+        expect(fs.existsSync(path.join(tmpDir, "bg"))).toBe(false);
+      });
+
+      it("portless prune removes dead bg entries without stopping live entries", async () => {
+        const livePort = await getFreePort();
+        const deadPort = await getFreePort();
+        expect(
+          run(["bg", "start", "--name", "live-prune", "--app-port", String(livePort), ...longRunningCommand()], {
+            env: bgEnv(),
+          }).status
+        ).toBe(0);
+        expect(
+          run(["bg", "start", "--name", "dead-prune", "--app-port", String(deadPort), ...longRunningCommand()], {
+            env: bgEnv(),
+          }).status
+        ).toBe(0);
+        const entries = readBgRegistry(tmpDir);
+        const live = entries.find((entry) => entry.label === "live-prune")!;
+        const dead = entries.find((entry) => entry.label === "dead-prune")!;
+        killProcessGroup(dead.pid);
+        await expect(waitForPidGone(dead.pid)).resolves.toBe(true);
+
+        expect(run(["prune"], { env: bgEnv() }).status).toBe(0);
+
+        const labels = readBgRegistry(tmpDir).map((entry) => entry.label);
+        expect(labels).toEqual(["live-prune"]);
+        expect(isPidAlive(live.pid)).toBe(true);
+      });
+
+      it("managed tunnel aliases are removed for stopped bg entries", async () => {
+        const appPort = await getFreePort();
+        writeCloudflaredShim(tmpDir, "https://stop-bg.trycloudflare.com");
+        expect(
+          run(
+            [
+              "bg",
+              "start",
+              "--name",
+              "tunnel-stop",
+              "--tunnel",
+              "cloudflare",
+              "--app-port",
+              String(appPort),
+              ...longRunningCommand(),
+            ],
+            { env: bgEnv({ PATH: `${tmpDir}${path.delimiter}${process.env.PATH ?? ""}` }) }
+          ).status
+        ).toBe(0);
+        expect(fs.existsSync(path.join(tmpDir, "tunnel-aliases.json"))).toBe(true);
+
+        expect(run(["bg", "stop", "tunnel-stop", "--force"], { env: bgEnv() }).status).toBe(0);
+
+        const aliases = JSON.parse(
+          fs.readFileSync(path.join(tmpDir, "tunnel-aliases.json"), "utf-8")
+        ) as unknown[];
+        expect(aliases).toEqual([]);
       });
     });
   });

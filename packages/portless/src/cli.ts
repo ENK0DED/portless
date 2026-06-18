@@ -131,7 +131,7 @@ import {
 } from "./turbo.js";
 import type { ManifestEntry } from "./turbo.js";
 import { buildServiceUninstallSudoArgs, handleService, tryUninstallService } from "./service.js";
-import { handleBg } from "./bg.js";
+import { handleBg, pruneBgEntriesForState, stopBgEntriesForState } from "./bg.js";
 import { PORTLESS_BG_ID_ENV, PORTLESS_BG_READY_PATH_ENV, writeBgReadyFile } from "./bg-ready.js";
 
 const chalk = colors;
@@ -3326,6 +3326,22 @@ ${colors.bold("Options:")}
   }
 
   const stateDirs = collectStateDirsForCleanup();
+  const bgStopFailedStateDirs = new Set<string>();
+  for (const stateDir of stateDirs) {
+    const result = await stopBgEntriesForState(stateDir);
+    if (result.stopped > 0) {
+      console.log(colors.green(`Stopped ${result.stopped} background app(s).`));
+    }
+    if (result.failed > 0) {
+      bgStopFailedStateDirs.add(stateDir);
+      console.warn(
+        colors.yellow(
+          `Could not stop ${result.failed} background app(s) in ${stateDir}. Leaving that state directory intact.`
+        )
+      );
+    }
+  }
+
   for (const stateDir of stateDirs) {
     const caPath = path.join(stateDir, "ca.pem");
     if (!fs.existsSync(caPath)) continue;
@@ -3345,6 +3361,7 @@ ${colors.bold("Options:")}
   }
 
   for (const stateDir of stateDirs) {
+    if (bgStopFailedStateDirs.has(stateDir)) continue;
     removePortlessStateFiles(stateDir);
   }
   console.log(colors.green("Removed portless state files from known state directories."));
@@ -3400,9 +3417,13 @@ ${colors.bold("Options:")}
 
   const stale = store.pruneStaleRoutes();
   const staleAliases = tunnelAliasStore.pruneManagedAliases();
-  if (stale.length === 0 && staleAliases.length === 0) {
+  const bgPruned = await pruneBgEntriesForState(dir);
+  if (stale.length === 0 && staleAliases.length === 0 && bgPruned.removed === 0) {
     console.log("No orphaned routes found.");
     return;
+  }
+  if (bgPruned.removed > 0) {
+    console.log(`  removed ${bgPruned.removed} dead background app entries`);
   }
 
   for (const route of stale) {

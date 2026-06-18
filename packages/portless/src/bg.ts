@@ -25,7 +25,9 @@ import {
   PORTLESS_BG_READY_PATH_ENV,
   waitForBgReadyFile,
 } from "./bg-ready.js";
+import { cleanupRouteSharing } from "./route-cleanup.js";
 import { RouteStore, type RouteMapping } from "./routes.js";
+import { TunnelAliasStore } from "./tunnel-aliases.js";
 import type { RouteProtocol, TunnelProviderName } from "./types.js";
 import { fixOwnership, normalizePathPrefix } from "./utils.js";
 
@@ -47,6 +49,7 @@ interface BgCommandContext {
   stateDir: string;
   store: BgStore;
   routeStore: RouteStore;
+  tunnelAliasStore: TunnelAliasStore;
 }
 
 interface EntryView extends BgProcessEntry {
@@ -400,6 +403,9 @@ async function createBgContext(): Promise<BgCommandContext> {
     routeStore: new RouteStore(state.dir, {
       onWarning: (msg) => console.warn(colors.yellow(msg)),
     }),
+    tunnelAliasStore: new TunnelAliasStore(state.dir, {
+      onWarning: (msg) => console.warn(colors.yellow(msg)),
+    }),
   };
 }
 
@@ -433,6 +439,105 @@ function refreshEntries(context: BgCommandContext): BgProcessEntry[] {
     }
     return refreshed;
   });
+}
+
+function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-pid, signal);
+    return;
+  } catch {
+    // The process may not be a group leader, or may already be gone.
+  }
+  try {
+    process.kill(pid, signal);
+  } catch {
+    // The process may already be gone.
+  }
+}
+
+async function waitForProcessExit(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    if (!isProcessAlive(pid)) return true;
+    await sleep(50);
+  }
+  return !isProcessAlive(pid);
+}
+
+function findExactRoute(context: BgCommandContext, entry: BgProcessEntry): RouteMapping | undefined {
+  return context.routeStore.loadRoutesRaw().find((route) => routeMatchesEntry(route, entry));
+}
+
+function cleanupExactRoute(context: BgCommandContext, entry: BgProcessEntry): void {
+  if (!entry.route) return;
+  const route = findExactRoute(context, entry);
+  if (!route || route.pid !== entry.pid) return;
+  cleanupRouteSharing(route, { tunnelAliasStore: context.tunnelAliasStore });
+  context.routeStore.removeRoute(entry.route.hostname, entry.pid, {
+    pathPrefix: entry.route.pathPrefix,
+  });
+}
+
+function removeEntryLogs(stateDir: string, entryId: string): void {
+  const logs = getBgLogPaths(stateDir, entryId);
+  for (const filePath of [logs.stdout, logs.stderr, logs.bg]) {
+    try {
+      fs.rmSync(filePath, { force: true });
+    } catch {
+      // Log cleanup is best effort.
+    }
+  }
+}
+
+async function stopEntry(
+  context: BgCommandContext,
+  entry: BgProcessEntry,
+  options: { force?: boolean; removeLogs?: boolean } = {}
+): Promise<{ stopped: boolean; alreadyStopped: boolean }> {
+  const alive = isProcessAlive(entry.pid);
+  if (alive) {
+    signalProcessGroup(entry.pid, options.force ? "SIGKILL" : "SIGTERM");
+    const exited = await waitForProcessExit(entry.pid, options.force ? 1000 : 5000);
+    if (!exited && !options.force) {
+      context.store.updateEntry(entry.id, { state: "unknown" });
+      return { stopped: false, alreadyStopped: false };
+    }
+    if (!exited && options.force) {
+      signalProcessGroup(entry.pid, "SIGKILL");
+      await waitForProcessExit(entry.pid, 1000);
+    }
+  }
+
+  cleanupExactRoute(context, entry);
+  context.store.removeEntry(entry.id);
+  if (options.removeLogs) removeEntryLogs(context.stateDir, entry.id);
+  return { stopped: true, alreadyStopped: !alive };
+}
+
+function runArgsFromIntent(intent: BgStartIntent, force: boolean): string[] {
+  const args: string[] = [];
+  if (intent.name) args.push("--name", intent.name);
+  if (force || intent.force) args.push("--force");
+  if (intent.appPort) args.push("--app-port", String(intent.appPort));
+  if (intent.protocol === "h2c") args.push("--h2c");
+  if (intent.pathPrefix && intent.pathPrefix !== "/") args.push("--path", intent.pathPrefix);
+  if (intent.tunnel) {
+    args.push("--tunnel", intent.tunnel.provider);
+    if (intent.tunnel.hostname) args.push("--tunnel-hostname", intent.tunnel.hostname);
+  }
+  if (intent.sharing.tailscale && !intent.sharing.funnel) args.push("--tailscale");
+  if (intent.sharing.tailscaleService) args.push("--tailscale-service");
+  if (intent.sharing.tailscaleServiceName) {
+    args.push("--tailscale-service-name", intent.sharing.tailscaleServiceName);
+  }
+  if (intent.sharing.funnel) args.push("--funnel");
+  if (intent.sharing.ngrok) args.push("--ngrok");
+  if (intent.sharing.netbird) args.push("--netbird");
+  if (intent.sharing.netbirdPassword) args.push("--netbird-password", intent.sharing.netbirdPassword);
+  if (intent.sharing.netbirdPin) args.push("--netbird-pin", intent.sharing.netbirdPin);
+  if (intent.sharing.netbirdGroups) args.push("--netbird-groups", intent.sharing.netbirdGroups);
+  if (intent.explicitCommand) args.push("--", ...intent.commandArgs);
+  return args;
 }
 
 function withLogs(stateDir: string, entry: BgProcessEntry): EntryView {
@@ -690,7 +795,246 @@ async function handleBgLogs(args: string[]): Promise<void> {
   }
 }
 
-async function handleBgStart(startArgs: string[], options: { entryScript: string }): Promise<void> {
+function parseStopArgs(args: string[]): {
+  name?: string;
+  pathPrefix?: string;
+  force: boolean;
+  json: boolean;
+} {
+  const parsed = parseNamePathJsonArgs(
+    args.filter((token) => token !== "--force"),
+    2
+  );
+  return {
+    ...parsed,
+    force: args.includes("--force"),
+  };
+}
+
+async function handleBgStop(args: string[]): Promise<void> {
+  if (args[2] === "--help" || args[2] === "-h") {
+    printSubcommandStubHelp("stop");
+    return;
+  }
+  let parsed: ReturnType<typeof parseStopArgs>;
+  try {
+    parsed = parseStopArgs(args);
+  } catch (err) {
+    console.error(colors.red(`Error: ${(err as Error).message}`));
+    console.error(colors.cyan("  portless bg stop --help"));
+    process.exit(1);
+  }
+  const context = await createBgContext();
+  try {
+    const entry = selectEntry(refreshEntries(context), parsed.name, parsed.pathPrefix);
+    const result = await stopEntry(context, entry, { force: parsed.force });
+    if (!result.stopped) {
+      console.error(colors.red(`Error: ${entry.label} did not exit after SIGTERM.`));
+      process.exit(1);
+    }
+    if (parsed.json) {
+      process.stdout.write(
+        JSON.stringify({ id: entry.id, label: entry.label, stopped: true }, null, 2) + "\n"
+      );
+    } else {
+      console.log(`Stopped ${entry.label}`);
+    }
+  } catch (err) {
+    console.error(colors.red(`Error: ${(err as Error).message}`));
+    process.exit(1);
+  }
+}
+
+function parseRestartArgs(args: string[]): {
+  name?: string;
+  pathPrefix?: string;
+  force: boolean;
+  waitSeconds: number | undefined;
+  keep: boolean;
+  json: boolean;
+} {
+  const passthrough: string[] = [];
+  let name: string | undefined;
+  let pathPrefix: string | undefined;
+  let force = false;
+  for (let i = 2; i < args.length; i++) {
+    const token = args[i];
+    if (token === "--force") {
+      force = true;
+    } else if (token === "--path") {
+      const value = args[++i];
+      if (!value) throw new Error("--path requires a path prefix");
+      pathPrefix = normalizePathPrefix(value);
+    } else if (
+      token === "--wait" ||
+      token === "--no-wait" ||
+      token === "--keep" ||
+      token === "--json"
+    ) {
+      passthrough.push(token);
+      if (token === "--wait" && canBeWaitValue(args[i + 1])) {
+        passthrough.push(args[++i]);
+      }
+    } else if (token.startsWith("-")) {
+      throw new Error(`Unknown flag "${token}"`);
+    } else if (!name) {
+      name = token;
+    } else {
+      throw new Error(`Unknown argument "${token}"`);
+    }
+  }
+  const parsedStart = parseBgStartArgs(passthrough);
+  return { name, pathPrefix, force, ...parsedStart };
+}
+
+async function handleBgRestart(
+  args: string[],
+  options: { entryScript: string }
+): Promise<void> {
+  if (args[2] === "--help" || args[2] === "-h") {
+    printSubcommandStubHelp("restart");
+    return;
+  }
+  let parsed: ReturnType<typeof parseRestartArgs>;
+  try {
+    parsed = parseRestartArgs(args);
+  } catch (err) {
+    console.error(colors.red(`Error: ${(err as Error).message}`));
+    console.error(colors.cyan("  portless bg restart --help"));
+    process.exit(1);
+  }
+  const context = await createBgContext();
+  try {
+    const entry = selectEntry(refreshEntries(context), parsed.name, parsed.pathPrefix);
+    const stopped = await stopEntry(context, entry, { force: parsed.force });
+    if (!stopped.stopped) {
+      console.error(colors.red(`Error: ${entry.label} did not exit after SIGTERM.`));
+      process.exit(1);
+    }
+    const runArgs = runArgsFromIntent(entry.intent, parsed.force);
+    const startArgs = [
+      ...runArgs,
+      ...(parsed.waitSeconds === undefined
+        ? ["--no-wait"]
+        : parsed.waitSeconds !== DEFAULT_BG_WAIT_SECONDS
+          ? ["--wait", String(parsed.waitSeconds)]
+          : []),
+      ...(parsed.keep ? ["--keep"] : []),
+      ...(parsed.json ? ["--json"] : []),
+    ];
+    await handleBgStart(startArgs, options, { cwd: entry.cwd });
+  } catch (err) {
+    console.error(colors.red(`Error: ${(err as Error).message}`));
+    process.exit(1);
+  }
+}
+
+function parseCleanArgs(args: string[]): {
+  name?: string;
+  pathPrefix?: string;
+  all: boolean;
+  json: boolean;
+} {
+  let name: string | undefined;
+  let pathPrefix: string | undefined;
+  let all = false;
+  let json = false;
+  for (let i = 2; i < args.length; i++) {
+    const token = args[i];
+    if (token === "--all") {
+      all = true;
+    } else if (token === "--json") {
+      json = true;
+    } else if (token === "--path") {
+      const value = args[++i];
+      if (!value) throw new Error("--path requires a path prefix");
+      pathPrefix = normalizePathPrefix(value);
+    } else if (token.startsWith("-")) {
+      throw new Error(`Unknown flag "${token}"`);
+    } else if (!name) {
+      name = token;
+    } else {
+      throw new Error(`Unknown argument "${token}"`);
+    }
+  }
+  return { name, pathPrefix, all, json };
+}
+
+async function handleBgClean(args: string[]): Promise<void> {
+  if (args[2] === "--help" || args[2] === "-h") {
+    printSubcommandStubHelp("clean");
+    return;
+  }
+  let parsed: ReturnType<typeof parseCleanArgs>;
+  try {
+    parsed = parseCleanArgs(args);
+  } catch (err) {
+    console.error(colors.red(`Error: ${(err as Error).message}`));
+    console.error(colors.cyan("  portless bg clean --help"));
+    process.exit(1);
+  }
+  const context = await createBgContext();
+  const entries = refreshEntries(context);
+  const candidates = parsed.all
+    ? entries
+    : [selectEntry(entries, parsed.name, parsed.pathPrefix)];
+  let removed = 0;
+  for (const entry of candidates) {
+    if (isProcessAlive(entry.pid)) continue;
+    cleanupExactRoute(context, entry);
+    context.store.removeEntry(entry.id);
+    removeEntryLogs(context.stateDir, entry.id);
+    removed++;
+  }
+  if (parsed.json) {
+    process.stdout.write(JSON.stringify({ removed }, null, 2) + "\n");
+  } else {
+    console.log(`Removed ${removed} dead background ${removed === 1 ? "entry" : "entries"}.`);
+  }
+}
+
+export async function stopBgEntriesForState(
+  stateDir: string
+): Promise<{ stopped: number; failed: number }> {
+  const context: BgCommandContext = {
+    stateDir,
+    store: new BgStore(stateDir),
+    routeStore: new RouteStore(stateDir),
+    tunnelAliasStore: new TunnelAliasStore(stateDir),
+  };
+  let stopped = 0;
+  let failed = 0;
+  for (const entry of refreshEntries(context)) {
+    const result = await stopEntry(context, entry);
+    if (result.stopped) stopped++;
+    else failed++;
+  }
+  return { stopped, failed };
+}
+
+export async function pruneBgEntriesForState(stateDir: string): Promise<{ removed: number }> {
+  const context: BgCommandContext = {
+    stateDir,
+    store: new BgStore(stateDir),
+    routeStore: new RouteStore(stateDir),
+    tunnelAliasStore: new TunnelAliasStore(stateDir),
+  };
+  let removed = 0;
+  for (const entry of refreshEntries(context)) {
+    if (isProcessAlive(entry.pid)) continue;
+    cleanupExactRoute(context, entry);
+    context.store.removeEntry(entry.id);
+    removeEntryLogs(context.stateDir, entry.id);
+    removed++;
+  }
+  return { removed };
+}
+
+async function handleBgStart(
+  startArgs: string[],
+  options: { entryScript: string },
+  startOptions: { cwd?: string } = {}
+): Promise<void> {
   let parsed: ParsedBgStartArgs;
   try {
     parsed = parseBgStartArgs(startArgs);
@@ -707,7 +1051,7 @@ async function handleBgStart(startArgs: string[], options: { entryScript: string
   const id = `bg-${randomUUID()}`;
   const readyPath = getBgReadyPath(state.dir, id);
   const logs = getBgLogPaths(state.dir, id);
-  const cwd = process.cwd();
+  const cwd = startOptions.cwd ?? process.cwd();
   const { intent, label } = parseRunIntent(parsed.runArgs, cwd);
   const startedAt = new Date().toISOString();
   let entry: BgProcessEntry = {
@@ -916,19 +1260,31 @@ export async function handleBg(args: string[], options: { entryScript: string })
     return;
   }
 
-  if (subcommand === "stop" || subcommand === "restart" || subcommand === "clean") {
-    if (args[2] === "--help" || args[2] === "-h") {
-      printSubcommandStubHelp(subcommand);
-      return;
-    }
+  if (subcommand === "stop") {
     if (isWindows) {
       console.error(colors.red("Error: portless bg currently supports macOS and Linux."));
       process.exit(1);
     }
-    console.error(
-      colors.red(`Error: portless bg ${subcommand} is not implemented in this commit.`)
-    );
-    process.exit(1);
+    await handleBgStop(args);
+    return;
+  }
+
+  if (subcommand === "restart") {
+    if (isWindows) {
+      console.error(colors.red("Error: portless bg currently supports macOS and Linux."));
+      process.exit(1);
+    }
+    await handleBgRestart(args, options);
+    return;
+  }
+
+  if (subcommand === "clean") {
+    if (isWindows) {
+      console.error(colors.red("Error: portless bg currently supports macOS and Linux."));
+      process.exit(1);
+    }
+    await handleBgClean(args);
+    return;
   }
 
   console.error(colors.red(`Error: Unknown bg subcommand "${subcommand}".`));
