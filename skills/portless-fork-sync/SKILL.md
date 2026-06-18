@@ -60,7 +60,7 @@ git merge upstream/main --no-edit
 7. Run invariant searches:
 
 ```bash
-rg --glob '!FORK.md' --glob '!docs/superpowers/plans/**' --glob '!skills/portless-fork-sync/SKILL.md' 'npm install -g [p]ortless|npm install -D [p]ortless|npm view [p]ortless|"name": "[p]ortless"|github.com/vercel-labs/[p]ortless|node_modules/[p]ortless'
+rg --glob '!FORK.md' --glob '!skills/portless-fork-sync/SKILL.md' 'npm install -g [p]ortless|npm install -D [p]ortless|npm view [p]ortless|"name": "[p]ortless"|github.com/vercel-labs/[p]ortless|node_modules/[p]ortless'
 rg '[p]npm install|[p]npm build|[p]npm test|[p]npm lint|[p]npm type-check|[p]npm format|[p]npm dev|[p]npm run dev:app'
 rg -n '^[<]{7}|^[=]{7}|^[>]{7}'
 ```
@@ -75,7 +75,7 @@ awk '/### Full Open Upstream PR State on/{flag=1; next} /## Sync Checklist/{flag
 comm -3 "$live" "$doc"
 ```
 
-If `comm` prints anything, update `FORK.md`. Every currently open upstream PR should be marked `implemented`, `implemented differently`, or `won't implement`, unless the fork intentionally leaves it `planned` or `deferred` with a linked implementation or research plan.
+If `comm` prints anything, update `FORK.md`. Every currently open upstream PR should be marked `implemented`, `implemented differently`, or `won't implement`. If a future pass temporarily needs `planned` or `deferred`, keep the discussion directly in `FORK.md` with an owner, date, and decision checkpoint.
 
 9. Refresh dependencies with Bun:
 
