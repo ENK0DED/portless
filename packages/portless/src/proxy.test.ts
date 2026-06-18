@@ -2128,6 +2128,111 @@ describe("createProxyServer with TLS (HTTP/2)", () => {
       expect(result.closed).toBe(true);
       expect(result.data.toString("utf8")).toBe("");
     });
+
+    it("keeps normal HTTP/2 requests working after a failed CONNECT stream", async () => {
+      const backend = trackServer(
+        http.createServer((_req, res) => {
+          res.writeHead(200, { "Content-Type": "text/plain" });
+          res.end("still works");
+        })
+      );
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const routes: RouteInfo[] = [{ hostname: "ok.localhost", port: backendAddr.port }];
+      const server = trackServer(
+        createProxyServer({
+          getRoutes: () => routes,
+          proxyPort: TEST_PROXY_PORT,
+          tls: { cert: tlsCert, key: tlsKey },
+        })
+      );
+      await listen(server);
+      const addr = server.address();
+      if (!addr || typeof addr === "string") throw new Error("no addr");
+
+      const client = http2.connect(`https://127.0.0.1:${addr.port}`, {
+        rejectUnauthorized: false,
+      });
+      try {
+        await new Promise<void>((resolve, reject) => {
+          client.on("error", reject);
+          client.on("remoteSettings", () => {
+            const connect = client.request(
+              {
+                ":method": "CONNECT",
+                ":protocol": "websocket",
+                ":scheme": "https",
+                ":path": "/socket",
+                ":authority": "missing.localhost",
+                "sec-websocket-version": "13",
+                "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ==",
+              },
+              { endStream: false }
+            );
+            connect.on("close", resolve);
+            connect.on("error", () => resolve());
+          });
+        });
+
+        const response = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+          const req = client.request({
+            ":method": "GET",
+            ":path": "/",
+            ":authority": "ok.localhost",
+          });
+          let body = "";
+          let status = 0;
+          req.on("response", (headers) => {
+            status = Number(headers[":status"]) || 0;
+          });
+          req.on("data", (chunk: Buffer) => {
+            body += chunk.toString("utf8");
+          });
+          req.on("end", () => resolve({ status, body }));
+          req.on("error", reject);
+          req.end();
+        });
+
+        expect(response).toEqual({ status: 200, body: "still works" });
+      } finally {
+        client.close();
+      }
+    });
+
+    it("does not send WebSocket traffic to reserved dashboard or certificate hosts", async () => {
+      let upgrades = 0;
+      const backend = websocketEchoBackend(() => {
+        upgrades++;
+      });
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const routes: RouteInfo[] = [
+        { hostname: "portless.localhost", port: backendAddr.port },
+        { hostname: "cert.localhost", port: backendAddr.port },
+      ];
+      const server = trackServer(
+        createProxyServer({
+          getRoutes: () => routes,
+          proxyPort: TEST_PROXY_PORT,
+          tls: { cert: tlsCert, key: tlsKey },
+        })
+      );
+      await listen(server);
+
+      const dashboard = await openH2WebSocket(server, {
+        ":path": "/",
+        ":authority": "portless.localhost",
+      });
+      const cert = await openH2WebSocket(server, { ":path": "/", ":authority": "cert.localhost" });
+
+      expect(dashboard.closed).toBe(true);
+      expect(cert.closed).toBe(true);
+      expect(upgrades).toBe(0);
+    });
   });
 
   it("redirects plain HTTP to HTTPS on the TLS-enabled port", async () => {
