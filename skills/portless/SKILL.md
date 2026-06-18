@@ -196,26 +196,28 @@ The suffix may be a single label such as `test` or a dotted suffix such as `serv
 
 ### Environment variables
 
-| Variable                    | Description                                                                 |
-| --------------------------- | --------------------------------------------------------------------------- |
-| `PORTLESS_PORT`             | Override the default proxy port (default: 443 with HTTPS, 80 without)       |
-| `PORTLESS_APP_PORT`         | Use a fixed app port; browser-blocked ports are rejected                    |
-| `PORTLESS_HTTPS`            | HTTPS on by default; set to `0` to disable (same as `--no-tls`)             |
-| `PORTLESS_LAN`              | Set to `1` to always enable LAN mode (auto-detects LAN IP)                  |
-| `PORTLESS_LAN_IP`           | Pin a specific LAN IP for LAN mode                                          |
-| `PORTLESS_SUFFIX`           | Use a custom suffix instead of localhost (e.g. test, acme.com)              |
-| `PORTLESS_TLD`              | Compatibility alias for `PORTLESS_SUFFIX`                                   |
-| `PORTLESS_WILDCARD`         | Set to `1` to allow unregistered subdomains to fall back to parent          |
-| `PORTLESS_SYNC_HOSTS`       | Set to `0` to disable auto-sync of /etc/hosts (on by default)               |
-| `PORTLESS_TAILSCALE`        | Set to `1` to share apps on your Tailscale network (same as `--tailscale`)  |
-| `PORTLESS_FUNNEL`           | Set to `1` to share apps publicly via Tailscale Funnel (same as `--funnel`) |
-| `PORTLESS_NGROK`            | Set to `1` to share apps publicly via ngrok (same as `--ngrok`)             |
-| `PORTLESS_NETBIRD`          | Set to `1` to share apps publicly via NetBird (same as `--netbird`)         |
-| `PORTLESS_NETBIRD_PASSWORD` | Require a password for the NetBird public URL                               |
-| `PORTLESS_NETBIRD_PIN`      | Require a PIN for the NetBird public URL                                    |
-| `PORTLESS_NETBIRD_GROUPS`   | Restrict the NetBird public URL to comma-separated user groups              |
-| `PORTLESS_STATE_DIR`        | Override the state directory                                                |
-| `PORTLESS=0`                | Bypass the proxy, run the command directly                                  |
+| Variable                          | Description                                                                 |
+| --------------------------------- | --------------------------------------------------------------------------- |
+| `PORTLESS_PORT`                   | Override the default proxy port (default: 443 with HTTPS, 80 without)       |
+| `PORTLESS_APP_PORT`               | Use a fixed app port; browser-blocked ports are rejected                    |
+| `PORTLESS_HTTPS`                  | HTTPS on by default; set to `0` to disable (same as `--no-tls`)             |
+| `PORTLESS_LAN`                    | Set to `1` to always enable LAN mode (auto-detects LAN IP)                  |
+| `PORTLESS_LAN_IP`                 | Pin a specific LAN IP for LAN mode                                          |
+| `PORTLESS_SUFFIX`                 | Use a custom suffix instead of localhost (e.g. test, acme.com)              |
+| `PORTLESS_TLD`                    | Compatibility alias for `PORTLESS_SUFFIX`                                   |
+| `PORTLESS_WILDCARD`               | Set to `1` to allow unregistered subdomains to fall back to parent          |
+| `PORTLESS_SYNC_HOSTS`             | Set to `0` to disable auto-sync of /etc/hosts (on by default)               |
+| `PORTLESS_TAILSCALE`              | Set to `1` to share apps on your Tailscale network (same as `--tailscale`)  |
+| `PORTLESS_TAILSCALE_SERVICE`      | Set to `1` to share apps as stable Tailscale Services                       |
+| `PORTLESS_TAILSCALE_SERVICE_NAME` | Use an explicit Tailscale Service name                                      |
+| `PORTLESS_FUNNEL`                 | Set to `1` to share apps publicly via Tailscale Funnel (same as `--funnel`) |
+| `PORTLESS_NGROK`                  | Set to `1` to share apps publicly via ngrok (same as `--ngrok`)             |
+| `PORTLESS_NETBIRD`                | Set to `1` to share apps publicly via NetBird (same as `--netbird`)         |
+| `PORTLESS_NETBIRD_PASSWORD`       | Require a password for the NetBird public URL                               |
+| `PORTLESS_NETBIRD_PIN`            | Require a PIN for the NetBird public URL                                    |
+| `PORTLESS_NETBIRD_GROUPS`         | Restrict the NetBird public URL to comma-separated user groups              |
+| `PORTLESS_STATE_DIR`              | Override the state directory                                                |
+| `PORTLESS=0`                      | Bypass the proxy, run the command directly                                  |
 
 ### HTTP/2 + HTTPS
 
@@ -256,21 +258,30 @@ LAN mode depends on the system mDNS helpers that portless launches: macOS includ
 
 ### Tailscale sharing
 
-Share dev servers with teammates on your Tailscale network using `--tailscale`, or expose to the public internet with `--funnel`:
+Share dev servers with teammates on your Tailscale network using `--tailscale`, give them stable Tailscale Service names with `--tailscale-service`, or expose to the public internet with `--funnel`:
 
 ```bash
 portless myapp --tailscale next dev
 # -> https://myapp.localhost           (local)
 # -> https://devbox.yourteam.ts.net    (tailnet)
 
+portless myapp --tailscale-service next dev
+# -> https://myapp.localhost           (local)
+# -> https://myapp.yourteam.ts.net     (tailnet service)
+
+portless myapp --tailscale-service --tailscale-service-name api next dev
+# -> https://api.yourteam.ts.net       (tailnet service)
+
 portless myapp --funnel next dev
 # -> https://myapp.localhost           (local)
 # -> https://devbox.yourteam.ts.net    (public internet)
 ```
 
-MagicDNS and Tailscale HTTPS certificates must be enabled before `--tailscale` or `--funnel` can register HTTPS URLs. Funnel must also be enabled for the tailnet and node before `--funnel` can register the public URL. If either setting is missing, portless exits before starting the child process.
+MagicDNS and Tailscale HTTPS certificates must be enabled before `--tailscale`, `--tailscale-service`, or `--funnel` can register HTTPS URLs. Funnel must also be enabled for the tailnet and node before `--funnel` can register the public URL. If either setting is missing, portless exits before starting the child process.
 
 Each `--tailscale` app is root-mounted on its own Tailscale HTTPS port (443, then 8443, 8444, etc.) so no framework `basePath` configuration is needed. Set `PORTLESS_TAILSCALE=1` to share every app by default. `portless list` shows both local and tailnet URLs. Tailscale serve registrations are cleaned up when the app exits. Requires `tailscale` CLI installed and connected, with MagicDNS and Tailscale HTTPS certificates enabled on the active tailnet.
+
+`--tailscale-service` is tailnet-scoped and does not imply public Funnel exposure. Tailscale Services require tagged device identity and may need admin approval before MagicDNS resolves. Portless records pending approval in `portless list`.
 
 ### ngrok sharing
 
@@ -326,58 +337,59 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 
 ## CLI Reference
 
-| Command                                | Description                                                    |
-| -------------------------------------- | -------------------------------------------------------------- |
-| `portless`                             | Run dev script through proxy                                   |
-| `portless`                             | From monorepo root: run all workspace packages                 |
-| `portless --script <name>`             | Run a specific package.json script (default: dev)              |
-| `portless run [cmd] [args...]`         | Infer name from project, run through proxy (auto-starts)       |
-| `portless run --name <name> <cmd>`     | Override inferred base name (worktree prefix still applies)    |
-| `portless <name> <cmd> [args...]`      | Run app at `https://<name>.localhost` (auto-starts proxy)      |
-| `portless get <name>`                  | Print URL for a service (for cross-service wiring)             |
-| `portless url <name>`                  | Alias for `portless get <name>`                                |
-| `portless get <name> --no-worktree`    | Print URL without worktree prefix                              |
-| `portless get <name> --json`           | Print service info as JSON                                     |
-| `portless list`                        | Show active routes                                             |
-| `portless ls`                          | Alias for `portless list`                                      |
-| `portless status`                      | Alias for `portless list`                                      |
-| `portless list --json`                 | Show active routes as JSON                                     |
-| `portless trust`                       | Add local CA to system trust store (for HTTPS)                 |
-| `portless clean`                       | Remove state, CA trust entry, and /etc/hosts block             |
-| `portless prune`                       | Kill orphaned dev servers from crashed sessions                |
-| `portless prune --force`               | Kill orphans with SIGKILL instead of SIGTERM                   |
-| `portless completion <shell>`          | Print shell completion script for bash, zsh, or fish           |
-| `portless proxy start`                 | Start HTTPS proxy as a daemon (port 443, auto-elevates)        |
-| `portless proxy start --no-tls`        | Start without HTTPS (plain HTTP on port 80)                    |
-| `portless proxy start --lan`           | Start in LAN mode (mDNS `.local`, auto-follows LAN IP changes) |
-| `portless proxy start -p <number>`     | Start the proxy on a custom port                               |
-| `portless proxy start --suffix test`   | Use .test instead of .localhost                                |
-| `portless proxy start --tld test`      | Compatibility alias for `--suffix`                             |
-| `portless proxy start --foreground`    | Start the proxy in foreground (for debugging)                  |
-| `portless proxy start --wildcard`      | Allow unregistered subdomains to fall back locally             |
-| `portless proxy stop`                  | Stop the proxy                                                 |
-| `portless service install`             | Start the HTTPS proxy when the OS starts                       |
-| `portless service install --lan`       | Start the service in LAN mode                                  |
-| `portless service install --wildcard`  | Persist wildcard routing in the startup service                |
-| `portless service status`              | Show service and proxy status                                  |
-| `portless service uninstall`           | Remove the startup service                                     |
-| `portless alias <name> <port>`         | Register a static route (e.g. for Docker containers)           |
-| `portless alias <name> <port> --force` | Overwrite an existing route                                    |
-| `portless alias --remove <name>`       | Remove a static route                                          |
-| `portless hosts sync`                  | Add routes to /etc/hosts (fixes Safari)                        |
-| `portless hosts clean`                 | Remove portless entries from /etc/hosts                        |
-| `portless <name> --app-port <n> <cmd>` | Use a fixed app port; browser-blocked ports are rejected       |
-| `portless <name> --tailscale <cmd>`    | Share the app on your Tailscale network (tailnet)              |
-| `portless <name> --funnel <cmd>`       | Share the app publicly via Tailscale Funnel                    |
-| `portless <name> --ngrok <cmd>`        | Share the app publicly via ngrok                               |
-| `portless <name> --netbird <cmd>`      | Share the app publicly via NetBird Peer Expose                 |
-| `portless <name> --force <cmd>`        | Kill the existing process and take over its route              |
-| `portless --name <name> <cmd>`         | Force `<name>` as app name (bypasses subcommand dispatch)      |
-| `portless <name> KEY=value <cmd>`      | Pass `KEY` only to the child command                           |
-| `portless <name> -- <cmd> [args...]`   | Stop flag parsing; everything after `--` is passed to child    |
-| `portless --help` / `-h`               | Show help                                                      |
-| `portless run --help`                  | Show help for a subcommand (also: alias, hosts, clean)         |
-| `portless --version` / `-v`            | Show version                                                   |
+| Command                                     | Description                                                    |
+| ------------------------------------------- | -------------------------------------------------------------- |
+| `portless`                                  | Run dev script through proxy                                   |
+| `portless`                                  | From monorepo root: run all workspace packages                 |
+| `portless --script <name>`                  | Run a specific package.json script (default: dev)              |
+| `portless run [cmd] [args...]`              | Infer name from project, run through proxy (auto-starts)       |
+| `portless run --name <name> <cmd>`          | Override inferred base name (worktree prefix still applies)    |
+| `portless <name> <cmd> [args...]`           | Run app at `https://<name>.localhost` (auto-starts proxy)      |
+| `portless get <name>`                       | Print URL for a service (for cross-service wiring)             |
+| `portless url <name>`                       | Alias for `portless get <name>`                                |
+| `portless get <name> --no-worktree`         | Print URL without worktree prefix                              |
+| `portless get <name> --json`                | Print service info as JSON                                     |
+| `portless list`                             | Show active routes                                             |
+| `portless ls`                               | Alias for `portless list`                                      |
+| `portless status`                           | Alias for `portless list`                                      |
+| `portless list --json`                      | Show active routes as JSON                                     |
+| `portless trust`                            | Add local CA to system trust store (for HTTPS)                 |
+| `portless clean`                            | Remove state, CA trust entry, and /etc/hosts block             |
+| `portless prune`                            | Kill orphaned dev servers from crashed sessions                |
+| `portless prune --force`                    | Kill orphans with SIGKILL instead of SIGTERM                   |
+| `portless completion <shell>`               | Print shell completion script for bash, zsh, or fish           |
+| `portless proxy start`                      | Start HTTPS proxy as a daemon (port 443, auto-elevates)        |
+| `portless proxy start --no-tls`             | Start without HTTPS (plain HTTP on port 80)                    |
+| `portless proxy start --lan`                | Start in LAN mode (mDNS `.local`, auto-follows LAN IP changes) |
+| `portless proxy start -p <number>`          | Start the proxy on a custom port                               |
+| `portless proxy start --suffix test`        | Use .test instead of .localhost                                |
+| `portless proxy start --tld test`           | Compatibility alias for `--suffix`                             |
+| `portless proxy start --foreground`         | Start the proxy in foreground (for debugging)                  |
+| `portless proxy start --wildcard`           | Allow unregistered subdomains to fall back locally             |
+| `portless proxy stop`                       | Stop the proxy                                                 |
+| `portless service install`                  | Start the HTTPS proxy when the OS starts                       |
+| `portless service install --lan`            | Start the service in LAN mode                                  |
+| `portless service install --wildcard`       | Persist wildcard routing in the startup service                |
+| `portless service status`                   | Show service and proxy status                                  |
+| `portless service uninstall`                | Remove the startup service                                     |
+| `portless alias <name> <port>`              | Register a static route (e.g. for Docker containers)           |
+| `portless alias <name> <port> --force`      | Overwrite an existing route                                    |
+| `portless alias --remove <name>`            | Remove a static route                                          |
+| `portless hosts sync`                       | Add routes to /etc/hosts (fixes Safari)                        |
+| `portless hosts clean`                      | Remove portless entries from /etc/hosts                        |
+| `portless <name> --app-port <n> <cmd>`      | Use a fixed app port; browser-blocked ports are rejected       |
+| `portless <name> --tailscale <cmd>`         | Share the app on your Tailscale network (tailnet)              |
+| `portless <name> --tailscale-service <cmd>` | Share the app as a stable Tailscale Service                    |
+| `portless <name> --funnel <cmd>`            | Share the app publicly via Tailscale Funnel                    |
+| `portless <name> --ngrok <cmd>`             | Share the app publicly via ngrok                               |
+| `portless <name> --netbird <cmd>`           | Share the app publicly via NetBird Peer Expose                 |
+| `portless <name> --force <cmd>`             | Kill the existing process and take over its route              |
+| `portless --name <name> <cmd>`              | Force `<name>` as app name (bypasses subcommand dispatch)      |
+| `portless <name> KEY=value <cmd>`           | Pass `KEY` only to the child command                           |
+| `portless <name> -- <cmd> [args...]`        | Stop flag parsing; everything after `--` is passed to child    |
+| `portless --help` / `-h`                    | Show help                                                      |
+| `portless run --help`                       | Show help for a subcommand (also: alias, hosts, clean)         |
+| `portless --version` / `-v`                 | Show version                                                   |
 
 **Reserved names:** `run`, `get`, `url`, `alias`, `hosts`, `list`, `ls`, `status`, `trust`, `clean`, `prune`, `proxy`, `service`, and `completion` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name, or `portless --name <name> <cmd>` to force any name including reserved ones.
 
@@ -546,14 +558,14 @@ Portless automatically sets `NODE_EXTRA_CA_CERTS` in child processes so Node.js 
 
 ### Tailscale not working
 
-If `--tailscale` or `--funnel` fails:
+If `--tailscale`, `--tailscale-service`, or `--funnel` fails:
 
 ```bash
 tailscale status     # Check if connected
 tailscale up         # Connect to your tailnet
 ```
 
-Requires the Tailscale CLI to be installed (https://tailscale.com/download) and on PATH, with MagicDNS and Tailscale HTTPS certificates enabled on the active tailnet.
+Requires the Tailscale CLI to be installed (https://tailscale.com/download) and on PATH, with MagicDNS and Tailscale HTTPS certificates enabled on the active tailnet. Tailscale Service mode also requires a tagged device identity and may need admin approval before the service URL resolves.
 
 ### ngrok not working
 
@@ -582,6 +594,6 @@ Requires the NetBird CLI to be installed (https://netbird.io/download), connecte
 - Node.js 24+
 - macOS, Linux, or Windows
 - `openssl` (for `--https` cert generation; ships with macOS and most Linux distributions; on Windows, install via `winget install -e --id ShiningLight.OpenSSL.Dev` or use the copy bundled with Git for Windows)
-- `tailscale` CLI (optional, for `--tailscale` and `--funnel`)
+- `tailscale` CLI (optional, for `--tailscale`, `--tailscale-service`, and `--funnel`)
 - `ngrok` CLI (optional, for `--ngrok`)
 - `netbird` CLI (optional, for `--netbird`)

@@ -353,6 +353,18 @@ portless myapp --tailscale next dev     # -> https://devbox.ts.net
 portless api --tailscale bun start     # -> https://devbox.ts.net:8443
 ```
 
+Use `--tailscale-service` for a stable [Tailscale Service](https://tailscale.com/docs/features/tailscale-services) MagicDNS name:
+
+```bash
+portless myapp --tailscale-service next dev
+# -> https://myapp.yourteam.ts.net
+
+portless myapp --tailscale-service --tailscale-service-name api next dev
+# -> https://api.yourteam.ts.net
+```
+
+Tailscale Services are tailnet-scoped and do not imply Tailscale Funnel. They require a tagged device identity and may need admin approval before MagicDNS resolves. Portless records pending approval in `portless list` instead of claiming the URL is reachable.
+
 Use `--funnel` to expose your dev server to the public internet via [Tailscale Funnel](https://tailscale.com/kb/1223/funnel/):
 
 ```bash
@@ -360,7 +372,7 @@ portless myapp --funnel next dev
 # -> https://devbox.yourteam.ts.net    (public)
 ```
 
-Tailscale HTTPS certificates must be enabled before `--tailscale` or `--funnel` can register HTTPS URLs. Funnel must also be enabled for the tailnet and node before `--funnel` can register the public URL. If either setting is missing, portless exits before starting the child process.
+Tailscale HTTPS certificates must be enabled before `--tailscale`, `--tailscale-service`, or `--funnel` can register HTTPS URLs. Funnel must also be enabled for the tailnet and node before `--funnel` can register the public URL. If either setting is missing, portless exits before starting the child process.
 
 Set `PORTLESS_TAILSCALE=1` in your shell profile or `.env` to share every app by default. `portless list` shows both local and tailnet URLs. Tailscale serve registrations are cleaned up automatically when the app exits.
 
@@ -471,6 +483,8 @@ portless service uninstall       # Remove the startup service
 --script <name>                  Run a specific package.json script (default: dev)
 --app-port <number>              Use a fixed app port; browser-blocked ports are rejected
 --tailscale                      Share the app on your Tailscale network (tailnet)
+--tailscale-service              Share the app as a stable Tailscale Service
+--tailscale-service-name <name>  Use an explicit Tailscale Service name
 --funnel                         Share the app publicly via Tailscale Funnel
 --ngrok                          Share the app publicly via ngrok
 --netbird                        Share the app publicly via NetBird Peer Expose
@@ -495,6 +509,9 @@ PORTLESS_TLD=<tld>               Compatibility alias for PORTLESS_SUFFIX
 PORTLESS_WILDCARD=1              Allow unregistered subdomains to fall back to parent route
 PORTLESS_SYNC_HOSTS=0            Disable auto-sync of /etc/hosts (on by default)
 PORTLESS_TAILSCALE=1             Share apps on your Tailscale network (same as --tailscale)
+PORTLESS_TAILSCALE_SERVICE=1     Share apps as Tailscale Services
+PORTLESS_TAILSCALE_SERVICE_NAME=<name>
+                                  Use an explicit Tailscale Service name
 PORTLESS_FUNNEL=1                Share apps publicly via Tailscale Funnel (same as --funnel)
 PORTLESS_NGROK=1                 Share apps publicly via ngrok (same as --ngrok)
 PORTLESS_NETBIRD=1               Share apps publicly via NetBird (same as --netbird)
@@ -509,6 +526,7 @@ PORT                             Ephemeral port the child should listen on
 HOST                             Usually 127.0.0.1 (omitted for Expo in LAN mode)
 PORTLESS_URL                     Public URL (e.g. https://myapp.localhost)
 PORTLESS_TAILSCALE_URL           Tailscale URL of the app (when --tailscale is active)
+PORTLESS_TAILSCALE_SERVICE_URL   Tailscale Service URL of the app
 PORTLESS_NGROK_URL               ngrok URL of the app (when --ngrok is active)
 PORTLESS_NETBIRD_URL             NetBird URL of the app (when --netbird is active)
 NODE_EXTRA_CA_CERTS              Path to the portless CA (when HTTPS is active)

@@ -18,9 +18,11 @@ import {
   findAvailableServePort,
   formatTailscaleUrl,
   getUsedServePorts,
+  registerService,
   registerFunnel,
   registerServe,
   unregisterTailscale,
+  buildTailscaleServiceName,
 } from "./tailscale.js";
 import { ensureNgrokAvailable, startNgrok, stopNgrok, stopNgrokProcess } from "./ngrok.js";
 import {
@@ -891,6 +893,16 @@ function listRoutes(store: RouteStore, proxyPort: number, tls: boolean, asJson =
       target_port: route.port,
       pid: route.pid,
       kind: route.pid === 0 ? "alias" : "app",
+      ...(route.tailscaleUrl ? { tailscale_url: route.tailscaleUrl } : {}),
+      ...(route.tailscaleServiceUrl
+        ? {
+            tailscale_service_url: route.tailscaleServiceUrl,
+            tailscale_service_name: route.tailscaleServiceName,
+            tailscale_service_pending: !!route.tailscaleServicePending,
+          }
+        : {}),
+      ...(route.ngrokUrl ? { ngrok_url: route.ngrokUrl } : {}),
+      ...(route.netbirdUrl ? { netbird_url: route.netbirdUrl } : {}),
     }));
     process.stdout.write(JSON.stringify(payload, null, 2) + "\n");
     return;
@@ -912,6 +924,12 @@ function listRoutes(store: RouteStore, proxyPort: number, tls: boolean, asJson =
     if (route.tailscaleUrl) {
       const tsLabel = route.tailscaleFunnel ? "funnel" : "tailscale";
       console.log(`    ${colors.gray(tsLabel + ":")} ${colors.green(route.tailscaleUrl)}`);
+    }
+    if (route.tailscaleServiceUrl) {
+      const pending = route.tailscaleServicePending ? " (pending admin approval)" : "";
+      console.log(
+        `    ${colors.gray("tailscale service:")} ${colors.green(route.tailscaleServiceUrl)}${colors.yellow(pending)}`
+      );
     }
     if (route.ngrokUrl) {
       console.log(`    ${colors.gray("ngrok:")} ${colors.green(route.ngrokUrl)}`);
@@ -1091,10 +1109,23 @@ async function runApp(
   // Check tailscale readiness early, before auto-starting the proxy.
   // No point starting the proxy if tailscale will fail afterward.
   const wantsFunnel = isEnabledEnv(process.env.PORTLESS_FUNNEL);
-  const wantsTailscale = wantsFunnel || isEnabledEnv(process.env.PORTLESS_TAILSCALE);
+  const wantsTailscaleService =
+    isEnabledEnv(process.env.PORTLESS_TAILSCALE_SERVICE) ||
+    !!process.env.PORTLESS_TAILSCALE_SERVICE_NAME;
+  const wantsPlainTailscale = isEnabledEnv(process.env.PORTLESS_TAILSCALE);
+  if (wantsTailscaleService && wantsFunnel) {
+    console.error(colors.red("Error: --tailscale-service cannot be combined with --funnel."));
+    process.exit(1);
+  }
+  if (wantsTailscaleService && wantsPlainTailscale) {
+    console.error(colors.red("Error: --tailscale-service cannot be combined with --tailscale."));
+    process.exit(1);
+  }
+  const wantsTailscale = wantsFunnel || wantsPlainTailscale || wantsTailscaleService;
   const wantsNgrok = isEnabledEnv(process.env.PORTLESS_NGROK);
   const wantsNetbird = isEnabledEnv(process.env.PORTLESS_NETBIRD) || hasNetbirdConfigEnv();
   let tsBaseUrl: string | undefined;
+  let tsTailnetDnsSuffix: string | undefined;
 
   if (wantsTailscale) {
     try {
@@ -1103,6 +1134,7 @@ async function runApp(
         requireHttps: true,
       });
       tsBaseUrl = tsReady.baseUrl;
+      tsTailnetDnsSuffix = tsReady.tailnetDnsSuffix;
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(colors.red(`Error: ${message}`));
@@ -1245,6 +1277,9 @@ async function runApp(
   // Readiness was already checked at the top of runApp().
   let tailscaleHttpsPort: number | undefined;
   let tailscaleUrl: string | undefined;
+  let tailscaleServiceName: string | undefined;
+  let tailscaleServiceUrl: string | undefined;
+  let tailscaleServicePending: boolean | undefined;
   let netbirdUrl: string | undefined;
   let netbirdProcess: Awaited<ReturnType<typeof startNetbirdExpose>> | undefined;
   let ngrokUrl: string | undefined;
@@ -1310,7 +1345,40 @@ async function runApp(
     }
   };
 
-  if (wantsTailscale && tsBaseUrl) {
+  if (wantsTailscaleService && tsTailnetDnsSuffix) {
+    tailscaleServiceName = buildTailscaleServiceName(
+      process.env.PORTLESS_TAILSCALE_SERVICE_NAME || name
+    );
+    try {
+      const service = registerService(port, tailscaleServiceName, tsTailnetDnsSuffix);
+      tailscaleServiceName = service.serviceName;
+      tailscaleServiceUrl = service.serviceUrl;
+      tailscaleServicePending = service.pendingApproval;
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(colors.red(`Error: ${message}`));
+      try {
+        store.removeRoute(hostname, process.pid);
+      } catch {
+        // Best-effort cleanup; non-fatal
+      }
+      process.exit(1);
+    }
+
+    const pending = tailscaleServicePending ? " (pending admin approval)" : "";
+    console.log(chalk.green(`  Tailscale Service -> ${tailscaleServiceUrl}${pending}`));
+    console.log(chalk.gray("  (accessible from your tailnet after service approval)\n"));
+
+    try {
+      store.updateRoute(hostname, {
+        tailscaleServiceName,
+        tailscaleServiceUrl,
+        tailscaleServicePending,
+      });
+    } catch {
+      // Non-fatal: route display metadata only
+    }
+  } else if (wantsTailscale && tsBaseUrl) {
     const maxAttempts = 3;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const usedPorts = getUsedServePorts();
@@ -1406,6 +1474,7 @@ async function runApp(
         unregisterTailscale({
           tailscaleHttpsPort,
           tailscaleFunnel: wantsFunnel || undefined,
+          tailscaleServiceName,
         });
       } catch {
         // Best-effort cleanup; non-fatal
@@ -1458,6 +1527,7 @@ async function runApp(
         unregisterTailscale({
           tailscaleHttpsPort,
           tailscaleFunnel: wantsFunnel || undefined,
+          tailscaleServiceName,
         });
       } catch {
         // Best-effort cleanup; non-fatal
@@ -1540,6 +1610,7 @@ async function runApp(
       // own LAN discovery natively.
       ...(lanMode ? { PORTLESS_LAN: "1" } : {}),
       ...(tailscaleUrl ? { PORTLESS_TAILSCALE_URL: tailscaleUrl } : {}),
+      ...(tailscaleServiceUrl ? { PORTLESS_TAILSCALE_SERVICE_URL: tailscaleServiceUrl } : {}),
       ...(ngrokUrl ? { PORTLESS_NGROK_URL: ngrokUrl } : {}),
       ...(netbirdUrl ? { PORTLESS_NETBIRD_URL: netbirdUrl } : {}),
       ...caEnv,
@@ -1553,6 +1624,7 @@ async function runApp(
         unregisterTailscale({
           tailscaleHttpsPort,
           tailscaleFunnel: wantsFunnel || undefined,
+          tailscaleServiceName,
         });
       } catch {
         // Best-effort cleanup; non-fatal
@@ -1652,9 +1724,17 @@ const NETBIRD_VALUE_FLAGS: ReadonlyMap<string, string> = new Map([
   ["--netbird-groups", "PORTLESS_NETBIRD_GROUPS"],
 ] as const);
 
+const TAILSCALE_SERVICE_VALUE_FLAGS: ReadonlyMap<string, string> = new Map([
+  ["--tailscale-service-name", "PORTLESS_TAILSCALE_SERVICE_NAME"],
+] as const);
+
 function applySharingFlag(flag: string): boolean {
   if (flag === "--tailscale") {
     process.env.PORTLESS_TAILSCALE = "1";
+    return true;
+  }
+  if (flag === "--tailscale-service") {
+    process.env.PORTLESS_TAILSCALE_SERVICE = "1";
     return true;
   }
   if (flag === "--funnel") {
@@ -1671,6 +1751,19 @@ function applySharingFlag(flag: string): boolean {
     return true;
   }
   return false;
+}
+
+function applyTailscaleServiceValueFlag(args: string[], index: number): number | null {
+  const envKey = TAILSCALE_SERVICE_VALUE_FLAGS.get(args[index]);
+  if (!envKey) return null;
+  const value = args[index + 1];
+  if (!value || value.startsWith("-")) {
+    console.error(colors.red(`Error: ${args[index]} requires a value.`));
+    process.exit(1);
+  }
+  process.env.PORTLESS_TAILSCALE_SERVICE = "1";
+  process.env[envKey] = value;
+  return index + 1;
 }
 
 function applyNetbirdValueFlag(args: string[], index: number): number | null {
@@ -1751,6 +1844,9 @@ ${colors.bold("Options:")}
   --force                Kill the existing process and take over its route
   --app-port <number>    Use a fixed app port; browser-blocked ports are rejected
   --tailscale            Share the app on your Tailscale network (tailnet)
+  --tailscale-service    Share the app as a stable Tailscale Service
+  --tailscale-service-name <name>
+                         Use an explicit Tailscale Service name
   --funnel               Share the app publicly via Tailscale Funnel
   --ngrok                Share the app publicly via ngrok
   --netbird              Share the app publicly via NetBird Peer Expose
@@ -1804,14 +1900,15 @@ ${colors.bold("Examples:")}
     } else if (applySharingFlag(args[i])) {
       // handled
     } else {
-      const consumedIndex = applyNetbirdValueFlag(args, i);
+      const consumedIndex =
+        applyTailscaleServiceValueFlag(args, i) ?? applyNetbirdValueFlag(args, i);
       if (consumedIndex !== null) {
         i = consumedIndex;
       } else {
         console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
         console.error(
           colors.blue(
-            "Known flags: --name, --force, --app-port, --tailscale, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups, --help"
+            "Known flags: --name, --force, --app-port, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups, --help"
           )
         );
         process.exit(1);
@@ -1858,14 +1955,15 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
     } else if (applySharingFlag(args[i])) {
       // handled
     } else {
-      const consumedIndex = applyNetbirdValueFlag(args, i);
+      const consumedIndex =
+        applyTailscaleServiceValueFlag(args, i) ?? applyNetbirdValueFlag(args, i);
       if (consumedIndex !== null) {
         i = consumedIndex;
       } else {
         console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
         console.error(
           colors.blue(
-            "Known flags: --force, --app-port, --tailscale, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups"
+            "Known flags: --force, --app-port, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups"
           )
         );
         process.exit(1);
@@ -1894,14 +1992,15 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
     } else if (applySharingFlag(args[i])) {
       // handled
     } else {
-      const consumedIndex = applyNetbirdValueFlag(args, i);
+      const consumedIndex =
+        applyTailscaleServiceValueFlag(args, i) ?? applyNetbirdValueFlag(args, i);
       if (consumedIndex !== null) {
         i = consumedIndex;
       } else {
         console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
         console.error(
           colors.blue(
-            "Known flags: --force, --app-port, --tailscale, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups"
+            "Known flags: --force, --app-port, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups"
           )
         );
         process.exit(1);
@@ -1974,6 +2073,12 @@ const GLOBAL_COMPLETION_FLAGS: CompletionFlag[] = [
   { name: "--state-dir", description: "Use a custom state directory", value: "path" },
   { name: "--app-port", description: "Use a fixed app port", value: "port" },
   { name: "--tailscale", description: "Share on Tailscale" },
+  { name: "--tailscale-service", description: "Share as a Tailscale Service" },
+  {
+    name: "--tailscale-service-name",
+    description: "Use an explicit Tailscale Service name",
+    value: "name",
+  },
   { name: "--funnel", description: "Share publicly via Tailscale Funnel" },
   { name: "--ngrok", description: "Share publicly via ngrok" },
   { name: "--netbird", description: "Share publicly via NetBird Peer Expose" },
@@ -1990,6 +2095,8 @@ const RUN_COMPLETION_FLAGS = GLOBAL_COMPLETION_FLAGS.filter((flag) =>
     "--force",
     "--app-port",
     "--tailscale",
+    "--tailscale-service",
+    "--tailscale-service-name",
     "--funnel",
     "--ngrok",
     "--netbird",
@@ -2004,6 +2111,8 @@ const APP_COMPLETION_FLAGS = GLOBAL_COMPLETION_FLAGS.filter((flag) =>
     "--force",
     "--app-port",
     "--tailscale",
+    "--tailscale-service",
+    "--tailscale-service-name",
     "--funnel",
     "--ngrok",
     "--netbird",
@@ -2346,6 +2455,8 @@ ${colors.bold("Examples:")}
   portless url backend                # Alias for get
   portless myapp API_URL=1 next dev   # Pass API_URL only to the child command
   portless myapp --tailscale next dev # -> also https://<node>.ts.net (tailnet)
+  portless myapp --tailscale-service next dev
+                                     # -> also https://<service>.<tailnet>.ts.net
   portless myapp --funnel next dev    # -> also https://<node>.ts.net (public)
   portless myapp --ngrok next dev     # -> also https://<random>.ngrok.app (public)
   portless myapp --netbird next dev   # -> also https://<name>.netbird.cloud (public)
@@ -2404,11 +2515,16 @@ ${colors.bold("Tailscale sharing:")}
   Use --tailscale to share your dev server with teammates on your tailnet.
   Each app is root-mounted on its own Tailscale HTTPS port (443, then 8443,
   8444, etc.) so no basePath configuration is needed.
+  Use --tailscale-service for a stable Tailscale Service MagicDNS name.
+  Tailscale Services require tagged device identity and may need admin approval
+  before the service name resolves.
   Use --funnel to expose your dev server to the public internet via
   Tailscale Funnel. Requires Tailscale CLI to be installed and connected,
   with MagicDNS and Tailscale HTTPS certificates enabled on the active tailnet.
   Funnel must also be enabled on your tailnet.
   ${colors.cyan("portless myapp --tailscale next dev")}
+  ${colors.cyan("portless myapp --tailscale-service next dev")}
+  ${colors.cyan("portless myapp --tailscale-service --tailscale-service-name api next dev")}
   ${colors.cyan("portless myapp --funnel next dev")}
 
 ${colors.bold("ngrok sharing:")}
@@ -2446,6 +2562,8 @@ ${colors.bold("Options:")}
   --state-dir <path>            Use a custom state directory with service install
   --app-port <number>           Use a fixed app port; browser-blocked ports are rejected
   --tailscale                   Share the app on your Tailscale network (tailnet)
+  --tailscale-service           Share the app as a stable Tailscale Service
+  --tailscale-service-name <n>  Use an explicit Tailscale Service name
   --funnel                      Share the app publicly via Tailscale Funnel
   --ngrok                       Share the app publicly via ngrok
   --netbird                     Share the app publicly via NetBird Peer Expose
@@ -2468,6 +2586,9 @@ ${colors.bold("Environment variables:")}
                                 Local proxy mode only; mDNS LAN mode cannot resolve wildcards
   PORTLESS_SYNC_HOSTS=0         Disable auto-sync of ${HOSTS_DISPLAY} (on by default)
   PORTLESS_TAILSCALE=1          Share apps on your Tailscale network (same as --tailscale)
+  PORTLESS_TAILSCALE_SERVICE=1  Share apps as Tailscale Services
+  PORTLESS_TAILSCALE_SERVICE_NAME=<n>
+                                Use an explicit Tailscale Service name
   PORTLESS_FUNNEL=1             Share apps publicly via Tailscale Funnel (same as --funnel)
   PORTLESS_NGROK=1              Share apps publicly via ngrok (same as --ngrok)
   PORTLESS_NETBIRD=1            Share apps publicly via NetBird (same as --netbird)
@@ -2485,6 +2606,8 @@ ${colors.bold("Child process environment:")}
   PORTLESS_URL                  Public URL of the app (e.g. https://myapp.localhost)
   PORTLESS_LAN                  Set to 1 when proxy is in LAN mode
   PORTLESS_TAILSCALE_URL        Tailscale URL of the app (when --tailscale is active)
+  PORTLESS_TAILSCALE_SERVICE_URL
+                                Tailscale Service URL of the app
   PORTLESS_NGROK_URL            ngrok URL of the app (when --ngrok is active)
   PORTLESS_NETBIRD_URL          NetBird URL of the app (when --netbird is active)
   NODE_EXTRA_CA_CERTS           Path to the portless CA (set when HTTPS is active)
@@ -2633,13 +2756,16 @@ ${colors.bold("Options:")}
   });
   await stopProxy(store, port, tls);
 
-  // Clean up any tailscale serve/funnel registrations tied to stale routes
+  // Clean up any tailscale serve/funnel/service registrations tied to stale routes
   const routesForClean = store.loadRoutesRaw();
   for (const route of routesForClean) {
-    if (route.tailscaleHttpsPort) {
+    if (route.tailscaleHttpsPort || route.tailscaleServiceName) {
       try {
         unregisterTailscale(route);
-        console.log(colors.green(`Removed tailscale serve on port ${route.tailscaleHttpsPort}.`));
+        const label = route.tailscaleServiceName
+          ? `service ${route.tailscaleServiceName}`
+          : `serve on port ${route.tailscaleHttpsPort}`;
+        console.log(colors.green(`Removed tailscale ${label}.`));
       } catch {
         // Tailscale may not be installed; non-fatal
       }
@@ -2731,12 +2857,13 @@ ${colors.bold("Options:")}
   }
 
   for (const route of stale) {
-    if (route.tailscaleHttpsPort) {
+    if (route.tailscaleHttpsPort || route.tailscaleServiceName) {
       try {
         unregisterTailscale(route);
-        console.log(
-          `  ${route.hostname} - removed tailscale serve on port ${route.tailscaleHttpsPort}`
-        );
+        const label = route.tailscaleServiceName
+          ? `service ${route.tailscaleServiceName}`
+          : `serve on port ${route.tailscaleHttpsPort}`;
+        console.log(`  ${route.hostname} - removed tailscale ${label}`);
       } catch {
         // Tailscale CLI may not be installed; non-fatal during prune
       }
@@ -4494,6 +4621,9 @@ async function main() {
   if (stripGlobalFlag("--tailscale", false)) {
     process.env.PORTLESS_TAILSCALE = "1";
   }
+  if (stripGlobalFlag("--tailscale-service", false)) {
+    process.env.PORTLESS_TAILSCALE_SERVICE = "1";
+  }
   if (stripGlobalFlag("--funnel", false)) {
     process.env.PORTLESS_FUNNEL = "1";
     process.env.PORTLESS_TAILSCALE = "1";
@@ -4503,6 +4633,17 @@ async function main() {
   }
   if (stripGlobalFlag("--netbird", false)) {
     process.env.PORTLESS_NETBIRD = "1";
+  }
+  for (const [flag, envKey] of TAILSCALE_SERVICE_VALUE_FLAGS) {
+    const value = stripGlobalFlag(flag, true);
+    if (value === false) {
+      console.error(colors.red(`Error: ${flag} requires a value.`));
+      process.exit(1);
+    }
+    if (typeof value === "string") {
+      process.env.PORTLESS_TAILSCALE_SERVICE = "1";
+      process.env[envKey] = value;
+    }
   }
   for (const [flag, envKey] of NETBIRD_VALUE_FLAGS) {
     const value = stripGlobalFlag(flag, true);

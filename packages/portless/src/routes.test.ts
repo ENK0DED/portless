@@ -455,12 +455,39 @@ describe("RouteStore", () => {
       expect(routes[0].tailscaleFunnel).toBe(true);
     });
 
+    it("persists and clears Tailscale Service metadata via updateRoute", () => {
+      store.addRoute("api.localhost", 4456, process.pid);
+      store.updateRoute("api.localhost", {
+        tailscaleServiceName: "api",
+        tailscaleServiceUrl: "https://api.example.ts.net",
+        tailscaleServicePending: true,
+      });
+
+      let routes = store.loadRoutes();
+      expect(routes).toHaveLength(1);
+      expect(routes[0].tailscaleServiceName).toBe("api");
+      expect(routes[0].tailscaleServiceUrl).toBe("https://api.example.ts.net");
+      expect(routes[0].tailscaleServicePending).toBe(true);
+
+      store.updateRoute("api.localhost", {
+        tailscaleServiceName: null,
+        tailscaleServiceUrl: null,
+        tailscaleServicePending: null,
+      });
+
+      routes = store.loadRoutes();
+      expect(routes[0].tailscaleServiceName).toBeUndefined();
+      expect(routes[0].tailscaleServiceUrl).toBeUndefined();
+      expect(routes[0].tailscaleServicePending).toBeUndefined();
+    });
+
     it("loads routes without tailscale fields (backward compat)", () => {
       store.addRoute("legacy.localhost", 4000, process.pid);
       const routes = store.loadRoutes();
       expect(routes).toHaveLength(1);
       expect(routes[0].tailscaleUrl).toBeUndefined();
       expect(routes[0].tailscaleHttpsPort).toBeUndefined();
+      expect(routes[0].tailscaleServiceName).toBeUndefined();
     });
 
     it("updateRoute is a no-op for nonexistent hostname", () => {

@@ -2245,8 +2245,10 @@ describe("CLI", () => {
       const { status, stdout } = run(["--help"]);
       expect(status).toBe(0);
       expect(stdout).toContain("--tailscale");
+      expect(stdout).toContain("--tailscale-service");
       expect(stdout).toContain("--funnel");
       expect(stdout).toContain("PORTLESS_TAILSCALE");
+      expect(stdout).toContain("PORTLESS_TAILSCALE_SERVICE");
       expect(stdout).toContain("MagicDNS");
       expect(stdout).toContain("HTTPS certificates");
     });
@@ -2275,10 +2277,29 @@ describe("CLI", () => {
       expect(stderr).toContain("Tailscale");
     });
 
+    it("accepts PORTLESS_TAILSCALE_SERVICE=1 env var", () => {
+      const { status, stderr } = run(["myapp", "echo", "hello"], {
+        env: { PORTLESS_TAILSCALE_SERVICE: "1", PATH: "/tmp/portless-no-ts-path" },
+      });
+      expect(status).toBe(1);
+      expect(stderr).toContain("Tailscale");
+    });
+
     it("accepts --tailscale after app name", () => {
       const { status, stderr } = run(["myapp", "--tailscale", "echo", "hello"], {
         env: { PATH: "/tmp/portless-no-ts-path" },
       });
+      expect(status).toBe(1);
+      expect(stderr).toContain("Tailscale");
+    });
+
+    it("accepts --tailscale-service and explicit service name after app name", () => {
+      const { status, stderr } = run(
+        ["myapp", "--tailscale-service", "--tailscale-service-name", "api", "echo", "hello"],
+        {
+          env: { PATH: "/tmp/portless-no-ts-path" },
+        }
+      );
       expect(status).toBe(1);
       expect(stderr).toContain("Tailscale");
     });
@@ -2296,6 +2317,27 @@ describe("CLI", () => {
       } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true });
       }
+    });
+
+    it("accepts --tailscale-service in run subcommand", () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-cli-ts-service-run-"));
+      try {
+        fs.writeFileSync(path.join(tmpDir, "package.json"), JSON.stringify({ name: "test-app" }));
+        const { status, stderr } = run(["run", "--tailscale-service", "echo", "hello"], {
+          cwd: tmpDir,
+          env: { PATH: "/tmp/portless-no-ts-path" },
+        });
+        expect(status).toBe(1);
+        expect(stderr).toContain("Tailscale");
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it("rejects combining --tailscale-service with --funnel", () => {
+      const { status, stderr } = run(["--tailscale-service", "--funnel", "myapp", "echo", "ok"]);
+      expect(status).toBe(1);
+      expect(stderr).toContain("--tailscale-service cannot be combined with --funnel");
     });
   });
 

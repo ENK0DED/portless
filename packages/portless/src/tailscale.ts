@@ -39,6 +39,7 @@ interface TailscaleStatusJson {
 export interface TailscaleReadyResult {
   dnsName: string;
   baseUrl: string;
+  tailnetDnsSuffix: string;
 }
 
 export interface EnsureTailscaleReadyOptions {
@@ -121,6 +122,20 @@ function statusToDnsName(status: TailscaleStatusJson): string {
   );
 }
 
+function statusToTailnetDnsSuffix(status: TailscaleStatusJson, dnsName: string): string {
+  const suffix = status.CurrentTailnet?.MagicDNSSuffix;
+  if (typeof suffix === "string" && suffix.length > 0) {
+    return trimDot(suffix);
+  }
+  const parts = dnsName.split(".");
+  if (parts.length > 1) {
+    return parts.slice(1).join(".");
+  }
+  throw new Error(
+    "Could not determine Tailscale tailnet DNS suffix from `tailscale status --json`."
+  );
+}
+
 function isFunnelCapability(value: string): boolean {
   const normalized = value.toLowerCase();
   return normalized === "funnel" || normalized.endsWith("/funnel");
@@ -184,6 +199,7 @@ export function ensureTailscaleReady(
   const statusResult = runOrThrow(["status", "--json"], "read tailscale status", runner);
   const status = parseStatusJson(statusResult.stdout);
   const dnsName = statusToDnsName(status);
+  const tailnetDnsSuffix = statusToTailnetDnsSuffix(status, dnsName);
   if (options.requireHttps && !hasHttpsCapability(status)) {
     throwHttpsNotEnabled();
   }
@@ -193,6 +209,7 @@ export function ensureTailscaleReady(
   return {
     dnsName,
     baseUrl: `https://${dnsName}`,
+    tailnetDnsSuffix,
   };
 }
 
@@ -301,6 +318,12 @@ export interface RegisterServeOptions {
   runner?: TailscaleCommandRunner;
 }
 
+export interface TailscaleServiceRegistration {
+  serviceName: string;
+  serviceUrl: string;
+  pendingApproval: boolean;
+}
+
 const CONFLICT_MESSAGES: Record<TailscaleMode, string> = {
   serve: "Stop the existing serve or let portless auto-assign a different port.",
   funnel: "Tailscale Funnel supports ports 443, 8443, and 10000.",
@@ -405,17 +428,119 @@ export function unregisterFunnel(
   unregister("funnel", httpsPort, options);
 }
 
+export function buildTailscaleServiceName(appName: string): string {
+  const normalized = appName
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 63)
+    .replace(/-+$/g, "");
+  return normalized || "portless";
+}
+
+function normalizeServiceUrl(url: string): string {
+  const trimmed = url.trim().replace(/\/+$/, "");
+  return trimmed.endsWith(":443") ? trimmed.slice(0, -4) : trimmed;
+}
+
+function extractServiceUrl(stdout: string): string | undefined {
+  const match = stdout.match(/https:\/\/[^\s/]+(?::443)?\/?/);
+  return match ? normalizeServiceUrl(match[0]) : undefined;
+}
+
+function isPendingServiceApproval(stdout: string, stderr = ""): boolean {
+  const text = `${stdout}\n${stderr}`.toLowerCase();
+  return text.includes("approval") || text.includes("pending");
+}
+
+export function registerService(
+  localPort: number,
+  serviceName: string,
+  tailnetDnsSuffix: string,
+  options?: RegisterServeOptions
+): TailscaleServiceRegistration {
+  const runner = options?.runner ?? defaultRunner;
+  const normalizedName = buildTailscaleServiceName(serviceName);
+  const target = `http://127.0.0.1:${localPort}`;
+  const result = runner([
+    "serve",
+    "--yes",
+    `--service=svc:${normalizedName}`,
+    "--https=443",
+    target,
+  ]);
+  if (result.error) {
+    const errno = result.error as NodeJS.ErrnoException;
+    if (errno.code === "ENOENT") {
+      throw new Error(
+        "Tailscale CLI not found. Install Tailscale (https://tailscale.com/download) and ensure `tailscale` is on PATH."
+      );
+    }
+    throw new Error(`Failed to register tailscale service: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    const details = normalizeSpace(result.stderr || result.stdout);
+    throw new Error(
+      `Failed to register tailscale service: ${details || "unknown tailscale error"}`
+    );
+  }
+
+  return {
+    serviceName: normalizedName,
+    serviceUrl: extractServiceUrl(result.stdout) ?? `https://${normalizedName}.${tailnetDnsSuffix}`,
+    pendingApproval: isPendingServiceApproval(result.stdout, result.stderr),
+  };
+}
+
+export function unregisterService(
+  serviceName: string,
+  options?: { ignoreMissing?: boolean; runner?: TailscaleCommandRunner }
+): void {
+  const runner = options?.runner ?? defaultRunner;
+  const normalizedName = buildTailscaleServiceName(serviceName);
+  const result = runner(["serve", "clear", `svc:${normalizedName}`]);
+  if (result.error) {
+    const errno = result.error as NodeJS.ErrnoException;
+    if (errno.code === "ENOENT") return;
+    throw new Error(`Failed to remove tailscale service: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    const text = `${result.stderr}\n${result.stdout}`.toLowerCase();
+    const looksLikeMissing =
+      text.includes("not found") ||
+      text.includes("no serve config") ||
+      text.includes("nothing to remove") ||
+      text.includes("does not exist");
+    if (options?.ignoreMissing && looksLikeMissing) return;
+    const details = normalizeSpace(result.stderr || result.stdout);
+    throw new Error(
+      `Failed to remove tailscale service ${normalizedName}: ${details || "unknown tailscale error"}`
+    );
+  }
+}
+
 /**
  * Best-effort cleanup of a tailscale serve or funnel registration from a
  * route's metadata. Picks the right subcommand based on `tailscaleFunnel`.
  */
-export function unregisterTailscale(route: {
-  tailscaleHttpsPort?: number;
-  tailscaleFunnel?: boolean;
-}): void {
+export function unregisterTailscale(
+  route: {
+    tailscaleHttpsPort?: number;
+    tailscaleFunnel?: boolean;
+    tailscaleServiceName?: string;
+  },
+  options?: { runner?: TailscaleCommandRunner }
+): void {
+  if (route.tailscaleServiceName) {
+    unregisterService(route.tailscaleServiceName, {
+      ignoreMissing: true,
+      runner: options?.runner,
+    });
+    return;
+  }
   if (!route.tailscaleHttpsPort) return;
   const mode: TailscaleMode = route.tailscaleFunnel ? "funnel" : "serve";
-  unregister(mode, route.tailscaleHttpsPort, { ignoreMissing: true });
+  unregister(mode, route.tailscaleHttpsPort, { ignoreMissing: true, runner: options?.runner });
 }
 
 // ---------------------------------------------------------------------------

@@ -33,6 +33,9 @@ export interface RouteMapping extends RouteInfo {
   tailscaleUrl?: string;
   tailscaleHttpsPort?: number;
   tailscaleFunnel?: boolean;
+  tailscaleServiceName?: string;
+  tailscaleServiceUrl?: string;
+  tailscaleServicePending?: boolean;
   ngrokUrl?: string;
   ngrokPid?: number;
   netbirdUrl?: string;
@@ -43,6 +46,9 @@ type RouteMetadataPatch = {
   tailscaleUrl?: string | null;
   tailscaleHttpsPort?: number | null;
   tailscaleFunnel?: boolean | null;
+  tailscaleServiceName?: string | null;
+  tailscaleServiceUrl?: string | null;
+  tailscaleServicePending?: boolean | null;
   ngrokUrl?: string | null;
   ngrokPid?: number | null;
   netbirdUrl?: string | null;
@@ -342,6 +348,21 @@ export class RouteStore {
         if (fields.tailscaleFunnel === null) delete route.tailscaleFunnel;
         else if (fields.tailscaleFunnel !== undefined)
           route.tailscaleFunnel = fields.tailscaleFunnel;
+      }
+      if ("tailscaleServiceName" in fields) {
+        if (fields.tailscaleServiceName === null) delete route.tailscaleServiceName;
+        else if (fields.tailscaleServiceName !== undefined)
+          route.tailscaleServiceName = fields.tailscaleServiceName;
+      }
+      if ("tailscaleServiceUrl" in fields) {
+        if (fields.tailscaleServiceUrl === null) delete route.tailscaleServiceUrl;
+        else if (fields.tailscaleServiceUrl !== undefined)
+          route.tailscaleServiceUrl = fields.tailscaleServiceUrl;
+      }
+      if ("tailscaleServicePending" in fields) {
+        if (fields.tailscaleServicePending === null) delete route.tailscaleServicePending;
+        else if (fields.tailscaleServicePending !== undefined)
+          route.tailscaleServicePending = fields.tailscaleServicePending;
       }
       if ("ngrokUrl" in fields) {
         if (fields.ngrokUrl === null) delete route.ngrokUrl;

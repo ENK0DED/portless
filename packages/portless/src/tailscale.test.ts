@@ -1,11 +1,14 @@
 import { describe, it, expect } from "vitest";
 import {
+  buildTailscaleServiceName,
   ensureTailscaleReady,
   findAvailableServePort,
   formatTailscaleUrl,
   getUsedServePorts,
+  registerService,
   registerFunnel,
   registerServe,
+  unregisterService,
   unregisterFunnel,
   unregisterServe,
   unregisterTailscale,
@@ -58,6 +61,7 @@ describe("tailscale", () => {
       const ready = ensureTailscaleReady({ runner });
       expect(ready.dnsName).toBe("devbox.example.ts.net");
       expect(ready.baseUrl).toBe("https://devbox.example.ts.net");
+      expect(ready.tailnetDnsSuffix).toBe("example.ts.net");
     });
 
     it("falls back to HostName and MagicDNSSuffix", () => {
@@ -73,6 +77,7 @@ describe("tailscale", () => {
       });
       const ready = ensureTailscaleReady({ runner });
       expect(ready.dnsName).toBe("devbox.example.ts.net");
+      expect(ready.tailnetDnsSuffix).toBe("example.ts.net");
     });
 
     it("throws when Funnel is required but not enabled on the tailnet", () => {
@@ -468,6 +473,77 @@ describe("tailscale", () => {
     });
   });
 
+  describe("Tailscale Service", () => {
+    it("normalizes inferred service names", () => {
+      expect(buildTailscaleServiceName("feature.auth.My App")).toBe("feature-auth-my-app");
+      expect(buildTailscaleServiceName("---")).toBe("portless");
+      expect(buildTailscaleServiceName("a".repeat(80))).toBe("a".repeat(63));
+    });
+
+    it("registers a service with structured tailscale args", () => {
+      const calls: string[][] = [];
+      const runner = createRunner(
+        {
+          "serve --yes --service=svc:api --https=443 http://127.0.0.1:4123": {
+            status: 0,
+            stdout: [
+              "Available within your tailnet:",
+              "https://api.example.ts.net/",
+              "|-- proxy http://127.0.0.1:4123",
+            ].join("\n"),
+          },
+        },
+        calls
+      );
+
+      const service = registerService(4123, "api", "example.ts.net", { runner });
+
+      expect(calls).toEqual([
+        ["serve", "--yes", "--service=svc:api", "--https=443", "http://127.0.0.1:4123"],
+      ]);
+      expect(service).toEqual({
+        serviceName: "api",
+        serviceUrl: "https://api.example.ts.net",
+        pendingApproval: false,
+      });
+    });
+
+    it("surfaces pending approval when service registration succeeds but needs approval", () => {
+      const runner = createRunner({
+        "serve --yes --service=svc:api --https=443 http://127.0.0.1:4123": {
+          status: 0,
+          stdout: [
+            "This machine is configured as a service host for `svc:api`, but approval from an admin is required.",
+            "Once approved, it will be available in your tailnet as:",
+            "https://api.example.ts.net:443/",
+          ].join("\n"),
+        },
+      });
+
+      const service = registerService(4123, "api", "example.ts.net", { runner });
+
+      expect(service.pendingApproval).toBe(true);
+      expect(service.serviceUrl).toBe("https://api.example.ts.net");
+    });
+
+    it("cleans up a service by exact service name", () => {
+      const calls: string[][] = [];
+      const runner = createRunner({ "serve clear svc:api": { status: 0 } }, calls);
+
+      unregisterService("api", { runner });
+
+      expect(calls).toEqual([["serve", "clear", "svc:api"]]);
+    });
+
+    it("ignores missing service cleanup when requested", () => {
+      const runner = createRunner({
+        "serve clear svc:missing": { status: 1, stderr: "not found" },
+      });
+
+      expect(() => unregisterService("missing", { ignoreMissing: true, runner })).not.toThrow();
+    });
+  });
+
   describe("unregisterFunnel", () => {
     it("calls tailscale funnel off with correct args", () => {
       const calls: string[][] = [];
@@ -512,6 +588,13 @@ describe("tailscale", () => {
 
     it("is a no-op when tailscaleHttpsPort is missing", () => {
       expect(() => unregisterTailscale({ tailscaleFunnel: true })).not.toThrow();
+    });
+
+    it("cleans up a service route by service name", () => {
+      const calls: string[][] = [];
+      const runner = createRunner({ "serve clear svc:api": { status: 0 } }, calls);
+      unregisterTailscale({ tailscaleServiceName: "api" }, { runner });
+      expect(calls).toEqual([["serve", "clear", "svc:api"]]);
     });
   });
 
