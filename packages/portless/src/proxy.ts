@@ -693,8 +693,14 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       return;
     }
 
+    const sessionSocket = stream.session?.socket;
+    if (!sessionSocket) {
+      stream.close(http2.constants.NGHTTP2_CANCEL);
+      return;
+    }
+
     const fakeReq = {
-      socket: stream.session.socket,
+      socket: sessionSocket,
       headers: { ...headers, host: selection.authority },
     } as unknown as http.IncomingMessage;
     let serialized: ReturnType<typeof serializeWebSocketUpgradeRequest>;
