@@ -4,7 +4,13 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import colors from "./colors.js";
 import { discoverState, isWindows, killTree } from "./cli-utils.js";
-import { appendBgLifecycleLog, getBgLogPaths, type BgLogPaths } from "./bg-logs.js";
+import {
+  appendBgLifecycleLog,
+  getBgLogPaths,
+  readLastBgLogLines,
+  readWholeBgLog,
+  type BgLogPaths,
+} from "./bg-logs.js";
 import {
   BG_DIR_MODE,
   BG_FILE_MODE,
@@ -19,6 +25,7 @@ import {
   PORTLESS_BG_READY_PATH_ENV,
   waitForBgReadyFile,
 } from "./bg-ready.js";
+import { RouteStore, type RouteMapping } from "./routes.js";
 import type { RouteProtocol, TunnelProviderName } from "./types.js";
 import { fixOwnership, normalizePathPrefix } from "./utils.js";
 
@@ -34,6 +41,16 @@ export interface ParsedBgStartArgs {
 interface ParsedRunIntent {
   intent: BgStartIntent;
   label: string;
+}
+
+interface BgCommandContext {
+  stateDir: string;
+  store: BgStore;
+  routeStore: RouteStore;
+}
+
+interface EntryView extends BgProcessEntry {
+  logs: BgLogPaths;
 }
 
 const RUN_VALUE_FLAGS = new Set([
@@ -120,6 +137,54 @@ ${colors.bold(`portless bg ${subcommand}`)} - Background app management command.
 
 This command is part of the background app management surface. Its runtime
 behavior is implemented by the follow-up lifecycle commits in this branch.
+`);
+}
+
+function printBgStatusHelp(): void {
+  console.log(`
+${colors.bold("portless bg status")} - Show background app status.
+
+${colors.bold("Usage:")}
+  ${colors.cyan("portless bg status [name] [--path <prefix>] [--json]")}
+
+${colors.bold("Options:")}
+  --path <prefix>               Resolve a path-scoped background route
+  --json                        Print machine-readable output
+  --help, -h                    Show this help
+`);
+}
+
+function printBgListHelp(): void {
+  console.log(`
+${colors.bold("portless bg list")} - List background apps.
+
+${colors.bold("Usage:")}
+  ${colors.cyan("portless bg list [--json]")}
+
+${colors.bold("Options:")}
+  --json                        Print machine-readable output
+  --help, -h                    Show this help
+`);
+}
+
+function printBgLogsHelp(): void {
+  console.log(`
+${colors.bold("portless bg logs")} - Print background app logs.
+
+${colors.bold("Usage:")}
+  ${colors.cyan("portless bg logs [name] [--path <prefix>] [--tail <lines>]")}
+  ${colors.cyan("portless bg logs [name] --all")}
+  ${colors.cyan("portless bg logs [name] --errors")}
+  ${colors.cyan("portless bg logs [name] --bg")}
+
+${colors.bold("Options:")}
+  --path <prefix>               Resolve a path-scoped background route
+  --tail <lines>                Print the last N lines (default: 100)
+  --all                         Print the whole selected log
+  --follow                      Continue printing new log data
+  --errors                      Print stderr logs
+  --bg                          Print lifecycle logs
+  --help, -h                    Show this help
 `);
 }
 
@@ -325,6 +390,306 @@ async function terminateChild(child: ChildProcess): Promise<void> {
   }
 }
 
+async function createBgContext(): Promise<BgCommandContext> {
+  const state = await discoverState();
+  return {
+    stateDir: state.dir,
+    store: new BgStore(state.dir, {
+      onWarning: (msg) => console.warn(colors.yellow(msg)),
+    }),
+    routeStore: new RouteStore(state.dir, {
+      onWarning: (msg) => console.warn(colors.yellow(msg)),
+    }),
+  };
+}
+
+function routeMatchesEntry(route: RouteMapping, entry: BgProcessEntry): boolean {
+  if (!entry.route) return false;
+  return (
+    route.hostname === entry.route.hostname &&
+    normalizePathPrefix(route.pathPrefix) === entry.route.pathPrefix
+  );
+}
+
+function refreshEntryState(entry: BgProcessEntry, routes: RouteMapping[]): BgProcessEntry {
+  if (!isProcessAlive(entry.pid)) {
+    return entry.state === "stopped" ? entry : { ...entry, state: "stopped" };
+  }
+  if (!entry.route) return entry;
+  const route = routes.find((candidate) => routeMatchesEntry(candidate, entry));
+  if (!route) {
+    return entry.state === "starting" ? entry : { ...entry, state: "unknown" };
+  }
+  if (route.pid !== entry.pid) return { ...entry, state: "unknown" };
+  return entry.readyAt ? { ...entry, state: "ready" } : entry;
+}
+
+function refreshEntries(context: BgCommandContext): BgProcessEntry[] {
+  const routes = context.routeStore.loadRoutesRaw();
+  return context.store.loadEntries().map((entry) => {
+    const refreshed = refreshEntryState(entry, routes);
+    if (refreshed.state !== entry.state) {
+      context.store.updateEntry(entry.id, { state: refreshed.state });
+    }
+    return refreshed;
+  });
+}
+
+function withLogs(stateDir: string, entry: BgProcessEntry): EntryView {
+  return {
+    ...entry,
+    logs: getBgLogPaths(stateDir, entry.id),
+  };
+}
+
+function serializeEntry(stateDir: string, entry: BgProcessEntry): EntryView {
+  return withLogs(stateDir, entry);
+}
+
+function matchesEntrySelector(
+  entry: BgProcessEntry,
+  name: string | undefined,
+  pathPrefix: string | undefined
+): boolean {
+  if (name && entry.label !== name && entry.route?.hostname.split(".")[0] !== name) return false;
+  if (pathPrefix && entry.route?.pathPrefix !== normalizePathPrefix(pathPrefix)) return false;
+  return true;
+}
+
+function selectEntry(
+  entries: BgProcessEntry[],
+  name: string | undefined,
+  pathPrefix: string | undefined
+): BgProcessEntry {
+  const matches = entries.filter((entry) => matchesEntrySelector(entry, name, pathPrefix));
+  if (matches.length === 1) return matches[0];
+  if (matches.length === 0) {
+    const label = name ?? "current directory";
+    throw new Error(`No background app found for "${label}"`);
+  }
+  throw new Error("Multiple background apps match. Use --path to disambiguate.");
+}
+
+function printStatus(entry: EntryView): void {
+  console.log(`${entry.label}  ${entry.state}`);
+  if (entry.url) console.log(entry.url);
+  if (entry.route) {
+    const routeLabel =
+      entry.route.pathPrefix === "/"
+        ? entry.route.hostname
+        : `${entry.route.hostname}${entry.route.pathPrefix}`;
+    console.log(`Route: ${routeLabel}`);
+  }
+  console.log(`PID: ${entry.pid}`);
+  console.log(`Logs: ${entry.logs.stdout}`);
+}
+
+function parseNamePathJsonArgs(
+  args: string[],
+  offset: number
+): {
+  name?: string;
+  pathPrefix?: string;
+  json: boolean;
+} {
+  let name: string | undefined;
+  let pathPrefix: string | undefined;
+  let json = false;
+  for (let i = offset; i < args.length; i++) {
+    const token = args[i];
+    if (token === "--json") {
+      json = true;
+    } else if (token === "--path") {
+      const value = args[++i];
+      if (!value) throw new Error("--path requires a path prefix");
+      pathPrefix = normalizePathPrefix(value);
+    } else if (token.startsWith("-")) {
+      throw new Error(`Unknown flag "${token}"`);
+    } else if (!name) {
+      name = token;
+    } else {
+      throw new Error(`Unknown argument "${token}"`);
+    }
+  }
+  return { name, pathPrefix, json };
+}
+
+async function handleBgStatus(args: string[]): Promise<void> {
+  if (args[2] === "--help" || args[2] === "-h") {
+    printBgStatusHelp();
+    return;
+  }
+  let parsed: ReturnType<typeof parseNamePathJsonArgs>;
+  try {
+    parsed = parseNamePathJsonArgs(args, 2);
+  } catch (err) {
+    console.error(colors.red(`Error: ${(err as Error).message}`));
+    console.error(colors.cyan("  portless bg status --help"));
+    process.exit(1);
+  }
+  const context = await createBgContext();
+  try {
+    const entry = selectEntry(refreshEntries(context), parsed.name, parsed.pathPrefix);
+    const view = serializeEntry(context.stateDir, entry);
+    if (parsed.json) {
+      process.stdout.write(JSON.stringify(view, null, 2) + "\n");
+    } else {
+      printStatus(view);
+    }
+  } catch (err) {
+    console.error(colors.red(`Error: ${(err as Error).message}`));
+    process.exit(1);
+  }
+}
+
+async function handleBgList(args: string[]): Promise<void> {
+  if (args[2] === "--help" || args[2] === "-h") {
+    printBgListHelp();
+    return;
+  }
+  let json = false;
+  for (let i = 2; i < args.length; i++) {
+    if (args[i] === "--json") {
+      json = true;
+    } else {
+      console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
+      console.error(colors.cyan("  portless bg list --help"));
+      process.exit(1);
+    }
+  }
+  const context = await createBgContext();
+  const entries = refreshEntries(context)
+    .map((entry) => serializeEntry(context.stateDir, entry))
+    .sort((a, b) => a.label.localeCompare(b.label));
+  if (json) {
+    process.stdout.write(JSON.stringify(entries, null, 2) + "\n");
+    return;
+  }
+  if (entries.length === 0) {
+    console.log("No background apps found.");
+    return;
+  }
+  for (const entry of entries) {
+    console.log(`${entry.label}  ${entry.state}${entry.url ? `  ${entry.url}` : ""}`);
+  }
+}
+
+function parseLogsArgs(args: string[]): {
+  name?: string;
+  pathPrefix?: string;
+  tail: number;
+  all: boolean;
+  follow: boolean;
+  source: "stdout" | "stderr" | "bg";
+} {
+  let name: string | undefined;
+  let pathPrefix: string | undefined;
+  let tail = 100;
+  let all = false;
+  let follow = false;
+  let source: "stdout" | "stderr" | "bg" = "stdout";
+
+  for (let i = 2; i < args.length; i++) {
+    const token = args[i];
+    if (token === "--path") {
+      const value = args[++i];
+      if (!value) throw new Error("--path requires a path prefix");
+      pathPrefix = normalizePathPrefix(value);
+    } else if (token === "--tail") {
+      const value = args[++i];
+      if (!value) throw new Error("--tail requires a line count");
+      const parsed = Number(value);
+      if (!Number.isInteger(parsed) || parsed < 0) {
+        throw new Error("--tail must be a non-negative integer");
+      }
+      tail = parsed;
+    } else if (token === "--all") {
+      all = true;
+    } else if (token === "--follow") {
+      follow = true;
+    } else if (token === "--errors") {
+      if (source === "bg") throw new Error("--errors cannot be combined with --bg");
+      source = "stderr";
+    } else if (token === "--bg") {
+      if (source === "stderr") throw new Error("--bg cannot be combined with --errors");
+      source = "bg";
+    } else if (token.startsWith("-")) {
+      throw new Error(`Unknown flag "${token}"`);
+    } else if (!name) {
+      name = token;
+    } else {
+      throw new Error(`Unknown argument "${token}"`);
+    }
+  }
+  return { name, pathPrefix, tail, all, follow, source };
+}
+
+function printLogSnapshot(filePath: string, all: boolean, tail: number): number {
+  const content = all ? readWholeBgLog(filePath) : readLastBgLogLines(filePath, tail).join("\n");
+  if (!content) return 0;
+  process.stdout.write(content.endsWith("\n") ? content : `${content}\n`);
+  return Buffer.byteLength(content);
+}
+
+function currentFileSize(filePath: string): number {
+  try {
+    return fs.statSync(filePath).size;
+  } catch {
+    return 0;
+  }
+}
+
+async function followLogFile(filePath: string, offset: number): Promise<never> {
+  let cursor = offset;
+  setInterval(() => {
+    try {
+      const stat = fs.statSync(filePath);
+      if (stat.size < cursor) cursor = 0;
+      if (stat.size === cursor) return;
+      const fd = fs.openSync(filePath, "r");
+      try {
+        const buffer = Buffer.alloc(stat.size - cursor);
+        fs.readSync(fd, buffer, 0, buffer.length, cursor);
+        cursor = stat.size;
+        process.stdout.write(buffer);
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch {
+      // The log file may not exist yet.
+    }
+  }, 250);
+  return new Promise(() => undefined);
+}
+
+async function handleBgLogs(args: string[]): Promise<void> {
+  if (args[2] === "--help" || args[2] === "-h") {
+    printBgLogsHelp();
+    return;
+  }
+  let parsed: ReturnType<typeof parseLogsArgs>;
+  try {
+    parsed = parseLogsArgs(args);
+  } catch (err) {
+    console.error(colors.red(`Error: ${(err as Error).message}`));
+    console.error(colors.cyan("  portless bg logs --help"));
+    process.exit(1);
+  }
+  const context = await createBgContext();
+  try {
+    const entry = selectEntry(refreshEntries(context), parsed.name, parsed.pathPrefix);
+    const logs = getBgLogPaths(context.stateDir, entry.id);
+    const filePath = logs[parsed.source];
+    printLogSnapshot(filePath, parsed.all, parsed.tail);
+    if (parsed.follow) {
+      await followLogFile(filePath, currentFileSize(filePath));
+    }
+  } catch (err) {
+    console.error(colors.red(`Error: ${(err as Error).message}`));
+    process.exit(1);
+  }
+}
+
 async function handleBgStart(startArgs: string[], options: { entryScript: string }): Promise<void> {
   let parsed: ParsedBgStartArgs;
   try {
@@ -524,14 +889,34 @@ export async function handleBg(args: string[], options: { entryScript: string })
     return;
   }
 
-  if (
-    subcommand === "stop" ||
-    subcommand === "restart" ||
-    subcommand === "status" ||
-    subcommand === "list" ||
-    subcommand === "logs" ||
-    subcommand === "clean"
-  ) {
+  if (subcommand === "status") {
+    if (isWindows) {
+      console.error(colors.red("Error: portless bg currently supports macOS and Linux."));
+      process.exit(1);
+    }
+    await handleBgStatus(args);
+    return;
+  }
+
+  if (subcommand === "list") {
+    if (isWindows) {
+      console.error(colors.red("Error: portless bg currently supports macOS and Linux."));
+      process.exit(1);
+    }
+    await handleBgList(args);
+    return;
+  }
+
+  if (subcommand === "logs") {
+    if (isWindows) {
+      console.error(colors.red("Error: portless bg currently supports macOS and Linux."));
+      process.exit(1);
+    }
+    await handleBgLogs(args);
+    return;
+  }
+
+  if (subcommand === "stop" || subcommand === "restart" || subcommand === "clean") {
     if (args[2] === "--help" || args[2] === "-h") {
       printSubcommandStubHelp(subcommand);
       return;

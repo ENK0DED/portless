@@ -151,6 +151,15 @@ async function waitForFileIncludes(filePath: string, text: string, timeoutMs = 3
   return false;
 }
 
+async function waitForPidGone(pid: number, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    if (!isPidAlive(pid)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return false;
+}
+
 function writeExpoShim(dir: string): void {
   const captureScriptPath = path.join(dir, "capture-expo.js");
   fs.writeFileSync(
@@ -764,6 +773,201 @@ describe("CLI", () => {
         await expect(
           waitForFileIncludes(logs.stdout, "https://bg-test.trycloudflare.com")
         ).resolves.toBe(true);
+      });
+
+      it("prints current bg status with URL and route state", async () => {
+        const appPort = await getFreePort();
+        expect(
+          run(
+            [
+              "bg",
+              "start",
+              "--name",
+              "status-web",
+              "--app-port",
+              String(appPort),
+              ...longRunningCommand(),
+            ],
+            {
+              env: bgEnv(),
+            }
+          ).status
+        ).toBe(0);
+
+        const { status, stdout } = run(["bg", "status", "status-web"], { env: bgEnv() });
+
+        expect(status).toBe(0);
+        expect(stdout).toContain("status-web");
+        expect(stdout).toContain("ready");
+        expect(stdout).toContain(`http://status-web.localhost:${proxyPort}`);
+      });
+
+      it("prints JSON status with route and log paths", async () => {
+        const appPort = await getFreePort();
+        expect(
+          run(
+            [
+              "bg",
+              "start",
+              "--name",
+              "json-web",
+              "--app-port",
+              String(appPort),
+              ...longRunningCommand(),
+            ],
+            {
+              env: bgEnv(),
+            }
+          ).status
+        ).toBe(0);
+
+        const { status, stdout } = run(["bg", "status", "json-web", "--json"], {
+          env: bgEnv(),
+        });
+        const parsed = JSON.parse(stdout) as TestBgEntry & { logs: Record<string, string> };
+
+        expect(status).toBe(0);
+        expect(parsed.route).toEqual({ hostname: "json-web.localhost", pathPrefix: "/" });
+        expect(parsed.logs.stdout).toContain(".stdout.log");
+        expect(parsed.logs.stderr).toContain(".stderr.log");
+      });
+
+      it("lists all background entries sorted by label", async () => {
+        const alphaPort = await getFreePort();
+        const zetaPort = await getFreePort();
+        expect(
+          run(
+            [
+              "bg",
+              "start",
+              "--name",
+              "zeta",
+              "--app-port",
+              String(zetaPort),
+              ...longRunningCommand(),
+            ],
+            {
+              env: bgEnv(),
+            }
+          ).status
+        ).toBe(0);
+        expect(
+          run(
+            [
+              "bg",
+              "start",
+              "--name",
+              "alpha",
+              "--app-port",
+              String(alphaPort),
+              ...longRunningCommand(),
+            ],
+            {
+              env: bgEnv(),
+            }
+          ).status
+        ).toBe(0);
+
+        const { status, stdout } = run(["bg", "list", "--json"], { env: bgEnv() });
+        const entries = JSON.parse(stdout) as TestBgEntry[];
+
+        expect(status).toBe(0);
+        expect(entries.map((entry) => entry.label)).toEqual(["alpha", "zeta"]);
+      });
+
+      it("marks entries stopped when the pid is no longer alive", async () => {
+        const appPort = await getFreePort();
+        expect(
+          run(
+            [
+              "bg",
+              "start",
+              "--name",
+              "dead-web",
+              "--app-port",
+              String(appPort),
+              ...longRunningCommand(),
+            ],
+            {
+              env: bgEnv(),
+            }
+          ).status
+        ).toBe(0);
+        const [entry] = readBgRegistry(tmpDir);
+        killProcessGroup(entry.pid);
+        await expect(waitForPidGone(entry.pid)).resolves.toBe(true);
+
+        const { status, stdout } = run(["bg", "status", "dead-web", "--json"], {
+          env: bgEnv(),
+        });
+        const parsed = JSON.parse(stdout) as TestBgEntry;
+
+        expect(status).toBe(0);
+        expect(parsed.state).toBe("stopped");
+      });
+
+      it("resolves route identity by hostname and path prefix", async () => {
+        const appPort = await getFreePort();
+        expect(
+          run(
+            [
+              "bg",
+              "start",
+              "--name",
+              "path-web",
+              "--path",
+              "/api",
+              "--app-port",
+              String(appPort),
+              ...longRunningCommand(),
+            ],
+            { env: bgEnv() }
+          ).status
+        ).toBe(0);
+
+        const { status, stdout } = run(["bg", "status", "path-web", "--path", "/api", "--json"], {
+          env: bgEnv(),
+        });
+        const parsed = JSON.parse(stdout) as TestBgEntry;
+
+        expect(status).toBe(0);
+        expect(parsed.route).toEqual({ hostname: "path-web.localhost", pathPrefix: "/api" });
+      });
+
+      it("prints background logs and returns no lines for --tail 0", async () => {
+        const appPort = await getFreePort();
+        expect(
+          run(
+            [
+              "bg",
+              "start",
+              "--name",
+              "log-web",
+              "--app-port",
+              String(appPort),
+              process.execPath,
+              "-e",
+              "console.log('out-one'); console.log('out-two'); console.error('err-one'); setInterval(() => {}, 1000)",
+            ],
+            { env: bgEnv() }
+          ).status
+        ).toBe(0);
+
+        const [entry] = readBgRegistry(tmpDir);
+        const logs = getBgLogPaths(tmpDir, entry.id);
+        await expect(waitForFileIncludes(logs.stdout, "out-two")).resolves.toBe(true);
+        await expect(waitForFileIncludes(logs.stderr, "err-one")).resolves.toBe(true);
+
+        const tailOne = run(["bg", "logs", "log-web", "--tail", "1"], { env: bgEnv() });
+        const tailZero = run(["bg", "logs", "log-web", "--tail", "0"], { env: bgEnv() });
+        const errors = run(["bg", "logs", "log-web", "--errors"], { env: bgEnv() });
+        const lifecycle = run(["bg", "logs", "log-web", "--bg"], { env: bgEnv() });
+
+        expect(tailOne.stdout).toContain("out-two");
+        expect(tailOne.stdout).not.toContain("out-one");
+        expect(tailZero.stdout).toBe("");
+        expect(errors.stdout).toContain("err-one");
+        expect(lifecycle.stdout).toContain("ready");
       });
     });
   });
