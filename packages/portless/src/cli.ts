@@ -132,6 +132,7 @@ import {
 import type { ManifestEntry } from "./turbo.js";
 import { buildServiceUninstallSudoArgs, handleService, tryUninstallService } from "./service.js";
 import { handleBg } from "./bg.js";
+import { PORTLESS_BG_ID_ENV, PORTLESS_BG_READY_PATH_ENV, writeBgReadyFile } from "./bg-ready.js";
 
 const chalk = colors;
 
@@ -1800,6 +1801,36 @@ async function runApp(
     }
   }
 
+  const bgId = process.env[PORTLESS_BG_ID_ENV];
+  const bgReadyPath = process.env[PORTLESS_BG_READY_PATH_ENV];
+  if (bgId && bgReadyPath) {
+    try {
+      writeBgReadyFile(bgReadyPath, {
+        version: 1,
+        bgId,
+        pid: process.pid,
+        hostname,
+        pathPrefix: routePathPrefix,
+        url: finalUrl,
+        stateDir,
+        appPort: port,
+        proxyPort,
+        tls,
+        sharing: {
+          ...(tailscaleUrl ? { tailscaleUrl } : {}),
+          ...(tailscaleServiceUrl ? { tailscaleServiceUrl } : {}),
+          ...(ngrokUrl ? { ngrokUrl } : {}),
+          ...(tunnelUrl ? { tunnelUrl } : {}),
+          ...(netbirdUrl ? { netbirdUrl } : {}),
+        },
+      });
+    } catch (err) {
+      console.warn(
+        colors.yellow(`Warning: Could not write background ready file: ${(err as Error).message}`)
+      );
+    }
+  }
+
   // Child servers always bind to localhost; the proxy handles cross-device LAN access.
   // Exception: Expo in LAN mode — Metro defaults to LAN and setting HOST=127.0.0.1
   // conflicts with its internal networking, causing HMR WebSocket degradation.
@@ -1837,7 +1868,10 @@ async function runApp(
   // portless CA as "self-signed certificate in certificate chain".
   // Respect any value the user already set, including leading child env
   // assignments such as NODE_EXTRA_CA_CERTS=/custom.pem.
-  const inheritedChildEnv = { ...process.env, ...childEnv };
+  const baseChildEnv: NodeJS.ProcessEnv = { ...process.env };
+  delete baseChildEnv[PORTLESS_BG_ID_ENV];
+  delete baseChildEnv[PORTLESS_BG_READY_PATH_ENV];
+  const inheritedChildEnv = { ...baseChildEnv, ...childEnv };
   const caEnv: Record<string, string> = {};
   if (tls && !inheritedChildEnv.NODE_EXTRA_CA_CERTS) {
     const caPath = path.join(stateDir, "ca.pem");
@@ -1858,7 +1892,7 @@ async function runApp(
 
   spawnCommand(commandArgs, {
     env: {
-      ...process.env,
+      ...baseChildEnv,
       ...childEnv,
       PORT: port.toString(),
       ...(hostBind ? { HOST: hostBind } : {}),

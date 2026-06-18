@@ -5,6 +5,7 @@ import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { getBgLogPaths } from "./bg-logs.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLI_PATH = path.resolve(__dirname, "../dist/cli.js");
@@ -83,6 +84,71 @@ function runGit(cwd: string, args: string[]): void {
 function writeJson(filePath: string, value: unknown): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, JSON.stringify(value, null, 2) + "\n");
+}
+
+interface TestBgEntry {
+  id: string;
+  label: string;
+  pid: number;
+  state: string;
+  url?: string;
+  route?: {
+    hostname: string;
+    pathPrefix: string;
+  };
+}
+
+function readBgRegistry(stateDir: string): TestBgEntry[] {
+  try {
+    const raw = fs.readFileSync(path.join(stateDir, "bg", "registry.json"), "utf-8");
+    return JSON.parse(raw) as TestBgEntry[];
+  } catch {
+    return [];
+  }
+}
+
+function readRoutesFile(stateDir: string): Array<Record<string, unknown>> {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(stateDir, "routes.json"), "utf-8")) as Array<
+      Record<string, unknown>
+    >;
+  } catch {
+    return [];
+  }
+}
+
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function killProcessGroup(pid: number): void {
+  try {
+    process.kill(-pid, "SIGTERM");
+  } catch {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      // Process may already have exited.
+    }
+  }
+}
+
+async function waitForFileIncludes(filePath: string, text: string, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    try {
+      if (fs.readFileSync(filePath, "utf-8").includes(text)) return true;
+    } catch {
+      // Log file may not exist yet.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return false;
 }
 
 function writeExpoShim(dir: string): void {
@@ -501,6 +567,204 @@ describe("CLI", () => {
       const { status, stderr } = run(["bg", "unknown"]);
       expect(status).toBe(1);
       expect(stderr).toContain('Unknown bg subcommand "unknown"');
+    });
+
+    describe("start", () => {
+      let tmpDir: string;
+      let proxyPort: number;
+
+      const bgEnv = (extra?: Record<string, string | undefined>) => ({
+        PORTLESS_STATE_DIR: tmpDir,
+        PORTLESS_PORT: String(proxyPort),
+        PORTLESS_HTTPS: "0",
+        PORTLESS_SYNC_HOSTS: "0",
+        ...extra,
+      });
+
+      const longRunningCommand = () => [process.execPath, "-e", "setInterval(() => {}, 1000)"];
+
+      beforeEach(async () => {
+        tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-cli-bg-"));
+        proxyPort = await getFreePort();
+      });
+
+      afterEach(() => {
+        for (const entry of readBgRegistry(tmpDir)) {
+          killProcessGroup(entry.pid);
+        }
+        run(["proxy", "stop"], { env: bgEnv() });
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      });
+
+      it("starts a background process and records the ready route", async () => {
+        const appPort = await getFreePort();
+        const { status, stdout, stderr } = run(
+          ["bg", "start", "--name", "web", "--app-port", String(appPort), ...longRunningCommand()],
+          { env: bgEnv() }
+        );
+
+        const entries = readBgRegistry(tmpDir);
+
+        expect({ status, stdout, stderr }).toMatchObject({ status: 0 });
+        expect(entries).toHaveLength(1);
+        expect(entries[0]).toMatchObject({
+          label: "web",
+          state: "ready",
+          route: { hostname: "web.localhost", pathPrefix: "/" },
+        });
+        expect(entries[0].url).toContain(`http://web.localhost:${proxyPort}`);
+        expect(isPidAlive(entries[0].pid)).toBe(true);
+      });
+
+      it("sets state to starting when --no-wait is used", async () => {
+        const appPort = await getFreePort();
+        const { status } = run(
+          [
+            "bg",
+            "start",
+            "--no-wait",
+            "--name",
+            "starting",
+            "--app-port",
+            String(appPort),
+            ...longRunningCommand(),
+          ],
+          { env: bgEnv() }
+        );
+
+        const entries = readBgRegistry(tmpDir);
+
+        expect(status).toBe(0);
+        expect(entries).toHaveLength(1);
+        expect(entries[0]).toMatchObject({ label: "starting", state: "starting" });
+      });
+
+      it("kills and removes a timed-out start by default", async () => {
+        const appPort = await getFreePort();
+        const { status, stderr } = run(
+          [
+            "bg",
+            "start",
+            "--wait",
+            "0.001",
+            "--name",
+            "timeout",
+            "--app-port",
+            String(appPort),
+            ...longRunningCommand(),
+          ],
+          { env: bgEnv() }
+        );
+
+        expect(status).toBe(1);
+        expect(stderr).toContain("timed out waiting for readiness");
+        expect(readBgRegistry(tmpDir)).toEqual([]);
+      });
+
+      it("keeps a timed-out process when --keep is used", async () => {
+        const appPort = await getFreePort();
+        const { status, stderr } = run(
+          [
+            "bg",
+            "start",
+            "--wait",
+            "0.001",
+            "--keep",
+            "--name",
+            "kept",
+            "--app-port",
+            String(appPort),
+            ...longRunningCommand(),
+          ],
+          { env: bgEnv() }
+        );
+
+        const entries = readBgRegistry(tmpDir);
+
+        expect(status).toBe(1);
+        expect(stderr).toContain("timed out waiting for readiness");
+        expect(entries).toHaveLength(1);
+        expect(entries[0]).toMatchObject({ label: "kept", state: "unknown" });
+        expect(isPidAlive(entries[0].pid)).toBe(true);
+      });
+
+      it("passes --path through and records the path-scoped URL", async () => {
+        const appPort = await getFreePort();
+        const { status } = run(
+          [
+            "bg",
+            "start",
+            "--name",
+            "api",
+            "--path",
+            "/api",
+            "--app-port",
+            String(appPort),
+            ...longRunningCommand(),
+          ],
+          { env: bgEnv() }
+        );
+
+        const [entry] = readBgRegistry(tmpDir);
+
+        expect(status).toBe(0);
+        expect(entry.route).toEqual({ hostname: "api.localhost", pathPrefix: "/api" });
+        expect(entry.url).toContain("/api");
+      });
+
+      it("passes --h2c through and records h2c route metadata", async () => {
+        const appPort = await getFreePort();
+        const { status } = run(
+          [
+            "bg",
+            "start",
+            "--name",
+            "grpc",
+            "--h2c",
+            "--app-port",
+            String(appPort),
+            ...longRunningCommand(),
+          ],
+          { env: bgEnv() }
+        );
+
+        const routes = readRoutesFile(tmpDir);
+
+        expect(status).toBe(0);
+        expect(routes.find((route) => route.hostname === "grpc.localhost")).toMatchObject({
+          protocol: "h2c",
+        });
+      });
+
+      it("passes managed tunnel flags through and records PORTLESS_TUNNEL_URL in child logs", async () => {
+        const appPort = await getFreePort();
+        writeCloudflaredShim(tmpDir, "https://bg-test.trycloudflare.com");
+        const { status } = run(
+          [
+            "bg",
+            "start",
+            "--name",
+            "tunnel",
+            "--tunnel",
+            "cloudflare",
+            "--app-port",
+            String(appPort),
+            process.execPath,
+            "-e",
+            "console.log(process.env.PORTLESS_TUNNEL_URL); setInterval(() => {}, 1000)",
+          ],
+          { env: bgEnv({ PATH: `${tmpDir}${path.delimiter}${process.env.PATH ?? ""}` }) }
+        );
+
+        const [entry] = readBgRegistry(tmpDir);
+        const logs = getBgLogPaths(tmpDir, entry.id);
+
+        expect(status).toBe(0);
+        expect(entry.url).toContain("tunnel.localhost");
+        await expect(
+          waitForFileIncludes(logs.stdout, "https://bg-test.trycloudflare.com")
+        ).resolves.toBe(true);
+      });
     });
   });
 

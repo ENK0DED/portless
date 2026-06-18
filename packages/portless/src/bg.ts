@@ -1,5 +1,26 @@
+import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import colors from "./colors.js";
-import { isWindows } from "./cli-utils.js";
+import { discoverState, isWindows, killTree } from "./cli-utils.js";
+import { appendBgLifecycleLog, getBgLogPaths, type BgLogPaths } from "./bg-logs.js";
+import {
+  BG_DIR_MODE,
+  BG_FILE_MODE,
+  BgStore,
+  type BgManagedTunnelOptions,
+  type BgProcessEntry,
+  type BgStartIntent,
+} from "./bg-store.js";
+import {
+  getBgReadyPath,
+  PORTLESS_BG_ID_ENV,
+  PORTLESS_BG_READY_PATH_ENV,
+  waitForBgReadyFile,
+} from "./bg-ready.js";
+import type { RouteProtocol, TunnelProviderName } from "./types.js";
+import { fixOwnership, normalizePathPrefix } from "./utils.js";
 
 export const DEFAULT_BG_WAIT_SECONDS = 30;
 
@@ -8,6 +29,11 @@ export interface ParsedBgStartArgs {
   waitSeconds: number | undefined;
   keep: boolean;
   json: boolean;
+}
+
+interface ParsedRunIntent {
+  intent: BgStartIntent;
+  label: string;
 }
 
 const RUN_VALUE_FLAGS = new Set([
@@ -120,6 +146,294 @@ function requireForwardedValue(tokens: string[], index: number): string {
   return value;
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parseTunnelProviderForIntent(value: string): TunnelProviderName {
+  if (value === "cloudflare" || value === "ngrok") return value;
+  throw new Error(`Unsupported tunnel provider "${value}"`);
+}
+
+function parseRunIntent(runArgs: string[], cwd: string): ParsedRunIntent {
+  let name: string | undefined;
+  let force = false;
+  let appPort: number | undefined;
+  let protocol: RouteProtocol | undefined;
+  let pathPrefix = "/";
+  let tunnel: BgManagedTunnelOptions | undefined;
+  const sharing: BgStartIntent["sharing"] = {
+    tailscale: false,
+    tailscaleService: false,
+    funnel: false,
+    ngrok: false,
+    netbird: false,
+  };
+  let commandArgs: string[] = [];
+  let explicitCommand = false;
+
+  for (let i = 0; i < runArgs.length; i++) {
+    const token = runArgs[i];
+    if (token === "--") {
+      explicitCommand = runArgs.length > i + 1;
+      commandArgs = runArgs.slice(i + 1);
+      break;
+    }
+    if (!token.startsWith("-")) {
+      explicitCommand = true;
+      commandArgs = runArgs.slice(i);
+      break;
+    }
+    if (token === "--name") {
+      name = runArgs[++i];
+    } else if (token === "--force") {
+      force = true;
+    } else if (token === "--app-port") {
+      const value = Number(runArgs[++i]);
+      if (!Number.isInteger(value) || value < 1 || value > 65535) {
+        throw new Error("--app-port requires a valid port number");
+      }
+      appPort = value;
+    } else if (token === "--h2c") {
+      protocol = "h2c";
+    } else if (token === "--path") {
+      pathPrefix = normalizePathPrefix(runArgs[++i]);
+    } else if (token === "--tunnel") {
+      tunnel = { ...(tunnel ?? {}), provider: parseTunnelProviderForIntent(runArgs[++i]) };
+    } else if (token === "--tunnel-hostname") {
+      if (!tunnel?.provider) throw new Error("--tunnel-hostname requires --tunnel");
+      tunnel = { ...tunnel, hostname: runArgs[++i] };
+    } else if (token === "--tailscale") {
+      sharing.tailscale = true;
+    } else if (token === "--tailscale-service") {
+      sharing.tailscaleService = true;
+    } else if (token === "--tailscale-service-name") {
+      sharing.tailscaleService = true;
+      sharing.tailscaleServiceName = runArgs[++i];
+    } else if (token === "--funnel") {
+      sharing.tailscale = true;
+      sharing.funnel = true;
+    } else if (token === "--ngrok") {
+      sharing.ngrok = true;
+    } else if (token === "--netbird") {
+      sharing.netbird = true;
+    } else if (token === "--netbird-password") {
+      sharing.netbird = true;
+      sharing.netbirdPassword = runArgs[++i];
+    } else if (token === "--netbird-pin") {
+      sharing.netbird = true;
+      sharing.netbirdPin = runArgs[++i];
+    } else if (token === "--netbird-groups") {
+      sharing.netbird = true;
+      sharing.netbirdGroups = runArgs[++i];
+    }
+  }
+
+  const fallbackLabel = path.basename(cwd) || "app";
+  const label = name ?? fallbackLabel;
+  return {
+    label,
+    intent: {
+      name,
+      cwd,
+      commandArgs,
+      explicitCommand,
+      force,
+      appPort,
+      protocol,
+      pathPrefix,
+      tunnel,
+      sharing,
+    },
+  };
+}
+
+function openPrivateAppendFile(filePath: string): number {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: BG_DIR_MODE });
+  try {
+    fs.chmodSync(path.dirname(path.dirname(filePath)), BG_DIR_MODE);
+    fs.chmodSync(path.dirname(filePath), BG_DIR_MODE);
+  } catch {
+    // Permission repair is best effort.
+  }
+  const fd = fs.openSync(filePath, "a", BG_FILE_MODE);
+  try {
+    fs.chmodSync(filePath, BG_FILE_MODE);
+  } catch {
+    // Permission repair is best effort.
+  }
+  fixOwnership(filePath);
+  return fd;
+}
+
+function closeLogFd(fd: number): void {
+  try {
+    fs.closeSync(fd);
+  } catch {
+    // File descriptor may already be closed.
+  }
+}
+
+function printStartResult(
+  entry: BgProcessEntry,
+  logs: BgLogPaths,
+  json: boolean,
+  ready: boolean
+): void {
+  if (json) {
+    process.stdout.write(
+      JSON.stringify(
+        {
+          id: entry.id,
+          label: entry.label,
+          pid: entry.pid,
+          state: entry.state,
+          url: entry.url,
+          route: entry.route,
+          logs,
+        },
+        null,
+        2
+      ) + "\n"
+    );
+    return;
+  }
+  if (ready && entry.url) {
+    console.log(colors.green(`Started background app "${entry.label}" (PID ${entry.pid}).`));
+    console.log(colors.cyan(`  ${entry.url}`));
+  } else {
+    console.log(colors.green(`Started background app "${entry.label}" (PID ${entry.pid}).`));
+    console.log(colors.yellow("Readiness was not requested; state remains starting."));
+  }
+  console.log(colors.gray(`Logs: ${logs.stdout}`));
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function terminateChild(child: ChildProcess): Promise<void> {
+  killTree(child, "SIGTERM");
+  await sleep(500);
+  if (child.pid && isProcessAlive(child.pid)) {
+    killTree(child, "SIGKILL");
+  }
+}
+
+async function handleBgStart(startArgs: string[], options: { entryScript: string }): Promise<void> {
+  let parsed: ParsedBgStartArgs;
+  try {
+    parsed = parseBgStartArgs(startArgs);
+  } catch (err) {
+    console.error(colors.red(`Error: ${(err as Error).message}`));
+    console.error(colors.cyan("  portless bg start --help"));
+    process.exit(1);
+  }
+
+  const state = await discoverState();
+  const store = new BgStore(state.dir, {
+    onWarning: (msg) => console.warn(colors.yellow(msg)),
+  });
+  const id = `bg-${randomUUID()}`;
+  const readyPath = getBgReadyPath(state.dir, id);
+  const logs = getBgLogPaths(state.dir, id);
+  const cwd = process.cwd();
+  const { intent, label } = parseRunIntent(parsed.runArgs, cwd);
+  const startedAt = new Date().toISOString();
+  let entry: BgProcessEntry = {
+    version: 1,
+    id,
+    label,
+    pid: 0,
+    cwd,
+    startedAt,
+    state: "starting",
+    intent,
+  };
+
+  const stdoutFd = openPrivateAppendFile(logs.stdout);
+  const stderrFd = openPrivateAppendFile(logs.stderr);
+  appendBgLifecycleLog(logs, `starting ${label}`);
+
+  let child: ChildProcess;
+  try {
+    const childEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      [PORTLESS_BG_ID_ENV]: id,
+      [PORTLESS_BG_READY_PATH_ENV]: readyPath,
+    };
+    delete childEnv.PORTLESS;
+    child = spawn(process.execPath, [options.entryScript, "run", ...parsed.runArgs], {
+      cwd,
+      detached: true,
+      env: childEnv,
+      stdio: ["ignore", stdoutFd, stderrFd],
+      windowsHide: true,
+    });
+  } catch (err) {
+    closeLogFd(stdoutFd);
+    closeLogFd(stderrFd);
+    appendBgLifecycleLog(logs, `spawn failed: ${(err as Error).message}`);
+    throw err;
+  }
+
+  closeLogFd(stdoutFd);
+  closeLogFd(stderrFd);
+
+  if (!child.pid) {
+    appendBgLifecycleLog(logs, "spawn failed without a child pid");
+    console.error(colors.red("Error: Failed to start background process."));
+    process.exit(1);
+  }
+
+  child.unref();
+  entry = { ...entry, pid: child.pid };
+  store.upsertEntry(entry);
+  appendBgLifecycleLog(logs, `spawned portless run pid ${child.pid}`);
+
+  if (parsed.waitSeconds === undefined) {
+    printStartResult(entry, logs, parsed.json, false);
+    return;
+  }
+
+  const ready = await waitForBgReadyFile(readyPath, id, parsed.waitSeconds * 1000);
+  if (ready) {
+    entry = {
+      ...entry,
+      state: "ready",
+      readyAt: new Date().toISOString(),
+      route: {
+        hostname: ready.hostname,
+        pathPrefix: ready.pathPrefix,
+      },
+      url: ready.url,
+    };
+    store.updateEntry(id, entry);
+    appendBgLifecycleLog(logs, `ready ${ready.url}`);
+    printStartResult(entry, logs, parsed.json, true);
+    return;
+  }
+
+  appendBgLifecycleLog(logs, `timed out waiting for readiness after ${parsed.waitSeconds}s`);
+  if (parsed.keep) {
+    entry = { ...entry, state: "unknown" };
+    store.updateEntry(id, entry);
+    console.error(colors.red("Error: timed out waiting for readiness; process kept running."));
+    process.exit(1);
+  }
+
+  await terminateChild(child);
+  store.removeEntry(id);
+  appendBgLifecycleLog(logs, "removed timed-out background entry");
+  console.error(colors.red("Error: timed out waiting for readiness."));
+  process.exit(1);
+}
+
 export function parseBgStartArgs(tokens: string[]): ParsedBgStartArgs {
   const runArgs: string[] = [];
   let waitSeconds: number | undefined = DEFAULT_BG_WAIT_SECONDS;
@@ -190,7 +504,6 @@ export function parseBgStartArgs(tokens: string[]): ParsedBgStartArgs {
 }
 
 export async function handleBg(args: string[], options: { entryScript: string }): Promise<void> {
-  void options;
   const subcommand = args[1];
 
   if (!subcommand || subcommand === "--help" || subcommand === "-h") {
@@ -207,15 +520,8 @@ export async function handleBg(args: string[], options: { entryScript: string })
       console.error(colors.red("Error: portless bg currently supports macOS and Linux."));
       process.exit(1);
     }
-    try {
-      parseBgStartArgs(args.slice(2));
-    } catch (err) {
-      console.error(colors.red(`Error: ${(err as Error).message}`));
-      console.error(colors.cyan("  portless bg start --help"));
-      process.exit(1);
-    }
-    console.error(colors.red("Error: portless bg start is not implemented in this commit."));
-    process.exit(1);
+    await handleBgStart(args.slice(2), options);
+    return;
   }
 
   if (
