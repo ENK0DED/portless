@@ -118,6 +118,31 @@ function writeExpoShim(dir: string): void {
   fs.chmodSync(shimPath, 0o755);
 }
 
+function writeCloudflaredShim(dir: string, url = "https://abc.trycloudflare.com"): void {
+  const scriptPath = path.join(dir, "cloudflared-shim.js");
+  fs.writeFileSync(
+    scriptPath,
+    [
+      "if (process.argv.includes('version')) { console.log('cloudflared version test'); process.exit(0); }",
+      `console.log(${JSON.stringify(url)});`,
+      "setInterval(() => {}, 1000);",
+      "process.on('SIGTERM', () => process.exit(0));",
+    ].join("\n") + "\n"
+  );
+
+  if (process.platform === "win32") {
+    fs.writeFileSync(
+      path.join(dir, "cloudflared.cmd"),
+      `@echo off\r\n"${process.execPath}" "${scriptPath}" %*\r\n`
+    );
+    return;
+  }
+
+  const shimPath = path.join(dir, "cloudflared");
+  fs.writeFileSync(shimPath, `#!/bin/sh\n"${process.execPath}" "${scriptPath}" "$@"\n`);
+  fs.chmodSync(shimPath, 0o755);
+}
+
 async function getFreePort(): Promise<number> {
   const server = http.createServer();
   try {
@@ -938,6 +963,63 @@ describe("CLI", () => {
       const { status, stderr } = run(["clean", "typo"], { env: { PORTLESS: "0" } });
       expect(status).toBe(1);
       expect(stderr).toContain("Unknown argument");
+    });
+  });
+
+  describe("tunnel subcommand", () => {
+    let tmpDir: string;
+
+    beforeEach(() => {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-cli-tunnel-test-"));
+    });
+
+    afterEach(() => {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it("prints help with --help", () => {
+      const { status, stdout } = run(["tunnel", "--help"]);
+      expect(status).toBe(0);
+      expect(stdout).toContain("portless tunnel");
+      expect(stdout).toContain("map");
+      expect(stdout).toContain("unmap");
+      expect(stdout).toContain("list");
+    });
+
+    it("maps, lists, and unmaps exact tunnel aliases", () => {
+      const env = { PORTLESS_STATE_DIR: tmpDir };
+
+      const mapped = run(["tunnel", "map", "myapp", "public.example.com", "--path", "/api"], {
+        env,
+      });
+      expect(mapped.status).toBe(0);
+      expect(mapped.stdout).toContain("public.example.com");
+
+      const listed = run(["tunnel", "list", "--json"], { env });
+      expect(listed.status).toBe(0);
+      expect(JSON.parse(listed.stdout)).toEqual([
+        {
+          externalHostname: "public.example.com",
+          targetHostname: "myapp.localhost",
+          targetPathPrefix: "/api",
+        },
+      ]);
+
+      const unmapped = run(["tunnel", "unmap", "public.example.com"], { env });
+      expect(unmapped.status).toBe(0);
+      expect(unmapped.stdout).toContain("Removed tunnel alias");
+      expect(
+        JSON.parse(fs.readFileSync(path.join(tmpDir, "tunnel-aliases.json"), "utf-8"))
+      ).toEqual([]);
+    });
+
+    it("rejects invalid external tunnel hostnames", () => {
+      const { status, stderr } = run(["tunnel", "map", "myapp", "https://public.example.com"], {
+        env: { PORTLESS_STATE_DIR: tmpDir },
+      });
+
+      expect(status).toBe(1);
+      expect(stderr).toContain("Invalid tunnel hostname");
     });
   });
 
@@ -2578,6 +2660,100 @@ describe("CLI", () => {
         expect(stderr).toContain("ngrok CLI not found");
       } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("--tunnel flag", () => {
+    it("shows generic tunnel options in help output", () => {
+      const { status, stdout } = run(["--help"]);
+      expect(status).toBe(0);
+      expect(stdout).toContain("--tunnel");
+      expect(stdout).toContain("PORTLESS_TUNNEL");
+      expect(stdout).toContain("PORTLESS_TUNNEL_URL");
+    });
+
+    it("fails with actionable message when cloudflared is not installed", () => {
+      const { status, stderr } = run(["--tunnel", "cloudflare", "myapp", "echo", "hello"], {
+        env: { PATH: "/tmp/portless-no-cloudflared-path" },
+      });
+
+      expect(status).toBe(1);
+      expect(stderr).toContain("cloudflared CLI not found");
+    });
+
+    it("activates Cloudflare from PORTLESS_TUNNEL", () => {
+      const { status, stderr } = run(["myapp", "echo", "hello"], {
+        env: { PORTLESS_TUNNEL: "cloudflare", PATH: "/tmp/portless-no-cloudflared-path" },
+      });
+
+      expect(status).toBe(1);
+      expect(stderr).toContain("cloudflared CLI not found");
+    });
+
+    it("sets PORTLESS_TUNNEL_URL for managed tunnel child commands", async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-cli-managed-tunnel-"));
+      const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-cloudflared-bin-"));
+      const server = http.createServer((_req, res) => {
+        res.setHeader("X-Portless", "1");
+        res.end("ok");
+      });
+      try {
+        const proxyPort = await new Promise<number>((resolve) => {
+          server.listen(0, "127.0.0.1", () => {
+            const addr = server.address();
+            if (addr && typeof addr !== "string") {
+              resolve(addr.port);
+            }
+          });
+        });
+        fs.writeFileSync(path.join(tmpDir, "proxy.port"), proxyPort.toString());
+        writeCloudflaredShim(binDir);
+
+        const capturePath = path.join(tmpDir, "capture.json");
+        const scriptPath = path.join(tmpDir, "capture-env.js");
+        fs.writeFileSync(
+          scriptPath,
+          [
+            'const fs = require("node:fs");',
+            `fs.writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify({`,
+            "  PORTLESS_URL: process.env.PORTLESS_URL,",
+            "  PORTLESS_TUNNEL_URL: process.env.PORTLESS_TUNNEL_URL,",
+            "}));",
+          ].join("\n") + "\n"
+        );
+
+        const { status, stdout } = run(
+          [
+            "run",
+            "--name",
+            "myapp",
+            "--app-port",
+            "4567",
+            "--tunnel",
+            "cloudflare",
+            "node",
+            scriptPath,
+          ],
+          {
+            env: {
+              PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+              PORTLESS_STATE_DIR: tmpDir,
+              PORTLESS_HTTPS: "0",
+            },
+          }
+        );
+
+        expect(status).toBe(0);
+        expect(stdout).toContain("Cloudflare Tunnel");
+        expect(JSON.parse(fs.readFileSync(capturePath, "utf-8"))).toMatchObject({
+          PORTLESS_URL: `http://myapp.localhost:${proxyPort}`,
+          PORTLESS_TUNNEL_URL: "https://abc.trycloudflare.com",
+        });
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+        fs.rmSync(binDir, { recursive: true, force: true });
       }
     });
   });

@@ -6,6 +6,8 @@ import { LEGACY_SYSTEM_STATE_DIR, USER_STATE_DIR } from "./cli-utils.js";
 const PORTLESS_STATE_FILES = [
   "routes.json",
   "routes.lock",
+  "tunnel-aliases.json",
+  "tunnel-aliases.lock",
   "proxy.pid",
   "proxy.port",
   "proxy.log",

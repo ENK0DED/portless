@@ -1,7 +1,7 @@
 import * as http from "node:http";
 import * as http2 from "node:http2";
 import * as net from "node:net";
-import type { ProxyServerOptions, RouteInfo } from "./types.js";
+import type { ProxyServerOptions, RouteInfo, TunnelAlias } from "./types.js";
 import { escapeHtml, formatUrl, matchesPathPrefix, normalizePathPrefix } from "./utils.js";
 import { ARROW_SVG, renderPage } from "./pages.js";
 
@@ -293,6 +293,7 @@ function pickLongestPathRoute(routes: RouteInfo[], requestPath: string): RouteIn
 
 function findRoute(
   routes: RouteInfo[],
+  tunnelAliases: TunnelAlias[],
   host: string,
   requestPath: string,
   strict?: boolean
@@ -302,6 +303,19 @@ function findRoute(
     requestPath
   );
   if (exact) return exact;
+
+  const alias = tunnelAliases.find((entry) => entry.externalHostname === host);
+  if (alias) {
+    const targetPathPrefix = normalizePathPrefix(alias.targetPathPrefix);
+    if (matchesPathPrefix(requestPath, targetPathPrefix)) {
+      return routes.find(
+        (route) =>
+          route.hostname === alias.targetHostname &&
+          normalizePathPrefix(route.pathPrefix) === targetPathPrefix
+      );
+    }
+  }
+
   if (strict) return undefined;
   return pickLongestPathRoute(
     routes.filter((r) => host.endsWith("." + r.hostname)),
@@ -326,6 +340,7 @@ export type ProxyServer = http.Server | net.Server;
 export function createProxyServer(options: ProxyServerOptions): ProxyServer {
   const {
     getRoutes,
+    getTunnelAliases = () => [],
     proxyPort,
     tld = "localhost",
     strict = true,
@@ -341,6 +356,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     res.setHeader(PORTLESS_LISTENER_PORT_HEADER, getListenerPort(req, proxyPort));
 
     const routes = getRoutes();
+    const tunnelAliases = getTunnelAliases();
     const host = getRequestHost(req).split(":")[0];
 
     if (!host) {
@@ -384,7 +400,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       return;
     }
 
-    const route = findRoute(routes, host, req.url || "/", strict);
+    const route = findRoute(routes, tunnelAliases, host, req.url || "/", strict);
 
     if (!route) {
       const safeHost = escapeHtml(host);
@@ -552,8 +568,9 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     }
 
     const routes = getRoutes();
+    const tunnelAliases = getTunnelAliases();
     const host = getRequestHost(req).split(":")[0];
-    const route = findRoute(routes, host, req.url || "/", strict);
+    const route = findRoute(routes, tunnelAliases, host, req.url || "/", strict);
 
     if (!route) {
       socket.destroy();

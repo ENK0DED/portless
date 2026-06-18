@@ -8,7 +8,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { createProxyServer, PORTLESS_HEADER, PORTLESS_LISTENER_PORT_HEADER } from "./proxy.js";
 import type { ProxyServer } from "./proxy.js";
-import type { RouteInfo } from "./types.js";
+import type { RouteInfo, TunnelAlias } from "./types.js";
 import { ensureCerts } from "./certs.js";
 
 const TEST_PROXY_PORT = 1355;
@@ -231,6 +231,136 @@ describe("createProxyServer", () => {
       const res = await request(server, { host: "myapp.localhost" });
       expect(res.status).toBe(200);
       expect(res.body).toBe("hello from backend");
+    });
+
+    it("routes exact tunnel aliases to their target route", async () => {
+      const backend = trackServer(http.createServer((_req, res) => res.end("via alias")));
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const routes: RouteInfo[] = [{ hostname: "myapp.localhost", port: backendAddr.port }];
+      const aliases: TunnelAlias[] = [
+        {
+          externalHostname: "public.example.com",
+          targetHostname: "myapp.localhost",
+          targetPathPrefix: "/",
+        },
+      ];
+      const server = trackServer(
+        createProxyServer({
+          getRoutes: () => routes,
+          getTunnelAliases: () => aliases,
+          proxyPort: TEST_PROXY_PORT,
+        })
+      );
+      await listen(server);
+
+      const res = await request(server, { host: "public.example.com" });
+      expect(res.status).toBe(200);
+      expect(res.body).toBe("via alias");
+    });
+
+    it("does not route arbitrary public hosts without an explicit tunnel alias", async () => {
+      const backend = trackServer(http.createServer((_req, res) => res.end("private app")));
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const routes: RouteInfo[] = [{ hostname: "myapp.localhost", port: backendAddr.port }];
+      const server = trackServer(
+        createProxyServer({
+          getRoutes: () => routes,
+          getTunnelAliases: () => [],
+          proxyPort: TEST_PROXY_PORT,
+          strict: false,
+        })
+      );
+      await listen(server);
+
+      const res = await request(server, { host: "random.example.com" });
+      expect(res.status).toBe(404);
+      expect(res.body).not.toBe("private app");
+    });
+
+    it("prefers a direct route over a tunnel alias with the same hostname", async () => {
+      const directBackend = trackServer(http.createServer((_req, res) => res.end("direct")));
+      const aliasBackend = trackServer(http.createServer((_req, res) => res.end("alias")));
+      await listen(directBackend);
+      await listen(aliasBackend);
+      const directAddr = directBackend.address();
+      const aliasAddr = aliasBackend.address();
+      if (
+        !directAddr ||
+        typeof directAddr === "string" ||
+        !aliasAddr ||
+        typeof aliasAddr === "string"
+      ) {
+        throw new Error("no addr");
+      }
+
+      const routes: RouteInfo[] = [
+        { hostname: "public.example.com", port: directAddr.port },
+        { hostname: "myapp.localhost", port: aliasAddr.port },
+      ];
+      const aliases: TunnelAlias[] = [
+        {
+          externalHostname: "public.example.com",
+          targetHostname: "myapp.localhost",
+          targetPathPrefix: "/",
+        },
+      ];
+      const server = trackServer(
+        createProxyServer({
+          getRoutes: () => routes,
+          getTunnelAliases: () => aliases,
+          proxyPort: TEST_PROXY_PORT,
+        })
+      );
+      await listen(server);
+
+      const res = await request(server, { host: "public.example.com" });
+      expect(res.status).toBe(200);
+      expect(res.body).toBe("direct");
+    });
+
+    it("composes tunnel aliases with path-scoped target routes", async () => {
+      const rootBackend = trackServer(http.createServer((_req, res) => res.end("root")));
+      const apiBackend = trackServer(http.createServer((_req, res) => res.end("api")));
+      await listen(rootBackend);
+      await listen(apiBackend);
+      const rootAddr = rootBackend.address();
+      const apiAddr = apiBackend.address();
+      if (!rootAddr || typeof rootAddr === "string" || !apiAddr || typeof apiAddr === "string") {
+        throw new Error("no addr");
+      }
+
+      const routes: RouteInfo[] = [
+        { hostname: "myapp.localhost", port: rootAddr.port },
+        { hostname: "myapp.localhost", port: apiAddr.port, pathPrefix: "/api" },
+      ];
+      const aliases: TunnelAlias[] = [
+        {
+          externalHostname: "public.example.com",
+          targetHostname: "myapp.localhost",
+          targetPathPrefix: "/api",
+        },
+      ];
+      const server = trackServer(
+        createProxyServer({
+          getRoutes: () => routes,
+          getTunnelAliases: () => aliases,
+          proxyPort: TEST_PROXY_PORT,
+        })
+      );
+      await listen(server);
+
+      expect((await request(server, { host: "public.example.com", path: "/api/users" })).body).toBe(
+        "api"
+      );
+      expect(
+        (await request(server, { host: "other.public.example.com", path: "/api" })).status
+      ).toBe(404);
     });
 
     it("uses the longest matching path prefix for the same hostname", async () => {

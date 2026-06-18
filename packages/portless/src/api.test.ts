@@ -98,13 +98,21 @@ describe("getUrl", () => {
     expect(`${result}`).toBe("https://myapp.localhost");
     expect(String(result)).toBe("https://myapp.localhost");
     expect(result + "/health").toBe("https://myapp.localhost/health");
-    expect(Object.keys(result).sort()).toEqual(["hostname", "port", "tld", "tls", "url"]);
+    expect(Object.keys(result).sort()).toEqual([
+      "hostname",
+      "pathPrefix",
+      "port",
+      "tld",
+      "tls",
+      "url",
+    ]);
     expect(JSON.parse(JSON.stringify(result))).toEqual({
       url: "https://myapp.localhost",
       hostname: "myapp.localhost",
       port: 443,
       tls: true,
       tld: "localhost",
+      pathPrefix: "/",
     });
   });
 

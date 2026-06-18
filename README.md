@@ -417,6 +417,32 @@ Set `PORTLESS_NGROK=1` in your shell profile or `.env` to enable ngrok by defaul
 
 Requires the ngrok CLI to be installed and authenticated. If ngrok reports an authentication error, run `ngrok config add-authtoken <token>` and try again.
 
+## Public tunnel aliases
+
+Use managed tunnels when a public HTTPS URL should route through the portless proxy instead of directly to a child app:
+
+```bash
+portless myapp --tunnel cloudflare next dev
+# -> https://myapp.localhost
+# -> https://abc.trycloudflare.com
+
+portless myapp --tunnel ngrok next dev
+# -> https://abc123.ngrok.app
+```
+
+Managed tunnel requests are public internet traffic. Portless keeps the child app bound to `127.0.0.1`, starts the tunnel to the local proxy, and registers an exact tunnel alias for the generated public hostname. Unknown public `Host` headers are rejected; portless does not route arbitrary tunnel hostnames to the only running app.
+
+Use manual tunnel aliases when another tool already provides the public hostname:
+
+```bash
+portless tunnel map myapp abc.trycloudflare.com
+portless tunnel map myapp public.example.com --path /api
+portless tunnel list
+portless tunnel unmap abc.trycloudflare.com
+```
+
+Cloudflare support uses [Cloudflare Quick Tunnels](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/) through the `cloudflared` CLI. ngrok managed tunnels require the `ngrok` CLI and authentication. `--tunnel-hostname <hostname>` requests a provider-specific stable hostname when supported; Cloudflare Quick Tunnels do not support this mode.
+
 ## NetBird sharing
 
 Expose your dev server to the public internet with [NetBird Peer Expose](https://docs.netbird.io/):
@@ -452,6 +478,9 @@ portless alias <name> <port> --force  # Overwrite an existing route
 portless alias <name> <port> --h2c  # Register an HTTP/2 cleartext route
 portless alias <name> <port> --path /api  # Register a path-scoped route
 portless alias --remove <name>   # Remove a static route
+portless tunnel map <route> <host>  # Map an exact public tunnel host
+portless tunnel list             # Show public tunnel aliases
+portless tunnel unmap <host>     # Remove a public tunnel alias
 portless get <name>              # Print URL for a service
 portless get <name> --json       # Print service info as JSON
 portless url <name>              # Alias for portless get
@@ -473,6 +502,7 @@ PORTLESS=0 bun dev               # Bypasses proxy, uses default port
 portless myapp API_URL=1 next dev # Pass API_URL only to the child command
 portless grpc --h2c bun grpc.js   # Proxy to an h2c or gRPC upstream
 portless myapp --path /api bun api.js  # Route only /api to this app
+portless myapp --tunnel cloudflare bun dev # Public Quick Tunnel URL
 
 # Proxy control
 portless proxy start             # Start the HTTPS proxy (port 443, daemon)
@@ -513,6 +543,8 @@ portless service uninstall       # Remove the startup service
 --app-port <number>              Use a fixed app port; browser-blocked ports are rejected
 --h2c                            Forward this route to an HTTP/2 cleartext upstream
 --path <prefix>                  Scope this route to a path prefix, e.g. /api
+--tunnel <provider>              Share publicly via a managed tunnel: cloudflare or ngrok
+--tunnel-hostname <hostname>     Request a provider-specific stable tunnel hostname
 --tailscale                      Share the app on your Tailscale network (tailnet)
 --tailscale-service              Share the app as a stable Tailscale Service
 --tailscale-service-name <name>  Use an explicit Tailscale Service name
@@ -534,6 +566,8 @@ PORTLESS_PORT=<number>           Override the default proxy port
 PORTLESS_APP_PORT=<number>       Use a fixed app port (same as --app-port)
 PORTLESS_H2C=1                   Forward app routes to HTTP/2 cleartext upstreams
 PORTLESS_PATH=<prefix>           Scope app routes to a path prefix
+PORTLESS_TUNNEL=<provider>       Share publicly via a managed tunnel provider
+PORTLESS_TUNNEL_HOSTNAME=<host>  Request a provider-specific stable tunnel hostname
 PORTLESS_HTTPS=0                 Disable HTTPS (same as --no-tls)
 PORTLESS_LAN=1                   Enable LAN mode when set to 1 (auto-detects LAN IP)
 PORTLESS_LAN_IP=<address>        Pin a specific LAN IP for LAN mode
@@ -561,6 +595,7 @@ PORTLESS_URL                     Public URL (e.g. https://myapp.localhost)
 PORTLESS_TAILSCALE_URL           Tailscale URL of the app (when --tailscale is active)
 PORTLESS_TAILSCALE_SERVICE_URL   Tailscale Service URL of the app
 PORTLESS_NGROK_URL               ngrok URL of the app (when --ngrok is active)
+PORTLESS_TUNNEL_URL              Managed tunnel URL of the app (when --tunnel is active)
 PORTLESS_NETBIRD_URL             NetBird URL of the app (when --netbird is active)
 NODE_EXTRA_CA_CERTS              Path to the portless CA (when HTTPS is active)
 ```
@@ -569,7 +604,7 @@ Command args can use exact placeholders `{PORT}`, `{HOST}`, and `{PORTLESS_URL}`
 
 Prefer `PORTLESS_SUFFIX` for new configuration. It accepts single-label suffixes such as `test` and dotted suffixes such as `acme.com` or `server01.acme.com`. `PORTLESS_TLD` is only a compatibility alias and is ignored when `PORTLESS_SUFFIX` is set.
 
-> **Reserved names:** `run`, `get`, `url`, `alias`, `hosts`, `list`, `ls`, `status`, `trust`, `clean`, `prune`, `proxy`, `service`, and `completion` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name from your project, or `portless --name <name> <cmd>` to force any name including reserved ones.
+> **Reserved names:** `run`, `get`, `url`, `alias`, `tunnel`, `hosts`, `list`, `ls`, `status`, `trust`, `clean`, `prune`, `proxy`, `service`, and `completion` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name from your project, or `portless --name <name> <cmd>` to force any name including reserved ones.
 
 ## Shell completion
 

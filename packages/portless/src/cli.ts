@@ -9,7 +9,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { createSNICallback, ensureCerts, isCATrusted, trustCA, untrustCA } from "./certs.js";
 import { createHttpRedirectServer, createProxyServer } from "./proxy.js";
-import type { RouteProtocol } from "./types.js";
+import type { RouteProtocol, TunnelAlias, TunnelProviderName } from "./types.js";
 import {
   fixOwnership,
   formatUrl,
@@ -20,6 +20,14 @@ import {
 import { getUrl } from "./api.js";
 import { syncHostsFile, cleanHostsFile, shouldAutoSyncHosts } from "./hosts.js";
 import { FILE_MODE, RouteConflictError, RouteStore } from "./routes.js";
+import { TunnelAliasStore, normalizeTunnelHostname } from "./tunnel-aliases.js";
+import {
+  ensureTunnelProviderAvailable,
+  getTunnelProvider,
+  stopTunnelPid,
+  stopTunnelProcess,
+  type TunnelInstance,
+} from "./tunnel.js";
 import {
   ensureTailscaleReady,
   findAvailableServePort,
@@ -634,6 +642,7 @@ function startProxyServer(
 
   const server = createProxyServer({
     getRoutes: () => cachedRoutes,
+    getTunnelAliases: () => new TunnelAliasStore(store.dir).loadAliases(),
     proxyPort,
     tld,
     strict,
@@ -890,29 +899,66 @@ async function stopProxy(store: RouteStore, proxyPort: number, _tls: boolean): P
   }
 }
 
-function listRoutes(store: RouteStore, proxyPort: number, tls: boolean, asJson = false): void {
+function tunnelAliasLabel(alias: Pick<TunnelAlias, "targetHostname" | "targetPathPrefix">): string {
+  const targetPathPrefix = normalizePathPrefix(alias.targetPathPrefix);
+  return targetPathPrefix === "/"
+    ? alias.targetHostname
+    : `${alias.targetHostname}${targetPathPrefix}`;
+}
+
+function aliasesForRoute(
+  aliases: TunnelAlias[],
+  hostname: string,
+  pathPrefix: string
+): TunnelAlias[] {
+  return aliases.filter(
+    (alias) =>
+      alias.targetHostname === hostname &&
+      normalizePathPrefix(alias.targetPathPrefix) === pathPrefix
+  );
+}
+
+function listRoutes(
+  store: RouteStore,
+  proxyPort: number,
+  tls: boolean,
+  asJson = false,
+  aliases: TunnelAlias[] = []
+): void {
   const routes = store.loadRoutes();
 
   if (asJson) {
-    const payload = routes.map((route) => ({
-      hostname: route.hostname,
-      url: formatUrl(route.hostname, proxyPort, tls, route.pathPrefix),
-      target_port: route.port,
-      path_prefix: normalizePathPrefix(route.pathPrefix),
-      upstream_protocol: route.protocol ?? "http1",
-      pid: route.pid,
-      kind: route.pid === 0 ? "alias" : "app",
-      ...(route.tailscaleUrl ? { tailscale_url: route.tailscaleUrl } : {}),
-      ...(route.tailscaleServiceUrl
-        ? {
-            tailscale_service_url: route.tailscaleServiceUrl,
-            tailscale_service_name: route.tailscaleServiceName,
-            tailscale_service_pending: !!route.tailscaleServicePending,
-          }
-        : {}),
-      ...(route.ngrokUrl ? { ngrok_url: route.ngrokUrl } : {}),
-      ...(route.netbirdUrl ? { netbird_url: route.netbirdUrl } : {}),
-    }));
+    const payload = routes.map((route) => {
+      const pathPrefix = normalizePathPrefix(route.pathPrefix);
+      const routeAliases = aliasesForRoute(aliases, route.hostname, pathPrefix);
+      return {
+        hostname: route.hostname,
+        url: formatUrl(route.hostname, proxyPort, tls, route.pathPrefix),
+        target_port: route.port,
+        path_prefix: pathPrefix,
+        upstream_protocol: route.protocol ?? "http1",
+        pid: route.pid,
+        kind: route.pid === 0 ? "alias" : "app",
+        ...(route.tailscaleUrl ? { tailscale_url: route.tailscaleUrl } : {}),
+        ...(route.tailscaleServiceUrl
+          ? {
+              tailscale_service_url: route.tailscaleServiceUrl,
+              tailscale_service_name: route.tailscaleServiceName,
+              tailscale_service_pending: !!route.tailscaleServicePending,
+            }
+          : {}),
+        ...(route.ngrokUrl ? { ngrok_url: route.ngrokUrl } : {}),
+        ...(route.tunnelUrl
+          ? {
+              tunnel_url: route.tunnelUrl,
+              tunnel_provider: route.tunnelProvider,
+              tunnel_external_hostname: route.tunnelExternalHostname,
+            }
+          : {}),
+        ...(routeAliases.length > 0 ? { tunnel_aliases: routeAliases } : {}),
+        ...(route.netbirdUrl ? { netbird_url: route.netbirdUrl } : {}),
+      };
+    });
     process.stdout.write(JSON.stringify(payload, null, 2) + "\n");
     return;
   }
@@ -920,10 +966,11 @@ function listRoutes(store: RouteStore, proxyPort: number, tls: boolean, asJson =
   if (routes.length === 0) {
     console.log(colors.yellow("No active routes."));
     console.log(colors.gray("Start an app with: portless <name> <command>"));
-    return;
+    if (aliases.length === 0) return;
+  } else {
+    console.log(colors.blue.bold("\nActive routes:\n"));
   }
 
-  console.log(colors.blue.bold("\nActive routes:\n"));
   for (const route of routes) {
     const pathPrefix = normalizePathPrefix(route.pathPrefix);
     const url = formatUrl(route.hostname, proxyPort, tls, pathPrefix);
@@ -946,8 +993,22 @@ function listRoutes(store: RouteStore, proxyPort: number, tls: boolean, asJson =
     if (route.ngrokUrl) {
       console.log(`    ${colors.gray("ngrok:")} ${colors.green(route.ngrokUrl)}`);
     }
+    if (route.tunnelUrl) {
+      console.log(
+        `    ${colors.gray(`${route.tunnelProvider ?? "tunnel"}:`)} ${colors.green(route.tunnelUrl)}`
+      );
+    }
     if (route.netbirdUrl) {
       console.log(`    ${colors.gray("netbird:")} ${colors.green(route.netbirdUrl)}`);
+    }
+  }
+  if (aliases.length > 0) {
+    console.log(colors.blue.bold("\nTunnel aliases:\n"));
+    for (const alias of aliases) {
+      const label = alias.managed ? `${alias.provider ?? "managed"} managed` : "manual";
+      console.log(
+        `  ${colors.cyan(alias.externalHostname)}  ${colors.gray("->")}  ${colors.white(tunnelAliasLabel(alias))}  ${colors.gray(`(${label})`)}`
+      );
     }
   }
   console.log();
@@ -1115,7 +1176,8 @@ async function runApp(
   scriptContext?: { scriptName: string; packageDir: string },
   childEnv: Record<string, string> = {},
   protocol?: RouteProtocol,
-  pathPrefix?: string
+  pathPrefix?: string,
+  tunnel?: ManagedTunnelOptions
 ) {
   let store = initialStore;
   console.log(chalk.blue.bold(`\nportless\n`));
@@ -1137,9 +1199,15 @@ async function runApp(
   }
   const wantsTailscale = wantsFunnel || wantsPlainTailscale || wantsTailscaleService;
   const wantsNgrok = isEnabledEnv(process.env.PORTLESS_NGROK);
+  const requestedTunnel = tunnel ?? tunnelFromEnv();
   const wantsNetbird = isEnabledEnv(process.env.PORTLESS_NETBIRD) || hasNetbirdConfigEnv();
   let tsBaseUrl: string | undefined;
   let tsTailnetDnsSuffix: string | undefined;
+
+  if (wantsNgrok && requestedTunnel) {
+    console.error(colors.red("Error: --ngrok cannot be combined with --tunnel."));
+    process.exit(1);
+  }
 
   if (wantsTailscale) {
     try {
@@ -1169,6 +1237,25 @@ async function runApp(
       const message = err instanceof Error ? err.message : String(err);
       console.error(colors.red(`Error: ${message}`));
       if (message.includes("not found")) {
+        console.error(colors.blue("Install ngrok: https://ngrok.com/download"));
+      }
+      process.exit(1);
+    }
+  }
+
+  if (requestedTunnel) {
+    try {
+      ensureTunnelProviderAvailable(requestedTunnel.provider);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(colors.red(`Error: ${message}`));
+      if (message.includes("cloudflared CLI not found")) {
+        console.error(
+          colors.blue(
+            "Install cloudflared: https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/"
+          )
+        );
+      } else if (message.includes("ngrok CLI not found")) {
         console.error(colors.blue("Install ngrok: https://ngrok.com/download"));
       }
       process.exit(1);
@@ -1231,6 +1318,10 @@ async function runApp(
     lanIp = runningConfig.lanIp;
     console.log(chalk.gray("-- Proxy is running"));
   }
+
+  const tunnelAliasStore = new TunnelAliasStore(stateDir, {
+    onWarning: (msg) => console.warn(colors.yellow(msg)),
+  });
 
   // Compute hostname after auto-start so tld reflects the running proxy
   // (e.g. --lan changes tld from "localhost" to "local")
@@ -1302,6 +1393,9 @@ async function runApp(
   let netbirdProcess: Awaited<ReturnType<typeof startNetbirdExpose>> | undefined;
   let ngrokUrl: string | undefined;
   let ngrokProcess: Awaited<ReturnType<typeof startNgrok>> | undefined;
+  let tunnelUrl: string | undefined;
+  let managedTunnel: TunnelInstance | undefined;
+  let managedTunnelExternalHostname: string | undefined;
   let stoppingNetbird = false;
   let netbirdRouteReady = false;
   let netbirdExitHandled = false;
@@ -1310,6 +1404,10 @@ async function runApp(
   let ngrokRouteReady = false;
   let ngrokExitHandled = false;
   let pendingNgrokExit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+  let stoppingTunnel = false;
+  let tunnelRouteReady = false;
+  let tunnelExitHandled = false;
+  let pendingTunnelExit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
 
   const handleNetbirdExit = (code: number | null, signal: NodeJS.Signals | null) => {
     if (stoppingNetbird || netbirdExitHandled) return;
@@ -1368,6 +1466,45 @@ async function runApp(
       );
     } catch {
       // Best-effort cleanup; non-fatal
+    }
+  };
+
+  const handleTunnelExit = (code: number | null, signal: NodeJS.Signals | null) => {
+    if (stoppingTunnel || tunnelExitHandled) return;
+    if (!tunnelRouteReady) {
+      pendingTunnelExit = { code, signal };
+      return;
+    }
+    tunnelExitHandled = true;
+    tunnelUrl = undefined;
+    console.warn(
+      colors.yellow(
+        `Warning: tunnel for ${hostname} stopped${formatProcessExitSuffix(
+          code,
+          signal
+        )}. Removing its public URL from the route list.`
+      )
+    );
+    try {
+      store.updateRoute(
+        hostname,
+        {
+          tunnelProvider: null,
+          tunnelUrl: null,
+          tunnelExternalHostname: null,
+          tunnelPid: null,
+        },
+        { pathPrefix: routePathPrefix }
+      );
+    } catch {
+      // Best-effort cleanup; non-fatal
+    }
+    if (managedTunnelExternalHostname) {
+      try {
+        tunnelAliasStore.removeManagedAlias(managedTunnelExternalHostname, process.pid);
+      } catch {
+        // Best-effort cleanup; non-fatal
+      }
     }
   };
 
@@ -1583,6 +1720,85 @@ async function runApp(
     }
   }
 
+  if (requestedTunnel) {
+    try {
+      const provider = getTunnelProvider(requestedTunnel.provider);
+      managedTunnel = await provider.start(proxyPort, {
+        hostname: requestedTunnel.hostname,
+        onExit: handleTunnelExit,
+      });
+      tunnelUrl = managedTunnel.url;
+      managedTunnelExternalHostname = managedTunnel.hostname;
+      tunnelAliasStore.setAlias({
+        externalHostname: managedTunnel.hostname,
+        targetHostname: hostname,
+        targetPathPrefix: routePathPrefix,
+        managed: true,
+        provider: managedTunnel.provider,
+        url: managedTunnel.url,
+        tunnelPid: managedTunnel.pid,
+        routeOwnerPid: process.pid,
+      });
+      const label = managedTunnel.provider === "cloudflare" ? "Cloudflare Tunnel" : "ngrok tunnel";
+      console.log(chalk.green(`  ${label} -> ${tunnelUrl}`));
+      console.log(
+        chalk.gray("  (accessible from the public internet through an exact tunnel alias)\n")
+      );
+
+      try {
+        store.updateRoute(
+          hostname,
+          {
+            tunnelProvider: managedTunnel.provider,
+            tunnelUrl,
+            tunnelExternalHostname: managedTunnel.hostname,
+            tunnelPid: managedTunnel.pid,
+          },
+          { pathPrefix: routePathPrefix }
+        );
+      } catch {
+        // Non-fatal: route display metadata only
+      } finally {
+        tunnelRouteReady = true;
+        if (pendingTunnelExit) {
+          handleTunnelExit(pendingTunnelExit.code, pendingTunnelExit.signal);
+          pendingTunnelExit = undefined;
+        }
+      }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(colors.red(`Error: ${message}`));
+      stoppingNetbird = true;
+      stoppingNgrok = true;
+      stoppingTunnel = true;
+      stopNetbirdExpose(netbirdProcess);
+      stopNgrokProcess(ngrokProcess?.child);
+      stopTunnelProcess(managedTunnel?.child);
+      if (managedTunnelExternalHostname) {
+        try {
+          tunnelAliasStore.removeManagedAlias(managedTunnelExternalHostname, process.pid);
+        } catch {
+          // Best-effort cleanup; non-fatal
+        }
+      }
+      try {
+        unregisterTailscale({
+          tailscaleHttpsPort,
+          tailscaleFunnel: wantsFunnel || undefined,
+          tailscaleServiceName,
+        });
+      } catch {
+        // Best-effort cleanup; non-fatal
+      }
+      try {
+        store.removeRoute(hostname, process.pid, { pathPrefix: routePathPrefix });
+      } catch {
+        // Best-effort cleanup; non-fatal
+      }
+      process.exit(1);
+    }
+  }
+
   // Child servers always bind to localhost; the proxy handles cross-device LAN access.
   // Exception: Expo in LAN mode — Metro defaults to LAN and setting HOST=127.0.0.1
   // conflicts with its internal networking, causing HMR WebSocket degradation.
@@ -1654,14 +1870,24 @@ async function runApp(
       ...(tailscaleUrl ? { PORTLESS_TAILSCALE_URL: tailscaleUrl } : {}),
       ...(tailscaleServiceUrl ? { PORTLESS_TAILSCALE_SERVICE_URL: tailscaleServiceUrl } : {}),
       ...(ngrokUrl ? { PORTLESS_NGROK_URL: ngrokUrl } : {}),
+      ...(tunnelUrl ? { PORTLESS_TUNNEL_URL: tunnelUrl } : {}),
       ...(netbirdUrl ? { PORTLESS_NETBIRD_URL: netbirdUrl } : {}),
       ...caEnv,
     },
     onCleanup: () => {
       stoppingNetbird = true;
       stoppingNgrok = true;
+      stoppingTunnel = true;
       stopNetbirdExpose(netbirdProcess);
       stopNgrokProcess(ngrokProcess?.child);
+      stopTunnelProcess(managedTunnel?.child);
+      if (managedTunnelExternalHostname) {
+        try {
+          tunnelAliasStore.removeManagedAlias(managedTunnelExternalHostname, process.pid);
+        } catch {
+          // Best-effort cleanup; non-fatal
+        }
+      }
       try {
         unregisterTailscale({
           tailscaleHttpsPort,
@@ -1720,6 +1946,8 @@ interface ParsedRunArgs {
   protocol?: RouteProtocol;
   /** Optional route path prefix. */
   pathPrefix?: string;
+  /** Optional managed public tunnel provider. */
+  tunnel?: ManagedTunnelOptions;
   /** The child command and its arguments, passed through untouched. */
   commandArgs: string[];
 }
@@ -1727,6 +1955,11 @@ interface ParsedRunArgs {
 interface ParsedAppArgs extends ParsedRunArgs {
   /** App name. */
   name: string;
+}
+
+interface ManagedTunnelOptions {
+  provider: TunnelProviderName;
+  hostname?: string;
 }
 
 function parseAppPort(value: string | undefined): number {
@@ -1757,6 +1990,49 @@ function appPortFromEnv(): number | undefined {
 
 function routeProtocolFromEnv(): RouteProtocol | undefined {
   return isEnabledEnv(process.env.PORTLESS_H2C) ? "h2c" : undefined;
+}
+
+function parseTunnelProvider(value: string | undefined, source: string): TunnelProviderName {
+  if (!value || value.startsWith("--")) {
+    console.error(colors.red(`Error: ${source} requires a tunnel provider.`));
+    console.error(colors.cyan(`  ${source} cloudflare`));
+    process.exit(1);
+  }
+  try {
+    return getTunnelProvider(value).name;
+  } catch (err) {
+    console.error(colors.red(`Error: ${(err as Error).message}`));
+    process.exit(1);
+  }
+}
+
+function parseTunnelHostname(value: string | undefined, source: string): string {
+  if (!value || value.startsWith("--")) {
+    console.error(colors.red(`Error: ${source} requires a hostname.`));
+    console.error(colors.cyan(`  ${source} example.ngrok-free.dev`));
+    process.exit(1);
+  }
+  try {
+    return normalizeTunnelHostname(value);
+  } catch (err) {
+    console.error(colors.red(`Error: ${(err as Error).message}`));
+    process.exit(1);
+  }
+}
+
+function tunnelFromEnv(): ManagedTunnelOptions | undefined {
+  if (process.env.PORTLESS_TUNNEL === undefined) return undefined;
+  return {
+    provider: parseTunnelProvider(process.env.PORTLESS_TUNNEL, "PORTLESS_TUNNEL"),
+    ...(process.env.PORTLESS_TUNNEL_HOSTNAME !== undefined
+      ? {
+          hostname: parseTunnelHostname(
+            process.env.PORTLESS_TUNNEL_HOSTNAME,
+            "PORTLESS_TUNNEL_HOSTNAME"
+          ),
+        }
+      : {}),
+  };
 }
 
 function parsePathPrefix(value: string | undefined, source: string): string {
@@ -1892,6 +2168,7 @@ function parseRunArgs(args: string[]): ParsedRunArgs {
   let name: string | undefined;
   let protocol = routeProtocolFromEnv();
   let pathPrefix = pathPrefixFromEnv();
+  let tunnel = tunnelFromEnv();
   let allowChildEnv = true;
   let i = 0;
 
@@ -1916,6 +2193,8 @@ ${colors.bold("Options:")}
   --app-port <number>    Use a fixed app port; browser-blocked ports are rejected
   --h2c                  Forward this route to an HTTP/2 cleartext upstream
   --path <prefix>        Scope the route to a path prefix, e.g. /api
+  --tunnel <provider>    Share publicly via a managed tunnel: cloudflare or ngrok
+  --tunnel-hostname <h>  Request a provider-specific stable tunnel hostname
   --tailscale            Share the app on your Tailscale network (tailnet)
   --tailscale-service    Share the app as a stable Tailscale Service
   --tailscale-service-name <name>
@@ -1953,6 +2232,8 @@ ${colors.bold("Examples:")}
   portless run vite dev               # -> https://<project>.localhost
   portless run --h2c grpc-server      # h2c or gRPC upstream
   portless run --path /api api-server # -> https://<project>.localhost/api
+  portless run --tunnel cloudflare next dev
+                                      # -> also https://<random>.trycloudflare.com
   portless run my-server --port {PORT}
   portless run --app-port 3000 bun start
 `);
@@ -1967,6 +2248,16 @@ ${colors.bold("Examples:")}
     } else if (args[i] === "--path") {
       i++;
       pathPrefix = parsePathPrefix(args[i], "--path");
+    } else if (args[i] === "--tunnel") {
+      i++;
+      tunnel = { ...(tunnel ?? {}), provider: parseTunnelProvider(args[i], "--tunnel") };
+    } else if (args[i] === "--tunnel-hostname") {
+      i++;
+      tunnel = {
+        provider:
+          tunnel?.provider ?? parseTunnelProvider(process.env.PORTLESS_TUNNEL, "PORTLESS_TUNNEL"),
+        hostname: parseTunnelHostname(args[i], "--tunnel-hostname"),
+      };
     } else if (args[i] === "--name") {
       i++;
       if (!args[i] || args[i].startsWith("-")) {
@@ -1988,7 +2279,7 @@ ${colors.bold("Examples:")}
         console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
         console.error(
           colors.blue(
-            "Known flags: --name, --force, --app-port, --h2c, --path, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups, --help"
+            "Known flags: --name, --force, --app-port, --h2c, --path, --tunnel, --tunnel-hostname, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups, --help"
           )
         );
         process.exit(1);
@@ -2003,7 +2294,7 @@ ${colors.bold("Examples:")}
     ? splitLeadingChildEnv(args.slice(i))
     : { childEnv: {}, commandArgs: args.slice(i) };
 
-  return { force, appPort, name, protocol, pathPrefix, ...parsedChild };
+  return { force, appPort, name, protocol, pathPrefix, tunnel, ...parsedChild };
 }
 
 /**
@@ -2018,6 +2309,7 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
   let appPort: number | undefined;
   let protocol = routeProtocolFromEnv();
   let pathPrefix = pathPrefixFromEnv();
+  let tunnel = tunnelFromEnv();
   let allowChildEnv = true;
   let i = 0;
 
@@ -2037,6 +2329,16 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
     } else if (args[i] === "--path") {
       i++;
       pathPrefix = parsePathPrefix(args[i], "--path");
+    } else if (args[i] === "--tunnel") {
+      i++;
+      tunnel = { ...(tunnel ?? {}), provider: parseTunnelProvider(args[i], "--tunnel") };
+    } else if (args[i] === "--tunnel-hostname") {
+      i++;
+      tunnel = {
+        provider:
+          tunnel?.provider ?? parseTunnelProvider(process.env.PORTLESS_TUNNEL, "PORTLESS_TUNNEL"),
+        hostname: parseTunnelHostname(args[i], "--tunnel-hostname"),
+      };
     } else if (args[i] === "--wildcard") {
       rejectMisplacedWildcardFlag();
     } else if (applySharingFlag(args[i])) {
@@ -2050,7 +2352,7 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
         console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
         console.error(
           colors.blue(
-            "Known flags: --force, --app-port, --h2c, --path, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups"
+            "Known flags: --force, --app-port, --h2c, --path, --tunnel, --tunnel-hostname, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups"
           )
         );
         process.exit(1);
@@ -2079,6 +2381,16 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
     } else if (args[i] === "--path") {
       i++;
       pathPrefix = parsePathPrefix(args[i], "--path");
+    } else if (args[i] === "--tunnel") {
+      i++;
+      tunnel = { ...(tunnel ?? {}), provider: parseTunnelProvider(args[i], "--tunnel") };
+    } else if (args[i] === "--tunnel-hostname") {
+      i++;
+      tunnel = {
+        provider:
+          tunnel?.provider ?? parseTunnelProvider(process.env.PORTLESS_TUNNEL, "PORTLESS_TUNNEL"),
+        hostname: parseTunnelHostname(args[i], "--tunnel-hostname"),
+      };
     } else if (args[i] === "--wildcard") {
       rejectMisplacedWildcardFlag();
     } else if (applySharingFlag(args[i])) {
@@ -2092,7 +2404,7 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
         console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
         console.error(
           colors.blue(
-            "Known flags: --force, --app-port, --h2c, --path, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups"
+            "Known flags: --force, --app-port, --h2c, --path, --tunnel, --tunnel-hostname, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups"
           )
         );
         process.exit(1);
@@ -2107,7 +2419,7 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
     ? splitLeadingChildEnv(args.slice(i))
     : { childEnv: {}, commandArgs: args.slice(i) };
 
-  return { force, appPort, name, protocol, pathPrefix, ...parsedChild };
+  return { force, appPort, name, protocol, pathPrefix, tunnel, ...parsedChild };
 }
 
 // ---------------------------------------------------------------------------
@@ -2134,6 +2446,7 @@ const TOP_LEVEL_COMPLETION_COMMANDS: CompletionCommand[] = [
   { name: "get", description: "Print URL for a service" },
   { name: "url", description: "Alias for get" },
   { name: "alias", description: "Register or remove a static route" },
+  { name: "tunnel", description: "Manage public tunnel aliases" },
   { name: "hosts", description: "Manage hosts file entries" },
   { name: "list", description: "Show active routes" },
   { name: "ls", description: "Alias for list" },
@@ -2166,6 +2479,8 @@ const GLOBAL_COMPLETION_FLAGS: CompletionFlag[] = [
   { name: "--app-port", description: "Use a fixed app port", value: "port" },
   { name: "--h2c", description: "Forward to an HTTP/2 cleartext upstream" },
   { name: "--path", description: "Scope route to a path prefix", value: "prefix" },
+  { name: "--tunnel", description: "Share publicly via tunnel provider", value: "provider" },
+  { name: "--tunnel-hostname", description: "Request stable tunnel hostname", value: "hostname" },
   { name: "--tailscale", description: "Share on Tailscale" },
   { name: "--tailscale-service", description: "Share as a Tailscale Service" },
   {
@@ -2190,6 +2505,8 @@ const RUN_COMPLETION_FLAGS = GLOBAL_COMPLETION_FLAGS.filter((flag) =>
     "--app-port",
     "--h2c",
     "--path",
+    "--tunnel",
+    "--tunnel-hostname",
     "--tailscale",
     "--tailscale-service",
     "--tailscale-service-name",
@@ -2208,6 +2525,8 @@ const APP_COMPLETION_FLAGS = GLOBAL_COMPLETION_FLAGS.filter((flag) =>
     "--app-port",
     "--h2c",
     "--path",
+    "--tunnel",
+    "--tunnel-hostname",
     "--tailscale",
     "--tailscale-service",
     "--tailscale-service-name",
@@ -2329,6 +2648,13 @@ _portless_completions() {
     alias)
       COMPREPLY=( $(compgen -W "--remove --force --h2c --path --help -h" -- "$cur") )
       ;;
+    tunnel)
+      if [[ $COMP_CWORD -eq 2 ]]; then
+        COMPREPLY=( $(compgen -W "map unmap list --help -h" -- "$cur") )
+      else
+        COMPREPLY=( $(compgen -W "--path --json --help -h" -- "$cur") )
+      fi
+      ;;
     hosts)
       if [[ $COMP_CWORD -eq 2 ]]; then
         COMPREPLY=( $(compgen -W "sync clean --help -h" -- "$cur") )
@@ -2408,6 +2734,13 @@ _portless() {
         alias)
           _arguments '--remove[Remove route]' '--force[Override existing route]' '--h2c[Forward to HTTP/2 cleartext upstream]' '--path[Scope route to path prefix]:prefix' '--help[Show help]' '-h[Show help]'
           ;;
+        tunnel)
+          if (( CURRENT == 3 )); then
+            _values 'tunnel command' map unmap list
+          else
+            _arguments '--path[Scope target route to path prefix]:prefix' '--json[Print JSON]' '--help[Show help]' '-h[Show help]'
+          fi
+          ;;
         hosts)
           _values 'hosts command' sync clean
           ;;
@@ -2460,13 +2793,16 @@ ${commandLines}
 
 ${fishFlagLines(GLOBAL_COMPLETION_FLAGS)}
 ${fishFlagLines(RUN_COMPLETION_FLAGS, "__fish_seen_subcommand_from run")}
-${fishFlagLines(APP_COMPLETION_FLAGS, "not __fish_seen_subcommand_from run get url list ls status alias hosts clean prune proxy service completion")}
+${fishFlagLines(APP_COMPLETION_FLAGS, "not __fish_seen_subcommand_from run get url list ls status alias tunnel hosts clean prune proxy service completion")}
 complete -c portless -n "__fish_seen_subcommand_from get url list ls status" -l json -d "Print JSON"
 complete -c portless -n "__fish_seen_subcommand_from get url" -l path -d "Scope URL to path prefix" -r
 complete -c portless -n "__fish_seen_subcommand_from alias" -l remove -d "Remove route"
 complete -c portless -n "__fish_seen_subcommand_from alias" -l force -d "Override existing route"
 complete -c portless -n "__fish_seen_subcommand_from alias" -l h2c -d "Forward to HTTP/2 cleartext upstream"
 complete -c portless -n "__fish_seen_subcommand_from alias" -l path -d "Scope route to path prefix" -r
+complete -c portless -n "__fish_seen_subcommand_from tunnel; and __fish_is_nth_token 2" -a "map unmap list"
+complete -c portless -n "__fish_seen_subcommand_from tunnel" -l path -d "Scope target route to path prefix" -r
+complete -c portless -n "__fish_seen_subcommand_from tunnel" -l json -d "Print JSON"
 complete -c portless -n "__fish_seen_subcommand_from hosts; and __fish_is_nth_token 2" -a "sync clean"
 complete -c portless -n "__fish_seen_subcommand_from clean" -l help -s h -d "Show help"
 complete -c portless -n "__fish_seen_subcommand_from prune" -l force -d "Send SIGKILL"
@@ -2533,6 +2869,7 @@ ${colors.bold("Usage:")}
   ${colors.cyan("portless url <name>")}              Alias for portless get
   ${colors.cyan("portless alias <name> <port>")}     Register a static route (e.g. for Docker)
   ${colors.cyan("portless alias --remove <name>")}   Remove a static route
+  ${colors.cyan("portless tunnel map <route> <host>")} Manage exact public tunnel aliases
   ${colors.cyan("portless list")}                    Show active routes
   ${colors.cyan("portless list --json")}             Show active routes as JSON
   ${colors.cyan("portless ls")} / ${colors.cyan("portless status")}   Aliases for portless list
@@ -2560,6 +2897,8 @@ ${colors.bold("Examples:")}
   portless myapp API_URL=1 next dev   # Pass API_URL only to the child command
   portless myapp --h2c grpc-server    # Proxy to an h2c or gRPC upstream
   portless myapp --path /api api-dev  # -> https://myapp.localhost/api
+  portless myapp --tunnel cloudflare next dev
+                                     # -> also https://<random>.trycloudflare.com (public)
   portless myapp --tailscale next dev # -> also https://<node>.ts.net (tailnet)
   portless myapp --tailscale-service next dev
                                      # -> also https://<service>.<tailnet>.ts.net
@@ -2633,8 +2972,15 @@ ${colors.bold("Tailscale sharing:")}
   ${colors.cyan("portless myapp --tailscale-service --tailscale-service-name api next dev")}
   ${colors.cyan("portless myapp --funnel next dev")}
 
-${colors.bold("ngrok sharing:")}
-  Use --ngrok to expose your dev server to the public internet with ngrok.
+${colors.bold("Public tunnel sharing:")}
+  Use --tunnel cloudflare or --tunnel ngrok to expose your dev server to
+  the public internet through the portless proxy with an exact tunnel alias.
+  Use portless tunnel map when you already have an external tunnel hostname.
+  Requires cloudflared or ngrok to be installed.
+  ${colors.cyan("portless myapp --tunnel cloudflare next dev")}
+
+${colors.bold("ngrok direct sharing:")}
+  Use --ngrok to expose your dev server directly with ngrok.
   Requires the ngrok CLI to be installed and authenticated.
   ${colors.cyan("portless myapp --ngrok next dev")}
 
@@ -2669,6 +3015,8 @@ ${colors.bold("Options:")}
   --app-port <number>           Use a fixed app port; browser-blocked ports are rejected
   --h2c                         Forward this route to an HTTP/2 cleartext upstream
   --path <prefix>               Scope this route to a path prefix, e.g. /api
+  --tunnel <provider>           Share publicly via a managed tunnel: cloudflare or ngrok
+  --tunnel-hostname <hostname>  Request a provider-specific stable tunnel hostname
   --tailscale                   Share the app on your Tailscale network (tailnet)
   --tailscale-service           Share the app as a stable Tailscale Service
   --tailscale-service-name <n>  Use an explicit Tailscale Service name
@@ -2687,6 +3035,8 @@ ${colors.bold("Environment variables:")}
   PORTLESS_APP_PORT=<number>    Use a fixed app port (same as --app-port)
   PORTLESS_H2C=1                Forward app routes to HTTP/2 cleartext upstreams
   PORTLESS_PATH=<prefix>        Scope app routes to a path prefix
+  PORTLESS_TUNNEL=<provider>    Share publicly via a managed tunnel provider
+  PORTLESS_TUNNEL_HOSTNAME=<h>  Request a provider-specific stable tunnel hostname
   PORTLESS_HTTPS=0              Disable HTTPS (same as --no-tls)
   PORTLESS_LAN=1                Enable LAN mode when set to 1 (set in .bashrc / .zshrc)
   PORTLESS_LAN_IP=<address>     Pin a specific LAN IP for LAN mode
@@ -2714,6 +3064,7 @@ ${colors.bold("Child process environment:")}
   PORT                          Ephemeral port the child should listen on
   HOST                          Usually 127.0.0.1 (omitted for Expo in LAN mode)
   PORTLESS_URL                  Public URL of the app (e.g. https://myapp.localhost)
+  PORTLESS_TUNNEL_URL           Public URL from a managed tunnel provider
   PORTLESS_LAN                  Set to 1 when proxy is in LAN mode
   PORTLESS_TAILSCALE_URL        Tailscale URL of the app (when --tailscale is active)
   PORTLESS_TAILSCALE_SERVICE_URL
@@ -2747,7 +3098,7 @@ ${colors.bold("Skip portless:")}
   PORTLESS=0 bun dev            # Runs command directly without proxy
 
 ${colors.bold("Reserved names:")}
-  run, get, url, alias, hosts, list, ls, status, trust, clean, prune, proxy, service, completion are subcommands and
+  run, get, url, alias, tunnel, hosts, list, ls, status, trust, clean, prune, proxy, service, completion are subcommands and
   cannot be used as app names directly. Use "portless run" to infer the name,
   or "portless --name <name>" to force any name including reserved ones.
 `);
@@ -2864,6 +3215,9 @@ ${colors.bold("Options:")}
   const store = new RouteStore(dir, {
     onWarning: (msg) => console.warn(colors.yellow(msg)),
   });
+  const tunnelAliasStore = new TunnelAliasStore(dir, {
+    onWarning: (msg) => console.warn(colors.yellow(msg)),
+  });
   await stopProxy(store, port, tls);
 
   // Clean up any tailscale serve/funnel/service registrations tied to stale routes
@@ -2884,9 +3238,19 @@ ${colors.bold("Options:")}
       stopNgrok(route);
       console.log(colors.green(`Stopped ngrok tunnel for ${route.hostname}.`));
     }
+    if (route.tunnelPid) {
+      stopTunnelPid(route.tunnelPid);
+      console.log(colors.green(`Stopped managed tunnel for ${route.hostname}.`));
+    }
     if (route.netbirdPid) {
       stopNetbird(route);
       console.log(colors.green(`Stopped NetBird expose for ${route.hostname}.`));
+    }
+  }
+  for (const alias of tunnelAliasStore.loadAliases()) {
+    if (alias.managed && alias.tunnelPid) {
+      stopTunnelPid(alias.tunnelPid);
+      console.log(colors.green(`Stopped managed tunnel for ${alias.externalHostname}.`));
     }
   }
 
@@ -2959,9 +3323,13 @@ ${colors.bold("Options:")}
   const store = new RouteStore(dir, {
     onWarning: (msg) => console.warn(colors.yellow(msg)),
   });
+  const tunnelAliasStore = new TunnelAliasStore(dir, {
+    onWarning: (msg) => console.warn(colors.yellow(msg)),
+  });
 
   const stale = store.pruneStaleRoutes();
-  if (stale.length === 0) {
+  const staleAliases = tunnelAliasStore.pruneManagedAliases();
+  if (stale.length === 0 && staleAliases.length === 0) {
     console.log("No orphaned routes found.");
     return;
   }
@@ -2982,9 +3350,19 @@ ${colors.bold("Options:")}
       stopNgrok(route);
       console.log(`  ${route.hostname} - stopped ngrok tunnel`);
     }
+    if (route.tunnelPid) {
+      stopTunnelPid(route.tunnelPid);
+      console.log(`  ${route.hostname} - stopped managed tunnel`);
+    }
     if (route.netbirdPid) {
       stopNetbird(route);
       console.log(`  ${route.hostname} - stopped NetBird expose`);
+    }
+  }
+  for (const alias of staleAliases) {
+    if (alias.tunnelPid) {
+      stopTunnelPid(alias.tunnelPid);
+      console.log(`  ${alias.externalHostname} - stopped managed tunnel alias`);
     }
   }
 
@@ -3011,7 +3389,7 @@ ${colors.bold("Options:")}
   const procWord = killed === 1 ? "process" : "processes";
   console.log(
     colors.green(
-      `\nPruned ${stale.length} stale ${routeWord}, killed ${killed} orphaned ${procWord}.`
+      `\nPruned ${stale.length} stale ${routeWord} and ${staleAliases.length} tunnel aliases, killed ${killed} orphaned ${procWord}.`
     )
   );
 }
@@ -3054,7 +3432,10 @@ ${colors.bold("JSON fields:")}
   const store = new RouteStore(dir, {
     onWarning: (msg) => console.warn(colors.yellow(msg)),
   });
-  listRoutes(store, port, tls, asJson);
+  const tunnelAliasStore = new TunnelAliasStore(dir, {
+    onWarning: (msg) => console.warn(colors.yellow(msg)),
+  });
+  listRoutes(store, port, tls, asJson, tunnelAliasStore.loadAliases());
 }
 
 async function handleGet(args: string[]): Promise<void> {
@@ -3159,6 +3540,134 @@ ${colors.bold("JSON fields:")}
 
   // Print bare URL to stdout so it works in $(portless get <name>)
   process.stdout.write(serviceUrl.url + "\n");
+}
+
+async function handleTunnel(args: string[]): Promise<void> {
+  if (args[1] === "--help" || args[1] === "-h" || args.length === 1) {
+    console.log(`
+${colors.bold("portless tunnel")} - Manage exact public tunnel aliases.
+
+Tunnel aliases let public tunnel hostnames route through the portless proxy
+without allowing arbitrary public Host headers to reach local apps.
+
+${colors.bold("Usage:")}
+  ${colors.cyan("portless tunnel map <route> <external-host>")}
+  ${colors.cyan("portless tunnel map <route> <external-host> --path /api")}
+  ${colors.cyan("portless tunnel unmap <external-host>")}
+  ${colors.cyan("portless tunnel list")}
+  ${colors.cyan("portless tunnel list --json")}
+
+${colors.bold("Examples:")}
+  portless tunnel map myapp abc.trycloudflare.com
+  portless tunnel map myapp public.example.com --path /api
+  portless tunnel unmap abc.trycloudflare.com
+`);
+    process.exit(0);
+  }
+
+  const { dir, tld } = await discoverState();
+  const store = new TunnelAliasStore(dir, {
+    onWarning: (msg) => console.warn(colors.yellow(msg)),
+  });
+  const command = args[1];
+
+  if (command === "map") {
+    const routeName = args[2];
+    const externalHostname = args[3];
+    if (!routeName || !externalHostname) {
+      console.error(colors.red("Error: Missing tunnel map arguments."));
+      console.error(colors.cyan("  portless tunnel map <route> <external-host>"));
+      process.exit(1);
+    }
+    let pathPrefix = pathPrefixFromEnv();
+    for (let i = 4; i < args.length; i++) {
+      if (args[i] === "--path") {
+        i++;
+        pathPrefix = parsePathPrefix(args[i], "--path");
+      } else {
+        console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
+        console.error(colors.blue("Known flags: --path, --help"));
+        process.exit(1);
+      }
+    }
+    const targetHostname = parseHostname(routeName, tld);
+    const targetPathPrefix = normalizePathPrefix(pathPrefix);
+    try {
+      store.setAlias({
+        externalHostname,
+        targetHostname,
+        targetPathPrefix,
+      });
+    } catch (err) {
+      console.error(colors.red(`Error: ${(err as Error).message}`));
+      process.exit(1);
+    }
+    const label = tunnelAliasLabel({
+      targetHostname,
+      targetPathPrefix,
+    });
+    console.log(colors.green(`Mapped tunnel alias: ${externalHostname} -> ${label}`));
+    return;
+  }
+
+  if (command === "unmap") {
+    const externalHostname = args[2];
+    if (!externalHostname) {
+      console.error(colors.red("Error: Missing external tunnel hostname."));
+      console.error(colors.cyan("  portless tunnel unmap <external-host>"));
+      process.exit(1);
+    }
+    for (let i = 3; i < args.length; i++) {
+      console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
+      console.error(colors.blue("Known flags: --help"));
+      process.exit(1);
+    }
+    try {
+      if (!store.removeAlias(externalHostname)) {
+        console.error(colors.red(`Error: No tunnel alias found for "${externalHostname}".`));
+        process.exit(1);
+      }
+    } catch (err) {
+      console.error(colors.red(`Error: ${(err as Error).message}`));
+      process.exit(1);
+    }
+    console.log(colors.green(`Removed tunnel alias: ${externalHostname}`));
+    return;
+  }
+
+  if (command === "list") {
+    let asJson = false;
+    for (let i = 2; i < args.length; i++) {
+      if (args[i] === "--json") {
+        asJson = true;
+      } else {
+        console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
+        console.error(colors.blue("Known flags: --json, --help"));
+        process.exit(1);
+      }
+    }
+    const aliases = store.loadAliases();
+    if (asJson) {
+      process.stdout.write(JSON.stringify(aliases, null, 2) + "\n");
+      return;
+    }
+    if (aliases.length === 0) {
+      console.log(colors.yellow("No tunnel aliases configured."));
+      return;
+    }
+    console.log(colors.blue.bold("\nTunnel aliases:\n"));
+    for (const alias of aliases) {
+      console.log(
+        `  ${colors.cyan(alias.externalHostname)}  ${colors.gray("->")}  ${colors.white(tunnelAliasLabel(alias))}`
+      );
+    }
+    console.log();
+    return;
+  }
+
+  console.error(colors.red(`Error: Unknown tunnel subcommand "${command}".`));
+  console.error(colors.cyan("  portless tunnel --help"));
+  process.exit(1);
 }
 
 async function handleAlias(args: string[]): Promise<void> {
@@ -4666,7 +5175,8 @@ async function handleRunMode(args: string[], globalScript?: string): Promise<voi
     scriptContext,
     parsed.childEnv,
     parsed.protocol,
-    parsed.pathPrefix
+    parsed.pathPrefix,
+    parsed.tunnel
   );
 }
 
@@ -4716,7 +5226,8 @@ async function handleNamedMode(args: string[]): Promise<void> {
     undefined,
     parsed.childEnv,
     parsed.protocol,
-    parsed.pathPrefix
+    parsed.pathPrefix,
+    parsed.tunnel
   );
 }
 
@@ -4825,6 +5336,25 @@ async function main() {
   } else if (typeof pathResult === "string") {
     process.env.PORTLESS_PATH = parsePathPrefix(pathResult, "--path");
   }
+  const tunnelResult = stripGlobalFlag("--tunnel", true);
+  if (tunnelResult === false) {
+    console.error(colors.red("Error: --tunnel requires a tunnel provider."));
+    console.error(colors.cyan("  portless --tunnel cloudflare run <command>"));
+    process.exit(1);
+  } else if (typeof tunnelResult === "string") {
+    process.env.PORTLESS_TUNNEL = parseTunnelProvider(tunnelResult, "--tunnel");
+  }
+  const tunnelHostnameResult = stripGlobalFlag("--tunnel-hostname", true);
+  if (tunnelHostnameResult === false) {
+    console.error(colors.red("Error: --tunnel-hostname requires a hostname."));
+    console.error(colors.cyan("  portless --tunnel-hostname example.ngrok-free.dev run <command>"));
+    process.exit(1);
+  } else if (typeof tunnelHostnameResult === "string") {
+    process.env.PORTLESS_TUNNEL_HOSTNAME = parseTunnelHostname(
+      tunnelHostnameResult,
+      "--tunnel-hostname"
+    );
+  }
   for (const [flag, envKey] of TAILSCALE_SERVICE_VALUE_FLAGS) {
     const value = stripGlobalFlag(flag, true);
     if (value === false) {
@@ -4859,7 +5389,7 @@ async function main() {
 
   // --name flag: treat the next arg as an explicit app name, bypassing
   // subcommand dispatch. Useful when the app name collides with a reserved
-  // subcommand (run, alias, hosts, list, trust, clean, prune, proxy, service, completion).
+  // subcommand (run, alias, tunnel, hosts, list, trust, clean, prune, proxy, service, completion).
   if (args[0] === "--name") {
     args.shift();
     if (!args[0]) {
@@ -4898,7 +5428,11 @@ async function main() {
     skipPortless &&
     (isRunCommand ||
       args.length === 0 ||
-      (args.length >= 2 && args[0] !== "proxy" && args[0] !== "clean" && args[0] !== "service"))
+      (args.length >= 2 &&
+        args[0] !== "proxy" &&
+        args[0] !== "clean" &&
+        args[0] !== "service" &&
+        args[0] !== "tunnel"))
   ) {
     const parsed = isRunCommand ? parseRunArgs(args) : parseAppArgs(args);
     let commandArgs = parsed.commandArgs;
@@ -4916,7 +5450,7 @@ async function main() {
     return;
   }
 
-  // Global dispatch: help, version, trust, clean, prune, list, alias, hosts, proxy, service, completion
+  // Global dispatch: help, version, trust, clean, prune, list, alias, tunnel, hosts, proxy, service, completion
   // When `run` is used, skip these so args like "list" or "--help" are treated
   // as child-command tokens, not portless subcommands.
   if (!isRunCommand) {
@@ -4968,6 +5502,10 @@ async function main() {
     }
     if (args[0] === "alias") {
       await handleAlias(args);
+      return;
+    }
+    if (args[0] === "tunnel") {
+      await handleTunnel(args);
       return;
     }
     if (args[0] === "hosts") {

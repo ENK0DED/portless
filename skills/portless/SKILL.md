@@ -214,6 +214,8 @@ The suffix may be a single label such as `test` or a dotted suffix such as `serv
 | `PORTLESS_TAILSCALE_SERVICE_NAME` | Use an explicit Tailscale Service name                                      |
 | `PORTLESS_FUNNEL`                 | Set to `1` to share apps publicly via Tailscale Funnel (same as `--funnel`) |
 | `PORTLESS_NGROK`                  | Set to `1` to share apps publicly via ngrok (same as `--ngrok`)             |
+| `PORTLESS_TUNNEL`                 | Managed public tunnel provider selector (`cloudflare` or `ngrok`)           |
+| `PORTLESS_TUNNEL_HOSTNAME`        | Request a provider-specific stable tunnel hostname                          |
 | `PORTLESS_NETBIRD`                | Set to `1` to share apps publicly via NetBird (same as `--netbird`)         |
 | `PORTLESS_NETBIRD_PASSWORD`       | Require a password for the NetBird public URL                               |
 | `PORTLESS_NETBIRD_PIN`            | Require a PIN for the NetBird public URL                                    |
@@ -322,6 +324,28 @@ portless myapp --ngrok next dev
 
 Set `PORTLESS_NGROK=1` to enable ngrok by default when portless runs an app. `portless list` shows both local and ngrok URLs. The ngrok tunnel is cleaned up when the app exits. Requires the `ngrok` CLI to be installed and authenticated with `ngrok config add-authtoken <token>`.
 
+### Public tunnel aliases
+
+Use managed tunnels when public internet traffic should enter through the portless proxy:
+
+```bash
+portless myapp --tunnel cloudflare next dev
+portless myapp --tunnel ngrok next dev
+```
+
+Managed tunnels are public. Portless keeps child apps bound to `127.0.0.1`, starts the tunnel to the local proxy, and registers an exact tunnel alias for the generated public hostname. Unknown public `Host` headers remain rejected. Do not create wildcard tunnel aliases.
+
+Use manual aliases when another tunnel tool already owns the external hostname:
+
+```bash
+portless tunnel map myapp abc.trycloudflare.com
+portless tunnel map myapp public.example.com --path /api
+portless tunnel list
+portless tunnel unmap abc.trycloudflare.com
+```
+
+`--tunnel cloudflare` uses Cloudflare Quick Tunnels through `cloudflared`. `--tunnel ngrok` requires the `ngrok` CLI and authentication. Child commands receive `PORTLESS_TUNNEL_URL` when managed tunnel startup succeeds.
+
 ### NetBird sharing
 
 Expose a dev server to the public internet with NetBird Peer Expose using `--netbird`:
@@ -364,65 +388,71 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 
 ## CLI Reference
 
-| Command                                     | Description                                                    |
-| ------------------------------------------- | -------------------------------------------------------------- |
-| `portless`                                  | Run dev script through proxy                                   |
-| `portless`                                  | From monorepo root: run all workspace packages                 |
-| `portless --script <name>`                  | Run a specific package.json script (default: dev)              |
-| `portless run [cmd] [args...]`              | Infer name from project, run through proxy (auto-starts)       |
-| `portless run --name <name> <cmd>`          | Override inferred base name (worktree prefix still applies)    |
-| `portless <name> <cmd> [args...]`           | Run app at `https://<name>.localhost` (auto-starts proxy)      |
-| `portless get <name>`                       | Print URL for a service (for cross-service wiring)             |
-| `portless url <name>`                       | Alias for `portless get <name>`                                |
-| `portless get <name> --no-worktree`         | Print URL without worktree prefix                              |
-| `portless get <name> --json`                | Print service info as JSON                                     |
-| `portless list`                             | Show active routes                                             |
-| `portless ls`                               | Alias for `portless list`                                      |
-| `portless status`                           | Alias for `portless list`                                      |
-| `portless list --json`                      | Show active routes as JSON                                     |
-| `portless trust`                            | Add local CA to system trust store (for HTTPS)                 |
-| `portless clean`                            | Remove state, CA trust entry, and /etc/hosts block             |
-| `portless prune`                            | Kill orphaned dev servers from crashed sessions                |
-| `portless prune --force`                    | Kill orphans with SIGKILL instead of SIGTERM                   |
-| `portless completion <shell>`               | Print shell completion script for bash, zsh, or fish           |
-| `portless proxy start`                      | Start HTTPS proxy as a daemon (port 443, auto-elevates)        |
-| `portless proxy start --no-tls`             | Start without HTTPS (plain HTTP on port 80)                    |
-| `portless proxy start --lan`                | Start in LAN mode (mDNS `.local`, auto-follows LAN IP changes) |
-| `portless proxy start -p <number>`          | Start the proxy on a custom port                               |
-| `portless proxy start --suffix test`        | Use .test instead of .localhost                                |
-| `portless proxy start --tld test`           | Compatibility alias for `--suffix`                             |
-| `portless proxy start --foreground`         | Start the proxy in foreground (for debugging)                  |
-| `portless proxy start --wildcard`           | Allow unregistered subdomains to fall back locally             |
-| `portless proxy stop`                       | Stop the proxy                                                 |
-| `portless service install`                  | Start the HTTPS proxy when the OS starts                       |
-| `portless service install --lan`            | Start the service in LAN mode                                  |
-| `portless service install --wildcard`       | Persist wildcard routing in the startup service                |
-| `portless service status`                   | Show service and proxy status                                  |
-| `portless service uninstall`                | Remove the startup service                                     |
-| `portless alias <name> <port>`              | Register a static route (e.g. for Docker containers)           |
-| `portless alias <name> <port> --force`      | Overwrite an existing route                                    |
-| `portless alias <name> <port> --h2c`        | Register an HTTP/2 cleartext upstream route                    |
-| `portless alias <name> <port> --path /api`  | Register a path-scoped route                                   |
-| `portless alias --remove <name>`            | Remove a static route                                          |
-| `portless hosts sync`                       | Add routes to /etc/hosts (fixes Safari)                        |
-| `portless hosts clean`                      | Remove portless entries from /etc/hosts                        |
-| `portless <name> --app-port <n> <cmd>`      | Use a fixed app port; browser-blocked ports are rejected       |
-| `portless <name> --h2c <cmd>`               | Forward this route to an HTTP/2 cleartext upstream             |
-| `portless <name> --path /api <cmd>`         | Scope this route to a path prefix                              |
-| `portless <name> --tailscale <cmd>`         | Share the app on your Tailscale network (tailnet)              |
-| `portless <name> --tailscale-service <cmd>` | Share the app as a stable Tailscale Service                    |
-| `portless <name> --funnel <cmd>`            | Share the app publicly via Tailscale Funnel                    |
-| `portless <name> --ngrok <cmd>`             | Share the app publicly via ngrok                               |
-| `portless <name> --netbird <cmd>`           | Share the app publicly via NetBird Peer Expose                 |
-| `portless <name> --force <cmd>`             | Kill the existing process and take over its route              |
-| `portless --name <name> <cmd>`              | Force `<name>` as app name (bypasses subcommand dispatch)      |
-| `portless <name> KEY=value <cmd>`           | Pass `KEY` only to the child command                           |
-| `portless <name> -- <cmd> [args...]`        | Stop flag parsing; everything after `--` is passed to child    |
-| `portless --help` / `-h`                    | Show help                                                      |
-| `portless run --help`                       | Show help for a subcommand (also: alias, hosts, clean)         |
-| `portless --version` / `-v`                 | Show version                                                   |
+| Command                                          | Description                                                    |
+| ------------------------------------------------ | -------------------------------------------------------------- |
+| `portless`                                       | Run dev script through proxy                                   |
+| `portless`                                       | From monorepo root: run all workspace packages                 |
+| `portless --script <name>`                       | Run a specific package.json script (default: dev)              |
+| `portless run [cmd] [args...]`                   | Infer name from project, run through proxy (auto-starts)       |
+| `portless run --name <name> <cmd>`               | Override inferred base name (worktree prefix still applies)    |
+| `portless <name> <cmd> [args...]`                | Run app at `https://<name>.localhost` (auto-starts proxy)      |
+| `portless get <name>`                            | Print URL for a service (for cross-service wiring)             |
+| `portless url <name>`                            | Alias for `portless get <name>`                                |
+| `portless get <name> --no-worktree`              | Print URL without worktree prefix                              |
+| `portless get <name> --json`                     | Print service info as JSON                                     |
+| `portless list`                                  | Show active routes                                             |
+| `portless ls`                                    | Alias for `portless list`                                      |
+| `portless status`                                | Alias for `portless list`                                      |
+| `portless list --json`                           | Show active routes as JSON                                     |
+| `portless trust`                                 | Add local CA to system trust store (for HTTPS)                 |
+| `portless clean`                                 | Remove state, CA trust entry, and /etc/hosts block             |
+| `portless prune`                                 | Kill orphaned dev servers from crashed sessions                |
+| `portless prune --force`                         | Kill orphans with SIGKILL instead of SIGTERM                   |
+| `portless completion <shell>`                    | Print shell completion script for bash, zsh, or fish           |
+| `portless proxy start`                           | Start HTTPS proxy as a daemon (port 443, auto-elevates)        |
+| `portless proxy start --no-tls`                  | Start without HTTPS (plain HTTP on port 80)                    |
+| `portless proxy start --lan`                     | Start in LAN mode (mDNS `.local`, auto-follows LAN IP changes) |
+| `portless proxy start -p <number>`               | Start the proxy on a custom port                               |
+| `portless proxy start --suffix test`             | Use .test instead of .localhost                                |
+| `portless proxy start --tld test`                | Compatibility alias for `--suffix`                             |
+| `portless proxy start --foreground`              | Start the proxy in foreground (for debugging)                  |
+| `portless proxy start --wildcard`                | Allow unregistered subdomains to fall back locally             |
+| `portless proxy stop`                            | Stop the proxy                                                 |
+| `portless service install`                       | Start the HTTPS proxy when the OS starts                       |
+| `portless service install --lan`                 | Start the service in LAN mode                                  |
+| `portless service install --wildcard`            | Persist wildcard routing in the startup service                |
+| `portless service status`                        | Show service and proxy status                                  |
+| `portless service uninstall`                     | Remove the startup service                                     |
+| `portless alias <name> <port>`                   | Register a static route (e.g. for Docker containers)           |
+| `portless alias <name> <port> --force`           | Overwrite an existing route                                    |
+| `portless alias <name> <port> --h2c`             | Register an HTTP/2 cleartext upstream route                    |
+| `portless alias <name> <port> --path /api`       | Register a path-scoped route                                   |
+| `portless alias --remove <name>`                 | Remove a static route                                          |
+| `portless tunnel map <route> <host>`             | Map an exact public tunnel hostname to a route                 |
+| `portless tunnel map <route> <host> --path /api` | Map a public tunnel hostname to a path-scoped route            |
+| `portless tunnel list`                           | Show public tunnel aliases                                     |
+| `portless tunnel unmap <host>`                   | Remove a public tunnel alias                                   |
+| `portless hosts sync`                            | Add routes to /etc/hosts (fixes Safari)                        |
+| `portless hosts clean`                           | Remove portless entries from /etc/hosts                        |
+| `portless <name> --app-port <n> <cmd>`           | Use a fixed app port; browser-blocked ports are rejected       |
+| `portless <name> --h2c <cmd>`                    | Forward this route to an HTTP/2 cleartext upstream             |
+| `portless <name> --path /api <cmd>`              | Scope this route to a path prefix                              |
+| `portless <name> --tunnel cloudflare <cmd>`      | Share publicly via a managed Cloudflare Quick Tunnel           |
+| `portless <name> --tunnel ngrok <cmd>`           | Share publicly via a managed ngrok tunnel through portless     |
+| `portless <name> --tailscale <cmd>`              | Share the app on your Tailscale network (tailnet)              |
+| `portless <name> --tailscale-service <cmd>`      | Share the app as a stable Tailscale Service                    |
+| `portless <name> --funnel <cmd>`                 | Share the app publicly via Tailscale Funnel                    |
+| `portless <name> --ngrok <cmd>`                  | Share the app publicly via ngrok                               |
+| `portless <name> --netbird <cmd>`                | Share the app publicly via NetBird Peer Expose                 |
+| `portless <name> --force <cmd>`                  | Kill the existing process and take over its route              |
+| `portless --name <name> <cmd>`                   | Force `<name>` as app name (bypasses subcommand dispatch)      |
+| `portless <name> KEY=value <cmd>`                | Pass `KEY` only to the child command                           |
+| `portless <name> -- <cmd> [args...]`             | Stop flag parsing; everything after `--` is passed to child    |
+| `portless --help` / `-h`                         | Show help                                                      |
+| `portless run --help`                            | Show help for a subcommand (also: alias, hosts, clean)         |
+| `portless --version` / `-v`                      | Show version                                                   |
 
-**Reserved names:** `run`, `get`, `url`, `alias`, `hosts`, `list`, `ls`, `status`, `trust`, `clean`, `prune`, `proxy`, `service`, and `completion` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name, or `portless --name <name> <cmd>` to force any name including reserved ones.
+**Reserved names:** `run`, `get`, `url`, `alias`, `tunnel`, `hosts`, `list`, `ls`, `status`, `trust`, `clean`, `prune`, `proxy`, `service`, and `completion` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name, or `portless --name <name> <cmd>` to force any name including reserved ones.
 
 ### Shell completion
 

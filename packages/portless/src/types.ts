@@ -1,6 +1,8 @@
 /** Route info used by the proxy server to map hostnames to ports. */
 export type RouteProtocol = "http1" | "h2c";
 
+export type TunnelProviderName = "ngrok" | "cloudflare";
+
 export interface RouteInfo {
   hostname: string;
   port: number;
@@ -10,9 +12,30 @@ export interface RouteInfo {
   protocol?: RouteProtocol;
 }
 
+export interface TunnelAlias {
+  /** Exact public tunnel hostname accepted by the proxy. */
+  externalHostname: string;
+  /** Local portless route hostname that receives traffic for this alias. */
+  targetHostname: string;
+  /** Target route path prefix. Missing means root ("/") for backward compatibility. */
+  targetPathPrefix?: string;
+  /** True when portless started and owns the tunnel process. */
+  managed?: boolean;
+  /** Provider that created this managed tunnel. */
+  provider?: TunnelProviderName;
+  /** Full public URL returned by the tunnel provider. */
+  url?: string;
+  /** Tunnel process PID, when known. */
+  tunnelPid?: number;
+  /** Portless CLI process that owns this managed alias. */
+  routeOwnerPid?: number;
+}
+
 export interface ProxyServerOptions {
   /** Called on each request to get the current route table. */
   getRoutes: () => RouteInfo[];
+  /** Called on each request to get exact public tunnel aliases. */
+  getTunnelAliases?: () => TunnelAlias[];
   /** The port the proxy is listening on (used to build correct URLs). */
   proxyPort: number;
   /** Suffix used for hostnames (default: "localhost"). */

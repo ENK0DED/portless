@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { RouteInfo, RouteProtocol } from "./types.js";
+import type { RouteInfo, RouteProtocol, TunnelProviderName } from "./types.js";
 import { fixOwnership, isErrnoException, normalizePathPrefix } from "./utils.js";
 
 /** How long (ms) before a lock directory is considered stale and forcibly removed. */
@@ -38,6 +38,10 @@ export interface RouteMapping extends RouteInfo {
   tailscaleServicePending?: boolean;
   ngrokUrl?: string;
   ngrokPid?: number;
+  tunnelProvider?: TunnelProviderName;
+  tunnelUrl?: string;
+  tunnelExternalHostname?: string;
+  tunnelPid?: number;
   netbirdUrl?: string;
   netbirdPid?: number;
 }
@@ -51,6 +55,10 @@ type RouteMetadataPatch = {
   tailscaleServicePending?: boolean | null;
   ngrokUrl?: string | null;
   ngrokPid?: number | null;
+  tunnelProvider?: TunnelProviderName | null;
+  tunnelUrl?: string | null;
+  tunnelExternalHostname?: string | null;
+  tunnelPid?: number | null;
   netbirdUrl?: string | null;
   netbirdPid?: number | null;
 };
@@ -422,6 +430,23 @@ export class RouteStore {
       if ("ngrokPid" in fields) {
         if (fields.ngrokPid === null) delete route.ngrokPid;
         else if (fields.ngrokPid !== undefined) route.ngrokPid = fields.ngrokPid;
+      }
+      if ("tunnelProvider" in fields) {
+        if (fields.tunnelProvider === null) delete route.tunnelProvider;
+        else if (fields.tunnelProvider !== undefined) route.tunnelProvider = fields.tunnelProvider;
+      }
+      if ("tunnelUrl" in fields) {
+        if (fields.tunnelUrl === null) delete route.tunnelUrl;
+        else if (fields.tunnelUrl !== undefined) route.tunnelUrl = fields.tunnelUrl;
+      }
+      if ("tunnelExternalHostname" in fields) {
+        if (fields.tunnelExternalHostname === null) delete route.tunnelExternalHostname;
+        else if (fields.tunnelExternalHostname !== undefined)
+          route.tunnelExternalHostname = fields.tunnelExternalHostname;
+      }
+      if ("tunnelPid" in fields) {
+        if (fields.tunnelPid === null) delete route.tunnelPid;
+        else if (fields.tunnelPid !== undefined) route.tunnelPid = fields.tunnelPid;
       }
       if ("netbirdUrl" in fields) {
         if (fields.netbirdUrl === null) delete route.netbirdUrl;
