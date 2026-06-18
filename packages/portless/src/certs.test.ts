@@ -362,11 +362,18 @@ describe("trustCA", () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("returns error when CA cert is missing", () => {
-    const result = trustCA(tmpDir);
-    expect(result.trusted).toBe(false);
-    expect(result.error).toContain("CA certificate not found");
-    expect(result.error).toContain("portless trust");
+  it("generates CA before attempting to trust when CA cert is missing", () => {
+    const originalPlatform = process.platform;
+    Object.defineProperty(process, "platform", { value: "freebsd" });
+    try {
+      const result = trustCA(tmpDir);
+      expect(result.trusted).toBe(false);
+      expect(result.error).toContain("Unsupported platform");
+      expect(fs.existsSync(path.join(tmpDir, "ca.pem"))).toBe(true);
+      expect(fs.existsSync(path.join(tmpDir, "ca-key.pem"))).toBe(true);
+    } finally {
+      Object.defineProperty(process, "platform", { value: originalPlatform });
+    }
   });
 
   it.skipIf(process.platform !== "darwin")(

@@ -855,10 +855,15 @@ export function createSNICallback(
 export function trustCA(stateDir: string): { trusted: boolean; error?: string } {
   const caCertPath = path.join(stateDir, CA_CERT_FILE);
   if (!fileExists(caCertPath)) {
-    return {
-      trusted: false,
-      error: "CA certificate not found. Run portless trust to generate it.",
-    };
+    try {
+      generateCA(stateDir);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        trusted: false,
+        error: `Failed to generate CA certificate: ${message}`,
+      };
+    }
   }
 
   try {
