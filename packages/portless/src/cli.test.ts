@@ -1677,6 +1677,36 @@ describe("CLI", () => {
       expect(stdout).toContain("hello");
     });
 
+    it("prints package.json as the name source for package portless config", async () => {
+      const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-cli-config-state-"));
+      const proxyPort = await getFreePort();
+      const env = {
+        PORTLESS_HTTPS: "0",
+        PORTLESS_PORT: String(proxyPort),
+        PORTLESS_STATE_DIR: stateDir,
+      };
+
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, "package.json"),
+          JSON.stringify({
+            name: "test-app",
+            scripts: { dev: `${process.execPath} -e "process.exit(0)"` },
+            portless: { name: "pkg-name" },
+          })
+        );
+
+        const { status, stdout } = run([], { cwd: tmpDir, env });
+
+        expect(status).toBe(0);
+        expect(stdout).toContain('Name "pkg-name" (from package.json)');
+        expect(stdout).not.toContain('Name "pkg-name" (from portless config)');
+      } finally {
+        run(["proxy", "stop"], { env });
+        fs.rmSync(stateDir, { recursive: true, force: true });
+      }
+    });
+
     it("portless (no args) forwards Vite port flags through bun run dev", async () => {
       const server = http.createServer((_req, res) => {
         res.setHeader("X-Portless", "1");

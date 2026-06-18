@@ -117,6 +117,11 @@ import { buildServiceUninstallSudoArgs, handleService, tryUninstallService } fro
 
 const chalk = colors;
 
+type LoadedAppConfig = {
+  config: AppConfig;
+  sourceLabel: string;
+};
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -3623,11 +3628,22 @@ ${colors.bold("LAN mode (--lan):")}
  * Load the effective AppConfig for the current directory from portless config.
  * Handles both single-app (top-level fields) and monorepo (apps map) configs.
  */
-function loadAppConfig(cwd: string = process.cwd()): AppConfig | null {
+function configSourceLabel(sourcePath: string, cwd: string): string {
+  const relative = path.relative(cwd, sourcePath).split(path.sep).join("/");
+  if (relative === "package.json") return "package.json";
+  if (relative === "portless.json") return "portless.json";
+  if (relative === ".config/portless.json") return ".config/portless.json";
+  return path.basename(sourcePath);
+}
+
+function loadAppConfig(cwd: string = process.cwd()): LoadedAppConfig | null {
   try {
     const loaded = loadConfig(cwd);
     if (!loaded) return null;
-    return resolveAppConfig(loaded.config, loaded.configDir, cwd);
+    return {
+      config: resolveAppConfig(loaded.config, loaded.configDir, cwd),
+      sourceLabel: configSourceLabel(loaded.sourcePath, cwd),
+    };
   } catch (err) {
     if (err instanceof ConfigValidationError) {
       console.error(colors.red(`Error: ${err.message}`));
@@ -3677,7 +3693,7 @@ async function handleDefaultMode(
   }
 
   const appConfig = loadAppConfig(cwd);
-  const scriptName = globalScript ?? appConfig?.script ?? "dev";
+  const scriptName = globalScript ?? appConfig?.config.script ?? "dev";
   if (hasScript(scriptName, cwd)) {
     await handleDefaultSingle(cwd, scriptName, appConfig);
     return true;
@@ -3692,7 +3708,7 @@ async function handleDefaultMode(
 async function handleDefaultSingle(
   cwd: string,
   scriptName: string,
-  appConfig: AppConfig | null
+  appConfig: LoadedAppConfig | null
 ): Promise<void> {
   const resolved = resolveScriptCommand(scriptName, cwd);
   if (!resolved) {
@@ -3703,12 +3719,12 @@ async function handleDefaultSingle(
   let baseName: string;
   let nameSource: string;
 
-  if (appConfig?.name) {
-    baseName = appConfig.name
+  if (appConfig?.config.name) {
+    baseName = appConfig.config.name
       .split(".")
       .map((label) => truncateLabel(label))
       .join(".");
-    nameSource = "portless config";
+    nameSource = appConfig.sourceLabel;
   } else {
     const inferred = inferProjectName(cwd);
     baseName = inferred.name;
@@ -3732,7 +3748,7 @@ async function handleDefaultSingle(
     tld,
     false,
     { nameSource, prefix: worktree?.prefix, prefixSource: worktree?.source },
-    appConfig?.appPort,
+    appConfig?.config.appPort,
     lanMode,
     lanIp,
     { scriptName, packageDir: cwd }
@@ -4280,7 +4296,7 @@ async function handleRunMode(args: string[], globalScript?: string): Promise<voi
   let scriptContext: { scriptName: string; packageDir: string } | undefined;
 
   if (parsed.commandArgs.length === 0) {
-    const scriptName = globalScript ?? appConfig?.script ?? "dev";
+    const scriptName = globalScript ?? appConfig?.config.script ?? "dev";
     const resolved = resolveScriptCommand(scriptName, process.cwd());
     if (resolved) {
       parsed.commandArgs = resolved;
@@ -4308,20 +4324,20 @@ async function handleRunMode(args: string[], globalScript?: string): Promise<voi
       .map((label) => truncateLabel(label))
       .join(".");
     nameSource = "--name flag";
-  } else if (appConfig?.name) {
-    baseName = appConfig.name
+  } else if (appConfig?.config.name) {
+    baseName = appConfig.config.name
       .split(".")
       .map((label) => truncateLabel(label))
       .join(".");
-    nameSource = "portless config";
+    nameSource = appConfig.sourceLabel;
   } else {
     const inferred = inferProjectName();
     baseName = inferred.name;
     nameSource = inferred.source;
   }
 
-  if (!parsed.appPort && appConfig?.appPort) {
-    parsed.appPort = appConfig.appPort;
+  if (!parsed.appPort && appConfig?.config.appPort) {
+    parsed.appPort = appConfig.config.appPort;
   }
 
   const worktree = detectWorktreePrefix();
@@ -4363,8 +4379,8 @@ async function handleNamedMode(args: string[]): Promise<void> {
 
   if (!parsed.appPort) {
     const appConfig = loadAppConfig();
-    if (appConfig?.appPort) {
-      parsed.appPort = appConfig.appPort;
+    if (appConfig?.config.appPort) {
+      parsed.appPort = appConfig.config.appPort;
     }
   }
 
@@ -4556,7 +4572,7 @@ async function main() {
     let commandArgs = parsed.commandArgs;
     if (commandArgs.length === 0 && (isRunCommand || args.length === 0)) {
       const appConfig = loadAppConfig();
-      const scriptName = globalScript ?? appConfig?.script ?? "dev";
+      const scriptName = globalScript ?? appConfig?.config.script ?? "dev";
       const resolved = resolveScriptCommand(scriptName, process.cwd());
       if (resolved) commandArgs = resolved;
     }
