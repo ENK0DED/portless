@@ -1401,7 +1401,7 @@ describe("createProxyServer", () => {
 
     it("proxies request bodies and trailers for h2c upstreams", async () => {
       const backend = trackServer(http2.createServer());
-      backend.on("stream", (stream) => {
+      backend.on("stream", (stream: http2.ServerHttp2Stream) => {
         let body = "";
         stream.on("data", (chunk) => {
           body += chunk;

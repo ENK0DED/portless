@@ -89,6 +89,7 @@ function writeJson(filePath: string, value: unknown): void {
 interface TestBgEntry {
   id: string;
   label: string;
+  cwd?: string;
   pid: number;
   state: string;
   url?: string;

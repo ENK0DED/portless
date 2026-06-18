@@ -1,12 +1,23 @@
 import * as fs from "node:fs";
-import { execFileSync } from "node:child_process";
+import { execFileSync, type ExecFileSyncOptions } from "node:child_process";
+
+type RuntimeReadFileSync = (
+  path: fs.PathOrFileDescriptor,
+  options?: BufferEncoding | { encoding?: BufferEncoding | null; flag?: string } | null
+) => string | Buffer;
+
+type RuntimeExecFileSync = (
+  file: string,
+  args?: readonly string[],
+  options?: ExecFileSyncOptions
+) => string | Buffer;
 
 interface WslRuntime {
   platform?: NodeJS.Platform;
   env?: NodeJS.ProcessEnv;
-  readFileSync?: typeof fs.readFileSync;
+  readFileSync?: RuntimeReadFileSync;
   existsSync?: typeof fs.existsSync;
-  execFileSync?: typeof execFileSync;
+  execFileSync?: RuntimeExecFileSync;
 }
 
 function runtimeOrDefault(runtime: WslRuntime = {}): Required<WslRuntime> {
