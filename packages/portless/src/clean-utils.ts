@@ -25,6 +25,7 @@ const PORTLESS_STATE_FILES = [
 ] as const;
 
 const HOST_CERTS_DIR = "host-certs";
+const BG_STATE_DIR = "bg";
 
 /**
  * Unique existing state directories to consider for cleanup: user dir, system
@@ -58,6 +59,11 @@ export function removePortlessStateFiles(dir: string): void {
   }
   try {
     fs.rmSync(path.join(dir, HOST_CERTS_DIR), { recursive: true, force: true });
+  } catch {
+    // non-fatal
+  }
+  try {
+    fs.rmSync(path.join(dir, BG_STATE_DIR), { recursive: true, force: true });
   } catch {
     // non-fatal
   }
