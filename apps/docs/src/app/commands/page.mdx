@@ -202,6 +202,22 @@ portless prune --force
 
 Finds and kills orphaned dev server processes left behind by crashed portless sessions. When the CLI is killed with `kill -9` or crashes, child dev servers may survive and continue holding their ports. This command checks routes whose owning process is dead but whose port is still in use, terminates the orphans, and removes the stale route entries. Use `--force` to send SIGKILL instead of SIGTERM.
 
+## Shell completion
+
+```bash
+portless completion bash
+portless completion zsh
+portless completion fish
+```
+
+Prints a shell completion script for the installed portless version:
+
+```bash
+source <(portless completion bash)
+eval "$(portless completion zsh)"
+portless completion fish > ~/.config/fish/completions/portless.fish
+```
+
 ## Proxy control
 
 ### Start

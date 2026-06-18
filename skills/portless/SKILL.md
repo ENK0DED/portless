@@ -346,6 +346,7 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 | `portless clean`                       | Remove state, CA trust entry, and /etc/hosts block             |
 | `portless prune`                       | Kill orphaned dev servers from crashed sessions                |
 | `portless prune --force`               | Kill orphans with SIGKILL instead of SIGTERM                   |
+| `portless completion <shell>`          | Print shell completion script for bash, zsh, or fish           |
 | `portless proxy start`                 | Start HTTPS proxy as a daemon (port 443, auto-elevates)        |
 | `portless proxy start --no-tls`        | Start without HTTPS (plain HTTP on port 80)                    |
 | `portless proxy start --lan`           | Start in LAN mode (mDNS `.local`, auto-follows LAN IP changes) |
@@ -378,7 +379,17 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 | `portless run --help`                  | Show help for a subcommand (also: alias, hosts, clean)         |
 | `portless --version` / `-v`            | Show version                                                   |
 
-**Reserved names:** `run`, `get`, `url`, `alias`, `hosts`, `list`, `ls`, `status`, `trust`, `clean`, `prune`, `proxy`, and `service` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name, or `portless --name <name> <cmd>` to force any name including reserved ones.
+**Reserved names:** `run`, `get`, `url`, `alias`, `hosts`, `list`, `ls`, `status`, `trust`, `clean`, `prune`, `proxy`, `service`, and `completion` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name, or `portless --name <name> <cmd>` to force any name including reserved ones.
+
+### Shell completion
+
+```bash
+source <(portless completion bash)
+eval "$(portless completion zsh)"
+portless completion fish > ~/.config/fish/completions/portless.fish
+```
+
+Generate completions from the installed portless binary so agents and humans get the flags supported by that version.
 
 ## Programmatic API
 

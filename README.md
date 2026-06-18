@@ -423,6 +423,7 @@ portless status                  # Alias for portless list
 portless trust                   # Add local CA to system trust store
 portless clean                   # Remove state, CA trust entry, and hosts block
 portless prune                   # Kill orphaned dev servers from crashed sessions
+portless completion <shell>      # Print shell completion script (bash, zsh, fish)
 portless hosts sync              # Add routes to /etc/hosts (fixes Safari)
 portless hosts clean             # Remove portless entries from /etc/hosts
 
@@ -517,7 +518,21 @@ Command args can use exact placeholders `{PORT}`, `{HOST}`, and `{PORTLESS_URL}`
 
 Prefer `PORTLESS_SUFFIX` for new configuration. It accepts single-label suffixes such as `test` and dotted suffixes such as `acme.com` or `server01.acme.com`. `PORTLESS_TLD` is only a compatibility alias and is ignored when `PORTLESS_SUFFIX` is set.
 
-> **Reserved names:** `run`, `get`, `url`, `alias`, `hosts`, `list`, `ls`, `status`, `trust`, `clean`, `prune`, `proxy`, and `service` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name from your project, or `portless --name <name> <cmd>` to force any name including reserved ones.
+> **Reserved names:** `run`, `get`, `url`, `alias`, `hosts`, `list`, `ls`, `status`, `trust`, `clean`, `prune`, `proxy`, `service`, and `completion` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name from your project, or `portless --name <name> <cmd>` to force any name including reserved ones.
+
+## Shell completion
+
+```bash
+# Bash
+source <(portless completion bash)
+
+# Zsh
+eval "$(portless completion zsh)"
+
+# Fish
+mkdir -p ~/.config/fish/completions
+portless completion fish > ~/.config/fish/completions/portless.fish
+```
 
 ## Programmatic API
 

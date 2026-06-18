@@ -1915,6 +1915,375 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
 }
 
 // ---------------------------------------------------------------------------
+// Shell completions
+// ---------------------------------------------------------------------------
+
+const COMPLETION_SHELLS = ["bash", "zsh", "fish"] as const;
+type CompletionShell = (typeof COMPLETION_SHELLS)[number];
+
+interface CompletionCommand {
+  name: string;
+  description: string;
+}
+
+interface CompletionFlag {
+  name: string;
+  description: string;
+  value?: string;
+  short?: string;
+}
+
+const TOP_LEVEL_COMPLETION_COMMANDS: CompletionCommand[] = [
+  { name: "run", description: "Infer project name and run through the proxy" },
+  { name: "get", description: "Print URL for a service" },
+  { name: "url", description: "Alias for get" },
+  { name: "alias", description: "Register or remove a static route" },
+  { name: "hosts", description: "Manage hosts file entries" },
+  { name: "list", description: "Show active routes" },
+  { name: "ls", description: "Alias for list" },
+  { name: "status", description: "Alias for list" },
+  { name: "trust", description: "Add local CA to system trust store" },
+  { name: "clean", description: "Remove portless artifacts from this machine" },
+  { name: "prune", description: "Kill orphaned dev servers from crashed sessions" },
+  { name: "proxy", description: "Manage proxy lifecycle" },
+  { name: "service", description: "Manage startup service" },
+  { name: "completion", description: "Generate shell completion script" },
+];
+
+const GLOBAL_COMPLETION_FLAGS: CompletionFlag[] = [
+  { name: "--help", short: "-h", description: "Show help" },
+  { name: "--version", short: "-v", description: "Show version" },
+  { name: "--name", description: "Use an explicit app name", value: "name" },
+  { name: "--script", description: "Run a specific package.json script", value: "script" },
+  { name: "--port", short: "-p", description: "Proxy port", value: "port" },
+  { name: "--no-tls", description: "Disable HTTPS" },
+  { name: "--https", description: "Enable HTTPS" },
+  { name: "--lan", description: "Enable LAN mode" },
+  { name: "--ip", description: "Pin a specific LAN IP", value: "address" },
+  { name: "--cert", description: "TLS certificate path", value: "path" },
+  { name: "--key", description: "TLS private key path", value: "path" },
+  { name: "--foreground", description: "Run proxy in foreground" },
+  { name: "--suffix", description: "Use a custom suffix", value: "suffix" },
+  { name: "--tld", description: "Compatibility alias for suffix", value: "suffix" },
+  { name: "--wildcard", description: "Enable wildcard routing" },
+  { name: "--state-dir", description: "Use a custom state directory", value: "path" },
+  { name: "--app-port", description: "Use a fixed app port", value: "port" },
+  { name: "--tailscale", description: "Share on Tailscale" },
+  { name: "--funnel", description: "Share publicly via Tailscale Funnel" },
+  { name: "--ngrok", description: "Share publicly via ngrok" },
+  { name: "--netbird", description: "Share publicly via NetBird Peer Expose" },
+  { name: "--netbird-password", description: "Require NetBird password", value: "password" },
+  { name: "--netbird-pin", description: "Require NetBird PIN", value: "pin" },
+  { name: "--netbird-groups", description: "Restrict NetBird user groups", value: "groups" },
+  { name: "--force", description: "Kill existing process and take over route" },
+];
+
+const RUN_COMPLETION_FLAGS = GLOBAL_COMPLETION_FLAGS.filter((flag) =>
+  [
+    "--help",
+    "--name",
+    "--force",
+    "--app-port",
+    "--tailscale",
+    "--funnel",
+    "--ngrok",
+    "--netbird",
+    "--netbird-password",
+    "--netbird-pin",
+    "--netbird-groups",
+  ].includes(flag.name)
+);
+
+const APP_COMPLETION_FLAGS = GLOBAL_COMPLETION_FLAGS.filter((flag) =>
+  [
+    "--force",
+    "--app-port",
+    "--tailscale",
+    "--funnel",
+    "--ngrok",
+    "--netbird",
+    "--netbird-password",
+    "--netbird-pin",
+    "--netbird-groups",
+  ].includes(flag.name)
+);
+
+const PROXY_START_COMPLETION_FLAGS = GLOBAL_COMPLETION_FLAGS.filter((flag) =>
+  [
+    "--help",
+    "--port",
+    "--no-tls",
+    "--https",
+    "--lan",
+    "--ip",
+    "--cert",
+    "--key",
+    "--foreground",
+    "--suffix",
+    "--tld",
+    "--wildcard",
+    "--state-dir",
+  ].includes(flag.name)
+);
+
+const SERVICE_INSTALL_COMPLETION_FLAGS = GLOBAL_COMPLETION_FLAGS.filter((flag) =>
+  [
+    "--help",
+    "--port",
+    "--no-tls",
+    "--https",
+    "--lan",
+    "--ip",
+    "--suffix",
+    "--tld",
+    "--wildcard",
+    "--state-dir",
+  ].includes(flag.name)
+);
+
+function completionFlagWords(flags: CompletionFlag[]): string {
+  return flags.flatMap((flag) => [flag.name, ...(flag.short ? [flag.short] : [])]).join(" ");
+}
+
+function completionCommandWords(commands = TOP_LEVEL_COMPLETION_COMMANDS): string {
+  return commands.map((command) => command.name).join(" ");
+}
+
+function completionShellWords(): string {
+  return COMPLETION_SHELLS.join(" ");
+}
+
+function zshFlag(flag: CompletionFlag): string {
+  const value = flag.value ? `:${flag.value}:` : "";
+  const short = flag.short ? `${flag.short}[${flag.description}] ` : "";
+  return `${short}'${flag.name}[${flag.description}]${value}'`;
+}
+
+function fishFlagLines(flags: CompletionFlag[], condition = ""): string {
+  const prefix = condition ? ` -n "${condition}"` : "";
+  return flags
+    .map((flag) => {
+      const short = flag.short ? ` -s ${flag.short.slice(1)}` : "";
+      const requiresValue = flag.value ? " -r" : "";
+      return `complete -c portless${prefix}${short} -l ${flag.name.slice(2)}${requiresValue} -d "${flag.description}"`;
+    })
+    .join("\n");
+}
+
+function printCompletionHelp(): void {
+  console.log(`
+${colors.bold("portless completion <shell>")} - Print a shell completion script.
+
+${colors.bold("Usage:")}
+  ${colors.cyan("portless completion <shell>")}
+
+${colors.bold("Shells:")}
+  bash
+  zsh
+  fish
+
+${colors.bold("Examples:")}
+  ${colors.cyan("source <(portless completion bash)")}
+  ${colors.cyan('eval "$(portless completion zsh)"')}
+  ${colors.cyan("portless completion fish > ~/.config/fish/completions/portless.fish")}
+`);
+}
+
+function getBashCompletionScript(): string {
+  const topWords = `${completionCommandWords()} ${completionFlagWords(GLOBAL_COMPLETION_FLAGS)}`;
+  return `# bash completion for portless
+_portless_completions() {
+  local cur cmd subcmd
+  COMPREPLY=()
+  cur="\${COMP_WORDS[COMP_CWORD]}"
+  cmd="\${COMP_WORDS[1]}"
+  subcmd="\${COMP_WORDS[2]}"
+
+  if [[ $COMP_CWORD -eq 1 ]]; then
+    COMPREPLY=( $(compgen -W "${topWords}" -- "$cur") )
+    return 0
+  fi
+
+  case "$cmd" in
+    run)
+      COMPREPLY=( $(compgen -W "${completionFlagWords(RUN_COMPLETION_FLAGS)} --" -- "$cur") )
+      ;;
+    get|url)
+      COMPREPLY=( $(compgen -W "--json --help -h" -- "$cur") )
+      ;;
+    list|ls|status)
+      COMPREPLY=( $(compgen -W "--json --help -h" -- "$cur") )
+      ;;
+    alias)
+      COMPREPLY=( $(compgen -W "--remove --force --help -h" -- "$cur") )
+      ;;
+    hosts)
+      if [[ $COMP_CWORD -eq 2 ]]; then
+        COMPREPLY=( $(compgen -W "sync clean --help -h" -- "$cur") )
+      else
+        COMPREPLY=( $(compgen -W "--help -h" -- "$cur") )
+      fi
+      ;;
+    clean)
+      COMPREPLY=( $(compgen -W "--help -h" -- "$cur") )
+      ;;
+    prune)
+      COMPREPLY=( $(compgen -W "--force --help -h" -- "$cur") )
+      ;;
+    proxy)
+      if [[ $COMP_CWORD -eq 2 ]]; then
+        COMPREPLY=( $(compgen -W "start stop --help -h" -- "$cur") )
+      elif [[ "$subcmd" == "start" ]]; then
+        COMPREPLY=( $(compgen -W "${completionFlagWords(PROXY_START_COMPLETION_FLAGS)}" -- "$cur") )
+      else
+        COMPREPLY=( $(compgen -W "--help -h" -- "$cur") )
+      fi
+      ;;
+    service)
+      if [[ $COMP_CWORD -eq 2 ]]; then
+        COMPREPLY=( $(compgen -W "install status uninstall --help -h" -- "$cur") )
+      elif [[ "$subcmd" == "install" ]]; then
+        COMPREPLY=( $(compgen -W "${completionFlagWords(SERVICE_INSTALL_COMPLETION_FLAGS)}" -- "$cur") )
+      else
+        COMPREPLY=( $(compgen -W "--help -h" -- "$cur") )
+      fi
+      ;;
+    completion)
+      COMPREPLY=( $(compgen -W "${completionShellWords()} --help -h" -- "$cur") )
+      ;;
+    *)
+      COMPREPLY=( $(compgen -W "${completionFlagWords(APP_COMPLETION_FLAGS)} --" -- "$cur") )
+      ;;
+  esac
+}
+
+complete -F _portless_completions portless
+`;
+}
+
+function getZshCompletionScript(): string {
+  const commands = TOP_LEVEL_COMPLETION_COMMANDS.map(
+    (command) => `'${command.name}:${command.description}'`
+  ).join("\n    ");
+  return `#compdef portless
+
+_portless() {
+  local -a commands
+  commands=(
+    ${commands}
+  )
+
+  _arguments -C \\
+    ${GLOBAL_COMPLETION_FLAGS.map(zshFlag).join(" \\\n    ")} \\
+    '1:command:->command' \\
+    '*::arg:->args'
+
+  case $state in
+    command)
+      _describe 'command' commands
+      ;;
+    args)
+      case $words[2] in
+        run)
+          _arguments ${RUN_COMPLETION_FLAGS.map(zshFlag).join(" ")}
+          ;;
+        get|url|list|ls|status)
+          _arguments '--json[Print JSON]' '--help[Show help]' '-h[Show help]'
+          ;;
+        alias)
+          _arguments '--remove[Remove route]' '--force[Override existing route]' '--help[Show help]' '-h[Show help]'
+          ;;
+        hosts)
+          _values 'hosts command' sync clean
+          ;;
+        clean)
+          _arguments '--help[Show help]' '-h[Show help]'
+          ;;
+        prune)
+          _arguments '--force[Send SIGKILL]' '--help[Show help]' '-h[Show help]'
+          ;;
+        proxy)
+          if (( CURRENT == 3 )); then
+            _values 'proxy command' start stop
+          else
+            _arguments ${PROXY_START_COMPLETION_FLAGS.map(zshFlag).join(" ")}
+          fi
+          ;;
+        service)
+          if (( CURRENT == 3 )); then
+            _values 'service command' install status uninstall
+          elif [[ $words[3] == install ]]; then
+            _arguments ${SERVICE_INSTALL_COMPLETION_FLAGS.map(zshFlag).join(" ")}
+          else
+            _arguments '--help[Show help]' '-h[Show help]'
+          fi
+          ;;
+        completion)
+          _values 'shell' ${completionShellWords()}
+          ;;
+        *)
+          _arguments ${APP_COMPLETION_FLAGS.map(zshFlag).join(" ")}
+          ;;
+      esac
+      ;;
+  esac
+}
+
+compdef _portless portless
+`;
+}
+
+function getFishCompletionScript(): string {
+  const commandLines = TOP_LEVEL_COMPLETION_COMMANDS.map(
+    (command) =>
+      `complete -c portless -n "__fish_is_nth_token 1" -a "${command.name}" -d "${command.description}"`
+  ).join("\n");
+
+  return `# fish completion for portless
+complete -c portless -n "__fish_is_nth_token 1" -f
+${commandLines}
+
+${fishFlagLines(GLOBAL_COMPLETION_FLAGS)}
+${fishFlagLines(RUN_COMPLETION_FLAGS, "__fish_seen_subcommand_from run")}
+${fishFlagLines(APP_COMPLETION_FLAGS, "not __fish_seen_subcommand_from run get url list ls status alias hosts clean prune proxy service completion")}
+complete -c portless -n "__fish_seen_subcommand_from get url list ls status" -l json -d "Print JSON"
+complete -c portless -n "__fish_seen_subcommand_from alias" -l remove -d "Remove route"
+complete -c portless -n "__fish_seen_subcommand_from alias" -l force -d "Override existing route"
+complete -c portless -n "__fish_seen_subcommand_from hosts; and __fish_is_nth_token 2" -a "sync clean"
+complete -c portless -n "__fish_seen_subcommand_from clean" -l help -s h -d "Show help"
+complete -c portless -n "__fish_seen_subcommand_from prune" -l force -d "Send SIGKILL"
+complete -c portless -n "__fish_seen_subcommand_from prune" -l help -s h -d "Show help"
+complete -c portless -n "__fish_seen_subcommand_from proxy; and __fish_is_nth_token 2" -a "start stop"
+${fishFlagLines(PROXY_START_COMPLETION_FLAGS, "__fish_seen_subcommand_from proxy")}
+complete -c portless -n "__fish_seen_subcommand_from service; and __fish_is_nth_token 2" -a "install status uninstall"
+${fishFlagLines(SERVICE_INSTALL_COMPLETION_FLAGS, "__fish_seen_subcommand_from service")}
+complete -c portless -n "__fish_seen_subcommand_from completion; and __fish_is_nth_token 2" -a "${completionShellWords()}"
+`;
+}
+
+function getCompletionScript(shell: CompletionShell): string {
+  if (shell === "bash") return getBashCompletionScript();
+  if (shell === "zsh") return getZshCompletionScript();
+  return getFishCompletionScript();
+}
+
+function handleCompletion(args: string[]): void {
+  if (args[1] === "--help" || args[1] === "-h" || !args[1]) {
+    printCompletionHelp();
+    process.exit(0);
+  }
+
+  const shell = args[1];
+  if (!COMPLETION_SHELLS.includes(shell as CompletionShell)) {
+    console.error(colors.red(`Unknown shell "${shell}".`));
+    console.error(colors.blue(`Supported shells: ${completionShellWords()}`));
+    process.exit(1);
+  }
+
+  process.stdout.write(getCompletionScript(shell as CompletionShell));
+}
+
+// ---------------------------------------------------------------------------
 // Subcommand handlers
 // ---------------------------------------------------------------------------
 
@@ -1952,6 +2321,7 @@ ${colors.bold("Usage:")}
   ${colors.cyan("portless trust")}                   Add local CA to system trust store
   ${colors.cyan("portless clean")}                   Remove portless state, trust entry, and hosts block
   ${colors.cyan("portless prune")}                   Kill orphaned dev servers from crashed sessions
+  ${colors.cyan("portless completion <shell>")}      Print shell completion script
   ${colors.cyan("portless hosts sync")}              Add routes to ${HOSTS_DISPLAY} (fixes Safari)
   ${colors.cyan("portless hosts clean")}             Remove portless entries from ${HOSTS_DISPLAY}
 
@@ -2139,7 +2509,7 @@ ${colors.bold("Skip portless:")}
   PORTLESS=0 bun dev            # Runs command directly without proxy
 
 ${colors.bold("Reserved names:")}
-  run, get, url, alias, hosts, list, ls, status, trust, clean, prune, proxy, service are subcommands and
+  run, get, url, alias, hosts, list, ls, status, trust, clean, prune, proxy, service, completion are subcommands and
   cannot be used as app names directly. Use "portless run" to infer the name,
   or "portless --name <name>" to force any name including reserved ones.
 `);
@@ -4141,7 +4511,7 @@ async function main() {
 
   // --name flag: treat the next arg as an explicit app name, bypassing
   // subcommand dispatch. Useful when the app name collides with a reserved
-  // subcommand (run, alias, hosts, list, trust, clean, prune, proxy, service).
+  // subcommand (run, alias, hosts, list, trust, clean, prune, proxy, service, completion).
   if (args[0] === "--name") {
     args.shift();
     if (!args[0]) {
@@ -4198,7 +4568,7 @@ async function main() {
     return;
   }
 
-  // Global dispatch: help, version, trust, clean, prune, list, alias, hosts, proxy, service
+  // Global dispatch: help, version, trust, clean, prune, list, alias, hosts, proxy, service, completion
   // When `run` is used, skip these so args like "list" or "--help" are treated
   // as child-command tokens, not portless subcommands.
   if (!isRunCommand) {
@@ -4227,6 +4597,10 @@ async function main() {
     }
     if (args[0] === "prune") {
       await handlePrune(args);
+      return;
+    }
+    if (args[0] === "completion") {
+      handleCompletion(args);
       return;
     }
     if (

@@ -155,6 +155,7 @@ describe("CLI", () => {
       expect(stdout).toContain("service install");
       expect(stdout).toContain("portless run");
       expect(stdout).toContain("portless get");
+      expect(stdout).toContain("portless completion <shell>");
       expect(stdout).toContain("run [--name <name>]");
       expect(stdout).toContain("--port");
       expect(stdout).toContain("-p");
@@ -198,6 +199,64 @@ describe("CLI", () => {
       const { status, stdout } = run(["-v"]);
       expect(status).toBe(0);
       expect(stdout.trim()).toMatch(/^\d+\.\d+\.\d+/);
+    });
+  });
+
+  describe("completion", () => {
+    it("prints completion usage with bare command", () => {
+      const { status, stdout } = run(["completion"]);
+      expect(status).toBe(0);
+      expect(stdout).toContain("portless completion <shell>");
+      expect(stdout).toContain("bash");
+      expect(stdout).toContain("zsh");
+      expect(stdout).toContain("fish");
+    });
+
+    it("prints completion usage with --help", () => {
+      const { status, stdout } = run(["completion", "--help"]);
+      expect(status).toBe(0);
+      expect(stdout).toContain("portless completion <shell>");
+    });
+
+    it("prints bash completion with current commands and flags", () => {
+      const { status, stdout } = run(["completion", "bash"]);
+      expect(status).toBe(0);
+      expect(stdout).toContain("_portless_completions");
+      expect(stdout).toContain("complete -F _portless_completions portless");
+      expect(stdout).toContain("service");
+      expect(stdout).toContain("clean");
+      expect(stdout).toContain("prune");
+      expect(stdout).toContain("--suffix");
+      expect(stdout).toContain("--wildcard");
+      expect(stdout).toContain("--lan");
+      expect(stdout).toContain("--netbird-groups");
+      expect(stdout).toContain("--ngrok");
+    });
+
+    it("prints zsh completion with current commands and flags", () => {
+      const { status, stdout } = run(["completion", "zsh"]);
+      expect(status).toBe(0);
+      expect(stdout).toContain("#compdef portless");
+      expect(stdout).toContain("_portless");
+      expect(stdout).toContain("service:Manage startup service");
+      expect(stdout).toContain("--netbird-groups");
+      expect(stdout).toContain("--suffix");
+    });
+
+    it("prints fish completion with current commands and flags", () => {
+      const { status, stdout } = run(["completion", "fish"]);
+      expect(status).toBe(0);
+      expect(stdout).toContain("complete -c portless");
+      expect(stdout).toContain('complete -c portless -n "__fish_is_nth_token 1" -f');
+      expect(stdout).toContain('-a "service"');
+      expect(stdout).toContain("-l netbird-groups");
+      expect(stdout).toContain("-l suffix");
+    });
+
+    it("exits 1 for an unknown shell", () => {
+      const { status, stderr } = run(["completion", "pwsh"]);
+      expect(status).toBe(1);
+      expect(stderr).toContain('Unknown shell "pwsh"');
     });
   });
 
