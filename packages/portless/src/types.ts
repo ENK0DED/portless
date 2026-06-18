@@ -1,7 +1,11 @@
 /** Route info used by the proxy server to map hostnames to ports. */
+export type RouteProtocol = "http1" | "h2c";
+
 export interface RouteInfo {
   hostname: string;
   port: number;
+  /** Upstream protocol. Missing means HTTP/1.1 for backward compatibility. */
+  protocol?: RouteProtocol;
 }
 
 export interface ProxyServerOptions {

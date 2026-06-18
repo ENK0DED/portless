@@ -166,6 +166,8 @@ describe("CLI", () => {
       expect(stdout).toContain("PORTLESS_NGROK");
       expect(stdout).toContain("PORTLESS_NGROK_URL");
       expect(stdout).toContain("portless clean");
+      expect(stdout).toContain("--h2c");
+      expect(stdout).toContain("PORTLESS_H2C");
     });
 
     it("prints help and exits 0 with -h", () => {
@@ -314,6 +316,7 @@ describe("CLI", () => {
           hostname: "myapp.localhost",
           url: "http://myapp.localhost:1355",
           target_port: 4100,
+          upstream_protocol: "http1",
           pid: process.pid,
           kind: "app",
         },
@@ -321,6 +324,7 @@ describe("CLI", () => {
           hostname: "redis.localhost",
           url: "http://redis.localhost:1355",
           target_port: 6379,
+          upstream_protocol: "http1",
           pid: 0,
           kind: "alias",
         },
@@ -342,7 +346,32 @@ describe("CLI", () => {
       expect(JSON.parse(stdout)[0]).toMatchObject({
         hostname: "myapp.localhost",
         kind: "app",
+        upstream_protocol: "http1",
       });
+    });
+
+    it("outputs h2c protocol metadata in JSON", () => {
+      fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
+      fs.writeFileSync(
+        path.join(tmpDir, "routes.json"),
+        JSON.stringify([{ hostname: "grpc.localhost", port: 50051, pid: 0, protocol: "h2c" }])
+      );
+
+      const { status, stdout } = run(["list", "--json"], {
+        env: { PORTLESS_STATE_DIR: tmpDir },
+      });
+
+      expect(status).toBe(0);
+      expect(JSON.parse(stdout)).toEqual([
+        {
+          hostname: "grpc.localhost",
+          url: "http://grpc.localhost:1355",
+          target_port: 50051,
+          upstream_protocol: "h2c",
+          pid: 0,
+          kind: "alias",
+        },
+      ]);
     });
 
     it("prints list help with --json documented", () => {
@@ -659,6 +688,30 @@ describe("CLI", () => {
       expect(stdout.trim()).toBe("ok");
     });
 
+    it("accepts --h2c in named mode (PORTLESS=0)", () => {
+      const { status, stdout } = run(["myapp", "--h2c", "echo", "ok"], {
+        env: { PORTLESS: "0" },
+      });
+      expect(status).toBe(0);
+      expect(stdout.trim()).toBe("ok");
+    });
+
+    it("accepts PORTLESS_H2C=1 in run mode (PORTLESS=0)", () => {
+      const { status, stdout } = run(["run", "echo", "ok"], {
+        env: { PORTLESS: "0", PORTLESS_H2C: "1" },
+      });
+      expect(status).toBe(0);
+      expect(stdout.trim()).toBe("ok");
+    });
+
+    it("accepts global --h2c before run in bypass mode (PORTLESS=0)", () => {
+      const { status, stdout } = run(["--h2c", "run", "echo", "ok"], {
+        env: { PORTLESS: "0" },
+      });
+      expect(status).toBe(0);
+      expect(stdout.trim()).toBe("ok");
+    });
+
     it("rejects browser-blocked PORTLESS_APP_PORT values", () => {
       const { status, stderr } = run(["run", "echo", "ok"], {
         env: { PORTLESS: "0", PORTLESS_APP_PORT: "4045" },
@@ -674,6 +727,7 @@ describe("CLI", () => {
       expect(status).toBe(0);
       expect(stdout).toContain("portless alias");
       expect(stdout).toContain("--remove");
+      expect(stdout).toContain("--h2c");
     });
 
     it("prints help with -h", () => {
@@ -704,6 +758,34 @@ describe("CLI", () => {
       const { status, stderr } = run(["alias", "--remove"]);
       expect(status).toBe(1);
       expect(stderr).toContain("No alias name");
+    });
+
+    it("registers an h2c alias route", () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-cli-alias-h2c-"));
+      try {
+        const { status, stdout } = run(["alias", "grpc", "50051", "--h2c"], {
+          env: { PORTLESS_STATE_DIR: tmpDir },
+        });
+
+        expect(status).toBe(0);
+        expect(stdout).toContain("(h2c)");
+        expect(JSON.parse(fs.readFileSync(path.join(tmpDir, "routes.json"), "utf-8"))).toEqual([
+          {
+            hostname: "grpc.localhost",
+            port: 50051,
+            pid: 0,
+            protocol: "h2c",
+          },
+        ]);
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it("rejects unknown alias flags", () => {
+      const { status, stderr } = run(["alias", "grpc", "50051", "--typo"]);
+      expect(status).toBe(1);
+      expect(stderr).toContain("Unknown flag");
     });
   });
 

@@ -1,7 +1,7 @@
 import * as http from "node:http";
 import * as http2 from "node:http2";
 import * as net from "node:net";
-import type { ProxyServerOptions } from "./types.js";
+import type { ProxyServerOptions, RouteInfo } from "./types.js";
 import { escapeHtml, formatUrl } from "./utils.js";
 import { ARROW_SVG, renderPage } from "./pages.js";
 
@@ -60,6 +60,7 @@ function activeAppLinkSuffix(req: http.IncomingMessage): string {
  */
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
+  "http2-settings",
   "keep-alive",
   "proxy-connection",
   "transfer-encoding",
@@ -112,6 +113,147 @@ function buildForwardedHeaders(req: http.IncomingMessage, tls: boolean): Record<
   return headers;
 }
 
+type H2cSessionCache = Map<number, http2.ClientHttp2Session>;
+
+function closeH2cSessions(sessions: H2cSessionCache): void {
+  for (const session of sessions.values()) {
+    session.close();
+  }
+  sessions.clear();
+}
+
+function getH2cSession(port: number, sessions: H2cSessionCache): http2.ClientHttp2Session {
+  const existing = sessions.get(port);
+  if (existing && !existing.closed && !existing.destroyed) {
+    return existing;
+  }
+
+  const session = http2.connect(`http://localhost:${port}`, {
+    createConnection: () =>
+      net.connect({
+        ...LOOPBACK_DIAL_OPTIONS,
+        port,
+      }),
+  });
+  const remove = () => {
+    if (sessions.get(port) === session) {
+      sessions.delete(port);
+    }
+  };
+  session.on("close", remove);
+  session.on("goaway", remove);
+  session.on("error", remove);
+  sessions.set(port, session);
+  return session;
+}
+
+function h2cResponseHeaders(headers: http2.IncomingHttpHeaders): {
+  status: number;
+  headers: http.OutgoingHttpHeaders;
+} {
+  const status = Number(headers[":status"]) || 502;
+  const responseHeaders: http.OutgoingHttpHeaders = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.startsWith(":") || HOP_BY_HOP_HEADERS.has(key.toLowerCase())) continue;
+    responseHeaders[key] = value as string | string[];
+  }
+  return { status, headers: responseHeaders };
+}
+
+function h2cRequestHeaders(
+  req: http.IncomingMessage,
+  reqTls: boolean,
+  hops: number
+): http2.OutgoingHttpHeaders {
+  const forwardedHeaders = buildForwardedHeaders(req, reqTls);
+  const headers: http2.OutgoingHttpHeaders = {
+    ":method": req.method || "GET",
+    ":path": req.url || "/",
+    ":scheme": "http",
+    ":authority": getRequestHost(req),
+  };
+
+  for (const [key, value] of Object.entries(req.headers)) {
+    const lower = key.toLowerCase();
+    if (lower.startsWith(":") || lower === "host" || HOP_BY_HOP_HEADERS.has(lower)) continue;
+    if (lower === "te" && value !== "trailers") continue;
+    headers[lower] = value as string | string[];
+  }
+  for (const [key, value] of Object.entries(forwardedHeaders)) {
+    headers[key] = value;
+  }
+  headers[PORTLESS_HOPS_HEADER] = String(hops + 1);
+
+  return headers;
+}
+
+function writePlainBadGateway(
+  res: http.ServerResponse,
+  route: { port: number },
+  detail = "The target app may not be running."
+): void {
+  res.writeHead(502, { "Content-Type": "text/plain" });
+  res.end(
+    [
+      `Bad Gateway: ${detail}`,
+      `Target: 127.0.0.1:${route.port}`,
+      "Check active routes with: portless list",
+    ].join("\n") + "\n"
+  );
+}
+
+function proxyH2c(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  route: { hostname: string; port: number },
+  reqTls: boolean,
+  hops: number,
+  sessions: H2cSessionCache,
+  onError: (message: string) => void
+): void {
+  const session = getH2cSession(route.port, sessions);
+  const proxyReq = session.request(h2cRequestHeaders(req, reqTls, hops));
+
+  proxyReq.on("response", (headers) => {
+    const response = h2cResponseHeaders(headers);
+    res.writeHead(response.status, response.headers);
+  });
+
+  proxyReq.on("trailers", (headers) => {
+    const trailers: Record<string, string | string[]> = {};
+    for (const [key, value] of Object.entries(headers)) {
+      if (key.startsWith(":") || value === undefined) continue;
+      trailers[key] = value as string | string[];
+    }
+    if (Object.keys(trailers).length > 0) {
+      res.addTrailers(trailers);
+    }
+  });
+
+  proxyReq.on("error", (err) => {
+    onError(`h2c proxy error for ${getRequestHost(req)}: ${dialErrorMessage(err)}`);
+    if (!res.headersSent) {
+      writePlainBadGateway(res, route);
+    } else {
+      res.destroy();
+    }
+  });
+
+  proxyReq.on("end", () => {
+    if (!res.destroyed) res.end();
+  });
+
+  res.on("close", () => {
+    proxyReq.close(http2.constants.NGHTTP2_CANCEL);
+  });
+  req.on("error", () => {
+    proxyReq.close(http2.constants.NGHTTP2_CANCEL);
+  });
+
+  proxyReq.pipe(res, { end: false });
+  req.pipe(proxyReq);
+}
+
 /**
  * Request header tracking how many times a request has passed through a
  * portless proxy. Used to detect forwarding loops (e.g. a frontend dev
@@ -135,11 +277,7 @@ const MAX_PROXY_HOPS = 5;
  * When `strict` is true, only exact matches are returned; unregistered
  * subdomain prefixes will not fall back to the base service.
  */
-function findRoute(
-  routes: { hostname: string; port: number }[],
-  host: string,
-  strict?: boolean
-): { hostname: string; port: number } | undefined {
+function findRoute(routes: RouteInfo[], host: string, strict?: boolean): RouteInfo | undefined {
   return (
     routes.find((r) => r.hostname === host) ||
     (strict ? undefined : routes.find((r) => host.endsWith("." + r.hostname)))
@@ -170,6 +308,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     tls,
   } = options;
   const tldSuffix = `.${tld}`;
+  const h2cSessions: H2cSessionCache = new Map();
 
   const handleRequest = (req: http.IncomingMessage, res: http.ServerResponse) => {
     const reqTls = isEncrypted(req);
@@ -254,6 +393,11 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
           `<div class="content"><p class="desc">No app registered for <strong>${safeHost}</strong></p>${routesList}<div class="section"><div class="terminal"><span class="prompt">$ </span>portless ${safeSuggestion} your-command</div></div></div>`
         )
       );
+      return;
+    }
+
+    if (route.protocol === "h2c") {
+      proxyH2c(req, res, route, reqTls, hops, h2cSessions, onError);
       return;
     }
 
@@ -542,6 +686,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     // Proxy close() through to inner servers so tests and cleanup work.
     const origClose = wrapper.close.bind(wrapper);
     wrapper.close = function (cb?: (err?: Error) => void) {
+      closeH2cSessions(h2cSessions);
       h2Server.close();
       plainServer.close();
       return origClose(cb);
@@ -552,6 +697,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
 
   const httpServer = http.createServer(handleRequest);
   httpServer.on("upgrade", handleUpgrade);
+  httpServer.on("close", () => closeH2cSessions(h2cSessions));
 
   return httpServer;
 }

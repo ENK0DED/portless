@@ -9,6 +9,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { createSNICallback, ensureCerts, isCATrusted, trustCA, untrustCA } from "./certs.js";
 import { createHttpRedirectServer, createProxyServer } from "./proxy.js";
+import type { RouteProtocol } from "./types.js";
 import { fixOwnership, formatUrl, isErrnoException, parseHostname } from "./utils.js";
 import { getUrl } from "./api.js";
 import { syncHostsFile, cleanHostsFile, shouldAutoSyncHosts } from "./hosts.js";
@@ -891,6 +892,7 @@ function listRoutes(store: RouteStore, proxyPort: number, tls: boolean, asJson =
       hostname: route.hostname,
       url: formatUrl(route.hostname, proxyPort, tls),
       target_port: route.port,
+      upstream_protocol: route.protocol ?? "http1",
       pid: route.pid,
       kind: route.pid === 0 ? "alias" : "app",
       ...(route.tailscaleUrl ? { tailscale_url: route.tailscaleUrl } : {}),
@@ -918,8 +920,9 @@ function listRoutes(store: RouteStore, proxyPort: number, tls: boolean, asJson =
   for (const route of routes) {
     const url = formatUrl(route.hostname, proxyPort, tls);
     const label = route.pid === 0 ? "(alias)" : `(pid ${route.pid})`;
+    const target = `localhost:${route.port}${route.protocol === "h2c" ? " (h2c)" : ""}`;
     console.log(
-      `  ${colors.cyan(url)}  ${colors.gray("->")}  ${colors.white(`localhost:${route.port}`)}  ${colors.gray(label)}`
+      `  ${colors.cyan(url)}  ${colors.gray("->")}  ${colors.white(target)}  ${colors.gray(label)}`
     );
     if (route.tailscaleUrl) {
       const tsLabel = route.tailscaleFunnel ? "funnel" : "tailscale";
@@ -1101,7 +1104,8 @@ async function runApp(
   lanMode = false,
   lanIp?: string | null,
   scriptContext?: { scriptName: string; packageDir: string },
-  childEnv: Record<string, string> = {}
+  childEnv: Record<string, string> = {},
+  protocol?: RouteProtocol
 ) {
   let store = initialStore;
   console.log(chalk.blue.bold(`\nportless\n`));
@@ -1254,7 +1258,7 @@ async function runApp(
   // Register route (--force kills the existing owner if any)
   let killedPid: number | undefined;
   try {
-    killedPid = store.addRoute(hostname, port, process.pid, force);
+    killedPid = store.addRoute(hostname, port, process.pid, force, { protocol });
   } catch (err) {
     if (err instanceof RouteConflictError) {
       console.error(colors.red(`Error: ${err.message}`));
@@ -1674,6 +1678,8 @@ interface ParsedRunArgs {
   name?: string;
   /** Leading KEY=value assignments that apply only to the child process. */
   childEnv: Record<string, string>;
+  /** Upstream protocol for this route. */
+  protocol?: RouteProtocol;
   /** The child command and its arguments, passed through untouched. */
   commandArgs: string[];
 }
@@ -1707,6 +1713,10 @@ function appPortFromEnv(): number | undefined {
   }
   rejectBlockedAppPort(port, "PORTLESS_APP_PORT");
   return port;
+}
+
+function routeProtocolFromEnv(): RouteProtocol | undefined {
+  return isEnabledEnv(process.env.PORTLESS_H2C) ? "h2c" : undefined;
 }
 
 function rejectBlockedAppPort(port: number, source: string): void {
@@ -1821,6 +1831,7 @@ function parseRunArgs(args: string[]): ParsedRunArgs {
   let force = false;
   let appPort: number | undefined;
   let name: string | undefined;
+  let protocol = routeProtocolFromEnv();
   let allowChildEnv = true;
   let i = 0;
 
@@ -1843,6 +1854,7 @@ ${colors.bold("Options:")}
   --name <name>          Override the inferred base name (worktree prefix still applies)
   --force                Kill the existing process and take over its route
   --app-port <number>    Use a fixed app port; browser-blocked ports are rejected
+  --h2c                  Forward this route to an HTTP/2 cleartext upstream
   --tailscale            Share the app on your Tailscale network (tailnet)
   --tailscale-service    Share the app as a stable Tailscale Service
   --tailscale-service-name <name>
@@ -1878,6 +1890,7 @@ ${colors.bold("Examples:")}
   portless run next dev               # -> https://<project>.localhost
   portless run --name myapp next dev  # -> https://myapp.localhost
   portless run vite dev               # -> https://<project>.localhost
+  portless run --h2c grpc-server      # h2c or gRPC upstream
   portless run my-server --port {PORT}
   portless run --app-port 3000 bun start
 `);
@@ -1887,6 +1900,8 @@ ${colors.bold("Examples:")}
     } else if (args[i] === "--app-port") {
       i++;
       appPort = parseAppPort(args[i]);
+    } else if (args[i] === "--h2c") {
+      protocol = "h2c";
     } else if (args[i] === "--name") {
       i++;
       if (!args[i] || args[i].startsWith("-")) {
@@ -1908,7 +1923,7 @@ ${colors.bold("Examples:")}
         console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
         console.error(
           colors.blue(
-            "Known flags: --name, --force, --app-port, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups, --help"
+            "Known flags: --name, --force, --app-port, --h2c, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups, --help"
           )
         );
         process.exit(1);
@@ -1923,7 +1938,7 @@ ${colors.bold("Examples:")}
     ? splitLeadingChildEnv(args.slice(i))
     : { childEnv: {}, commandArgs: args.slice(i) };
 
-  return { force, appPort, name, ...parsedChild };
+  return { force, appPort, name, protocol, ...parsedChild };
 }
 
 /**
@@ -1936,6 +1951,7 @@ ${colors.bold("Examples:")}
 function parseAppArgs(args: string[]): ParsedAppArgs {
   let force = false;
   let appPort: number | undefined;
+  let protocol = routeProtocolFromEnv();
   let allowChildEnv = true;
   let i = 0;
 
@@ -1950,6 +1966,8 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
     } else if (args[i] === "--app-port") {
       i++;
       appPort = parseAppPort(args[i]);
+    } else if (args[i] === "--h2c") {
+      protocol = "h2c";
     } else if (args[i] === "--wildcard") {
       rejectMisplacedWildcardFlag();
     } else if (applySharingFlag(args[i])) {
@@ -1963,7 +1981,7 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
         console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
         console.error(
           colors.blue(
-            "Known flags: --force, --app-port, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups"
+            "Known flags: --force, --app-port, --h2c, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups"
           )
         );
         process.exit(1);
@@ -1987,6 +2005,8 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
     } else if (args[i] === "--app-port") {
       i++;
       appPort = parseAppPort(args[i]);
+    } else if (args[i] === "--h2c") {
+      protocol = "h2c";
     } else if (args[i] === "--wildcard") {
       rejectMisplacedWildcardFlag();
     } else if (applySharingFlag(args[i])) {
@@ -2000,7 +2020,7 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
         console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
         console.error(
           colors.blue(
-            "Known flags: --force, --app-port, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups"
+            "Known flags: --force, --app-port, --h2c, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups"
           )
         );
         process.exit(1);
@@ -2015,7 +2035,7 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
     ? splitLeadingChildEnv(args.slice(i))
     : { childEnv: {}, commandArgs: args.slice(i) };
 
-  return { force, appPort, name, ...parsedChild };
+  return { force, appPort, name, protocol, ...parsedChild };
 }
 
 // ---------------------------------------------------------------------------
@@ -2072,6 +2092,7 @@ const GLOBAL_COMPLETION_FLAGS: CompletionFlag[] = [
   { name: "--wildcard", description: "Enable wildcard routing" },
   { name: "--state-dir", description: "Use a custom state directory", value: "path" },
   { name: "--app-port", description: "Use a fixed app port", value: "port" },
+  { name: "--h2c", description: "Forward to an HTTP/2 cleartext upstream" },
   { name: "--tailscale", description: "Share on Tailscale" },
   { name: "--tailscale-service", description: "Share as a Tailscale Service" },
   {
@@ -2094,6 +2115,7 @@ const RUN_COMPLETION_FLAGS = GLOBAL_COMPLETION_FLAGS.filter((flag) =>
     "--name",
     "--force",
     "--app-port",
+    "--h2c",
     "--tailscale",
     "--tailscale-service",
     "--tailscale-service-name",
@@ -2110,6 +2132,7 @@ const APP_COMPLETION_FLAGS = GLOBAL_COMPLETION_FLAGS.filter((flag) =>
   [
     "--force",
     "--app-port",
+    "--h2c",
     "--tailscale",
     "--tailscale-service",
     "--tailscale-service-name",
@@ -2229,7 +2252,7 @@ _portless_completions() {
       COMPREPLY=( $(compgen -W "--json --help -h" -- "$cur") )
       ;;
     alias)
-      COMPREPLY=( $(compgen -W "--remove --force --help -h" -- "$cur") )
+      COMPREPLY=( $(compgen -W "--remove --force --h2c --help -h" -- "$cur") )
       ;;
     hosts)
       if [[ $COMP_CWORD -eq 2 ]]; then
@@ -2305,7 +2328,7 @@ _portless() {
           _arguments '--json[Print JSON]' '--help[Show help]' '-h[Show help]'
           ;;
         alias)
-          _arguments '--remove[Remove route]' '--force[Override existing route]' '--help[Show help]' '-h[Show help]'
+          _arguments '--remove[Remove route]' '--force[Override existing route]' '--h2c[Forward to HTTP/2 cleartext upstream]' '--help[Show help]' '-h[Show help]'
           ;;
         hosts)
           _values 'hosts command' sync clean
@@ -2363,6 +2386,7 @@ ${fishFlagLines(APP_COMPLETION_FLAGS, "not __fish_seen_subcommand_from run get u
 complete -c portless -n "__fish_seen_subcommand_from get url list ls status" -l json -d "Print JSON"
 complete -c portless -n "__fish_seen_subcommand_from alias" -l remove -d "Remove route"
 complete -c portless -n "__fish_seen_subcommand_from alias" -l force -d "Override existing route"
+complete -c portless -n "__fish_seen_subcommand_from alias" -l h2c -d "Forward to HTTP/2 cleartext upstream"
 complete -c portless -n "__fish_seen_subcommand_from hosts; and __fish_is_nth_token 2" -a "sync clean"
 complete -c portless -n "__fish_seen_subcommand_from clean" -l help -s h -d "Show help"
 complete -c portless -n "__fish_seen_subcommand_from prune" -l force -d "Send SIGKILL"
@@ -2454,6 +2478,7 @@ ${colors.bold("Examples:")}
   portless get backend --json         # Service info for scripts and agents
   portless url backend                # Alias for get
   portless myapp API_URL=1 next dev   # Pass API_URL only to the child command
+  portless myapp --h2c grpc-server    # Proxy to an h2c or gRPC upstream
   portless myapp --tailscale next dev # -> also https://<node>.ts.net (tailnet)
   portless myapp --tailscale-service next dev
                                      # -> also https://<service>.<tailnet>.ts.net
@@ -2561,6 +2586,7 @@ ${colors.bold("Options:")}
                                 Proxy-level only; restart proxy to change this mode
   --state-dir <path>            Use a custom state directory with service install
   --app-port <number>           Use a fixed app port; browser-blocked ports are rejected
+  --h2c                         Forward this route to an HTTP/2 cleartext upstream
   --tailscale                   Share the app on your Tailscale network (tailnet)
   --tailscale-service           Share the app as a stable Tailscale Service
   --tailscale-service-name <n>  Use an explicit Tailscale Service name
@@ -2577,6 +2603,7 @@ ${colors.bold("Options:")}
 ${colors.bold("Environment variables:")}
   PORTLESS_PORT=<number>        Override the default proxy port (e.g. in .bashrc)
   PORTLESS_APP_PORT=<number>    Use a fixed app port (same as --app-port)
+  PORTLESS_H2C=1                Forward app routes to HTTP/2 cleartext upstreams
   PORTLESS_HTTPS=0              Disable HTTPS (same as --no-tls)
   PORTLESS_LAN=1                Enable LAN mode when set to 1 (set in .bashrc / .zshrc)
   PORTLESS_LAN_IP=<address>     Pin a specific LAN IP for LAN mode
@@ -2927,6 +2954,7 @@ ${colors.bold("JSON fields:")}
   hostname               Route hostname (e.g. myapp.localhost)
   url                    Full URL served by the proxy
   target_port            Local port the app listens on
+  upstream_protocol      "http1" or "h2c"
   pid                    Owning process PID (0 for alias)
   kind                   "app" or "alias"
 `);
@@ -3044,12 +3072,14 @@ ${colors.bold("portless alias")} - Register a static route for services not mana
 
 ${colors.bold("Usage:")}
   ${colors.cyan("portless alias <name> <port>")}        Register a route
+  ${colors.cyan("portless alias <name> <port> --h2c")}  Register an h2c route
   ${colors.cyan("portless alias --remove <name>")}      Remove a route
   ${colors.cyan("portless alias <name> <port> --force")} Override existing route
 
 ${colors.bold("Examples:")}
   portless alias my-postgres 5432     # -> https://my-postgres.localhost
   portless alias redis 6379           # -> https://redis.localhost
+  portless alias grpc 50051 --h2c     # HTTP/2 cleartext upstream
   portless alias --remove my-postgres # Remove the alias
 `);
     process.exit(0);
@@ -3098,9 +3128,23 @@ ${colors.bold("Examples:")}
     process.exit(1);
   }
 
-  const force = args.includes("--force");
-  store.addRoute(hostname, port, 0, force);
-  console.log(colors.green(`Alias registered: ${hostname} -> 127.0.0.1:${port}`));
+  let force = false;
+  let protocol = routeProtocolFromEnv();
+  for (const arg of args.slice(3)) {
+    if (arg === "--force") {
+      force = true;
+    } else if (arg === "--h2c") {
+      protocol = "h2c";
+    } else {
+      console.error(colors.red(`Error: Unknown flag "${arg}".`));
+      console.error(colors.blue("Known flags: --force, --h2c, --help"));
+      process.exit(1);
+    }
+  }
+
+  store.addRoute(hostname, port, 0, force, { protocol });
+  const suffix = protocol === "h2c" ? " (h2c)" : "";
+  console.log(colors.green(`Alias registered: ${hostname} -> 127.0.0.1:${port}${suffix}`));
 }
 
 async function handleHosts(args: string[]): Promise<void> {
@@ -3976,7 +4020,7 @@ async function spawnProxiedApp(
     displayUrl = url;
 
     hostname = parseHostname(app.name, tld);
-    store.addRoute(hostname, appPort, process.pid);
+    store.addRoute(hostname, appPort, process.pid, false, { protocol: routeProtocolFromEnv() });
 
     env = {
       ...pkgEnv,
@@ -4232,7 +4276,7 @@ async function runWithTurbo(
     appUrls.push({ label: app.label, url });
 
     const hostname = parseHostname(app.name, tld);
-    store.addRoute(hostname, appPort, process.pid);
+    store.addRoute(hostname, appPort, process.pid, false, { protocol: routeProtocolFromEnv() });
     routes.push({ hostname });
 
     const entry: ManifestEntry = {
@@ -4488,7 +4532,8 @@ async function handleRunMode(args: string[], globalScript?: string): Promise<voi
     lanMode,
     lanIp,
     scriptContext,
-    parsed.childEnv
+    parsed.childEnv,
+    parsed.protocol
   );
 }
 
@@ -4536,7 +4581,8 @@ async function handleNamedMode(args: string[]): Promise<void> {
     lanMode,
     lanIp,
     undefined,
-    parsed.childEnv
+    parsed.childEnv,
+    parsed.protocol
   );
 }
 
@@ -4633,6 +4679,9 @@ async function main() {
   }
   if (stripGlobalFlag("--netbird", false)) {
     process.env.PORTLESS_NETBIRD = "1";
+  }
+  if (stripGlobalFlag("--h2c", false)) {
+    process.env.PORTLESS_H2C = "1";
   }
   for (const [flag, envKey] of TAILSCALE_SERVICE_VALUE_FLAGS) {
     const value = stripGlobalFlag(flag, true);

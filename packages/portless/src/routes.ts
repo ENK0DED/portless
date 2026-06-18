@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { RouteInfo } from "./types.js";
+import type { RouteInfo, RouteProtocol } from "./types.js";
 import { fixOwnership, isErrnoException } from "./utils.js";
 
 /** How long (ms) before a lock directory is considered stale and forcibly removed. */
@@ -54,6 +54,10 @@ type RouteMetadataPatch = {
   netbirdUrl?: string | null;
   netbirdPid?: number | null;
 };
+
+interface AddRouteOptions {
+  protocol?: RouteProtocol;
+}
 
 /** Runtime check that a parsed JSON value is a valid RouteMapping. */
 function isValidRoute(value: unknown): value is RouteMapping {
@@ -236,7 +240,13 @@ export class RouteStore {
    * replaced. Returns the PID of the killed process (if any) so the caller can
    * log it.
    */
-  addRoute(hostname: string, port: number, pid: number, force = false): number | undefined {
+  addRoute(
+    hostname: string,
+    port: number,
+    pid: number,
+    force = false,
+    options: AddRouteOptions = {}
+  ): number | undefined {
     this.ensureDir();
     if (!this.acquireLock()) {
       throw new Error("Failed to acquire route lock");
@@ -258,7 +268,12 @@ export class RouteStore {
         }
       }
       const filtered = routes.filter((r) => r.hostname !== hostname);
-      const entry: RouteMapping = { hostname, port, pid };
+      const entry: RouteMapping = {
+        hostname,
+        port,
+        pid,
+        ...(options.protocol && options.protocol !== "http1" ? { protocol: options.protocol } : {}),
+      };
       filtered.push(entry);
       this.saveRoutes(filtered);
     } finally {

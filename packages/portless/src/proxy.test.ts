@@ -13,21 +13,36 @@ import { ensureCerts } from "./certs.js";
 
 const TEST_PROXY_PORT = 1355;
 
-/** Helper type covering both http.Server and http2.Http2SecureServer */
-type AnyServer = http.Server | ProxyServer;
+/** Helper type covering plain HTTP, HTTP/2, and proxy wrapper servers. */
+type AnyServer = http.Server | http2.Http2Server | http2.Http2SecureServer | ProxyServer;
 
 function request(
   server: AnyServer,
-  options: { host?: string; path?: string; method?: string; accept?: string | null }
-): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }> {
+  options: {
+    host?: string;
+    path?: string;
+    method?: string;
+    accept?: string | null;
+    headers?: Record<string, string>;
+    body?: string;
+  }
+): Promise<{
+  status: number;
+  headers: http.IncomingHttpHeaders;
+  trailers: http.IncomingHttpHeaders;
+  body: string;
+}> {
   return new Promise((resolve, reject) => {
     const addr = server.address();
     if (!addr || typeof addr === "string") {
       return reject(new Error("Server not listening"));
     }
-    const headers: Record<string, string> = { host: options.host || "" };
+    const headers: Record<string, string> = { host: options.host || "", ...options.headers };
     if (options.accept !== null) {
       headers.accept = options.accept ?? "text/html";
+    }
+    if (options.body !== undefined && !headers["content-length"]) {
+      headers["content-length"] = Buffer.byteLength(options.body).toString();
     }
     const req = http.request(
       {
@@ -40,11 +55,13 @@ function request(
       (res) => {
         let body = "";
         res.on("data", (chunk) => (body += chunk));
-        res.on("end", () => resolve({ status: res.statusCode!, headers: res.headers, body }));
+        res.on("end", () =>
+          resolve({ status: res.statusCode!, headers: res.headers, trailers: res.trailers, body })
+        );
       }
     );
     req.on("error", reject);
-    req.end();
+    req.end(options.body);
   });
 }
 
@@ -1095,6 +1112,100 @@ describe("createProxyServer", () => {
       });
 
       expect(destroyed).toBe(true);
+    });
+
+    it("proxies requests to an h2c upstream when the route opts in", async () => {
+      const backend = trackServer(
+        http2.createServer((req, res) => {
+          res.stream.respond({
+            ":status": 200,
+            "content-type": "application/json",
+            "x-backend-protocol": "h2c",
+          });
+          res.end(
+            JSON.stringify({
+              method: req.method,
+              path: req.url,
+              authority: req.headers[":authority"],
+              host: req.headers.host,
+              forwardedHost: req.headers["x-forwarded-host"],
+              hops: req.headers["x-portless-hops"],
+            })
+          );
+        })
+      );
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const routes: RouteInfo[] = [
+        { hostname: "grpc.localhost", port: backendAddr.port, protocol: "h2c" },
+      ];
+      const server = trackServer(
+        createProxyServer({ getRoutes: () => routes, proxyPort: TEST_PROXY_PORT })
+      );
+      await listen(server);
+
+      const res = await request(server, { host: "grpc.localhost", path: "/Greeter/SayHello" });
+      const payload = JSON.parse(res.body) as Record<string, string>;
+
+      expect(res.status).toBe(200);
+      expect(res.headers["x-backend-protocol"]).toBe("h2c");
+      expect(payload).toMatchObject({
+        method: "GET",
+        path: "/Greeter/SayHello",
+        authority: "grpc.localhost",
+        forwardedHost: "grpc.localhost",
+        hops: "1",
+      });
+      expect(payload.host).toBeUndefined();
+    });
+
+    it("proxies request bodies and trailers for h2c upstreams", async () => {
+      const backend = trackServer(http2.createServer());
+      backend.on("stream", (stream) => {
+        let body = "";
+        stream.on("data", (chunk) => {
+          body += chunk;
+        });
+        stream.on("end", () => {
+          stream.respond(
+            {
+              ":status": 200,
+              "content-type": "text/plain",
+              trailer: "grpc-status",
+            },
+            { waitForTrailers: true }
+          );
+          stream.on("wantTrailers", () => {
+            stream.sendTrailers({ "grpc-status": "0" });
+          });
+          stream.end(body);
+        });
+      });
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const routes: RouteInfo[] = [
+        { hostname: "grpc.localhost", port: backendAddr.port, protocol: "h2c" },
+      ];
+      const server = trackServer(
+        createProxyServer({ getRoutes: () => routes, proxyPort: TEST_PROXY_PORT })
+      );
+      await listen(server);
+
+      const res = await request(server, {
+        host: "grpc.localhost",
+        path: "/grpc.Service/Call",
+        method: "POST",
+        headers: { "content-type": "application/grpc", te: "trailers" },
+        body: "grpc-body",
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.body).toBe("grpc-body");
+      expect(res.trailers["grpc-status"]).toBe("0");
     });
   });
 });

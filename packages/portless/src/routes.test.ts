@@ -501,6 +501,24 @@ describe("RouteStore", () => {
     });
   });
 
+  describe("route protocol metadata", () => {
+    it("persists h2c protocol when a route is added", () => {
+      store.addRoute("grpc.localhost", 50051, process.pid, false, { protocol: "h2c" });
+
+      const routes = store.loadRoutes();
+      expect(routes).toHaveLength(1);
+      expect(routes[0].protocol).toBe("h2c");
+    });
+
+    it("loads legacy routes without protocol as HTTP/1.1 routes", () => {
+      store.addRoute("web.localhost", 4123, process.pid);
+
+      const routes = store.loadRoutes();
+      expect(routes).toHaveLength(1);
+      expect(routes[0].protocol).toBeUndefined();
+    });
+  });
+
   describe("ngrok metadata", () => {
     it("persists and loads ngrok fields via updateRoute", () => {
       store.addRoute("myapp.localhost", 4123, process.pid);
