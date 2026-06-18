@@ -201,6 +201,7 @@ The suffix may be a single label such as `test` or a dotted suffix such as `serv
 | `PORTLESS_PORT`                   | Override the default proxy port (default: 443 with HTTPS, 80 without)       |
 | `PORTLESS_APP_PORT`               | Use a fixed app port; browser-blocked ports are rejected                    |
 | `PORTLESS_H2C`                    | Set to `1` to forward app routes to HTTP/2 cleartext upstreams              |
+| `PORTLESS_PATH`                   | Scope app routes to a path prefix                                           |
 | `PORTLESS_HTTPS`                  | HTTPS on by default; set to `0` to disable (same as `--no-tls`)             |
 | `PORTLESS_LAN`                    | Set to `1` to always enable LAN mode (auto-detects LAN IP)                  |
 | `PORTLESS_LAN_IP`                 | Pin a specific LAN IP for LAN mode                                          |
@@ -243,6 +244,19 @@ PORTLESS_H2C=1 portless run bun run grpc-server
 ```
 
 `--h2c` affects only the loopback hop from portless to the app. Browser-facing HTTPS/HTTP/2, route names, sharing modes, and loopback-only child app binding keep their defaults. Do not assume h2c automatically. There is no protocol probing.
+
+### Path-based routes
+
+Use `--path <prefix>` only when a route should match a path prefix instead of the whole hostname:
+
+```bash
+portless myapp --path /api bun run api
+portless myapp --path /docs bun run docs
+portless alias myapp 4100 --path /legacy
+PORTLESS_PATH=/api portless run bun run api
+```
+
+Path matching is boundary-aware: `/api` matches `/api` and `/api/users`, not `/api-v2`. Portless forwards the full path unchanged to the upstream app. Do not strip the prefix unless the upstream app is configured to do that itself.
 
 ### LAN mode
 
@@ -388,11 +402,13 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 | `portless alias <name> <port>`              | Register a static route (e.g. for Docker containers)           |
 | `portless alias <name> <port> --force`      | Overwrite an existing route                                    |
 | `portless alias <name> <port> --h2c`        | Register an HTTP/2 cleartext upstream route                    |
+| `portless alias <name> <port> --path /api`  | Register a path-scoped route                                   |
 | `portless alias --remove <name>`            | Remove a static route                                          |
 | `portless hosts sync`                       | Add routes to /etc/hosts (fixes Safari)                        |
 | `portless hosts clean`                      | Remove portless entries from /etc/hosts                        |
 | `portless <name> --app-port <n> <cmd>`      | Use a fixed app port; browser-blocked ports are rejected       |
 | `portless <name> --h2c <cmd>`               | Forward this route to an HTTP/2 cleartext upstream             |
+| `portless <name> --path /api <cmd>`         | Scope this route to a path prefix                              |
 | `portless <name> --tailscale <cmd>`         | Share the app on your Tailscale network (tailnet)              |
 | `portless <name> --tailscale-service <cmd>` | Share the app as a stable Tailscale Service                    |
 | `portless <name> --funnel <cmd>`            | Share the app publicly via Tailscale Funnel                    |

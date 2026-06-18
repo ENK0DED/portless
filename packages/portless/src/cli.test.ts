@@ -168,6 +168,8 @@ describe("CLI", () => {
       expect(stdout).toContain("portless clean");
       expect(stdout).toContain("--h2c");
       expect(stdout).toContain("PORTLESS_H2C");
+      expect(stdout).toContain("--path");
+      expect(stdout).toContain("PORTLESS_PATH");
     });
 
     it("prints help and exits 0 with -h", () => {
@@ -316,6 +318,7 @@ describe("CLI", () => {
           hostname: "myapp.localhost",
           url: "http://myapp.localhost:1355",
           target_port: 4100,
+          path_prefix: "/",
           upstream_protocol: "http1",
           pid: process.pid,
           kind: "app",
@@ -324,6 +327,7 @@ describe("CLI", () => {
           hostname: "redis.localhost",
           url: "http://redis.localhost:1355",
           target_port: 6379,
+          path_prefix: "/",
           upstream_protocol: "http1",
           pid: 0,
           kind: "alias",
@@ -367,9 +371,33 @@ describe("CLI", () => {
           hostname: "grpc.localhost",
           url: "http://grpc.localhost:1355",
           target_port: 50051,
+          path_prefix: "/",
           upstream_protocol: "h2c",
           pid: 0,
           kind: "alias",
+        },
+      ]);
+    });
+
+    it("outputs path prefixes in JSON URLs", () => {
+      fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
+      fs.writeFileSync(
+        path.join(tmpDir, "routes.json"),
+        JSON.stringify([
+          { hostname: "api.localhost", port: 4100, pid: process.pid, pathPrefix: "/v1" },
+        ])
+      );
+
+      const { status, stdout } = run(["list", "--json"], {
+        env: { PORTLESS_STATE_DIR: tmpDir },
+      });
+
+      expect(status).toBe(0);
+      expect(JSON.parse(stdout)).toMatchObject([
+        {
+          hostname: "api.localhost",
+          url: "http://api.localhost:1355/v1",
+          path_prefix: "/v1",
         },
       ]);
     });
@@ -638,6 +666,7 @@ describe("CLI", () => {
       expect(stdout).toContain("portless run");
       expect(stdout).toContain("--force");
       expect(stdout).toContain("--app-port");
+      expect(stdout).toContain("--path");
     });
 
     it("prints run-specific help for run -h", () => {
@@ -712,6 +741,39 @@ describe("CLI", () => {
       expect(stdout.trim()).toBe("ok");
     });
 
+    it("accepts --path in named mode (PORTLESS=0)", () => {
+      const { status, stdout } = run(["myapp", "--path", "/api", "echo", "ok"], {
+        env: { PORTLESS: "0" },
+      });
+      expect(status).toBe(0);
+      expect(stdout.trim()).toBe("ok");
+    });
+
+    it("accepts --path in run mode (PORTLESS=0)", () => {
+      const { status, stdout } = run(["run", "--path", "/api", "echo", "ok"], {
+        env: { PORTLESS: "0" },
+      });
+      expect(status).toBe(0);
+      expect(stdout.trim()).toBe("ok");
+    });
+
+    it("accepts PORTLESS_PATH in run mode (PORTLESS=0)", () => {
+      const { status, stdout } = run(["run", "echo", "ok"], {
+        env: { PORTLESS: "0", PORTLESS_PATH: "/api" },
+      });
+      expect(status).toBe(0);
+      expect(stdout.trim()).toBe("ok");
+    });
+
+    it("rejects invalid --path values before running the child command", () => {
+      const { status, stderr, stdout } = run(["run", "--path", "api", "echo", "ok"], {
+        env: { PORTLESS: "0" },
+      });
+      expect(status).toBe(1);
+      expect(stderr).toContain("Invalid path prefix");
+      expect(stdout).not.toContain("ok");
+    });
+
     it("rejects browser-blocked PORTLESS_APP_PORT values", () => {
       const { status, stderr } = run(["run", "echo", "ok"], {
         env: { PORTLESS: "0", PORTLESS_APP_PORT: "4045" },
@@ -775,6 +837,28 @@ describe("CLI", () => {
             port: 50051,
             pid: 0,
             protocol: "h2c",
+          },
+        ]);
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it("registers an alias route at a path prefix", () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-cli-alias-path-"));
+      try {
+        const { status, stdout } = run(["alias", "api", "4100", "--path", "/v1"], {
+          env: { PORTLESS_STATE_DIR: tmpDir },
+        });
+
+        expect(status).toBe(0);
+        expect(stdout).toContain("/v1");
+        expect(JSON.parse(fs.readFileSync(path.join(tmpDir, "routes.json"), "utf-8"))).toEqual([
+          {
+            hostname: "api.localhost",
+            port: 4100,
+            pid: 0,
+            pathPrefix: "/v1",
           },
         ]);
       } finally {
@@ -1350,6 +1434,7 @@ describe("CLI", () => {
       expect(stdout).toContain("portless get");
       expect(stdout).toContain("--no-worktree");
       expect(stdout).toContain("--json");
+      expect(stdout).toContain("--path");
     });
 
     it("prints help with -h", () => {
@@ -1406,9 +1491,34 @@ describe("CLI", () => {
         name: "backend",
         hostname: "backend.localhost",
         url: "https://backend.localhost",
+        path_prefix: "/",
         proxy_port: 443,
         tls: true,
         tld: "localhost",
+      });
+    });
+
+    it("prints service URL with a path prefix", () => {
+      fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
+
+      const { status, stdout } = run(["get", "backend", "--path", "/api"], { env: getEnv() });
+
+      expect(status).toBe(0);
+      expect(stdout.trim()).toBe("http://backend.localhost:1355/api");
+    });
+
+    it("prints service JSON with a path prefix from PORTLESS_PATH", () => {
+      fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
+
+      const { status, stdout } = run(["get", "backend", "--json"], {
+        env: { ...getEnv(), PORTLESS_PATH: "/api" },
+      });
+
+      expect(status).toBe(0);
+      expect(JSON.parse(stdout)).toMatchObject({
+        hostname: "backend.localhost",
+        url: "http://backend.localhost:1355/api",
+        path_prefix: "/api",
       });
     });
 

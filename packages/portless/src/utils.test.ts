@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { escapeHtml, formatUrl, isErrnoException, parseHostname } from "./utils.js";
+import {
+  escapeHtml,
+  formatUrl,
+  isErrnoException,
+  matchesPathPrefix,
+  normalizePathPrefix,
+  parseHostname,
+} from "./utils.js";
 
 describe("escapeHtml", () => {
   it("escapes angle brackets", () => {
@@ -66,6 +73,52 @@ describe("formatUrl", () => {
     expect(formatUrl("myapp.localhost", 1355)).toBe("http://myapp.localhost:1355");
     expect(formatUrl("myapp.localhost", 8080)).toBe("http://myapp.localhost:8080");
     expect(formatUrl("myapp.localhost", 3000)).toBe("http://myapp.localhost:3000");
+  });
+
+  it("appends non-root route path prefixes", () => {
+    expect(formatUrl("myapp.localhost", 1355, false, "/api")).toBe(
+      "http://myapp.localhost:1355/api"
+    );
+    expect(formatUrl("myapp.localhost", 443, true, "/docs/v1")).toBe(
+      "https://myapp.localhost/docs/v1"
+    );
+  });
+});
+
+describe("normalizePathPrefix", () => {
+  it.each([
+    [undefined, "/"],
+    ["/", "/"],
+    ["/api", "/api"],
+    ["/docs/v1", "/docs/v1"],
+    ["/api///", "/api"],
+  ] as const)("normalizes %s to %s", (input, expected) => {
+    expect(normalizePathPrefix(input)).toBe(expected);
+  });
+
+  it.each(["", "   ", "api", "?x=1", "/api?x=1", "/api#frag", "/api\nv1"])(
+    "rejects invalid path prefix %s",
+    (input) => {
+      expect(() => normalizePathPrefix(input)).toThrow("Invalid path prefix");
+    }
+  );
+});
+
+describe("matchesPathPrefix", () => {
+  it("matches root against all request paths", () => {
+    expect(matchesPathPrefix("/", "/")).toBe(true);
+    expect(matchesPathPrefix("/api", "/")).toBe(true);
+  });
+
+  it("matches exact prefixes and child segments", () => {
+    expect(matchesPathPrefix("/api", "/api")).toBe(true);
+    expect(matchesPathPrefix("/api/users", "/api")).toBe(true);
+    expect(matchesPathPrefix("/api/users?active=1", "/api")).toBe(true);
+  });
+
+  it("does not match partial path segments", () => {
+    expect(matchesPathPrefix("/api-v2", "/api")).toBe(false);
+    expect(matchesPathPrefix("/apis", "/api")).toBe(false);
   });
 });
 

@@ -4,6 +4,8 @@ export type RouteProtocol = "http1" | "h2c";
 export interface RouteInfo {
   hostname: string;
   port: number;
+  /** Route path prefix. Missing means root ("/") for backward compatibility. */
+  pathPrefix?: string;
   /** Upstream protocol. Missing means HTTP/1.1 for backward compatibility. */
   protocol?: RouteProtocol;
 }

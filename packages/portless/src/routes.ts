@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { RouteInfo, RouteProtocol } from "./types.js";
-import { fixOwnership, isErrnoException } from "./utils.js";
+import { fixOwnership, isErrnoException, normalizePathPrefix } from "./utils.js";
 
 /** How long (ms) before a lock directory is considered stale and forcibly removed. */
 const STALE_LOCK_THRESHOLD_MS = 10_000;
@@ -57,17 +57,48 @@ type RouteMetadataPatch = {
 
 interface AddRouteOptions {
   protocol?: RouteProtocol;
+  pathPrefix?: string;
+}
+
+interface RouteKeyOptions {
+  pathPrefix?: string;
 }
 
 /** Runtime check that a parsed JSON value is a valid RouteMapping. */
 function isValidRoute(value: unknown): value is RouteMapping {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    typeof (value as RouteMapping).hostname === "string" &&
-    typeof (value as RouteMapping).port === "number" &&
-    typeof (value as RouteMapping).pid === "number"
-  );
+  if (
+    !(
+      typeof value === "object" &&
+      value !== null &&
+      typeof (value as RouteMapping).hostname === "string" &&
+      typeof (value as RouteMapping).port === "number" &&
+      typeof (value as RouteMapping).pid === "number"
+    )
+  ) {
+    return false;
+  }
+  const pathPrefix = (value as RouteMapping).pathPrefix;
+  if (pathPrefix !== undefined) {
+    if (typeof pathPrefix !== "string") return false;
+    try {
+      normalizePathPrefix(pathPrefix);
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+function routePathPrefix(route: Pick<RouteMapping, "pathPrefix">): string {
+  return normalizePathPrefix(route.pathPrefix);
+}
+
+function routeMatchesKey(route: RouteMapping, hostname: string, pathPrefix: string): boolean {
+  return route.hostname === hostname && routePathPrefix(route) === pathPrefix;
+}
+
+function routeLabel(hostname: string, pathPrefix: string): string {
+  return pathPrefix === "/" ? hostname : `${hostname}${pathPrefix}`;
 }
 
 /**
@@ -77,15 +108,17 @@ function isValidRoute(value: unknown): value is RouteMapping {
 export class RouteConflictError extends Error {
   readonly hostname: string;
   readonly existingPid: number;
+  readonly pathPrefix: string;
 
-  constructor(hostname: string, existingPid: number) {
+  constructor(hostname: string, existingPid: number, pathPrefix = "/") {
     super(
-      `"${hostname}" is already registered by a running process (PID ${existingPid}). ` +
+      `"${routeLabel(hostname, pathPrefix)}" is already registered by a running process (PID ${existingPid}). ` +
         `Use --force to override.`
     );
     this.name = "RouteConflictError";
     this.hostname = hostname;
     this.existingPid = existingPid;
+    this.pathPrefix = pathPrefix;
   }
 }
 
@@ -254,10 +287,11 @@ export class RouteStore {
     let killedPid: number | undefined;
     try {
       const routes = this.loadRoutes(true);
-      const existing = routes.find((r) => r.hostname === hostname);
+      const pathPrefix = normalizePathPrefix(options.pathPrefix);
+      const existing = routes.find((r) => routeMatchesKey(r, hostname, pathPrefix));
       if (existing && existing.pid !== pid && this.isProcessAlive(existing.pid)) {
         if (!force) {
-          throw new RouteConflictError(hostname, existing.pid);
+          throw new RouteConflictError(hostname, existing.pid, pathPrefix);
         }
         // --force: kill the existing process before taking over
         try {
@@ -267,11 +301,12 @@ export class RouteStore {
           // Process may have exited between the check and the kill; non-fatal
         }
       }
-      const filtered = routes.filter((r) => r.hostname !== hostname);
+      const filtered = routes.filter((r) => !routeMatchesKey(r, hostname, pathPrefix));
       const entry: RouteMapping = {
         hostname,
         port,
         pid,
+        ...(pathPrefix !== "/" ? { pathPrefix } : {}),
         ...(options.protocol && options.protocol !== "http1" ? { protocol: options.protocol } : {}),
       };
       filtered.push(entry);
@@ -339,16 +374,17 @@ export class RouteStore {
 
   /**
    * Update metadata on an existing route entry. Only provided fields are
-   * merged; the route must already exist (matched by hostname).
+   * merged; the route must already exist (matched by hostname and path prefix).
    */
-  updateRoute(hostname: string, fields: RouteMetadataPatch): void {
+  updateRoute(hostname: string, fields: RouteMetadataPatch, options: RouteKeyOptions = {}): void {
     this.ensureDir();
     if (!this.acquireLock()) {
       throw new Error("Failed to acquire route lock");
     }
     try {
       const routes = this.loadRoutes(true);
-      const route = routes.find((r) => r.hostname === hostname);
+      const pathPrefix = normalizePathPrefix(options.pathPrefix);
+      const route = routes.find((r) => routeMatchesKey(r, hostname, pathPrefix));
       if (!route) return;
       if ("tailscaleUrl" in fields) {
         if (fields.tailscaleUrl === null) delete route.tailscaleUrl;
@@ -407,14 +443,17 @@ export class RouteStore {
    * pass their own pid: after a `--force` takeover the killed process would
    * otherwise deregister the route the new owner just registered.
    */
-  removeRoute(hostname: string, ownerPid?: number): void {
+  removeRoute(hostname: string, ownerPid?: number, options: RouteKeyOptions = {}): void {
     this.ensureDir();
     if (!this.acquireLock()) {
       throw new Error("Failed to acquire route lock");
     }
     try {
+      const pathPrefix = normalizePathPrefix(options.pathPrefix);
       const routes = this.loadRoutes(true).filter(
-        (r) => r.hostname !== hostname || (ownerPid !== undefined && r.pid !== ownerPid)
+        (r) =>
+          !routeMatchesKey(r, hostname, pathPrefix) ||
+          (ownerPid !== undefined && r.pid !== ownerPid)
       );
       this.saveRoutes(routes);
     } finally {

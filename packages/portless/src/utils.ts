@@ -42,16 +42,55 @@ export function escapeHtml(str: string): string {
     .replace(/'/g, "&#39;");
 }
 
+function hasControlCharacters(value: string): boolean {
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code <= 0x1f || code === 0x7f) return true;
+  }
+  return false;
+}
+
+export function normalizePathPrefix(value: string | undefined): string {
+  if (value === undefined) return "/";
+  const trimmed = value.trim();
+  if (
+    trimmed === "" ||
+    !trimmed.startsWith("/") ||
+    trimmed.includes("?") ||
+    trimmed.includes("#") ||
+    hasControlCharacters(trimmed)
+  ) {
+    throw new Error(
+      `Invalid path prefix "${value}": must start with / and cannot include query strings, fragments, or control characters`
+    );
+  }
+  return trimmed.replace(/\/+$/, "") || "/";
+}
+
+export function matchesPathPrefix(requestPath: string, prefix: string): boolean {
+  const normalizedPrefix = normalizePathPrefix(prefix);
+  if (normalizedPrefix === "/") return true;
+  const pathname = (requestPath || "/").split(/[?#]/, 1)[0] || "/";
+  return pathname === normalizedPrefix || pathname.startsWith(`${normalizedPrefix}/`);
+}
+
 /**
  * Format a URL for the given hostname. Omits the port when it matches the
- * protocol default (80 for HTTP, 443 for HTTPS).
+ * protocol default (80 for HTTP, 443 for HTTPS). When provided, appends a
+ * normalized non-root route path prefix.
  */
-export function formatUrl(hostname: string, proxyPort: number, tls = false): string {
+export function formatUrl(
+  hostname: string,
+  proxyPort: number,
+  tls = false,
+  pathPrefix?: string
+): string {
   const proto = tls ? "https" : "http";
   const defaultPort = tls ? 443 : 80;
-  return proxyPort === defaultPort
-    ? `${proto}://${hostname}`
-    : `${proto}://${hostname}:${proxyPort}`;
+  const base =
+    proxyPort === defaultPort ? `${proto}://${hostname}` : `${proto}://${hostname}:${proxyPort}`;
+  const normalizedPathPrefix = normalizePathPrefix(pathPrefix);
+  return normalizedPathPrefix === "/" ? base : `${base}${normalizedPathPrefix}`;
 }
 
 /**

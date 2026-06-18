@@ -185,6 +185,26 @@ describe("RouteStore", () => {
       const hostnames = routes.map((r) => r.hostname).sort();
       expect(hostnames).toEqual(["app1.localhost", "app2.localhost"]);
     });
+
+    it("allows the same hostname to use multiple path prefixes", () => {
+      store.addRoute("myapp.localhost", 4001, process.pid, false, { pathPrefix: "/api" });
+      store.addRoute("myapp.localhost", 4002, process.pid, false, { pathPrefix: "/docs" });
+
+      const routes = store.loadRoutes();
+      expect(routes).toHaveLength(2);
+      expect(routes.map((route) => [route.pathPrefix, route.port]).sort()).toEqual([
+        ["/api", 4001],
+        ["/docs", 4002],
+      ]);
+    });
+
+    it("keeps legacy root routes compatible without storing a path prefix", () => {
+      store.addRoute("myapp.localhost", 4001, process.pid);
+
+      const routes = store.loadRoutes();
+      expect(routes).toHaveLength(1);
+      expect(routes[0].pathPrefix).toBeUndefined();
+    });
   });
 
   describe("addRoute with force", () => {
@@ -213,6 +233,25 @@ describe("RouteStore", () => {
         expect(() => store.addRoute("app.localhost", 4002, process.pid)).toThrow(
           RouteConflictError
         );
+      } finally {
+        try {
+          process.kill(otherPid, "SIGTERM");
+        } catch {
+          // already dead
+        }
+      }
+    });
+
+    it("throws only for the same hostname and path prefix", () => {
+      const otherPid = spawnSleeper();
+      try {
+        store.addRoute("app.localhost", 4001, otherPid, false, { pathPrefix: "/api" });
+        expect(() =>
+          store.addRoute("app.localhost", 4002, process.pid, false, { pathPrefix: "/api" })
+        ).toThrow(RouteConflictError);
+        expect(() =>
+          store.addRoute("app.localhost", 4003, process.pid, false, { pathPrefix: "/docs" })
+        ).not.toThrow();
       } finally {
         try {
           process.kill(otherPid, "SIGTERM");
@@ -258,6 +297,30 @@ describe("RouteStore", () => {
       }
     });
 
+    it("force override only replaces the matching path prefix", () => {
+      const otherPid = spawnSleeper();
+      try {
+        store.addRoute("app.localhost", 4001, otherPid, false, { pathPrefix: "/api" });
+        store.addRoute("app.localhost", 4002, process.pid, false, { pathPrefix: "/docs" });
+        store.addRoute("app.localhost", 4003, process.pid, true, { pathPrefix: "/api" });
+
+        const routes = store
+          .loadRoutes()
+          .sort((a, b) => (a.pathPrefix ?? "/").localeCompare(b.pathPrefix ?? "/"));
+        expect(routes).toHaveLength(2);
+        expect(routes.map((route) => [route.pathPrefix, route.port])).toEqual([
+          ["/api", 4003],
+          ["/docs", 4002],
+        ]);
+      } finally {
+        try {
+          process.kill(otherPid, "SIGTERM");
+        } catch {
+          // already dead
+        }
+      }
+    });
+
     it("returns undefined when no conflicting process exists", () => {
       const killedPid = store.addRoute("app.localhost", 4001, process.pid, true);
       expect(killedPid).toBeUndefined();
@@ -286,6 +349,18 @@ describe("RouteStore", () => {
       const routes = store.loadRoutes();
       expect(routes).toHaveLength(1);
       expect(routes[0].hostname).toBe("app2.localhost");
+    });
+
+    it("removes only the requested path prefix", () => {
+      store.addRoute("myapp.localhost", 4001, process.pid, false, { pathPrefix: "/api" });
+      store.addRoute("myapp.localhost", 4002, process.pid, false, { pathPrefix: "/docs" });
+
+      store.removeRoute("myapp.localhost", undefined, { pathPrefix: "/api" });
+
+      const routes = store.loadRoutes();
+      expect(routes).toHaveLength(1);
+      expect(routes[0].pathPrefix).toBe("/docs");
+      expect(routes[0].port).toBe(4002);
     });
 
     it("removes the route when the caller still owns it", () => {

@@ -233,6 +233,113 @@ describe("createProxyServer", () => {
       expect(res.body).toBe("hello from backend");
     });
 
+    it("uses the longest matching path prefix for the same hostname", async () => {
+      const rootBackend = trackServer(http.createServer((_req, res) => res.end("root")));
+      const apiBackend = trackServer(http.createServer((_req, res) => res.end("api")));
+      const v1Backend = trackServer(http.createServer((_req, res) => res.end("v1")));
+      await listen(rootBackend);
+      await listen(apiBackend);
+      await listen(v1Backend);
+      const rootAddr = rootBackend.address();
+      const apiAddr = apiBackend.address();
+      const v1Addr = v1Backend.address();
+      if (
+        !rootAddr ||
+        typeof rootAddr === "string" ||
+        !apiAddr ||
+        typeof apiAddr === "string" ||
+        !v1Addr ||
+        typeof v1Addr === "string"
+      ) {
+        throw new Error("no addr");
+      }
+
+      const routes: RouteInfo[] = [
+        { hostname: "myapp.localhost", port: rootAddr.port },
+        { hostname: "myapp.localhost", port: apiAddr.port, pathPrefix: "/api" },
+        { hostname: "myapp.localhost", port: v1Addr.port, pathPrefix: "/api/v1" },
+      ];
+      const server = trackServer(
+        createProxyServer({ getRoutes: () => routes, proxyPort: TEST_PROXY_PORT })
+      );
+      await listen(server);
+
+      expect((await request(server, { host: "myapp.localhost", path: "/" })).body).toBe("root");
+      expect((await request(server, { host: "myapp.localhost", path: "/api/users" })).body).toBe(
+        "api"
+      );
+      expect((await request(server, { host: "myapp.localhost", path: "/api/v1/users" })).body).toBe(
+        "v1"
+      );
+    });
+
+    it("does not match partial path segments", async () => {
+      const rootBackend = trackServer(http.createServer((_req, res) => res.end("root")));
+      const apiBackend = trackServer(http.createServer((_req, res) => res.end("api")));
+      await listen(rootBackend);
+      await listen(apiBackend);
+      const rootAddr = rootBackend.address();
+      const apiAddr = apiBackend.address();
+      if (!rootAddr || typeof rootAddr === "string" || !apiAddr || typeof apiAddr === "string") {
+        throw new Error("no addr");
+      }
+
+      const routes: RouteInfo[] = [
+        { hostname: "myapp.localhost", port: rootAddr.port },
+        { hostname: "myapp.localhost", port: apiAddr.port, pathPrefix: "/api" },
+      ];
+      const server = trackServer(
+        createProxyServer({ getRoutes: () => routes, proxyPort: TEST_PROXY_PORT })
+      );
+      await listen(server);
+
+      const res = await request(server, { host: "myapp.localhost", path: "/api-v2/users" });
+      expect(res.status).toBe(200);
+      expect(res.body).toBe("root");
+    });
+
+    it("forwards the full request path without stripping the matched prefix", async () => {
+      const backend = trackServer(http.createServer((req, res) => res.end(req.url)));
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const routes: RouteInfo[] = [
+        { hostname: "myapp.localhost", port: backendAddr.port, pathPrefix: "/api" },
+      ];
+      const server = trackServer(
+        createProxyServer({ getRoutes: () => routes, proxyPort: TEST_PROXY_PORT })
+      );
+      await listen(server);
+
+      const res = await request(server, { host: "myapp.localhost", path: "/api/users?active=1" });
+      expect(res.status).toBe(200);
+      expect(res.body).toBe("/api/users?active=1");
+    });
+
+    it("routes wildcard subdomains with path prefixes when strict is false", async () => {
+      const backend = trackServer(http.createServer((_req, res) => res.end("wildcard path")));
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const routes: RouteInfo[] = [
+        { hostname: "myapp.localhost", port: backendAddr.port, pathPrefix: "/api" },
+      ];
+      const server = trackServer(
+        createProxyServer({
+          getRoutes: () => routes,
+          proxyPort: TEST_PROXY_PORT,
+          strict: false,
+        })
+      );
+      await listen(server);
+
+      const res = await request(server, { host: "tenant.myapp.localhost", path: "/api/users" });
+      expect(res.status).toBe(200);
+      expect(res.body).toBe("wildcard path");
+    });
+
     it("proxies to a backend listening on IPv6 loopback only", async () => {
       const backend = trackServer(
         http.createServer((_req, res) => {

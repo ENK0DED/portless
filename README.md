@@ -303,6 +303,19 @@ PORTLESS_H2C=1 portless run bun run grpc-server
 
 `--h2c` changes only the loopback connection from portless to the local app. Browser-facing HTTPS, route names, sharing modes, and loopback-only child app binding keep their existing defaults. There is no automatic protocol probing.
 
+### Path-based routes
+
+By default, each hostname routes from `/`. Use `--path <prefix>` when you want multiple local apps under one hostname, such as an API and docs service:
+
+```bash
+portless myapp --path /api bun run api
+portless myapp --path /docs bun run docs
+portless alias myapp 4100 --path /legacy
+PORTLESS_PATH=/api portless run bun run api
+```
+
+Path routing is explicit and boundary-aware. `/api` matches `/api` and `/api/users`, but not `/api-v2`. Portless forwards the full request path unchanged, so the upstream app still receives `/api/users`.
+
 ## Start at OS startup
 
 Install the proxy as an OS startup service so clean HTTPS URLs are available after reboot without starting the proxy from a terminal:
@@ -437,6 +450,7 @@ portless <name> <cmd> [args...]  # Run app at https://<name>.localhost
 portless alias <name> <port>     # Register a static route (e.g. for Docker)
 portless alias <name> <port> --force  # Overwrite an existing route
 portless alias <name> <port> --h2c  # Register an HTTP/2 cleartext route
+portless alias <name> <port> --path /api  # Register a path-scoped route
 portless alias --remove <name>   # Remove a static route
 portless get <name>              # Print URL for a service
 portless get <name> --json       # Print service info as JSON
@@ -458,6 +472,7 @@ PORTLESS=0 bun dev               # Bypasses proxy, uses default port
 # Child env assignments
 portless myapp API_URL=1 next dev # Pass API_URL only to the child command
 portless grpc --h2c bun grpc.js   # Proxy to an h2c or gRPC upstream
+portless myapp --path /api bun api.js  # Route only /api to this app
 
 # Proxy control
 portless proxy start             # Start the HTTPS proxy (port 443, daemon)
@@ -497,6 +512,7 @@ portless service uninstall       # Remove the startup service
 --script <name>                  Run a specific package.json script (default: dev)
 --app-port <number>              Use a fixed app port; browser-blocked ports are rejected
 --h2c                            Forward this route to an HTTP/2 cleartext upstream
+--path <prefix>                  Scope this route to a path prefix, e.g. /api
 --tailscale                      Share the app on your Tailscale network (tailnet)
 --tailscale-service              Share the app as a stable Tailscale Service
 --tailscale-service-name <name>  Use an explicit Tailscale Service name
@@ -517,6 +533,7 @@ portless service uninstall       # Remove the startup service
 PORTLESS_PORT=<number>           Override the default proxy port
 PORTLESS_APP_PORT=<number>       Use a fixed app port (same as --app-port)
 PORTLESS_H2C=1                   Forward app routes to HTTP/2 cleartext upstreams
+PORTLESS_PATH=<prefix>           Scope app routes to a path prefix
 PORTLESS_HTTPS=0                 Disable HTTPS (same as --no-tls)
 PORTLESS_LAN=1                   Enable LAN mode when set to 1 (auto-detects LAN IP)
 PORTLESS_LAN_IP=<address>        Pin a specific LAN IP for LAN mode

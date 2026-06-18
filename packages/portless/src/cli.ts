@@ -10,7 +10,13 @@ import { StringDecoder } from "node:string_decoder";
 import { createSNICallback, ensureCerts, isCATrusted, trustCA, untrustCA } from "./certs.js";
 import { createHttpRedirectServer, createProxyServer } from "./proxy.js";
 import type { RouteProtocol } from "./types.js";
-import { fixOwnership, formatUrl, isErrnoException, parseHostname } from "./utils.js";
+import {
+  fixOwnership,
+  formatUrl,
+  isErrnoException,
+  normalizePathPrefix,
+  parseHostname,
+} from "./utils.js";
 import { getUrl } from "./api.js";
 import { syncHostsFile, cleanHostsFile, shouldAutoSyncHosts } from "./hosts.js";
 import { FILE_MODE, RouteConflictError, RouteStore } from "./routes.js";
@@ -890,8 +896,9 @@ function listRoutes(store: RouteStore, proxyPort: number, tls: boolean, asJson =
   if (asJson) {
     const payload = routes.map((route) => ({
       hostname: route.hostname,
-      url: formatUrl(route.hostname, proxyPort, tls),
+      url: formatUrl(route.hostname, proxyPort, tls, route.pathPrefix),
       target_port: route.port,
+      path_prefix: normalizePathPrefix(route.pathPrefix),
       upstream_protocol: route.protocol ?? "http1",
       pid: route.pid,
       kind: route.pid === 0 ? "alias" : "app",
@@ -918,9 +925,11 @@ function listRoutes(store: RouteStore, proxyPort: number, tls: boolean, asJson =
 
   console.log(colors.blue.bold("\nActive routes:\n"));
   for (const route of routes) {
-    const url = formatUrl(route.hostname, proxyPort, tls);
+    const pathPrefix = normalizePathPrefix(route.pathPrefix);
+    const url = formatUrl(route.hostname, proxyPort, tls, pathPrefix);
     const label = route.pid === 0 ? "(alias)" : `(pid ${route.pid})`;
-    const target = `localhost:${route.port}${route.protocol === "h2c" ? " (h2c)" : ""}`;
+    const targetPath = pathPrefix === "/" ? "" : pathPrefix;
+    const target = `localhost:${route.port}${targetPath}${route.protocol === "h2c" ? " (h2c)" : ""}`;
     console.log(
       `  ${colors.cyan(url)}  ${colors.gray("->")}  ${colors.white(target)}  ${colors.gray(label)}`
     );
@@ -1105,7 +1114,8 @@ async function runApp(
   lanIp?: string | null,
   scriptContext?: { scriptName: string; packageDir: string },
   childEnv: Record<string, string> = {},
-  protocol?: RouteProtocol
+  protocol?: RouteProtocol,
+  pathPrefix?: string
 ) {
   let store = initialStore;
   console.log(chalk.blue.bold(`\nportless\n`));
@@ -1225,6 +1235,7 @@ async function runApp(
   // Compute hostname after auto-start so tld reflects the running proxy
   // (e.g. --lan changes tld from "localhost" to "local")
   const hostname = parseHostname(name, tld);
+  const routePathPrefix = normalizePathPrefix(pathPrefix ?? pathPrefixFromEnv());
 
   const configuredTldEnv = getConfiguredTldEnv();
   if (configuredTldEnv && desired.envTld !== DEFAULT_TLD && desired.envTld !== tld) {
@@ -1258,7 +1269,10 @@ async function runApp(
   // Register route (--force kills the existing owner if any)
   let killedPid: number | undefined;
   try {
-    killedPid = store.addRoute(hostname, port, process.pid, force, { protocol });
+    killedPid = store.addRoute(hostname, port, process.pid, force, {
+      protocol,
+      pathPrefix: routePathPrefix,
+    });
   } catch (err) {
     if (err instanceof RouteConflictError) {
       console.error(colors.red(`Error: ${err.message}`));
@@ -1270,7 +1284,7 @@ async function runApp(
     console.log(colors.yellow(`Killed existing process (PID ${killedPid})`));
   }
 
-  const finalUrl = formatUrl(hostname, proxyPort, tls);
+  const finalUrl = formatUrl(hostname, proxyPort, tls, routePathPrefix);
   console.log(chalk.cyan.bold(`\n  -> ${finalUrl}\n`));
   if (lanIp) {
     console.log(chalk.green(`  LAN -> ${finalUrl}`));
@@ -1314,10 +1328,14 @@ async function runApp(
       )
     );
     try {
-      store.updateRoute(hostname, {
-        netbirdUrl: null,
-        netbirdPid: null,
-      });
+      store.updateRoute(
+        hostname,
+        {
+          netbirdUrl: null,
+          netbirdPid: null,
+        },
+        { pathPrefix: routePathPrefix }
+      );
     } catch {
       // Best-effort cleanup; non-fatal
     }
@@ -1340,10 +1358,14 @@ async function runApp(
       )
     );
     try {
-      store.updateRoute(hostname, {
-        ngrokUrl: null,
-        ngrokPid: null,
-      });
+      store.updateRoute(
+        hostname,
+        {
+          ngrokUrl: null,
+          ngrokPid: null,
+        },
+        { pathPrefix: routePathPrefix }
+      );
     } catch {
       // Best-effort cleanup; non-fatal
     }
@@ -1362,7 +1384,7 @@ async function runApp(
       const message = err instanceof Error ? err.message : String(err);
       console.error(colors.red(`Error: ${message}`));
       try {
-        store.removeRoute(hostname, process.pid);
+        store.removeRoute(hostname, process.pid, { pathPrefix: routePathPrefix });
       } catch {
         // Best-effort cleanup; non-fatal
       }
@@ -1374,11 +1396,15 @@ async function runApp(
     console.log(chalk.gray("  (accessible from your tailnet after service approval)\n"));
 
     try {
-      store.updateRoute(hostname, {
-        tailscaleServiceName,
-        tailscaleServiceUrl,
-        tailscaleServicePending,
-      });
+      store.updateRoute(
+        hostname,
+        {
+          tailscaleServiceName,
+          tailscaleServiceUrl,
+          tailscaleServicePending,
+        },
+        { pathPrefix: routePathPrefix }
+      );
     } catch {
       // Non-fatal: route display metadata only
     }
@@ -1415,11 +1441,15 @@ async function runApp(
     }
 
     try {
-      store.updateRoute(hostname, {
-        tailscaleUrl: tailscaleUrl,
-        tailscaleHttpsPort,
-        tailscaleFunnel: wantsFunnel || undefined,
-      });
+      store.updateRoute(
+        hostname,
+        {
+          tailscaleUrl: tailscaleUrl,
+          tailscaleHttpsPort,
+          tailscaleFunnel: wantsFunnel || undefined,
+        },
+        { pathPrefix: routePathPrefix }
+      );
     } catch {
       // Non-fatal: route display metadata only
     }
@@ -1451,10 +1481,14 @@ async function runApp(
       console.log(chalk.gray("  (accessible from the public internet via NetBird)\n"));
 
       try {
-        store.updateRoute(hostname, {
-          netbirdUrl,
-          netbirdPid: netbirdProcess.pid,
-        });
+        store.updateRoute(
+          hostname,
+          {
+            netbirdUrl,
+            netbirdPid: netbirdProcess.pid,
+          },
+          { pathPrefix: routePathPrefix }
+        );
       } catch {
         // Non-fatal: route display metadata only
       } finally {
@@ -1484,7 +1518,7 @@ async function runApp(
         // Best-effort cleanup; non-fatal
       }
       try {
-        store.removeRoute(hostname, process.pid);
+        store.removeRoute(hostname, process.pid, { pathPrefix: routePathPrefix });
       } catch {
         // Best-effort cleanup; non-fatal
       }
@@ -1503,10 +1537,14 @@ async function runApp(
       console.log(chalk.gray("  (accessible from the public internet via ngrok)\n"));
 
       try {
-        store.updateRoute(hostname, {
-          ngrokUrl,
-          ngrokPid: ngrokProcess.pid,
-        });
+        store.updateRoute(
+          hostname,
+          {
+            ngrokUrl,
+            ngrokPid: ngrokProcess.pid,
+          },
+          { pathPrefix: routePathPrefix }
+        );
       } catch {
         // Non-fatal: route display metadata only
       } finally {
@@ -1537,7 +1575,7 @@ async function runApp(
         // Best-effort cleanup; non-fatal
       }
       try {
-        store.removeRoute(hostname, process.pid);
+        store.removeRoute(hostname, process.pid, { pathPrefix: routePathPrefix });
       } catch {
         // Best-effort cleanup; non-fatal
       }
@@ -1634,7 +1672,7 @@ async function runApp(
         // Best-effort cleanup; non-fatal
       }
       try {
-        store.removeRoute(hostname, process.pid);
+        store.removeRoute(hostname, process.pid, { pathPrefix: routePathPrefix });
       } catch {
         // Lock acquisition may fail during cleanup; non-fatal
       }
@@ -1680,6 +1718,8 @@ interface ParsedRunArgs {
   childEnv: Record<string, string>;
   /** Upstream protocol for this route. */
   protocol?: RouteProtocol;
+  /** Optional route path prefix. */
+  pathPrefix?: string;
   /** The child command and its arguments, passed through untouched. */
   commandArgs: string[];
 }
@@ -1717,6 +1757,25 @@ function appPortFromEnv(): number | undefined {
 
 function routeProtocolFromEnv(): RouteProtocol | undefined {
   return isEnabledEnv(process.env.PORTLESS_H2C) ? "h2c" : undefined;
+}
+
+function parsePathPrefix(value: string | undefined, source: string): string {
+  if (!value || value.startsWith("--")) {
+    console.error(colors.red(`Error: ${source} requires a path prefix.`));
+    console.error(colors.cyan(`  ${source} /api`));
+    process.exit(1);
+  }
+  try {
+    return normalizePathPrefix(value);
+  } catch (err) {
+    console.error(colors.red(`Error: ${(err as Error).message}`));
+    process.exit(1);
+  }
+}
+
+function pathPrefixFromEnv(): string | undefined {
+  if (process.env.PORTLESS_PATH === undefined) return undefined;
+  return parsePathPrefix(process.env.PORTLESS_PATH, "PORTLESS_PATH");
 }
 
 function rejectBlockedAppPort(port: number, source: string): void {
@@ -1832,6 +1891,7 @@ function parseRunArgs(args: string[]): ParsedRunArgs {
   let appPort: number | undefined;
   let name: string | undefined;
   let protocol = routeProtocolFromEnv();
+  let pathPrefix = pathPrefixFromEnv();
   let allowChildEnv = true;
   let i = 0;
 
@@ -1855,6 +1915,7 @@ ${colors.bold("Options:")}
   --force                Kill the existing process and take over its route
   --app-port <number>    Use a fixed app port; browser-blocked ports are rejected
   --h2c                  Forward this route to an HTTP/2 cleartext upstream
+  --path <prefix>        Scope the route to a path prefix, e.g. /api
   --tailscale            Share the app on your Tailscale network (tailnet)
   --tailscale-service    Share the app as a stable Tailscale Service
   --tailscale-service-name <name>
@@ -1891,6 +1952,7 @@ ${colors.bold("Examples:")}
   portless run --name myapp next dev  # -> https://myapp.localhost
   portless run vite dev               # -> https://<project>.localhost
   portless run --h2c grpc-server      # h2c or gRPC upstream
+  portless run --path /api api-server # -> https://<project>.localhost/api
   portless run my-server --port {PORT}
   portless run --app-port 3000 bun start
 `);
@@ -1902,6 +1964,9 @@ ${colors.bold("Examples:")}
       appPort = parseAppPort(args[i]);
     } else if (args[i] === "--h2c") {
       protocol = "h2c";
+    } else if (args[i] === "--path") {
+      i++;
+      pathPrefix = parsePathPrefix(args[i], "--path");
     } else if (args[i] === "--name") {
       i++;
       if (!args[i] || args[i].startsWith("-")) {
@@ -1923,7 +1988,7 @@ ${colors.bold("Examples:")}
         console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
         console.error(
           colors.blue(
-            "Known flags: --name, --force, --app-port, --h2c, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups, --help"
+            "Known flags: --name, --force, --app-port, --h2c, --path, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups, --help"
           )
         );
         process.exit(1);
@@ -1938,7 +2003,7 @@ ${colors.bold("Examples:")}
     ? splitLeadingChildEnv(args.slice(i))
     : { childEnv: {}, commandArgs: args.slice(i) };
 
-  return { force, appPort, name, protocol, ...parsedChild };
+  return { force, appPort, name, protocol, pathPrefix, ...parsedChild };
 }
 
 /**
@@ -1952,6 +2017,7 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
   let force = false;
   let appPort: number | undefined;
   let protocol = routeProtocolFromEnv();
+  let pathPrefix = pathPrefixFromEnv();
   let allowChildEnv = true;
   let i = 0;
 
@@ -1968,6 +2034,9 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
       appPort = parseAppPort(args[i]);
     } else if (args[i] === "--h2c") {
       protocol = "h2c";
+    } else if (args[i] === "--path") {
+      i++;
+      pathPrefix = parsePathPrefix(args[i], "--path");
     } else if (args[i] === "--wildcard") {
       rejectMisplacedWildcardFlag();
     } else if (applySharingFlag(args[i])) {
@@ -1981,7 +2050,7 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
         console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
         console.error(
           colors.blue(
-            "Known flags: --force, --app-port, --h2c, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups"
+            "Known flags: --force, --app-port, --h2c, --path, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups"
           )
         );
         process.exit(1);
@@ -2007,6 +2076,9 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
       appPort = parseAppPort(args[i]);
     } else if (args[i] === "--h2c") {
       protocol = "h2c";
+    } else if (args[i] === "--path") {
+      i++;
+      pathPrefix = parsePathPrefix(args[i], "--path");
     } else if (args[i] === "--wildcard") {
       rejectMisplacedWildcardFlag();
     } else if (applySharingFlag(args[i])) {
@@ -2020,7 +2092,7 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
         console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
         console.error(
           colors.blue(
-            "Known flags: --force, --app-port, --h2c, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups"
+            "Known flags: --force, --app-port, --h2c, --path, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups"
           )
         );
         process.exit(1);
@@ -2035,7 +2107,7 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
     ? splitLeadingChildEnv(args.slice(i))
     : { childEnv: {}, commandArgs: args.slice(i) };
 
-  return { force, appPort, name, protocol, ...parsedChild };
+  return { force, appPort, name, protocol, pathPrefix, ...parsedChild };
 }
 
 // ---------------------------------------------------------------------------
@@ -2093,6 +2165,7 @@ const GLOBAL_COMPLETION_FLAGS: CompletionFlag[] = [
   { name: "--state-dir", description: "Use a custom state directory", value: "path" },
   { name: "--app-port", description: "Use a fixed app port", value: "port" },
   { name: "--h2c", description: "Forward to an HTTP/2 cleartext upstream" },
+  { name: "--path", description: "Scope route to a path prefix", value: "prefix" },
   { name: "--tailscale", description: "Share on Tailscale" },
   { name: "--tailscale-service", description: "Share as a Tailscale Service" },
   {
@@ -2116,6 +2189,7 @@ const RUN_COMPLETION_FLAGS = GLOBAL_COMPLETION_FLAGS.filter((flag) =>
     "--force",
     "--app-port",
     "--h2c",
+    "--path",
     "--tailscale",
     "--tailscale-service",
     "--tailscale-service-name",
@@ -2133,6 +2207,7 @@ const APP_COMPLETION_FLAGS = GLOBAL_COMPLETION_FLAGS.filter((flag) =>
     "--force",
     "--app-port",
     "--h2c",
+    "--path",
     "--tailscale",
     "--tailscale-service",
     "--tailscale-service-name",
@@ -2246,13 +2321,13 @@ _portless_completions() {
       COMPREPLY=( $(compgen -W "${completionFlagWords(RUN_COMPLETION_FLAGS)} --" -- "$cur") )
       ;;
     get|url)
-      COMPREPLY=( $(compgen -W "--json --help -h" -- "$cur") )
+      COMPREPLY=( $(compgen -W "--json --path --help -h" -- "$cur") )
       ;;
     list|ls|status)
       COMPREPLY=( $(compgen -W "--json --help -h" -- "$cur") )
       ;;
     alias)
-      COMPREPLY=( $(compgen -W "--remove --force --h2c --help -h" -- "$cur") )
+      COMPREPLY=( $(compgen -W "--remove --force --h2c --path --help -h" -- "$cur") )
       ;;
     hosts)
       if [[ $COMP_CWORD -eq 2 ]]; then
@@ -2324,11 +2399,14 @@ _portless() {
         run)
           _arguments ${RUN_COMPLETION_FLAGS.map(zshFlag).join(" ")}
           ;;
-        get|url|list|ls|status)
+        get|url)
+          _arguments '--json[Print JSON]' '--path[Scope URL to path prefix]:prefix' '--help[Show help]' '-h[Show help]'
+          ;;
+        list|ls|status)
           _arguments '--json[Print JSON]' '--help[Show help]' '-h[Show help]'
           ;;
         alias)
-          _arguments '--remove[Remove route]' '--force[Override existing route]' '--h2c[Forward to HTTP/2 cleartext upstream]' '--help[Show help]' '-h[Show help]'
+          _arguments '--remove[Remove route]' '--force[Override existing route]' '--h2c[Forward to HTTP/2 cleartext upstream]' '--path[Scope route to path prefix]:prefix' '--help[Show help]' '-h[Show help]'
           ;;
         hosts)
           _values 'hosts command' sync clean
@@ -2384,9 +2462,11 @@ ${fishFlagLines(GLOBAL_COMPLETION_FLAGS)}
 ${fishFlagLines(RUN_COMPLETION_FLAGS, "__fish_seen_subcommand_from run")}
 ${fishFlagLines(APP_COMPLETION_FLAGS, "not __fish_seen_subcommand_from run get url list ls status alias hosts clean prune proxy service completion")}
 complete -c portless -n "__fish_seen_subcommand_from get url list ls status" -l json -d "Print JSON"
+complete -c portless -n "__fish_seen_subcommand_from get url" -l path -d "Scope URL to path prefix" -r
 complete -c portless -n "__fish_seen_subcommand_from alias" -l remove -d "Remove route"
 complete -c portless -n "__fish_seen_subcommand_from alias" -l force -d "Override existing route"
 complete -c portless -n "__fish_seen_subcommand_from alias" -l h2c -d "Forward to HTTP/2 cleartext upstream"
+complete -c portless -n "__fish_seen_subcommand_from alias" -l path -d "Scope route to path prefix" -r
 complete -c portless -n "__fish_seen_subcommand_from hosts; and __fish_is_nth_token 2" -a "sync clean"
 complete -c portless -n "__fish_seen_subcommand_from clean" -l help -s h -d "Show help"
 complete -c portless -n "__fish_seen_subcommand_from prune" -l force -d "Send SIGKILL"
@@ -2479,6 +2559,7 @@ ${colors.bold("Examples:")}
   portless url backend                # Alias for get
   portless myapp API_URL=1 next dev   # Pass API_URL only to the child command
   portless myapp --h2c grpc-server    # Proxy to an h2c or gRPC upstream
+  portless myapp --path /api api-dev  # -> https://myapp.localhost/api
   portless myapp --tailscale next dev # -> also https://<node>.ts.net (tailnet)
   portless myapp --tailscale-service next dev
                                      # -> also https://<service>.<tailnet>.ts.net
@@ -2587,6 +2668,7 @@ ${colors.bold("Options:")}
   --state-dir <path>            Use a custom state directory with service install
   --app-port <number>           Use a fixed app port; browser-blocked ports are rejected
   --h2c                         Forward this route to an HTTP/2 cleartext upstream
+  --path <prefix>               Scope this route to a path prefix, e.g. /api
   --tailscale                   Share the app on your Tailscale network (tailnet)
   --tailscale-service           Share the app as a stable Tailscale Service
   --tailscale-service-name <n>  Use an explicit Tailscale Service name
@@ -2604,6 +2686,7 @@ ${colors.bold("Environment variables:")}
   PORTLESS_PORT=<number>        Override the default proxy port (e.g. in .bashrc)
   PORTLESS_APP_PORT=<number>    Use a fixed app port (same as --app-port)
   PORTLESS_H2C=1                Forward app routes to HTTP/2 cleartext upstreams
+  PORTLESS_PATH=<prefix>        Scope app routes to a path prefix
   PORTLESS_HTTPS=0              Disable HTTPS (same as --no-tls)
   PORTLESS_LAN=1                Enable LAN mode when set to 1 (set in .bashrc / .zshrc)
   PORTLESS_LAN_IP=<address>     Pin a specific LAN IP for LAN mode
@@ -2954,6 +3037,7 @@ ${colors.bold("JSON fields:")}
   hostname               Route hostname (e.g. myapp.localhost)
   url                    Full URL served by the proxy
   target_port            Local port the app listens on
+  path_prefix            Route path prefix
   upstream_protocol      "http1" or "h2c"
   pid                    Owning process PID (0 for alias)
   kind                   "app" or "alias"
@@ -2993,6 +3077,7 @@ With --json, prints a JSON object suitable for scripts and agents.
 
 ${colors.bold("Options:")}
   --no-worktree          Skip worktree prefix detection
+  --path <prefix>        Append a route path prefix, e.g. /api
   --json                 Output a JSON object to stdout
   --help, -h             Show this help
 
@@ -3001,12 +3086,14 @@ ${colors.bold("Examples:")}
   portless url backend                  # -> https://backend.localhost
   portless get backend                  # in worktree -> https://auth.backend.localhost
   portless get backend --no-worktree    # -> https://backend.localhost (skip worktree)
+  portless get backend --path /api      # -> https://backend.localhost/api
   portless get backend --json           # -> {"name":"backend",...}
 
 ${colors.bold("JSON fields:")}
   name                   Requested service name
   hostname               Resolved hostname (with any worktree prefix)
   url                    Full URL served by the proxy
+  path_prefix            Route path prefix
   proxy_port             Proxy port
   tls                    Whether HTTPS is enabled
   tld                    Configured suffix
@@ -3016,6 +3103,7 @@ ${colors.bold("JSON fields:")}
 
   let skipWorktree = false;
   let asJson = false;
+  let pathPrefix = pathPrefixFromEnv();
   const positional: string[] = [];
 
   for (let i = 1; i < args.length; i++) {
@@ -3023,9 +3111,12 @@ ${colors.bold("JSON fields:")}
       skipWorktree = true;
     } else if (args[i] === "--json") {
       asJson = true;
+    } else if (args[i] === "--path") {
+      i++;
+      pathPrefix = parsePathPrefix(args[i], "--path");
     } else if (args[i].startsWith("-")) {
       console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
-      console.error(colors.blue("Known flags: --no-worktree, --json, --help"));
+      console.error(colors.blue("Known flags: --no-worktree, --path, --json, --help"));
       process.exit(1);
     } else {
       positional.push(args[i]);
@@ -3042,7 +3133,11 @@ ${colors.bold("JSON fields:")}
   }
 
   const name = positional[0];
-  const serviceUrl = await getUrl(name, { worktree: !skipWorktree });
+  const normalizedPathPrefix = normalizePathPrefix(pathPrefix);
+  const serviceUrl = await getUrl(name, {
+    worktree: !skipWorktree,
+    pathPrefix: normalizedPathPrefix,
+  });
   if (asJson) {
     process.stdout.write(
       JSON.stringify(
@@ -3050,6 +3145,7 @@ ${colors.bold("JSON fields:")}
           name,
           hostname: serviceUrl.hostname,
           url: serviceUrl.url,
+          path_prefix: normalizedPathPrefix,
           proxy_port: serviceUrl.port,
           tls: serviceUrl.tls,
           tld: serviceUrl.tld,
@@ -3073,6 +3169,8 @@ ${colors.bold("portless alias")} - Register a static route for services not mana
 ${colors.bold("Usage:")}
   ${colors.cyan("portless alias <name> <port>")}        Register a route
   ${colors.cyan("portless alias <name> <port> --h2c")}  Register an h2c route
+  ${colors.cyan("portless alias <name> <port> --path /api")}
+                         Register a route at a path prefix
   ${colors.cyan("portless alias --remove <name>")}      Remove a route
   ${colors.cyan("portless alias <name> <port> --force")} Override existing route
 
@@ -3080,6 +3178,7 @@ ${colors.bold("Examples:")}
   portless alias my-postgres 5432     # -> https://my-postgres.localhost
   portless alias redis 6379           # -> https://redis.localhost
   portless alias grpc 50051 --h2c     # HTTP/2 cleartext upstream
+  portless alias api 4100 --path /v1  # Path-scoped route
   portless alias --remove my-postgres # Remove the alias
 `);
     process.exit(0);
@@ -3098,14 +3197,33 @@ ${colors.bold("Examples:")}
       process.exit(1);
     }
     const hostname = parseHostname(aliasName, tld);
+    let pathPrefix = pathPrefixFromEnv();
+    for (let i = 3; i < args.length; i++) {
+      if (args[i] === "--path") {
+        i++;
+        pathPrefix = parsePathPrefix(args[i], "--path");
+      } else {
+        console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
+        console.error(colors.blue("Known flags: --path, --help"));
+        process.exit(1);
+      }
+    }
+    const normalizedPathPrefix = normalizePathPrefix(pathPrefix);
     const routes = store.loadRoutes();
-    const existing = routes.find((r) => r.hostname === hostname && r.pid === 0);
+    const existing = routes.find(
+      (r) =>
+        r.hostname === hostname &&
+        normalizePathPrefix(r.pathPrefix) === normalizedPathPrefix &&
+        r.pid === 0
+    );
     if (!existing) {
-      console.error(colors.red(`Error: No alias found for "${hostname}".`));
+      const label = normalizedPathPrefix === "/" ? hostname : `${hostname}${normalizedPathPrefix}`;
+      console.error(colors.red(`Error: No alias found for "${label}".`));
       process.exit(1);
     }
-    store.removeRoute(hostname);
-    console.log(colors.green(`Removed alias: ${hostname}`));
+    store.removeRoute(hostname, undefined, { pathPrefix: normalizedPathPrefix });
+    const label = normalizedPathPrefix === "/" ? hostname : `${hostname}${normalizedPathPrefix}`;
+    console.log(colors.green(`Removed alias: ${label}`));
     return;
   }
 
@@ -3130,21 +3248,28 @@ ${colors.bold("Examples:")}
 
   let force = false;
   let protocol = routeProtocolFromEnv();
-  for (const arg of args.slice(3)) {
+  let pathPrefix = pathPrefixFromEnv();
+  for (let i = 3; i < args.length; i++) {
+    const arg = args[i];
     if (arg === "--force") {
       force = true;
     } else if (arg === "--h2c") {
       protocol = "h2c";
+    } else if (arg === "--path") {
+      i++;
+      pathPrefix = parsePathPrefix(args[i], "--path");
     } else {
       console.error(colors.red(`Error: Unknown flag "${arg}".`));
-      console.error(colors.blue("Known flags: --force, --h2c, --help"));
+      console.error(colors.blue("Known flags: --force, --h2c, --path, --help"));
       process.exit(1);
     }
   }
 
-  store.addRoute(hostname, port, 0, force, { protocol });
+  const normalizedPathPrefix = normalizePathPrefix(pathPrefix);
+  store.addRoute(hostname, port, 0, force, { protocol, pathPrefix: normalizedPathPrefix });
   const suffix = protocol === "h2c" ? " (h2c)" : "";
-  console.log(colors.green(`Alias registered: ${hostname} -> 127.0.0.1:${port}${suffix}`));
+  const label = normalizedPathPrefix === "/" ? hostname : `${hostname}${normalizedPathPrefix}`;
+  console.log(colors.green(`Alias registered: ${label} -> 127.0.0.1:${port}${suffix}`));
 }
 
 async function handleHosts(args: string[]): Promise<void> {
@@ -3992,7 +4117,7 @@ async function spawnProxiedApp(
 ): Promise<{
   child: ReturnType<typeof spawn>;
   displayUrl: string;
-  route: { store: RouteStore; hostname: string } | null;
+  route: { store: RouteStore; hostname: string; pathPrefix: string } | null;
 }> {
   const usesPortless = app.commandArgs[0] === "portless";
 
@@ -4002,6 +4127,7 @@ async function spawnProxiedApp(
   let env: Record<string, string | undefined>;
   let store: RouteStore | null = null;
   let hostname: string | null = null;
+  let routePathPrefix: string | null = null;
   let displayUrl: string;
 
   if (usesPortless) {
@@ -4013,14 +4139,15 @@ async function spawnProxiedApp(
     });
 
     const appPort = app.appPort ?? (await findFreePort());
-    const protocol = tls ? "https" : "http";
-    const portSuffix =
-      (tls && proxyPort === 443) || (!tls && proxyPort === 80) ? "" : `:${proxyPort}`;
-    const url = `${protocol}://${app.name}.${tld}${portSuffix}`;
+    routePathPrefix = normalizePathPrefix(pathPrefixFromEnv());
+    const url = formatUrl(`${app.name}.${tld}`, proxyPort, tls, routePathPrefix);
     displayUrl = url;
 
     hostname = parseHostname(app.name, tld);
-    store.addRoute(hostname, appPort, process.pid, false, { protocol: routeProtocolFromEnv() });
+    store.addRoute(hostname, appPort, process.pid, false, {
+      protocol: routeProtocolFromEnv(),
+      pathPrefix: routePathPrefix,
+    });
 
     env = {
       ...pkgEnv,
@@ -4042,6 +4169,7 @@ async function spawnProxiedApp(
 
   const capturedStore = store;
   const capturedHostname = hostname;
+  const capturedPathPrefix = routePathPrefix;
   child.on("exit", (code, signal) => {
     exitCodes.set(app.name, code);
     if (code !== 0 && code !== null) {
@@ -4051,14 +4179,17 @@ async function spawnProxiedApp(
     }
     if (capturedStore && capturedHostname) {
       try {
-        capturedStore.removeRoute(capturedHostname, process.pid);
+        capturedStore.removeRoute(capturedHostname, process.pid, {
+          pathPrefix: capturedPathPrefix ?? undefined,
+        });
       } catch {
         // non-fatal
       }
     }
   });
 
-  const route = store && hostname ? { store, hostname } : null;
+  const route =
+    store && hostname && routePathPrefix ? { store, hostname, pathPrefix: routePathPrefix } : null;
   return { child, displayUrl, route };
 }
 
@@ -4258,7 +4389,7 @@ async function runWithTurbo(
   });
 
   const manifest: Record<string, ManifestEntry> = {};
-  const routes: { hostname: string }[] = [];
+  const routes: { hostname: string; pathPrefix: string }[] = [];
   const appUrls: { label: string; url: string }[] = [];
 
   for (const app of proxiedApps) {
@@ -4269,15 +4400,16 @@ async function runWithTurbo(
     }
 
     const appPort = app.appPort ?? (await findFreePort());
-    const protocol = tls ? "https" : "http";
-    const portSuffix =
-      (tls && proxyPort === 443) || (!tls && proxyPort === 80) ? "" : `:${proxyPort}`;
-    const url = `${protocol}://${app.name}.${tld}${portSuffix}`;
+    const routePathPrefix = normalizePathPrefix(pathPrefixFromEnv());
+    const url = formatUrl(`${app.name}.${tld}`, proxyPort, tls, routePathPrefix);
     appUrls.push({ label: app.label, url });
 
     const hostname = parseHostname(app.name, tld);
-    store.addRoute(hostname, appPort, process.pid, false, { protocol: routeProtocolFromEnv() });
-    routes.push({ hostname });
+    store.addRoute(hostname, appPort, process.pid, false, {
+      protocol: routeProtocolFromEnv(),
+      pathPrefix: routePathPrefix,
+    });
+    routes.push({ hostname, pathPrefix: routePathPrefix });
 
     const entry: ManifestEntry = {
       PORT: String(appPort),
@@ -4339,9 +4471,9 @@ async function runWithTurbo(
       }
     }, SIGKILL_TIMEOUT_MS).unref();
 
-    for (const { hostname } of routes) {
+    for (const { hostname, pathPrefix } of routes) {
       try {
-        store.removeRoute(hostname, process.pid);
+        store.removeRoute(hostname, process.pid, { pathPrefix });
       } catch {
         // non-fatal
       }
@@ -4375,7 +4507,7 @@ async function runWithDirectSpawn(
   const children: ReturnType<typeof spawn>[] = [];
   const exitCodes = new Map<string, number | null>();
   const appUrls: { label: string; url: string }[] = [];
-  const routeEntries: { store: RouteStore; hostname: string }[] = [];
+  const routeEntries: { store: RouteStore; hostname: string; pathPrefix: string }[] = [];
 
   // Sequential: each spawnProxiedApp calls findFreePort() which binds/releases
   // a port, so parallel spawning could cause port collisions.
@@ -4427,9 +4559,9 @@ async function runWithDirectSpawn(
       }
     }, SIGKILL_TIMEOUT_MS).unref();
 
-    for (const { store, hostname } of routeEntries) {
+    for (const { store, hostname, pathPrefix } of routeEntries) {
       try {
-        store.removeRoute(hostname, process.pid);
+        store.removeRoute(hostname, process.pid, { pathPrefix });
       } catch {
         // non-fatal
       }
@@ -4533,7 +4665,8 @@ async function handleRunMode(args: string[], globalScript?: string): Promise<voi
     lanIp,
     scriptContext,
     parsed.childEnv,
-    parsed.protocol
+    parsed.protocol,
+    parsed.pathPrefix
   );
 }
 
@@ -4582,7 +4715,8 @@ async function handleNamedMode(args: string[]): Promise<void> {
     lanIp,
     undefined,
     parsed.childEnv,
-    parsed.protocol
+    parsed.protocol,
+    parsed.pathPrefix
   );
 }
 
@@ -4682,6 +4816,14 @@ async function main() {
   }
   if (stripGlobalFlag("--h2c", false)) {
     process.env.PORTLESS_H2C = "1";
+  }
+  const pathResult = stripGlobalFlag("--path", true);
+  if (pathResult === false) {
+    console.error(colors.red("Error: --path requires a path prefix."));
+    console.error(colors.cyan("  portless --path /api run <command>"));
+    process.exit(1);
+  } else if (typeof pathResult === "string") {
+    process.env.PORTLESS_PATH = parsePathPrefix(pathResult, "--path");
   }
   for (const [flag, envKey] of TAILSCALE_SERVICE_VALUE_FLAGS) {
     const value = stripGlobalFlag(flag, true);

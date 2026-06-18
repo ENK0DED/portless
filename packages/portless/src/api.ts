@@ -1,6 +1,6 @@
 import { detectWorktreePrefix } from "./auto.js";
 import { discoverState } from "./cli-utils.js";
-import { formatUrl, parseHostname } from "./utils.js";
+import { formatUrl, normalizePathPrefix, parseHostname } from "./utils.js";
 
 export interface ServiceUrl {
   /** The full URL, including protocol and any non-default proxy port. */
@@ -13,6 +13,8 @@ export interface ServiceUrl {
   tls: boolean;
   /** The suffix configured on the proxy, e.g. localhost or test. */
   tld: string;
+  /** Route path prefix. */
+  pathPrefix: string;
   /** Coerce the object to its URL string. */
   toString(): string;
 }
@@ -25,6 +27,8 @@ export interface GetUrlOptions {
   worktree?: boolean;
   /** Working directory used for git worktree detection. */
   cwd?: string;
+  /** Optional route path prefix to append to the resolved URL. */
+  pathPrefix?: string;
 }
 
 /**
@@ -40,9 +44,10 @@ export async function getUrl(name: string, options: GetUrlOptions = {}): Promise
 
   const { port, tls, tld } = await discoverState();
   const hostname = parseHostname(effectiveName, tld);
-  const url = formatUrl(hostname, port, tls);
+  const pathPrefix = normalizePathPrefix(options.pathPrefix);
+  const url = formatUrl(hostname, port, tls, pathPrefix);
 
-  const result = { url, hostname, port, tls, tld } as ServiceUrl;
+  const result = { url, hostname, port, tls, tld, pathPrefix } as ServiceUrl;
   Object.defineProperty(result, "toString", {
     value: () => url,
     enumerable: false,

@@ -2,7 +2,7 @@ import * as http from "node:http";
 import * as http2 from "node:http2";
 import * as net from "node:net";
 import type { ProxyServerOptions, RouteInfo } from "./types.js";
-import { escapeHtml, formatUrl } from "./utils.js";
+import { escapeHtml, formatUrl, matchesPathPrefix, normalizePathPrefix } from "./utils.js";
 import { ARROW_SVG, renderPage } from "./pages.js";
 
 /** Response header used to identify a portless proxy (for health checks). */
@@ -277,10 +277,35 @@ const MAX_PROXY_HOPS = 5;
  * When `strict` is true, only exact matches are returned; unregistered
  * subdomain prefixes will not fall back to the base service.
  */
-function findRoute(routes: RouteInfo[], host: string, strict?: boolean): RouteInfo | undefined {
-  return (
-    routes.find((r) => r.hostname === host) ||
-    (strict ? undefined : routes.find((r) => host.endsWith("." + r.hostname)))
+function pickLongestPathRoute(routes: RouteInfo[], requestPath: string): RouteInfo | undefined {
+  let best: RouteInfo | undefined;
+  let bestLength = -1;
+  for (const route of routes) {
+    const pathPrefix = normalizePathPrefix(route.pathPrefix);
+    if (!matchesPathPrefix(requestPath, pathPrefix)) continue;
+    if (pathPrefix.length > bestLength) {
+      best = route;
+      bestLength = pathPrefix.length;
+    }
+  }
+  return best;
+}
+
+function findRoute(
+  routes: RouteInfo[],
+  host: string,
+  requestPath: string,
+  strict?: boolean
+): RouteInfo | undefined {
+  const exact = pickLongestPathRoute(
+    routes.filter((r) => r.hostname === host),
+    requestPath
+  );
+  if (exact) return exact;
+  if (strict) return undefined;
+  return pickLongestPathRoute(
+    routes.filter((r) => host.endsWith("." + r.hostname)),
+    requestPath
   );
 }
 
@@ -359,7 +384,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       return;
     }
 
-    const route = findRoute(routes, host, strict);
+    const route = findRoute(routes, host, req.url || "/", strict);
 
     if (!route) {
       const safeHost = escapeHtml(host);
@@ -370,7 +395,9 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
         if (routes.length > 0) {
           lines.push("Active apps:");
           for (const route of routes) {
-            lines.push(`- ${textSafe(route.hostname)} -> 127.0.0.1:${route.port}`);
+            const pathPrefix = normalizePathPrefix(route.pathPrefix);
+            const label = pathPrefix === "/" ? route.hostname : `${route.hostname}${pathPrefix}`;
+            lines.push(`- ${textSafe(label)} -> 127.0.0.1:${route.port}`);
           }
         } else {
           lines.push("No apps running.");
@@ -383,7 +410,14 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       const linkSuffix = activeAppLinkSuffix(req);
       const routesList =
         routes.length > 0
-          ? `<div class="section"><p class="label">Active apps</p><ul class="card">${routes.map((r) => `<li><a href="${escapeHtml(`${formatUrl(r.hostname, proxyPort, reqTls)}${linkSuffix}`)}" class="card-link"><span class="name">${escapeHtml(r.hostname)}</span><span class="meta"><code class="port">127.0.0.1:${escapeHtml(String(r.port))}</code><span class="arrow">${ARROW_SVG}</span></span></a></li>`).join("")}</ul></div>`
+          ? `<div class="section"><p class="label">Active apps</p><ul class="card">${routes
+              .map((r) => {
+                const pathPrefix = normalizePathPrefix(r.pathPrefix);
+                const hrefSuffix = pathPrefix === "/" ? linkSuffix : "";
+                const name = pathPrefix === "/" ? r.hostname : `${r.hostname}${pathPrefix}`;
+                return `<li><a href="${escapeHtml(`${formatUrl(r.hostname, proxyPort, reqTls, pathPrefix)}${hrefSuffix}`)}" class="card-link"><span class="name">${escapeHtml(name)}</span><span class="meta"><code class="port">127.0.0.1:${escapeHtml(String(r.port))}</code><span class="arrow">${ARROW_SVG}</span></span></a></li>`;
+              })
+              .join("")}</ul></div>`
           : '<p class="empty">No apps running.</p>';
       res.writeHead(404, { "Content-Type": "text/html" });
       res.end(
@@ -519,7 +553,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
 
     const routes = getRoutes();
     const host = getRequestHost(req).split(":")[0];
-    const route = findRoute(routes, host, strict);
+    const route = findRoute(routes, host, req.url || "/", strict);
 
     if (!route) {
       socket.destroy();
