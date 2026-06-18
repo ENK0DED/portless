@@ -5,6 +5,7 @@ import * as tls from "node:tls";
 import { execFile as execFileCb, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { fixOwnership } from "./utils.js";
+import { isWSL, runPowerShellFromWSL, wslToWindowsPath } from "./wsl-utils.js";
 
 /** How long the CA certificate is valid (10 years, in days). */
 const CA_VALIDITY_DAYS = 3650;
@@ -73,6 +74,12 @@ function caFingerprint(stateDir: string): string | null {
   } catch {
     return null;
   }
+}
+
+function certSha1Fingerprint(caCertPath: string): string {
+  const pem = fs.readFileSync(caCertPath, "utf-8");
+  const cert = new crypto.X509Certificate(pem);
+  return cert.fingerprint.replace(/:/g, "").toLowerCase();
 }
 
 function readTrustMarker(stateDir: string): string | null {
@@ -439,8 +446,10 @@ export function isCATrusted(stateDir: string): boolean {
   if (!fileExists(caCertPath)) return false;
 
   // Fast path: if we previously trusted this exact CA, skip the OS check.
+  // On WSL, keep checking the Windows user store so older Linux-only markers
+  // do not suppress browser trust setup.
   const marker = readTrustMarker(stateDir);
-  if (marker) {
+  if (marker && !(process.platform === "linux" && isWSL())) {
     const fp = caFingerprint(stateDir);
     if (fp && marker === fp) return true;
   }
@@ -448,6 +457,7 @@ export function isCATrusted(stateDir: string): boolean {
   if (process.platform === "darwin") {
     return isCATrustedMacOS(caCertPath);
   } else if (process.platform === "linux") {
+    if (isWSL()) return isCATrustedWindowsFromWSL(caCertPath);
     return isCATrustedLinux(stateDir);
   } else if (process.platform === "win32") {
     return isCATrustedWindows(caCertPath);
@@ -457,11 +467,7 @@ export function isCATrusted(stateDir: string): boolean {
 
 function isCATrustedWindows(caCertPath: string): boolean {
   try {
-    const fingerprint = openssl(["x509", "-in", caCertPath, "-noout", "-fingerprint", "-sha1"])
-      .trim()
-      .replace(/^.*=/, "")
-      .replace(/:/g, "")
-      .toLowerCase();
+    const fingerprint = certSha1Fingerprint(caCertPath);
     const result = execFileSync("certutil", ["-store", "-user", "Root"], {
       encoding: "utf-8",
       timeout: 10_000,
@@ -470,6 +476,58 @@ function isCATrustedWindows(caCertPath: string): boolean {
     return result.replace(/\s/g, "").toLowerCase().includes(fingerprint);
   } catch {
     return false;
+  }
+}
+
+function isCATrustedWindowsFromWSL(caCertPath: string): boolean {
+  try {
+    const fingerprint = certSha1Fingerprint(caCertPath);
+    const result = runPowerShellFromWSL([
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      "$ErrorActionPreference = 'Stop'; if (Test-Path -LiteralPath ('Cert:\\CurrentUser\\Root\\' + $args[0])) { $args[0] }",
+      fingerprint,
+    ]);
+    return result.replace(/\s/g, "").toLowerCase().includes(fingerprint);
+  } catch {
+    return false;
+  }
+}
+
+function trustCAWindowsFromWSL(caCertPath: string): void {
+  const windowsPath = wslToWindowsPath(caCertPath);
+  runPowerShellFromWSL([
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
+    "$ErrorActionPreference = 'Stop'; Import-Certificate -FilePath $args[0] -CertStoreLocation Cert:\\CurrentUser\\Root | Out-Null",
+    windowsPath,
+  ]);
+}
+
+function untrustCAWindowsFromWSL(caCertPath: string): { removed: boolean; error?: string } {
+  try {
+    const fingerprint = certSha1Fingerprint(caCertPath);
+    if (!isCATrustedWindowsFromWSL(caCertPath)) return { removed: true };
+
+    runPowerShellFromWSL([
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      "$ErrorActionPreference = 'Stop'; Remove-Item -LiteralPath ('Cert:\\CurrentUser\\Root\\' + $args[0]) -Force",
+      fingerprint,
+    ]);
+
+    if (isCATrustedWindowsFromWSL(caCertPath)) {
+      return {
+        removed: false,
+        error: "Could not remove the portless CA from the Windows CurrentUser Root store",
+      };
+    }
+    return { removed: true };
+  } catch (err: unknown) {
+    return { removed: false, error: err instanceof Error ? err.message : String(err) };
   }
 }
 
@@ -852,7 +910,32 @@ export function createSNICallback(
  *
  * Supported Linux distros: Debian/Ubuntu, Arch, Fedora/RHEL/CentOS, openSUSE.
  */
-export function trustCA(stateDir: string): { trusted: boolean; error?: string } {
+export type TrustCAResult = { trusted: boolean; error?: string; warning?: string };
+
+function formatTrustError(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  if (message.includes("ETIMEDOUT")) {
+    if (process.platform === "darwin") {
+      return (
+        "The macOS security command timed out. This can happen when the " +
+        "Keychain Services daemon is unresponsive or a system authorization " +
+        "dialog was not dismissed in time. Try restarting Keychain Access " +
+        "(or run: sudo killall securityd) and then: portless trust"
+      );
+    }
+    return "The trust command timed out. Try: portless trust";
+  }
+  if (
+    message.includes("authorization") ||
+    message.includes("permission") ||
+    message.includes("EACCES")
+  ) {
+    return "Permission denied. Try: portless trust";
+  }
+  return message;
+}
+
+export function trustCA(stateDir: string): TrustCAResult {
   const caCertPath = path.join(stateDir, CA_CERT_FILE);
   if (!fileExists(caCertPath)) {
     try {
@@ -864,6 +947,53 @@ export function trustCA(stateDir: string): { trusted: boolean; error?: string } 
         error: `Failed to generate CA certificate: ${message}`,
       };
     }
+  }
+
+  if (process.platform === "linux" && isWSL()) {
+    const warnings: string[] = [];
+    const errors: string[] = [];
+    let trustedWindows = false;
+    let trustedLinux = false;
+
+    try {
+      trustCAWindowsFromWSL(caCertPath);
+      trustedWindows = isCATrustedWindowsFromWSL(caCertPath);
+      if (!trustedWindows) {
+        errors.push("Windows CurrentUser Root store did not report the portless CA as trusted");
+      }
+    } catch (err: unknown) {
+      errors.push("Could not add CA to the Windows trust store from WSL. " + formatTrustError(err));
+    }
+
+    try {
+      const config = getLinuxCATrustConfig();
+      if (!fs.existsSync(config.certDir)) {
+        fs.mkdirSync(config.certDir, { recursive: true });
+      }
+      const dest = path.join(config.certDir, "portless-ca.crt");
+      fs.copyFileSync(caCertPath, dest);
+      execFileSync(config.updateCommand, [], { stdio: "pipe", timeout: 30_000 });
+      trustedLinux = true;
+    } catch (err: unknown) {
+      const linuxMessage = formatTrustError(err);
+      if (trustedWindows) {
+        warnings.push(
+          "Could not add CA to the WSL Linux trust store. Windows browsers should trust portless, and child Node.js processes receive NODE_EXTRA_CA_CERTS. " +
+            linuxMessage
+        );
+      } else {
+        errors.push("Could not add CA to the WSL Linux trust store. " + linuxMessage);
+      }
+    }
+
+    if (trustedWindows || trustedLinux) {
+      writeTrustMarker(stateDir);
+      return warnings.length > 0
+        ? { trusted: true, warning: warnings.join(" ") }
+        : { trusted: true };
+    }
+
+    return { trusted: false, error: errors.join(" ") || "Failed to trust CA from WSL" };
   }
 
   try {
@@ -913,28 +1043,7 @@ export function trustCA(stateDir: string): { trusted: boolean; error?: string } 
     }
     return { trusted: false, error: `Unsupported platform: ${process.platform}` };
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    if (message.includes("ETIMEDOUT")) {
-      const hint =
-        process.platform === "darwin"
-          ? "The macOS security command timed out. This can happen when the " +
-            "Keychain Services daemon is unresponsive or a system authorization " +
-            "dialog was not dismissed in time. Try restarting Keychain Access " +
-            "(or run: sudo killall securityd) and then: portless trust"
-          : "The trust command timed out. Try: portless trust";
-      return { trusted: false, error: hint };
-    }
-    if (
-      message.includes("authorization") ||
-      message.includes("permission") ||
-      message.includes("EACCES")
-    ) {
-      return {
-        trusted: false,
-        error: "Permission denied. Try: portless trust",
-      };
-    }
-    return { trusted: false, error: message };
+    return { trusted: false, error: formatTrustError(err) };
   }
 }
 
@@ -945,6 +1054,29 @@ export function trustCA(stateDir: string): { trusted: boolean; error?: string } 
 export function untrustCA(stateDir: string): { removed: boolean; error?: string } {
   const caCertPath = path.join(stateDir, CA_CERT_FILE);
   if (!fileExists(caCertPath)) {
+    clearTrustMarker(stateDir);
+    return { removed: true };
+  }
+
+  if (process.platform === "linux" && isWSL()) {
+    const linuxTrusted = isCATrustedLinux(stateDir);
+    const windowsTrusted = isCATrustedWindowsFromWSL(caCertPath);
+    if (!linuxTrusted && !windowsTrusted) {
+      clearTrustMarker(stateDir);
+      return { removed: true };
+    }
+
+    const results = [untrustCALinux(stateDir), untrustCAWindowsFromWSL(caCertPath)];
+    const failed = results.filter((result) => !result.removed);
+    if (failed.length > 0) {
+      return {
+        removed: false,
+        error: failed
+          .map((result) => result.error)
+          .filter(Boolean)
+          .join("; "),
+      };
+    }
     clearTrustMarker(stateDir);
     return { removed: true };
   }
@@ -1056,7 +1188,7 @@ function untrustCALinux(stateDir: string): { removed: boolean; error?: string } 
     }
   }
 
-  if (isCATrusted(stateDir)) {
+  if (isCATrustedLinux(stateDir)) {
     return {
       removed: false,
       error:
@@ -1069,11 +1201,7 @@ function untrustCALinux(stateDir: string): { removed: boolean; error?: string } 
 
 function untrustCAWindows(caCertPath: string): { removed: boolean; error?: string } {
   try {
-    const fingerprint = openssl(["x509", "-in", caCertPath, "-noout", "-fingerprint", "-sha1"])
-      .trim()
-      .replace(/^.*=/, "")
-      .replace(/:/g, "")
-      .toLowerCase();
+    const fingerprint = certSha1Fingerprint(caCertPath);
 
     const storeListing = execFileSync("certutil", ["-store", "-user", "Root"], {
       encoding: "utf-8",
@@ -1086,7 +1214,7 @@ function untrustCAWindows(caCertPath: string): { removed: boolean; error?: strin
       return { removed: true };
     }
 
-    execFileSync("certutil", ["-delstore", "-user", "Root", "portless Local CA"], {
+    execFileSync("certutil", ["-delstore", "-user", "Root", fingerprint], {
       stdio: "pipe",
       timeout: 30_000,
     });
