@@ -49,6 +49,7 @@ import {
   getDefaultPort,
   getDefaultTld,
   hasConfiguredTldEnv,
+  hasPlaceholders,
   injectFrameworkFlags,
   isHttpsEnvDisabled,
   isPortListening,
@@ -64,6 +65,7 @@ import {
   readWildcardMarker,
   resolveWindowsExecutable,
   resolveStateDir,
+  replacePlaceholders,
   spawnCommand,
   augmentedPath,
   validateTld,
@@ -1331,9 +1333,18 @@ async function runApp(
     process.env.PORTLESS_LAN = "1";
   }
 
-  // Inject --port for frameworks that ignore the PORT env var (e.g. Vite)
-  injectPackageScriptFrameworkFlags(commandArgs, port, scriptContext);
-  injectFrameworkFlags(commandArgs, port);
+  const usedPlaceholders = hasPlaceholders(commandArgs);
+  replacePlaceholders(commandArgs, {
+    PORT: port.toString(),
+    HOST: hostBind ?? childEnv.HOST ?? "127.0.0.1",
+    PORTLESS_URL: finalUrl,
+  });
+
+  if (!usedPlaceholders) {
+    // Inject --port for frameworks that ignore the PORT env var (e.g. Vite)
+    injectPackageScriptFrameworkFlags(commandArgs, port, scriptContext);
+    injectFrameworkFlags(commandArgs, port);
+  }
 
   // Point Node.js at the portless CA so server-side fetches (e.g. Next.js
   // Server Components) trust portless-proxied HTTPS services. Node.js does
@@ -1572,11 +1583,20 @@ ${colors.bold("Name inference (in order):")}
   In git worktrees, the branch name is prepended as a subdomain prefix
   (e.g. feature-auth.myapp.localhost).
 
+${colors.bold("Command placeholders:")}
+  {PORT}                 Assigned app port
+  {HOST}                 Usually 127.0.0.1
+  {PORTLESS_URL}         Public URL of the app
+
+  Placeholders are replaced only when they are whole arguments.
+  When a placeholder is used, automatic framework flag injection is skipped.
+
 ${colors.bold("Examples:")}
   portless run                        # Run dev script through proxy
   portless run next dev               # -> https://<project>.localhost
   portless run --name myapp next dev  # -> https://myapp.localhost
   portless run vite dev               # -> https://<project>.localhost
+  portless run my-server --port {PORT}
   portless run --app-port 3000 bun start
 `);
       process.exit(0);
@@ -1873,6 +1893,13 @@ ${colors.bold("Child process environment:")}
   PORTLESS_TAILSCALE_URL        Tailscale URL of the app (when --tailscale is active)
   PORTLESS_NGROK_URL            ngrok URL of the app (when --ngrok is active)
   NODE_EXTRA_CA_CERTS           Path to the portless CA (set when HTTPS is active)
+
+${colors.bold("Command placeholders:")}
+  {PORT}                        Assigned app port
+  {HOST}                        Usually 127.0.0.1
+  {PORTLESS_URL}                Public URL of the app
+                                Example: portless run my-server --port {PORT}
+                                Whole-argument matches only; --port={PORT} is unchanged
 
 ${colors.bold("Programmatic API:")}
   import { getUrl } from "@enk0ded/portless"

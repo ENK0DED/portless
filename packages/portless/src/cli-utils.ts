@@ -1127,6 +1127,33 @@ function findFrameworkBasename(commandArgs: string[]): string | null {
   return FRAMEWORKS_NEEDING_PORT[name] ? name : null;
 }
 
+const PLACEHOLDERS = ["{PORT}", "{HOST}", "{PORTLESS_URL}"] as const;
+
+type PlaceholderVars = {
+  PORT: string;
+  HOST: string;
+  PORTLESS_URL: string;
+};
+
+export function hasPlaceholders(commandArgs: string[]): boolean {
+  return commandArgs.some((arg) => (PLACEHOLDERS as readonly string[]).includes(arg));
+}
+
+export function replacePlaceholders(commandArgs: string[], vars: PlaceholderVars): void {
+  const replacements: Record<string, string> = {
+    "{PORT}": vars.PORT,
+    "{HOST}": vars.HOST,
+    "{PORTLESS_URL}": vars.PORTLESS_URL,
+  };
+
+  for (let i = 0; i < commandArgs.length; i++) {
+    const replacement = replacements[commandArgs[i]];
+    if (replacement !== undefined) {
+      commandArgs[i] = replacement;
+    }
+  }
+}
+
 /**
  * Check if `commandArgs` invokes a framework that ignores `PORT` and, if so,
  * mutate the array in-place to append the correct CLI flags so the app

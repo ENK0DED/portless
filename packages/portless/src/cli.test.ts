@@ -1708,6 +1708,104 @@ describe("CLI", () => {
       }
     });
 
+    it("replaces command placeholders and skips framework flag injection", async () => {
+      const server = http.createServer((_req, res) => {
+        res.setHeader("X-Portless", "1");
+        res.end("ok");
+      });
+      const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-vite-shim-"));
+      const capturePath = path.join(shimDir, "capture.json");
+
+      try {
+        const proxyPort = await new Promise<number>((resolve) => {
+          server.listen(0, "127.0.0.1", () => {
+            const addr = server.address();
+            if (addr && typeof addr !== "string") {
+              resolve(addr.port);
+            }
+          });
+        });
+
+        fs.writeFileSync(path.join(tmpDir, "proxy.port"), proxyPort.toString());
+
+        const captureScriptPath = path.join(shimDir, "capture-vite.js");
+        fs.writeFileSync(
+          captureScriptPath,
+          [
+            'const fs = require("node:fs");',
+            "const capturePath = process.env.PORTLESS_TEST_CAPTURE_FILE;",
+            "const payload = {",
+            "  args: process.argv.slice(2),",
+            "  env: {",
+            "    PORT: process.env.PORT,",
+            "    HOST: process.env.HOST,",
+            "    PORTLESS_URL: process.env.PORTLESS_URL,",
+            "  },",
+            "};",
+            "fs.writeFileSync(capturePath, JSON.stringify(payload));",
+          ].join("\n") + "\n"
+        );
+
+        if (process.platform === "win32") {
+          fs.writeFileSync(
+            path.join(shimDir, "vite.cmd"),
+            `@echo off\r\n"${process.execPath}" "${captureScriptPath}" %*\r\n`
+          );
+        } else {
+          const shimPath = path.join(shimDir, "vite");
+          fs.writeFileSync(
+            shimPath,
+            `#!/bin/sh\n"${process.execPath}" "${captureScriptPath}" "$@"\n`
+          );
+          fs.chmodSync(shimPath, 0o755);
+        }
+
+        const { status } = run(
+          [
+            "run",
+            "--name",
+            "web",
+            "--app-port",
+            "4567",
+            "vite",
+            "dev",
+            "--listen",
+            "{HOST}",
+            "--public-url",
+            "{PORTLESS_URL}",
+          ],
+          {
+            cwd: tmpDir,
+            env: {
+              PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ""}`,
+              PORTLESS_STATE_DIR: tmpDir,
+              PORTLESS_TEST_CAPTURE_FILE: capturePath,
+              PORTLESS_HTTPS: "0",
+            },
+          }
+        );
+
+        expect(status).toBe(0);
+
+        const capture = JSON.parse(fs.readFileSync(capturePath, "utf-8")) as {
+          args: string[];
+          env: Record<string, string>;
+        };
+
+        const url = `http://web.localhost:${proxyPort}`;
+        expect(capture.args).toEqual(["dev", "--listen", "127.0.0.1", "--public-url", url]);
+        expect(capture.args).not.toContain("--port");
+        expect(capture.env).toMatchObject({
+          PORT: "4567",
+          HOST: "127.0.0.1",
+          PORTLESS_URL: url,
+        });
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        fs.rmSync(shimDir, { recursive: true, force: true });
+      }
+    });
+
     it("omits HOST for bun --bun commands so Next.js fast refresh can validate proxy origins", async () => {
       const server = http.createServer((_req, res) => {
         res.setHeader("X-Portless", "1");

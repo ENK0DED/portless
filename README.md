@@ -36,6 +36,12 @@ HTTPS with HTTP/2 is enabled by default. On first run, portless generates a loca
 
 The proxy auto-starts when you run an app. A random port in the 4000 to 4999 range that is free on `127.0.0.1` is assigned via the `PORT` environment variable. Portless skips browser-blocked ports during auto-assignment and rejects them for fixed app ports. Most frameworks (Next.js, Express, Nuxt, etc.) respect this automatically. For frameworks that ignore `PORT` (Vite, VitePlus, VitePress, Astro, React Router, Angular, Laravel, Expo, React Native, Wrangler), portless auto-injects the right `--port` flag and, when needed, a matching `--host` flag or Wrangler's `--ip` flag.
 
+For other tools, use exact command placeholders. Portless replaces whole arguments matching `{PORT}`, `{HOST}`, or `{PORTLESS_URL}` after assigning the app port and before spawning the child process. When any placeholder is present, automatic framework flag injection is skipped.
+
+```bash
+portless run my-server --port {PORT} --host {HOST} --url {PORTLESS_URL}
+```
+
 When auto-starting, portless reuses the configuration (port, TLS, suffix) from the most recent proxy run, so a restart or reboot does not silently revert to defaults. Explicit env vars (`PORTLESS_PORT`, `PORTLESS_HTTPS`, etc.) always take priority.
 
 In non-interactive environments (no TTY, or `CI=1`), portless exits with a descriptive error instead of prompting, so task runners like turborepo and CI scripts fail early with a clear message.
@@ -474,6 +480,8 @@ PORTLESS_TAILSCALE_URL           Tailscale URL of the app (when --tailscale is a
 PORTLESS_NGROK_URL               ngrok URL of the app (when --ngrok is active)
 NODE_EXTRA_CA_CERTS              Path to the portless CA (when HTTPS is active)
 ```
+
+Command args can use exact placeholders `{PORT}`, `{HOST}`, and `{PORTLESS_URL}`. Portless replaces only whole-argument matches. For example, `{PORT}` is replaced, but `--port={PORT}` is left unchanged.
 
 Prefer `PORTLESS_SUFFIX` for new configuration. It accepts single-label suffixes such as `test` and dotted suffixes such as `acme.com` or `server01.acme.com`. `PORTLESS_TLD` is only a compatibility alias and is ignored when `PORTLESS_SUFFIX` is set.
 

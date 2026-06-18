@@ -169,6 +169,14 @@ PORTLESS=0 bun dev    # Bypasses proxy, uses default port
 
 Most frameworks (Next.js, Express, Nuxt, etc.) respect the `PORT` env var automatically. Portless skips browser-blocked ports during auto-assignment and rejects them for fixed app ports. For frameworks that ignore `PORT` (Vite, VitePlus, VitePress, Astro, React Router, Angular, Laravel, Expo, React Native, Wrangler), portless auto-injects the correct `--port` flag and, when needed, a matching `--host` CLI flag or Wrangler's `--ip` flag.
 
+For other tools, command args can use exact placeholders:
+
+```bash
+portless run my-server --port {PORT} --host {HOST} --url {PORTLESS_URL}
+```
+
+Portless replaces only whole arguments matching `{PORT}`, `{HOST}`, or `{PORTLESS_URL}` after assigning the app port. When any placeholder is present, automatic framework flag injection is skipped.
+
 ### State directory
 
 Portless stores its state (routes, PID file, port file) in `~/.portless`. Override with the `PORTLESS_STATE_DIR` environment variable.
@@ -424,9 +432,17 @@ portless proxy start -p 8080
 
 Portless auto-injects the right `--port` flag and, when needed, a matching `--host` flag for frameworks that ignore the `PORT` env var: **Vite**, **VitePlus** (`vp`), **VitePress**, **Astro**, **React Router**, **Angular**, **Laravel**, **Expo**, **React Native**, and **Wrangler**. Wrangler gets `--ip` because its `--host` flag means route hostname. SvelteKit uses Vite internally and is handled automatically.
 
-For other frameworks that don't read `PORT`, pass the port manually:
+If a tool needs a custom flag shape, use exact command placeholders instead:
 
-- **Webpack Dev Server**: use `--port $PORT`
+```bash
+portless run my-server --listen {HOST} --port {PORT}
+```
+
+Only exact whole-argument placeholders are replaced. `{PORT}` is replaced, but `--port={PORT}` is not. Supported placeholders are `{PORT}`, `{HOST}`, and `{PORTLESS_URL}`.
+
+For other frameworks that don't read `PORT`, pass the assigned values with placeholders:
+
+- **Webpack Dev Server**: use `--port {PORT}`
 - **Custom servers**: read `process.env.PORT` and listen on it
 
 ### Permission errors

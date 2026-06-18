@@ -11,6 +11,7 @@ import {
   BLOCKED_PORTS,
   DEFAULT_TLD,
   FALLBACK_PROXY_PORT,
+  hasPlaceholders,
   INTERNAL_LAN_IP_FLAG,
   LEGACY_TLD_ENV,
   LEGACY_SYSTEM_STATE_DIR,
@@ -32,6 +33,7 @@ import {
   readPersistedProxyState,
   readTldFromDir,
   readWildcardMarker,
+  replacePlaceholders,
   resolveWindowsExecutable,
   resolveStateDir,
   validateTld,
@@ -906,6 +908,54 @@ describe("injectFrameworkFlags", () => {
     const args = ["php", "artisan", "serve"];
     injectFrameworkFlags(args, 4567);
     expect(args).toEqual(["php", "artisan", "serve", "--port", "4567", "--host", "127.0.0.1"]);
+  });
+});
+
+describe("hasPlaceholders", () => {
+  it("returns true when command args contain supported placeholders", () => {
+    expect(hasPlaceholders(["my-server", "--port", "{PORT}"])).toBe(true);
+    expect(hasPlaceholders(["my-server", "--host", "{HOST}"])).toBe(true);
+    expect(hasPlaceholders(["my-server", "--url", "{PORTLESS_URL}"])).toBe(true);
+  });
+
+  it("requires exact uppercase placeholder arguments", () => {
+    expect(hasPlaceholders(["my-server", "--port={PORT}"])).toBe(false);
+    expect(hasPlaceholders(["my-server", "{port}"])).toBe(false);
+    expect(hasPlaceholders(["my-server", "{UNKNOWN}"])).toBe(false);
+  });
+});
+
+describe("replacePlaceholders", () => {
+  it("replaces supported placeholders in place", () => {
+    const args = ["my-server", "--port", "{PORT}", "--host", "{HOST}", "--url", "{PORTLESS_URL}"];
+
+    replacePlaceholders(args, {
+      PORT: "4567",
+      HOST: "127.0.0.1",
+      PORTLESS_URL: "https://myapp.localhost",
+    });
+
+    expect(args).toEqual([
+      "my-server",
+      "--port",
+      "4567",
+      "--host",
+      "127.0.0.1",
+      "--url",
+      "https://myapp.localhost",
+    ]);
+  });
+
+  it("leaves partial, lowercase, and unknown placeholders unchanged", () => {
+    const args = ["my-server", "--port={PORT}", "{port}", "{UNKNOWN}"];
+
+    replacePlaceholders(args, {
+      PORT: "4567",
+      HOST: "127.0.0.1",
+      PORTLESS_URL: "https://myapp.localhost",
+    });
+
+    expect(args).toEqual(["my-server", "--port={PORT}", "{port}", "{UNKNOWN}"]);
   });
 });
 

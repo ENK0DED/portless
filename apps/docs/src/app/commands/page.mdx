@@ -36,6 +36,14 @@ portless api pnpm start
 portless docs.myapp next dev
 ```
 
+Command args can use exact placeholders for tools that do not read the injected env vars:
+
+```bash
+portless run my-server --port {PORT} --host {HOST} --url {PORTLESS_URL}
+```
+
+Supported placeholders are `{PORT}`, `{HOST}`, and `{PORTLESS_URL}`. Portless replaces only whole arguments and skips automatic framework flag injection when any placeholder is present.
+
 <table>
   <thead>
     <tr>
