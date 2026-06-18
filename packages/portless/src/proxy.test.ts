@@ -144,6 +144,45 @@ describe("createProxyServer", () => {
       expect(res.body).toContain('href="http://myapp.localhost:8080"');
     });
 
+    it("preserves request path in 404 page links", async () => {
+      const routes: RouteInfo[] = [{ hostname: "myapp.localhost", port: 4001 }];
+      const server = trackServer(createProxyServer({ getRoutes: () => routes, proxyPort: 8080 }));
+      await listen(server);
+
+      const res = await request(server, {
+        host: "other.localhost",
+        path: "/oauth/callback",
+      });
+      expect(res.status).toBe(404);
+      expect(res.body).toContain('href="http://myapp.localhost:8080/oauth/callback"');
+    });
+
+    it("preserves request path and query in 404 page links", async () => {
+      const routes: RouteInfo[] = [{ hostname: "myapp.localhost", port: 4001 }];
+      const server = trackServer(createProxyServer({ getRoutes: () => routes, proxyPort: 8080 }));
+      await listen(server);
+
+      const res = await request(server, {
+        host: "other.localhost",
+        path: "/oauth/callback?code=abc&state=xyz",
+      });
+      expect(res.status).toBe(404);
+      expect(res.body).toContain(
+        'href="http://myapp.localhost:8080/oauth/callback?code=abc&amp;state=xyz"'
+      );
+    });
+
+    it("omits root path from 404 page links", async () => {
+      const routes: RouteInfo[] = [{ hostname: "myapp.localhost", port: 4001 }];
+      const server = trackServer(createProxyServer({ getRoutes: () => routes, proxyPort: 8080 }));
+      await listen(server);
+
+      const res = await request(server, { host: "other.localhost", path: "/" });
+      expect(res.status).toBe(404);
+      expect(res.body).toContain('href="http://myapp.localhost:8080"');
+      expect(res.body).not.toContain('href="http://myapp.localhost:8080/"');
+    });
+
     it("omits port 80 in 404 page links", async () => {
       const routes: RouteInfo[] = [{ hostname: "myapp.localhost", port: 4001 }];
       const server = trackServer(createProxyServer({ getRoutes: () => routes, proxyPort: 80 }));

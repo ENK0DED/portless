@@ -163,6 +163,8 @@ The auth library is constructing the callback URL from `localhost` instead of th
 - **Auth.js v5**: `AUTH_URL=https://myapp.dev`
 - **Manual**: `PORTLESS_URL` is injected automatically; use it as the base URL
 
+If an OAuth callback lands on the portless 404 page, click the correct active app link. Portless preserves the callback path and query string in those links.
+
 ## Example
 
 See [`examples/google-oauth`](../../examples/google-oauth) for a complete working example with Next.js + NextAuth + Google OAuth using `--suffix dev`.

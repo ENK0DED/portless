@@ -103,4 +103,4 @@ If you only need Google OAuth and don't want to change suffixes, you can add `ht
 NEXTAUTH_URL=http://localhost:3000
 ```
 
-The downside is you lose the portless benefits (named URLs, no port conflicts) for the OAuth callback flow.
+The downside is you lose the portless benefits (named URLs, no port conflicts) for the OAuth callback flow. If the callback lands on a portless 404 page, click the correct active app link; portless preserves the callback path and query string in those links.

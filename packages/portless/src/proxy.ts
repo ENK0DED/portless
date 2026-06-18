@@ -47,6 +47,12 @@ function textSafe(value: string): string {
   return value.replace(/[\r\n]/g, " ");
 }
 
+function activeAppLinkSuffix(req: http.IncomingMessage): string {
+  const url = req.url ?? "/";
+  if (!url || url === "/" || !url.startsWith("/")) return "";
+  return url;
+}
+
 /**
  * HTTP/1.1 hop-by-hop headers that are forbidden in HTTP/2 responses.
  * These must be stripped when proxying an HTTP/1.1 backend response
@@ -235,9 +241,10 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
         res.end(lines.join("\n") + "\n");
         return;
       }
+      const linkSuffix = activeAppLinkSuffix(req);
       const routesList =
         routes.length > 0
-          ? `<div class="section"><p class="label">Active apps</p><ul class="card">${routes.map((r) => `<li><a href="${escapeHtml(formatUrl(r.hostname, proxyPort, reqTls))}" class="card-link"><span class="name">${escapeHtml(r.hostname)}</span><span class="meta"><code class="port">127.0.0.1:${escapeHtml(String(r.port))}</code><span class="arrow">${ARROW_SVG}</span></span></a></li>`).join("")}</ul></div>`
+          ? `<div class="section"><p class="label">Active apps</p><ul class="card">${routes.map((r) => `<li><a href="${escapeHtml(`${formatUrl(r.hostname, proxyPort, reqTls)}${linkSuffix}`)}" class="card-link"><span class="name">${escapeHtml(r.hostname)}</span><span class="meta"><code class="port">127.0.0.1:${escapeHtml(String(r.port))}</code><span class="arrow">${ARROW_SVG}</span></span></a></li>`).join("")}</ul></div>`
           : '<p class="empty">No apps running.</p>';
       res.writeHead(404, { "Content-Type": "text/html" });
       res.end(
