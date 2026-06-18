@@ -10,6 +10,8 @@ Regenerate the current fork-only history with:
 git log --oneline upstream/main..HEAD
 ```
 
+Use that log as source material for behavior-protecting fork commits. A commit that only updates this ledger cannot know its own final hash, so it may be absent until the next sweep.
+
 Current fork-owned commits and what they protect:
 
 | Commit    | Purpose                                                                                                                                                                                            |
@@ -71,6 +73,9 @@ Current fork-owned commits and what they protect:
 | `6824fb9` | Covered HTTP/2 WebSocket compatibility paths in tests.                                                                                                                                             |
 | `341b26a` | Guarded HTTP/2 WebSocket session socket access before payload forwarding.                                                                                                                          |
 | `ecf8f4a` | Documented HTTP/2 WebSocket support in the user, agent, and CLI help surfaces.                                                                                                                     |
+| `cb0d38b` | Refreshed fork sweep records, upstream PR coverage checks, Bun docs drift, and HTTP/2 Extended CONNECT docs-site coverage.                                                                         |
+| `29fb586` | Restored the fork verification gate by fixing TypeScript-only test and WSL runtime dependency-injection types.                                                                                     |
+| `7f5a036` | Normalized background app source formatting so the repository Prettier gate stays green.                                                                                                           |
 
 ## Fork-Owned Invariants
 
@@ -380,7 +385,7 @@ Rechecked against upstream on 2026-06-18: GitHub reported 48 open PRs, and every
 6. Run the package-name search above and fix every hit outside intentional upstream PR references or compatibility tests.
 7. Run `bun install` to refresh `bun.lock`.
 8. Compare the live upstream open PR set with "Full Open Upstream PR State" and update that table when upstream opens or closes PRs.
-9. Review `git log --oneline upstream/main..HEAD` and update this ledger when the fork adds or removes fork-only commits.
+9. Review `git log --oneline upstream/main..HEAD` and update this ledger when the fork adds or removes behavior-protecting fork-only commits. The ledger-maintenance commit itself can be picked up by the next sweep.
 10. Run focused tests for any fork invariant touched by the merge.
 11. Run full verification before pushing.
 
