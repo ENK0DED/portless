@@ -22,6 +22,16 @@ If you skipped the trust prompt on first run:
 portless trust
 ```
 
+## Trust the CA on other devices
+
+`portless trust` handles your own machine automatically. For other devices where the CLI is not available (phones, other computers, other browsers), the running proxy serves a certificate trust page at `https://cert.localhost` (or `https://cert.<suffix>` for a custom suffix).
+
+The page offers only the public CA certificate at `/portless-ca.pem`, shows its SHA-256 fingerprint, and lists per-OS install steps for macOS, Linux, Windows, and Firefox. Open it from the target device and follow the steps for that OS.
+
+In [LAN mode](/commands), devices reach this page over your local network using the proxy's `.local` hostname, which is the common case for trusting the CA on a phone.
+
+Security: the trust page never exposes the private key, only the public certificate is downloadable. Install it only on machines you control.
+
 ## Disable HTTPS
 
 Use `--no-tls` to run with plain HTTP on port 80:
@@ -29,3 +39,15 @@ Use `--no-tls` to run with plain HTTP on port 80:
 ```bash
 portless proxy start --no-tls
 ```
+
+## h2c and gRPC upstreams
+
+By default, portless forwards each route to the local app with HTTP/1.1. Use `--h2c` only when the upstream app expects HTTP/2 cleartext (h2c), such as a local gRPC service:
+
+```bash
+portless grpc --h2c bun run grpc-server
+portless alias grpc 50051 --h2c
+PORTLESS_H2C=1 portless run bun run grpc-server
+```
+
+`--h2c` changes only the loopback connection from portless to the local app. Browser-facing HTTPS, route names, sharing modes, and loopback-only child app binding keep their defaults. There is no automatic protocol probing. See [Commands](/commands) for how h2c routes appear in `list`.

@@ -199,8 +199,8 @@ const stable = await getUrl("backend", { worktree: false });
     <tr>
       <td>`PORTLESS_SUFFIX`</td>
       <td>
-        Use a custom suffix instead of `.localhost` (e.g. `test`, `acme.com`). `PORTLESS_TLD` still
-        works as a compatibility alias.
+        Use a custom suffix instead of `.localhost` (e.g. `test`, `acme.com`). Read before
+        `PORTLESS_TLD`, and wins when both are set; `PORTLESS_TLD` is a compatibility alias.
       </td>
       <td>`localhost`</td>
     </tr>
@@ -208,6 +208,31 @@ const stable = await getUrl("backend", { worktree: false });
       <td>`PORTLESS_APP_PORT`</td>
       <td>Use a fixed app port. Browser-blocked ports are rejected.</td>
       <td>random 4000 to 4999</td>
+    </tr>
+    <tr>
+      <td>`PORTLESS_H2C`</td>
+      <td>Set to `1` to forward app routes to HTTP/2 cleartext (h2c) upstreams.</td>
+      <td>off</td>
+    </tr>
+    <tr>
+      <td>`PORTLESS_PATH`</td>
+      <td>Scope app routes to a path prefix (e.g. `/api`).</td>
+      <td>unset</td>
+    </tr>
+    <tr>
+      <td>`PORTLESS_MULTIPLEX`</td>
+      <td>Set to `1` to share the hostname with other apps (same as `--multiplex`)</td>
+      <td>off</td>
+    </tr>
+    <tr>
+      <td>`PORTLESS_LABEL`</td>
+      <td>Label for this multiplexed app (same as `--label`). Setting it implies multiplex mode.</td>
+      <td>directory name</td>
+    </tr>
+    <tr>
+      <td>`PORTLESS_DASHBOARD`</td>
+      <td>Set to `0` to disable the dashboard at `portless.<suffix>`</td>
+      <td>on</td>
     </tr>
     <tr>
       <td>`PORTLESS_SYNC_HOSTS`</td>
@@ -225,6 +250,16 @@ const stable = await getUrl("backend", { worktree: false });
       <td>off</td>
     </tr>
     <tr>
+      <td>`PORTLESS_TAILSCALE_SERVICE`</td>
+      <td>Set to `1` to share apps as stable Tailscale Services</td>
+      <td>off</td>
+    </tr>
+    <tr>
+      <td>`PORTLESS_TAILSCALE_SERVICE_NAME`</td>
+      <td>Use an explicit Tailscale Service name</td>
+      <td>unset</td>
+    </tr>
+    <tr>
       <td>`PORTLESS_FUNNEL`</td>
       <td>Set to `1` to share apps publicly via Tailscale Funnel</td>
       <td>off</td>
@@ -233,6 +268,16 @@ const stable = await getUrl("backend", { worktree: false });
       <td>`PORTLESS_NGROK`</td>
       <td>Set to `1` to share apps publicly via ngrok</td>
       <td>off</td>
+    </tr>
+    <tr>
+      <td>`PORTLESS_TUNNEL`</td>
+      <td>Managed public tunnel provider selector (`cloudflare` or `ngrok`)</td>
+      <td>unset</td>
+    </tr>
+    <tr>
+      <td>`PORTLESS_TUNNEL_HOSTNAME`</td>
+      <td>Request a provider-specific stable tunnel hostname</td>
+      <td>unset</td>
     </tr>
     <tr>
       <td>`PORTLESS_NETBIRD`</td>

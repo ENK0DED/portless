@@ -69,8 +69,32 @@ Supported placeholders are `{PORT}`, `{HOST}`, and `{PORTLESS_URL}`. Portless re
       <td>Override an existing route registered by another process</td>
     </tr>
     <tr>
+      <td>`--h2c`</td>
+      <td>Forward this route to an HTTP/2 cleartext (h2c) upstream, such as a local gRPC service. Also configurable via `PORTLESS_H2C=1`.</td>
+    </tr>
+    <tr>
+      <td>`--path <prefix>`</td>
+      <td>Scope this route to a path prefix, e.g. `/api`. Also configurable via `PORTLESS_PATH`.</td>
+    </tr>
+    <tr>
+      <td>`--tunnel <provider>`</td>
+      <td>Share publicly via a managed tunnel: `cloudflare` or `ngrok`. Also configurable via `PORTLESS_TUNNEL`.</td>
+    </tr>
+    <tr>
+      <td>`--tunnel-hostname <hostname>`</td>
+      <td>Request a provider-specific stable tunnel hostname. Also configurable via `PORTLESS_TUNNEL_HOSTNAME`. Cloudflare Quick Tunnels do not support this mode.</td>
+    </tr>
+    <tr>
       <td>`--tailscale`</td>
       <td>Share the app on your Tailscale network.</td>
+    </tr>
+    <tr>
+      <td>`--tailscale-service`</td>
+      <td>Share the app as a stable Tailscale Service. Also configurable via `PORTLESS_TAILSCALE_SERVICE=1`.</td>
+    </tr>
+    <tr>
+      <td>`--tailscale-service-name <name>`</td>
+      <td>Use an explicit Tailscale Service name. Also configurable via `PORTLESS_TAILSCALE_SERVICE_NAME`.</td>
     </tr>
     <tr>
       <td>`--funnel`</td>
@@ -96,11 +120,20 @@ Supported placeholders are `{PORT}`, `{HOST}`, and `{PORTLESS_URL}`. Portless re
       <td>`--netbird-groups <csv>`</td>
       <td>Restrict the NetBird public URL to user groups.</td>
     </tr>
+    <tr>
+      <td>`--multiplex`</td>
+      <td>Share the hostname with other apps (shows an app picker). Also configurable via `PORTLESS_MULTIPLEX=1`.</td>
+    </tr>
+    <tr>
+      <td>`--label <label>`</td>
+      <td>Label for this multiplexed app (default: directory name). Implies `--multiplex`. Also configurable via `PORTLESS_LABEL`.</td>
+    </tr>
   </tbody>
 </table>
 
 ```bash
 portless myapp --tailscale next dev
+portless myapp --tailscale-service next dev
 portless myapp --funnel next dev
 portless myapp --ngrok next dev
 portless myapp --netbird --netbird-groups team next dev
@@ -108,7 +141,108 @@ portless myapp --netbird --netbird-groups team next dev
 
 Tailscale sharing requires the Tailscale CLI to be connected with MagicDNS and HTTPS certificates enabled on the active tailnet. Funnel also requires Funnel to be enabled for the tailnet and node.
 
-NetBird sharing requires the NetBird CLI to be connected, with Peer Expose enabled and allowed for the active peer. NetBird public URLs should be restricted with `--netbird-password`, `--netbird-pin`, or `--netbird-groups` when exposing production-like services.
+### Tailscale Service mode
+
+`--tailscale-service` shares the app under a stable [Tailscale Service](https://tailscale.com/docs/features/tailscale-services) MagicDNS name. It is an additional sharing mode alongside Serve (`--tailscale`) and Funnel (`--funnel`):
+
+```bash
+portless myapp --tailscale-service next dev
+# -> https://myapp.localhost           (local)
+# -> https://myapp.yourteam.ts.net     (tailnet service)
+
+portless myapp --tailscale-service --tailscale-service-name api next dev
+# -> https://api.yourteam.ts.net       (tailnet service)
+```
+
+Tailscale Services are tailnet-scoped and never imply Tailscale Funnel or public exposure. They require a tagged device identity and may need admin approval before MagicDNS resolves. Portless persists the service URL and pending-approval state, so `portless list` reports pending approval instead of claiming the URL is reachable. Set `PORTLESS_TAILSCALE_SERVICE=1` or `PORTLESS_TAILSCALE_SERVICE_NAME=<name>` to enable this mode without the flags.
+
+### NetBird sharing
+
+`--netbird` exposes the app to the public internet through [NetBird Peer Expose](https://docs.netbird.io/):
+
+```bash
+portless myapp --netbird next dev
+# -> https://myapp.localhost            (local)
+# -> https://myapp-a1b2c3.netbird.cloud (public)
+```
+
+NetBird URLs are public reverse proxy URLs. Restrict access with `--netbird-password`, `--netbird-pin`, or `--netbird-groups`:
+
+```bash
+portless myapp --netbird --netbird-groups team next dev
+portless myapp --netbird-password secret --netbird-pin 123456 next dev
+```
+
+Set `PORTLESS_NETBIRD=1` to enable NetBird by default. Setting `PORTLESS_NETBIRD_PASSWORD`, `PORTLESS_NETBIRD_PIN`, or `PORTLESS_NETBIRD_GROUPS` also enables NetBird sharing. Child processes receive `PORTLESS_NETBIRD_URL`. NetBird sharing requires the NetBird CLI to be connected, with Peer Expose enabled and allowed for the active peer.
+
+Portless keeps the child app bound to `127.0.0.1` by default even when NetBird sharing is active, and warns when NetBird is used without `--netbird-password`, `--netbird-pin`, or `--netbird-groups`.
+
+### h2c and gRPC upstreams
+
+By default, portless forwards each route to the local app with HTTP/1.1. Use `--h2c` only when the upstream app expects HTTP/2 cleartext, such as a local gRPC service:
+
+```bash
+portless grpc --h2c bun run grpc-server
+portless alias grpc 50051 --h2c
+PORTLESS_H2C=1 portless run bun run grpc-server
+```
+
+`--h2c` changes only the loopback connection from portless to the local app. Browser-facing HTTPS, route names, sharing modes, and loopback-only child app binding keep their defaults. There is no automatic protocol probing. An h2c route shows a `(h2c)` marker in `portless list`, and `portless list --json` reports `"upstream_protocol": "h2c"` (the default is `"http1"`).
+
+### Path-based routes
+
+By default, each hostname routes from `/`. Use `--path <prefix>` to host multiple local apps under one hostname:
+
+```bash
+portless myapp --path /api bun run api
+portless myapp --path /docs bun run docs
+portless alias myapp 4100 --path /legacy
+PORTLESS_PATH=/api portless run bun run api
+```
+
+Path routing uses longest-prefix matching and is boundary-aware on segment boundaries: `/api` matches `/api` and `/api/users`, but never `/api-v2`. Portless forwards the full request path unchanged, so the upstream still receives `/api/users`. Path-scoped routes appear in `portless list` with the prefix on the target (e.g. `localhost:4100/legacy`), and `portless list --json` reports the prefix in `"path_prefix"`.
+
+### Public tunnel aliases
+
+Use managed tunnels when a public HTTPS URL should route through the portless proxy instead of directly to a child app:
+
+```bash
+portless myapp --tunnel cloudflare next dev
+# -> https://myapp.localhost
+# -> https://abc.trycloudflare.com
+
+portless myapp --tunnel ngrok next dev
+# -> https://abc123.ngrok.app
+```
+
+Managed tunnel requests are public internet traffic. Portless keeps the child app bound to `127.0.0.1`, starts the tunnel to the local proxy, and registers an exact tunnel alias for the generated public hostname. Child processes receive `PORTLESS_TUNNEL_URL`. Unknown public `Host` headers are rejected; portless does not route arbitrary tunnel hostnames to the only running app, and wildcard tunnel hosts are rejected.
+
+`--tunnel cloudflare` uses [Cloudflare Quick Tunnels](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/) through the `cloudflared` CLI. `--tunnel ngrok` requires the `ngrok` CLI and authentication. `--tunnel-hostname <hostname>` requests a provider-specific stable hostname when supported; Cloudflare Quick Tunnels do not support this mode.
+
+Use the `tunnel` subcommands to manage aliases manually when another tool already provides the public hostname:
+
+```bash
+portless tunnel map myapp abc.trycloudflare.com
+portless tunnel map myapp public.example.com --path /api
+portless tunnel list
+portless tunnel list --json
+portless tunnel unmap abc.trycloudflare.com
+```
+
+Tunnel aliases map an exact public hostname to a local route in `tunnel-aliases.json`. The proxy checks local routes before tunnel aliases, so a local hostname always wins over an alias for the same name. Wildcard tunnel hosts are rejected, and there is no zero-config public `Host` passthrough.
+
+### Multiplexed hostnames
+
+Use `--multiplex` to let several apps share one hostname, such as two git worktrees of the same app both served at `https://myapp.localhost`. Each app registers under a `--label`, which defaults to the current directory name:
+
+```bash
+portless myapp --multiplex -- npm run dev                 # from worktree A
+portless myapp --multiplex --label hotfix -- npm run dev  # from worktree B
+```
+
+Opening the shared hostname in a browser shows a small portless app picker. Your choice is remembered per hostname via a host-scoped cookie, and you can switch any time at `<host>/__portless/switch` (e.g. `https://myapp.localhost/__portless/switch`).
+
+Portless never modifies your app's HTML or response headers. The selection lives entirely in portless's own picker and redirect responses, so auth flows, cookies, and page content reach the browser untouched. Set `PORTLESS_MULTIPLEX=1` and `PORTLESS_LABEL=<label>` to enable multiplexing without the flags.
 
 ## Get a service URL
 
@@ -143,15 +277,19 @@ portless get backend --json
 ```bash
 portless alias <name> <port>
 portless alias <name> <port> --force
+portless alias <name> <port> --h2c
+portless alias <name> <port> --path /api
 portless alias --remove <name>
 ```
 
-Register a route for a service not managed by portless (e.g. a Docker container). Aliases persist across stale-route cleanup.
+Register a route for a service not managed by portless (e.g. a Docker container). Aliases persist across stale-route cleanup. The `--h2c` and `--path` variants register HTTP/2 cleartext and path-scoped static routes, the same way they work for `portless <name> <cmd>`.
 
 ```bash
-portless alias my-postgres 5432     # -> https://my-postgres.localhost
-portless alias redis 6379           # -> https://redis.localhost
-portless alias --remove my-postgres # remove the alias
+portless alias my-postgres 5432         # -> https://my-postgres.localhost
+portless alias redis 6379               # -> https://redis.localhost
+portless alias grpc 50051 --h2c         # h2c / gRPC upstream
+portless alias myapp 4100 --path /legacy # path-scoped static route
+portless alias --remove my-postgres     # remove the alias
 ```
 
 ## List routes
@@ -171,11 +309,25 @@ portless list --json
 #     "hostname": "myapp.localhost",
 #     "url": "https://myapp.localhost",
 #     "target_port": 4321,
+#     "path_prefix": "/",
+#     "upstream_protocol": "http1",
 #     "pid": 12345,
 #     "kind": "app"
 #   }
 # ]
 ```
+
+Path-scoped routes report their prefix in `path_prefix`, and h2c routes report `"upstream_protocol": "h2c"`.
+
+## Dashboard
+
+While the proxy runs it serves a read-only dashboard in the browser at `https://portless.localhost` (or `https://portless.<suffix>` for a custom suffix). The dashboard URL is also printed when the proxy starts.
+
+The dashboard lists every running app with its hostname, local port, public-exposure badges (Tailscale, Funnel, ngrok, tunnel, NetBird), and the local CA trust status. Each row opens the app or copies its URL with one click.
+
+It is read-only: it never controls processes from the browser, so there is no CSRF surface. The `portless.<suffix>` hostname is reserved and cannot be claimed by an app.
+
+Disable the dashboard with `PORTLESS_DASHBOARD=0`.
 
 ## Trust the CA
 

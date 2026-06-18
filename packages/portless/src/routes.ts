@@ -30,6 +30,8 @@ export function isRetryableLockError(err: unknown): boolean {
 
 export interface RouteMapping extends RouteInfo {
   pid: number;
+  /** Distinguishing label when several routes multiplex one hostname. */
+  label?: string;
   tailscaleUrl?: string;
   tailscaleHttpsPort?: number;
   tailscaleFunnel?: boolean;
@@ -66,10 +68,24 @@ type RouteMetadataPatch = {
 interface AddRouteOptions {
   protocol?: RouteProtocol;
   pathPrefix?: string;
+  /**
+   * When set, the route joins (or replaces, by label) a multiplexed hostname
+   * shared by several apps instead of claiming sole ownership of it.
+   */
+  label?: string;
 }
 
 interface RouteKeyOptions {
   pathPrefix?: string;
+  /** When set, only the multiplexed member with this label is targeted. */
+  label?: string;
+}
+
+/** Normalize a multiplex label: trimmed, or undefined for a sole-owner route. */
+function normalizeLabel(label: string | undefined): string | undefined {
+  if (label === undefined) return undefined;
+  const trimmed = label.trim();
+  return trimmed === "" ? undefined : trimmed;
 }
 
 /** Runtime check that a parsed JSON value is a valid RouteMapping. */
@@ -94,6 +110,8 @@ function isValidRoute(value: unknown): value is RouteMapping {
       return false;
     }
   }
+  const label = (value as RouteMapping).label;
+  if (label !== undefined && typeof label !== "string") return false;
   return true;
 }
 
@@ -118,11 +136,31 @@ export class RouteConflictError extends Error {
   readonly existingPid: number;
   readonly pathPrefix: string;
 
-  constructor(hostname: string, existingPid: number, pathPrefix = "/") {
-    super(
-      `"${routeLabel(hostname, pathPrefix)}" is already registered by a running process (PID ${existingPid}). ` +
-        `Use --force to override.`
-    );
+  constructor(
+    hostname: string,
+    existingPid: number,
+    pathPrefix = "/",
+    options: { conflict?: "sole-owner" | "multiplex-host" | "same-label"; label?: string } = {}
+  ) {
+    const target = routeLabel(hostname, pathPrefix);
+    let detail: string;
+    switch (options.conflict) {
+      case "multiplex-host":
+        detail =
+          `"${target}" is already shared by other apps (multiplex mode). ` +
+          `Register this app with --multiplex too, or use --force to take over.`;
+        break;
+      case "same-label":
+        detail =
+          `"${target}" already has a running app labeled "${options.label}" (PID ${existingPid}). ` +
+          `Pass a different --label, or use --force to replace it.`;
+        break;
+      default:
+        detail =
+          `"${target}" is already registered by a running process (PID ${existingPid}). ` +
+          `Use --multiplex to share the hostname, or --force to override.`;
+    }
+    super(detail);
     this.name = "RouteConflictError";
     this.hostname = hostname;
     this.existingPid = existingPid;
@@ -275,11 +313,41 @@ export class RouteStore {
     fixOwnership(this.routesPath);
   }
 
+  private buildEntry(
+    hostname: string,
+    port: number,
+    pid: number,
+    pathPrefix: string,
+    protocol: RouteProtocol | undefined,
+    label: string | undefined
+  ): RouteMapping {
+    return {
+      hostname,
+      port,
+      pid,
+      ...(pathPrefix !== "/" ? { pathPrefix } : {}),
+      ...(protocol && protocol !== "http1" ? { protocol } : {}),
+      ...(label !== undefined ? { label } : {}),
+    };
+  }
+
+  /** True if a route entry currently has an owning process (or is reserved). */
+  private routeIsPresent(route: RouteMapping): boolean {
+    return route.pid === 0 || this.isProcessAlive(route.pid);
+  }
+
   /**
-   * Register a route. When `force` is true and the hostname is already claimed
-   * by another live process, that process is sent SIGTERM before the route is
-   * replaced. Returns the PID of the killed process (if any) so the caller can
-   * log it.
+   * Register a route. Two modes:
+   *
+   * - Sole-owner (default): the route claims its hostname exclusively. A live
+   *   route already on the slot is a conflict unless `force` is set, in which
+   *   case it is sent SIGTERM and replaced.
+   * - Multiplex (`options.label` set): the route joins a hostname shared by
+   *   several apps, distinguished by label. A new member coexists with other
+   *   live members; only a same-label member or a displaced sole owner is
+   *   replaced. Mixing a sole owner with members requires `force`.
+   *
+   * Returns the PID of a process killed during a forced takeover (if any).
    */
   addRoute(
     hostname: string,
@@ -296,29 +364,72 @@ export class RouteStore {
     try {
       const routes = this.loadRoutes(true);
       const pathPrefix = normalizePathPrefix(options.pathPrefix);
-      const existing = routes.find((r) => routeMatchesKey(r, hostname, pathPrefix));
-      if (existing && existing.pid !== pid && this.isProcessAlive(existing.pid)) {
-        if (!force) {
-          throw new RouteConflictError(hostname, existing.pid, pathPrefix);
-        }
-        // --force: kill the existing process before taking over
+      const label = normalizeLabel(options.label);
+
+      // Other live routes already occupying this hostname+pathPrefix slot.
+      const group = routes.filter(
+        (r) => routeMatchesKey(r, hostname, pathPrefix) && r.pid !== pid && this.routeIsPresent(r)
+      );
+
+      const killLive = (r: RouteMapping): void => {
+        if (r.pid <= 0) return;
         try {
-          process.kill(existing.pid, "SIGTERM");
-          killedPid = existing.pid;
+          process.kill(r.pid, "SIGTERM");
+          killedPid = r.pid;
         } catch {
           // Process may have exited between the check and the kill; non-fatal
         }
-      }
-      const filtered = routes.filter((r) => !routeMatchesKey(r, hostname, pathPrefix));
-      const entry: RouteMapping = {
-        hostname,
-        port,
-        pid,
-        ...(pathPrefix !== "/" ? { pathPrefix } : {}),
-        ...(options.protocol && options.protocol !== "http1" ? { protocol: options.protocol } : {}),
       };
-      filtered.push(entry);
-      this.saveRoutes(filtered);
+
+      if (label === undefined) {
+        // Sole-owner registration: any live route on this slot blocks it.
+        if (group.length > 0) {
+          if (!force) {
+            const blocker = group[0];
+            throw new RouteConflictError(hostname, blocker.pid, pathPrefix, {
+              conflict: blocker.label !== undefined ? "multiplex-host" : "sole-owner",
+            });
+          }
+          group.forEach(killLive);
+        }
+        const filtered = routes.filter((r) => !routeMatchesKey(r, hostname, pathPrefix));
+        filtered.push(
+          this.buildEntry(hostname, port, pid, pathPrefix, options.protocol, undefined)
+        );
+        this.saveRoutes(filtered);
+      } else {
+        // Multiplex member registration.
+        const soleOwner = group.find((r) => r.label === undefined);
+        if (soleOwner) {
+          if (!force) {
+            throw new RouteConflictError(hostname, soleOwner.pid, pathPrefix, {
+              conflict: "sole-owner",
+            });
+          }
+          killLive(soleOwner);
+        }
+        const sameLabel = group.find((r) => r.label === label);
+        if (sameLabel) {
+          if (!force) {
+            throw new RouteConflictError(hostname, sameLabel.pid, pathPrefix, {
+              conflict: "same-label",
+              label,
+            });
+          }
+          killLive(sameLabel);
+        }
+        // Keep other live members; drop this pid's prior entry, any displaced
+        // sole owner, and the same-label member being replaced.
+        const filtered = routes.filter((r) => {
+          if (!routeMatchesKey(r, hostname, pathPrefix)) return true;
+          if (r.pid === pid) return false;
+          if (r.label === undefined) return false;
+          if (r.label === label) return false;
+          return true;
+        });
+        filtered.push(this.buildEntry(hostname, port, pid, pathPrefix, options.protocol, label));
+        this.saveRoutes(filtered);
+      }
     } finally {
       this.releaseLock();
     }
@@ -392,7 +503,11 @@ export class RouteStore {
     try {
       const routes = this.loadRoutes(true);
       const pathPrefix = normalizePathPrefix(options.pathPrefix);
-      const route = routes.find((r) => routeMatchesKey(r, hostname, pathPrefix));
+      const label = normalizeLabel(options.label);
+      const route = routes.find(
+        (r) =>
+          routeMatchesKey(r, hostname, pathPrefix) && (label === undefined || r.label === label)
+      );
       if (!route) return;
       if ("tailscaleUrl" in fields) {
         if (fields.tailscaleUrl === null) delete route.tailscaleUrl;
@@ -475,11 +590,13 @@ export class RouteStore {
     }
     try {
       const pathPrefix = normalizePathPrefix(options.pathPrefix);
-      const routes = this.loadRoutes(true).filter(
-        (r) =>
-          !routeMatchesKey(r, hostname, pathPrefix) ||
-          (ownerPid !== undefined && r.pid !== ownerPid)
-      );
+      const label = normalizeLabel(options.label);
+      const routes = this.loadRoutes(true).filter((r) => {
+        if (!routeMatchesKey(r, hostname, pathPrefix)) return true;
+        if (ownerPid !== undefined && r.pid !== ownerPid) return true;
+        if (label !== undefined && r.label !== label) return true;
+        return false;
+      });
       this.saveRoutes(routes);
     } finally {
       this.releaseLock();

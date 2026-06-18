@@ -291,6 +291,16 @@ portless trust
 
 On Linux, `portless trust` supports Debian/Ubuntu, Arch, Fedora/RHEL/CentOS, and openSUSE (via `update-ca-certificates` or `update-ca-trust`). On Windows, it uses `certutil` to add the CA to the system trust store. In WSL, portless also installs the CA into the Windows CurrentUser Root store so Windows browsers trust WSL-served portless HTTPS URLs.
 
+### Trust the CA on other devices
+
+`portless trust` installs the CA on the machine running portless. To trust it on another device — a phone testing over [LAN mode](#lan-mode), a second machine, or a browser with its own trust store — open the certificate page the proxy serves in the browser:
+
+```text
+https://cert.localhost          # or cert.<suffix> for a custom suffix
+```
+
+The page offers the **public** CA certificate for download (`/portless-ca.pem`), shows its SHA-256 fingerprint so you can verify it, and gives step-by-step install instructions for macOS, Linux, Windows, and Firefox. Only the public certificate is ever served — the CA private key never leaves the machine that generated it. Install a CA only on devices you control: it can vouch for any HTTPS site to that device.
+
 ### h2c and gRPC upstreams
 
 By default, portless forwards each route to the local app with HTTP/1.1. Use `--h2c` only when the upstream app expects HTTP/2 cleartext, such as a local gRPC service:
@@ -487,6 +497,33 @@ Private stdout, stderr, and lifecycle logs are stored under `${PORTLESS_STATE_DI
 
 Use `portless bg list` to see all registered background apps, `portless bg status [name]` for one app, `portless bg logs [name]` for logs, `portless bg restart [name]` to restart from the stored command intent, and `portless bg clean [name|--all]` to remove dead entries and their logs. `portless clean` stops registered background apps before removing state, and `portless prune` removes dead background entries without stopping live ones.
 
+## Local dashboard
+
+While the proxy runs it serves a small dashboard in the browser:
+
+```text
+https://portless.localhost      # or portless.<suffix> for a custom suffix
+```
+
+The dashboard lists every running app with its hostname, local port, and any public exposure (Tailscale, Funnel, ngrok, managed tunnels, NetBird), plus the proxy's suffix, protocol, and CA trust status. It links straight to the [certificate page](#trust-the-ca-on-other-devices) when the CA is not yet trusted.
+
+It is intentionally **read-only**: it never controls processes from the browser (no cross-origin control surface). Each row opens the app or copies its URL with one click. The hostname is reserved and cannot be claimed by an app. The dashboard URL is printed when the proxy starts; disable the dashboard with `PORTLESS_DASHBOARD=0`.
+
+## Multiplexed hostnames
+
+Use `--multiplex` to let several apps share one hostname — for example two git worktrees of the same project, both reachable at `https://myapp.localhost`:
+
+```bash
+# from worktree A
+portless myapp --multiplex -- npm run dev
+# from worktree B
+portless myapp --multiplex --label hotfix -- npm run dev
+```
+
+Each app gets a `--label` (default: the current directory name). Opening the shared hostname shows a portless app picker; your choice is remembered per hostname via a host-scoped cookie, and you can switch any time at `https://myapp.localhost/__portless/switch`. WebSocket connections follow the same cookie.
+
+portless never modifies your app's HTML or response headers — the selection lives entirely in portless's own picker and redirect responses, so auth flows, cookies, and content stream through untouched. Without `--multiplex`, a hostname has a single owner exactly as before; the two modes cannot be mixed without `--force`. Env equivalents: `PORTLESS_MULTIPLEX=1` and `PORTLESS_LABEL=<label>`.
+
 ## Commands
 
 ```bash
@@ -570,6 +607,8 @@ portless service uninstall       # Remove the startup service
 --script <name>                  Run a specific package.json script (default: dev)
 --app-port <number>              Use a fixed app port; browser-blocked ports are rejected
 --h2c                            Forward this route to an HTTP/2 cleartext upstream
+--multiplex                      Share this hostname with other apps (shows an app picker)
+--label <label>                  Label for this multiplexed app (default: directory name)
 --path <prefix>                  Scope this route to a path prefix, e.g. /api
 --tunnel <provider>              Share publicly via a managed tunnel: cloudflare or ngrok
 --tunnel-hostname <hostname>     Request a provider-specific stable tunnel hostname
@@ -598,6 +637,9 @@ bg stop --force                  Force-stop the exact registered background app
 PORTLESS_PORT=<number>           Override the default proxy port
 PORTLESS_APP_PORT=<number>       Use a fixed app port (same as --app-port)
 PORTLESS_H2C=1                   Forward app routes to HTTP/2 cleartext upstreams
+PORTLESS_MULTIPLEX=1             Share the hostname with other apps (same as --multiplex)
+PORTLESS_LABEL=<label>           Label for this multiplexed app (same as --label)
+PORTLESS_DASHBOARD=0             Disable the dashboard at portless.<suffix>
 PORTLESS_PATH=<prefix>           Scope app routes to a path prefix
 PORTLESS_TUNNEL=<provider>       Share publicly via a managed tunnel provider
 PORTLESS_TUNNEL_HOSTNAME=<host>  Request a provider-specific stable tunnel hostname

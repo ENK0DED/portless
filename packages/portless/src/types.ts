@@ -10,6 +10,25 @@ export interface RouteInfo {
   pathPrefix?: string;
   /** Upstream protocol. Missing means HTTP/1.1 for backward compatibility. */
   protocol?: RouteProtocol;
+  /**
+   * Distinguishing label for a multiplexed route. When several routes share a
+   * hostname (e.g. multiple worktrees of one app), the label is how the proxy's
+   * app picker and the selection cookie tell them apart. Missing means the route
+   * is the sole owner of its hostname (the default, single-owner behavior).
+   */
+  label?: string;
+  /**
+   * Public-exposure URLs, surfaced for display only (the dashboard and the
+   * `list` command). These are populated on the live route objects the proxy
+   * reads; the proxy itself never routes by them.
+   */
+  tailscaleUrl?: string;
+  tailscaleServiceUrl?: string;
+  tailscaleFunnel?: boolean;
+  ngrokUrl?: string;
+  tunnelUrl?: string;
+  tunnelProvider?: TunnelProviderName;
+  netbirdUrl?: string;
 }
 
 export interface TunnelAlias {
@@ -48,6 +67,19 @@ export interface ProxyServerOptions {
   strict?: boolean;
   /** Optional error logger; defaults to console.error. */
   onError?: (message: string) => void;
+  /**
+   * Serve portless's own pages at reserved hostnames — the dashboard at
+   * `portless.<suffix>` and the certificate trust page at `cert.<suffix>`.
+   * Defaults to true. These are intercepted before route dispatch, so a user
+   * app can never be reached at those hostnames.
+   */
+  internalPages?: boolean;
+  /**
+   * Returns whether the local CA is installed in the OS trust store, surfaced
+   * on the dashboard and certificate page. Should be cheap/memoized — it is
+   * called per internal-page request. Return undefined when unknown.
+   */
+  getCaTrusted?: () => boolean | undefined;
   /** When provided, enables HTTP/2 over TLS (HTTPS). */
   tls?: {
     cert: Buffer;

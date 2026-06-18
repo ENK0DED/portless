@@ -146,7 +146,7 @@ describe("createProxyServer", () => {
 
       const res = await request(server, { host: "other.localhost" });
       expect(res.status).toBe(404);
-      expect(res.body).toContain("Active apps");
+      expect(res.body).toContain("Apps");
       expect(res.body).toContain("myapp.localhost");
       expect(res.body).toContain("api.localhost");
     });
@@ -2018,4 +2018,173 @@ describe("createProxyServer with TLS (HTTP/2)", () => {
     },
     15_000
   );
+});
+
+describe("internal pages and multiplex routing", () => {
+  const servers: AnyServer[] = [];
+  const backends: http.Server[] = [];
+
+  function track<T extends AnyServer>(server: T): T {
+    servers.push(server);
+    return server;
+  }
+
+  function startBackend(label: string): Promise<number> {
+    return new Promise((resolve) => {
+      const b = http.createServer((_req, res) => {
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end(`backend:${label}`);
+      });
+      backends.push(b);
+      b.listen(0, "127.0.0.1", () => resolve((b.address() as net.AddressInfo).port));
+    });
+  }
+
+  afterEach(async () => {
+    for (const s of servers) await new Promise<void>((r) => s.close(() => r()));
+    for (const b of backends) await new Promise<void>((r) => b.close(() => r()));
+    servers.length = 0;
+    backends.length = 0;
+  });
+
+  it("serves the dashboard at portless.<suffix>", async () => {
+    const routes: RouteInfo[] = [{ hostname: "web.localhost", port: 4001 }];
+    const server = track(
+      createProxyServer({ getRoutes: () => routes, proxyPort: TEST_PROXY_PORT })
+    );
+    await listen(server);
+    const res = await request(server, { host: "portless.localhost" });
+    expect(res.status).toBe(200);
+    expect(res.headers["content-type"]).toContain("text/html");
+    expect(res.body).toContain("Local dashboard");
+    expect(res.body).toContain("web.localhost");
+  });
+
+  it("cannot be shadowed by a user route on the reserved hostname", async () => {
+    const routes: RouteInfo[] = [{ hostname: "portless.localhost", port: 4001 }];
+    const server = track(
+      createProxyServer({ getRoutes: () => routes, proxyPort: TEST_PROXY_PORT })
+    );
+    await listen(server);
+    const res = await request(server, { host: "portless.localhost" });
+    expect(res.status).toBe(200);
+    expect(res.body).toContain("Local dashboard");
+  });
+
+  it("serves the certificate page at cert.<suffix>", async () => {
+    const server = track(createProxyServer({ getRoutes: () => [], proxyPort: TEST_PROXY_PORT }));
+    await listen(server);
+    const res = await request(server, { host: "cert.localhost" });
+    expect(res.status).toBe(200);
+    expect(res.body).toContain("Certificate authority");
+  });
+
+  it("returns 404 for CA download when the proxy has no CA (no TLS)", async () => {
+    const server = track(createProxyServer({ getRoutes: () => [], proxyPort: TEST_PROXY_PORT }));
+    await listen(server);
+    const res = await request(server, { host: "cert.localhost", path: "/portless-ca.pem" });
+    expect(res.status).toBe(404);
+  });
+
+  it("serves a read-only state.json on the dashboard host", async () => {
+    const routes: RouteInfo[] = [{ hostname: "web.localhost", port: 4001 }];
+    const server = track(
+      createProxyServer({ getRoutes: () => routes, proxyPort: TEST_PROXY_PORT })
+    );
+    await listen(server);
+    const res = await request(server, {
+      host: "portless.localhost",
+      path: "/__portless/state.json",
+      accept: "application/json",
+    });
+    expect(res.status).toBe(200);
+    const parsed = JSON.parse(res.body);
+    expect(parsed.apps[0].name).toBe("web.localhost");
+  });
+
+  it("can disable internal pages with internalPages:false", async () => {
+    const server = track(
+      createProxyServer({ getRoutes: () => [], proxyPort: TEST_PROXY_PORT, internalPages: false })
+    );
+    await listen(server);
+    const res = await request(server, { host: "portless.localhost" });
+    expect(res.status).toBe(404);
+    expect(res.body).not.toContain("Local dashboard");
+  });
+
+  it("shows the app picker for a multiplexed host with no selection", async () => {
+    const routes: RouteInfo[] = [
+      { hostname: "app.localhost", port: 4001, label: "main" },
+      { hostname: "app.localhost", port: 4002, label: "hotfix" },
+    ];
+    const server = track(
+      createProxyServer({ getRoutes: () => routes, proxyPort: TEST_PROXY_PORT })
+    );
+    await listen(server);
+    const res = await request(server, { host: "app.localhost" });
+    expect(res.status).toBe(200);
+    expect(res.body).toContain("Choose an app");
+    expect(res.body).toContain("main");
+    expect(res.body).toContain("hotfix");
+  });
+
+  it("records a selection and redirects with a host-scoped cookie", async () => {
+    const routes: RouteInfo[] = [
+      { hostname: "app.localhost", port: 4001, label: "main" },
+      { hostname: "app.localhost", port: 4002, label: "hotfix" },
+    ];
+    const server = track(
+      createProxyServer({ getRoutes: () => routes, proxyPort: TEST_PROXY_PORT })
+    );
+    await listen(server);
+    const res = await request(server, {
+      host: "app.localhost",
+      path: "/__portless/select?label=main",
+    });
+    expect(res.status).toBe(302);
+    const setCookie = String(res.headers["set-cookie"]);
+    expect(setCookie).toContain("portless_app=main");
+    expect(setCookie).toContain("SameSite=Lax");
+  });
+
+  it("routes a multiplexed host to the cookie-selected member", async () => {
+    const mainPort = await startBackend("main");
+    const hotfixPort = await startBackend("hotfix");
+    const routes: RouteInfo[] = [
+      { hostname: "app.localhost", port: mainPort, label: "main" },
+      { hostname: "app.localhost", port: hotfixPort, label: "hotfix" },
+    ];
+    const server = track(
+      createProxyServer({ getRoutes: () => routes, proxyPort: TEST_PROXY_PORT })
+    );
+    await listen(server);
+
+    const toMain = await request(server, {
+      host: "app.localhost",
+      headers: { cookie: "portless_app=main" },
+    });
+    expect(toMain.body).toBe("backend:main");
+
+    const toHotfix = await request(server, {
+      host: "app.localhost",
+      headers: { cookie: "portless_app=hotfix" },
+    });
+    expect(toHotfix.body).toBe("backend:hotfix");
+  });
+
+  it("falls back to a default member for non-HTML requests without a selection", async () => {
+    const mainPort = await startBackend("main");
+    const hotfixPort = await startBackend("hotfix");
+    const routes: RouteInfo[] = [
+      { hostname: "app.localhost", port: mainPort, label: "main" },
+      { hostname: "app.localhost", port: hotfixPort, label: "hotfix" },
+    ];
+    const server = track(
+      createProxyServer({ getRoutes: () => routes, proxyPort: TEST_PROXY_PORT })
+    );
+    await listen(server);
+    const res = await request(server, { host: "app.localhost", accept: "application/json" });
+    // Lowest label wins deterministically ("hotfix" < "main").
+    expect(res.body).toBe("backend:hotfix");
+  });
 });

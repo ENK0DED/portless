@@ -642,6 +642,26 @@ function startProxyServer(
   // Publish mDNS for routes that already exist at startup
   publishCachedRoutes();
 
+  // Memoize the OS trust check: isCATrusted can spawn `security`/`certutil`,
+  // so cache it and refresh at most once a minute for the dashboard/cert page.
+  const CA_TRUST_TTL_MS = 60_000;
+  let caTrustedCache: { value: boolean | undefined; at: number } | null = null;
+  const getCaTrusted = (): boolean | undefined => {
+    if (!isTls) return undefined;
+    const now = Date.now();
+    if (caTrustedCache && now - caTrustedCache.at < CA_TRUST_TTL_MS) {
+      return caTrustedCache.value;
+    }
+    let value: boolean | undefined;
+    try {
+      value = isCATrusted(store.dir);
+    } catch {
+      value = undefined;
+    }
+    caTrustedCache = { value, at: now };
+    return value;
+  };
+
   const server = createProxyServer({
     getRoutes: () => cachedRoutes,
     getTunnelAliases: () => new TunnelAliasStore(store.dir).loadAliases(),
@@ -650,6 +670,8 @@ function startProxyServer(
     strict,
     onError: (msg) => console.error(colors.red(msg)),
     tls: tlsOptions,
+    internalPages: process.env.PORTLESS_DASHBOARD !== "0",
+    getCaTrusted,
   });
 
   server.on("error", (err: NodeJS.ErrnoException) => {
@@ -761,6 +783,11 @@ function startProxyServer(
   process.on("SIGTERM", cleanup);
 
   console.log(colors.cyan("\nProxy is running. Press Ctrl+C to stop.\n"));
+  if (process.env.PORTLESS_DASHBOARD !== "0") {
+    const scheme = isTls ? "https" : "http";
+    const portPart = proxyPort === (isTls ? 443 : 80) ? "" : `:${proxyPort}`;
+    console.log(colors.gray(`Dashboard:   ${scheme}://portless.${tld}${portPart}`));
+  }
   console.log(colors.gray(`Routes file: ${store.getRoutesPath()}`));
 }
 
@@ -1360,11 +1387,13 @@ async function runApp(
   }
 
   // Register route (--force kills the existing owner if any)
+  assertNotReservedHostname(hostname, tld);
   let killedPid: number | undefined;
   try {
     killedPid = store.addRoute(hostname, port, process.pid, force, {
       protocol,
       pathPrefix: routePathPrefix,
+      label: multiplexLabelFromEnv(),
     });
   } catch (err) {
     if (err instanceof RouteConflictError) {
@@ -2089,6 +2118,36 @@ function pathPrefixFromEnv(): string | undefined {
   return parsePathPrefix(process.env.PORTLESS_PATH, "PORTLESS_PATH");
 }
 
+/**
+ * Resolve the multiplex label for this registration, or undefined for a normal
+ * sole-owner route. Multiplex mode is on when `--multiplex`/PORTLESS_MULTIPLEX
+ * is set or an explicit `--label`/PORTLESS_LABEL is provided. The default label
+ * is the current directory name, which is stable and meaningful per worktree.
+ */
+function multiplexLabelFromEnv(): string | undefined {
+  const explicit = process.env.PORTLESS_LABEL?.trim();
+  const enabled = isEnabledEnv(process.env.PORTLESS_MULTIPLEX) || !!explicit;
+  if (!enabled) return undefined;
+  return explicit || path.basename(process.cwd()) || undefined;
+}
+
+/**
+ * portless reserves `portless.<suffix>` (dashboard) and `cert.<suffix>`
+ * (certificate trust page) for its own UI. Reject app names that would collide
+ * with them so a confusing dead route is never written to disk; the proxy also
+ * intercepts these hostnames before route dispatch as a runtime backstop.
+ */
+function assertNotReservedHostname(hostname: string, tld: string): void {
+  if (hostname === `portless.${tld}` || hostname === `cert.${tld}`) {
+    console.error(colors.red(`Error: "${hostname}" is reserved by portless.`));
+    console.error(
+      colors.blue("It serves the portless dashboard and certificate pages. Pick another name:")
+    );
+    console.error(colors.cyan("  portless myapp -- <command>"));
+    process.exit(1);
+  }
+}
+
 function rejectBlockedAppPort(port: number, source: string): void {
   if (!BLOCKED_PORTS.has(port)) return;
   console.error(
@@ -2514,6 +2573,8 @@ const GLOBAL_COMPLETION_FLAGS: CompletionFlag[] = [
   { name: "--state-dir", description: "Use a custom state directory", value: "path" },
   { name: "--app-port", description: "Use a fixed app port", value: "port" },
   { name: "--h2c", description: "Forward to an HTTP/2 cleartext upstream" },
+  { name: "--multiplex", description: "Share the hostname with other apps (app picker)" },
+  { name: "--label", description: "Label for this multiplexed app", value: "label" },
   { name: "--path", description: "Scope route to a path prefix", value: "prefix" },
   { name: "--tunnel", description: "Share publicly via tunnel provider", value: "provider" },
   { name: "--tunnel-hostname", description: "Request stable tunnel hostname", value: "hostname" },
@@ -2540,6 +2601,8 @@ const RUN_COMPLETION_FLAGS = GLOBAL_COMPLETION_FLAGS.filter((flag) =>
     "--force",
     "--app-port",
     "--h2c",
+    "--multiplex",
+    "--label",
     "--path",
     "--tunnel",
     "--tunnel-hostname",
@@ -2560,6 +2623,8 @@ const APP_COMPLETION_FLAGS = GLOBAL_COMPLETION_FLAGS.filter((flag) =>
     "--force",
     "--app-port",
     "--h2c",
+    "--multiplex",
+    "--label",
     "--path",
     "--tunnel",
     "--tunnel-hostname",
@@ -3085,6 +3150,22 @@ ${colors.bold("NetBird sharing:")}
   Portless keeps the child app bound to 127.0.0.1 by default.
   ${colors.cyan("portless myapp --netbird --netbird-groups team next dev")}
 
+${colors.bold("Multiplexed hostnames:")}
+  Use --multiplex to let several apps share one hostname (e.g. two worktrees
+  of the same app on https://myapp.localhost). Each app gets a --label (default:
+  the current directory name). Opening the shared hostname shows a small picker;
+  your choice is remembered per hostname until you switch at /__portless/switch.
+  Portless never modifies your app's HTML or headers - the selection lives only
+  in portless's own pages.
+  ${colors.cyan("portless myapp --multiplex -- npm run dev          # from worktree A")}
+  ${colors.cyan("portless myapp --multiplex --label hotfix -- npm run dev  # from worktree B")}
+
+${colors.bold("Local pages:")}
+  While the proxy runs it serves two of its own pages, reachable in the browser:
+  ${colors.cyan("https://portless.localhost")}      Dashboard: every running app and its status
+  ${colors.cyan("https://cert.localhost")}          Download and trust the local CA on any device
+  These hostnames are reserved; disable the dashboard with PORTLESS_DASHBOARD=0.
+
 ${colors.bold("Options:")}
   run [--name <name>] <cmd>      Infer project name (or override with --name)
                                 Adds worktree prefix in git worktrees
@@ -3106,6 +3187,8 @@ ${colors.bold("Options:")}
   --state-dir <path>            Use a custom state directory with service install
   --app-port <number>           Use a fixed app port; browser-blocked ports are rejected
   --h2c                         Forward this route to an HTTP/2 cleartext upstream
+  --multiplex                   Share this hostname with other apps (shows an app picker)
+  --label <label>               Label for this multiplexed app (default: directory name)
   --path <prefix>               Scope this route to a path prefix, e.g. /api
   --tunnel <provider>           Share publicly via a managed tunnel: cloudflare or ngrok
   --tunnel-hostname <hostname>  Request a provider-specific stable tunnel hostname
@@ -3131,6 +3214,9 @@ ${colors.bold("Environment variables:")}
   PORTLESS_PORT=<number>        Override the default proxy port (e.g. in .bashrc)
   PORTLESS_APP_PORT=<number>    Use a fixed app port (same as --app-port)
   PORTLESS_H2C=1                Forward app routes to HTTP/2 cleartext upstreams
+  PORTLESS_MULTIPLEX=1          Share the hostname with other apps (same as --multiplex)
+  PORTLESS_LABEL=<label>        Label for this multiplexed app (same as --label)
+  PORTLESS_DASHBOARD=0          Disable the dashboard at portless.<suffix>
   PORTLESS_PATH=<prefix>        Scope app routes to a path prefix
   PORTLESS_TUNNEL=<provider>    Share publicly via a managed tunnel provider
   PORTLESS_TUNNEL_HOSTNAME=<h>  Request a provider-specific stable tunnel hostname
@@ -3445,11 +3531,12 @@ ${colors.bold("Options:")}
   const staleAliases = tunnelAliasStore.pruneManagedAliases();
   const bgPruned = await pruneBgEntriesForState(dir);
   if (stale.length === 0 && staleAliases.length === 0 && bgPruned.removed === 0) {
-    console.log("No orphaned routes found.");
+    console.log(colors.gray("No orphaned routes found."));
     return;
   }
   if (bgPruned.removed > 0) {
-    console.log(`  removed ${bgPruned.removed} dead background app entries`);
+    const bgWord = bgPruned.removed === 1 ? "entry" : "entries";
+    console.log(colors.gray(`  removed ${bgPruned.removed} dead background app ${bgWord}`));
   }
 
   for (const route of stale) {
@@ -3459,28 +3546,28 @@ ${colors.bold("Options:")}
         const label = route.tailscaleServiceName
           ? `service ${route.tailscaleServiceName}`
           : `serve on port ${route.tailscaleHttpsPort}`;
-        console.log(`  ${route.hostname} - removed tailscale ${label}`);
+        console.log(colors.gray(`  ${route.hostname} - removed tailscale ${label}`));
       } catch {
         // Tailscale CLI may not be installed; non-fatal during prune
       }
     }
     if (route.ngrokPid) {
       stopNgrok(route);
-      console.log(`  ${route.hostname} - stopped ngrok tunnel`);
+      console.log(colors.gray(`  ${route.hostname} - stopped ngrok tunnel`));
     }
     if (route.tunnelPid) {
       stopTunnelPid(route.tunnelPid);
-      console.log(`  ${route.hostname} - stopped managed tunnel`);
+      console.log(colors.gray(`  ${route.hostname} - stopped managed tunnel`));
     }
     if (route.netbirdPid) {
       stopNetbird(route);
-      console.log(`  ${route.hostname} - stopped NetBird expose`);
+      console.log(colors.gray(`  ${route.hostname} - stopped NetBird expose`));
     }
   }
   for (const alias of staleAliases) {
     if (alias.tunnelPid) {
       stopTunnelPid(alias.tunnelPid);
-      console.log(`  ${alias.externalHostname} - stopped managed tunnel alias`);
+      console.log(colors.gray(`  ${alias.externalHostname} - stopped managed tunnel alias`));
     }
   }
 
@@ -3488,7 +3575,9 @@ ${colors.bold("Options:")}
   for (const route of stale) {
     const pids = findPidsOnPort(route.port);
     if (pids.length === 0) {
-      console.log(`  ${route.hostname} :${route.port} - route removed (port already free)`);
+      console.log(
+        colors.gray(`  ${route.hostname} :${route.port} - route removed (port already free)`)
+      );
       continue;
     }
     const signal = forceKill ? "SIGKILL" : "SIGTERM";
@@ -3496,18 +3585,21 @@ ${colors.bold("Options:")}
       try {
         process.kill(pid, signal);
         killed++;
-        console.log(`  ${route.hostname} :${route.port} - killed PID ${pid} (${signal})`);
+        console.log(
+          colors.gray(`  ${route.hostname} :${route.port} - killed PID ${pid} (${signal})`)
+        );
       } catch {
-        console.log(`  ${route.hostname} :${route.port} - PID ${pid} already exited`);
+        console.log(colors.gray(`  ${route.hostname} :${route.port} - PID ${pid} already exited`));
       }
     }
   }
 
   const routeWord = stale.length === 1 ? "route" : "routes";
+  const aliasWord = staleAliases.length === 1 ? "alias" : "aliases";
   const procWord = killed === 1 ? "process" : "processes";
   console.log(
     colors.green(
-      `\nPruned ${stale.length} stale ${routeWord} and ${staleAliases.length} tunnel aliases, killed ${killed} orphaned ${procWord}.`
+      `\nPruned ${stale.length} stale ${routeWord} and ${staleAliases.length} tunnel ${aliasWord}, killed ${killed} orphaned ${procWord}.`
     )
   );
 }
@@ -4771,9 +4863,11 @@ async function spawnProxiedApp(
     displayUrl = url;
 
     hostname = parseHostname(app.name, tld);
+    assertNotReservedHostname(hostname, tld);
     store.addRoute(hostname, appPort, process.pid, false, {
       protocol: routeProtocolFromEnv(),
       pathPrefix: routePathPrefix,
+      label: multiplexLabelFromEnv(),
     });
 
     env = {
@@ -5032,9 +5126,11 @@ async function runWithTurbo(
     appUrls.push({ label: app.label, url });
 
     const hostname = parseHostname(app.name, tld);
+    assertNotReservedHostname(hostname, tld);
     store.addRoute(hostname, appPort, process.pid, false, {
       protocol: routeProtocolFromEnv(),
       pathPrefix: routePathPrefix,
+      label: multiplexLabelFromEnv(),
     });
     routes.push({ hostname, pathPrefix: routePathPrefix });
 
@@ -5445,6 +5541,18 @@ async function main() {
   }
   if (stripGlobalFlag("--h2c", false)) {
     process.env.PORTLESS_H2C = "1";
+  }
+  if (stripGlobalFlag("--multiplex", false)) {
+    process.env.PORTLESS_MULTIPLEX = "1";
+  }
+  const labelResult = stripGlobalFlag("--label", true);
+  if (labelResult === false) {
+    console.error(colors.red("Error: --label requires a value."));
+    console.error(colors.cyan("  portless myapp --label feature -- npm run dev"));
+    process.exit(1);
+  } else if (typeof labelResult === "string") {
+    process.env.PORTLESS_LABEL = labelResult;
+    process.env.PORTLESS_MULTIPLEX = "1";
   }
   const pathResult = stripGlobalFlag("--path", true);
   if (pathResult === false) {

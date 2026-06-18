@@ -151,6 +151,17 @@ No config changes needed. Put `portless run` in `package.json` once and it works
 
 Monorepo workspace apps use the same prefixing rule, including names set through the root `apps` map.
 
+### Multiplexed hostnames
+
+Use `--multiplex` when several apps should share one stable hostname instead of getting unique URLs — for example multiple worktrees of the same app, all reachable at `https://myapp.localhost`:
+
+```bash
+portless myapp --multiplex -- npm run dev                  # worktree A
+portless myapp --multiplex --label hotfix -- npm run dev   # worktree B
+```
+
+Each member gets a `--label` (default: the current directory name; `PORTLESS_LABEL` is the env equivalent, `PORTLESS_MULTIPLEX=1` enables it). Visiting the shared hostname in a browser shows a portless app picker; the choice is stored in a host-scoped cookie and can be changed at `<host>/__portless/switch`. portless never rewrites the app's HTML or headers — only its own picker/redirect responses carry the selection, so auth and cookies are untouched. Single-owner routing is unchanged when `--multiplex` is absent; the two modes cannot be mixed without `--force`.
+
 ### Bypassing portless
 
 Set `PORTLESS=0` to run the command directly without the proxy:
@@ -218,6 +229,9 @@ The suffix may be a single label such as `test` or a dotted suffix such as `serv
 | `PORTLESS_PORT`                   | Override the default proxy port (default: 443 with HTTPS, 80 without)       |
 | `PORTLESS_APP_PORT`               | Use a fixed app port; browser-blocked ports are rejected                    |
 | `PORTLESS_H2C`                    | Set to `1` to forward app routes to HTTP/2 cleartext upstreams              |
+| `PORTLESS_MULTIPLEX`              | Set to `1` to share the hostname with other apps (same as `--multiplex`)    |
+| `PORTLESS_LABEL`                  | Label for this multiplexed app (same as `--label`)                          |
+| `PORTLESS_DASHBOARD`              | Set to `0` to disable the dashboard at `portless.<suffix>`                  |
 | `PORTLESS_PATH`                   | Scope app routes to a path prefix                                           |
 | `PORTLESS_HTTPS`                  | HTTPS on by default; set to `0` to disable (same as `--no-tls`)             |
 | `PORTLESS_LAN`                    | Set to `1` to always enable LAN mode (auto-detects LAN IP)                  |
@@ -251,6 +265,12 @@ portless trust                                      # Add CA to trust store late
 ```
 
 On Linux, `portless trust` supports Debian/Ubuntu, Arch, Fedora/RHEL/CentOS, and openSUSE (via `update-ca-certificates` or `update-ca-trust`). On Windows, it uses `certutil` to add the CA to the system trust store. In WSL, portless also installs the CA into the Windows CurrentUser Root store so Windows browsers trust WSL-served portless HTTPS URLs.
+
+To trust the CA on another device (a phone over LAN mode, a second machine, or a browser with its own store), open `https://cert.localhost` (`cert.<suffix>`) in that browser. It serves the **public** CA only (`/portless-ca.pem`, with its SHA-256 fingerprint) plus per-OS install steps; the private key is never exposed. On the host machine, `portless trust` already does this.
+
+### Dashboard
+
+While the proxy runs, `https://portless.localhost` (`portless.<suffix>`) serves a read-only dashboard of every running app — hostnames, ports, public-exposure state, and CA trust. It never controls processes from the browser; each row opens the app or copies its URL. The hostname is reserved; disable with `PORTLESS_DASHBOARD=0`.
 
 ### h2c and gRPC upstreams
 
@@ -413,6 +433,8 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 | `portless run [cmd] [args...]`                   | Infer name from project, run through proxy (auto-starts)       |
 | `portless run --name <name> <cmd>`               | Override inferred base name (worktree prefix still applies)    |
 | `portless <name> <cmd> [args...]`                | Run app at `https://<name>.localhost` (auto-starts proxy)      |
+| `portless <name> <cmd> --multiplex`              | Share the hostname with other apps (browser app picker)        |
+| `portless <name> <cmd> --multiplex --label <l>`  | Multiplex with an explicit label (default: directory name)     |
 | `portless get <name>`                            | Print URL for a service (for cross-service wiring)             |
 | `portless url <name>`                            | Alias for `portless get <name>`                                |
 | `portless get <name> --no-worktree`              | Print URL without worktree prefix                              |
@@ -440,13 +462,13 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 | `portless service install --wildcard`            | Persist wildcard routing in the startup service                |
 | `portless service status`                        | Show service and proxy status                                  |
 | `portless service uninstall`                     | Remove the startup service                                     |
-| `portless bg start [cmd]`                         | Start an app in the background                                 |
-| `portless bg status [name] --json`                | Show background app status for scripts and agents              |
-| `portless bg list`                                | List background apps                                           |
-| `portless bg logs [name] --tail 200`              | Print recent background app logs                               |
-| `portless bg stop [name]`                         | Stop a background app                                          |
-| `portless bg restart [name]`                      | Restart a background app from stored command intent            |
-| `portless bg clean [name]`                        | Remove dead background entries and their private logs          |
+| `portless bg start [cmd]`                        | Start an app in the background                                 |
+| `portless bg status [name] --json`               | Show background app status for scripts and agents              |
+| `portless bg list`                               | List background apps                                           |
+| `portless bg logs [name] --tail 200`             | Print recent background app logs                               |
+| `portless bg stop [name]`                        | Stop a background app                                          |
+| `portless bg restart [name]`                     | Restart a background app from stored command intent            |
+| `portless bg clean [name]`                       | Remove dead background entries and their private logs          |
 | `portless alias <name> <port>`                   | Register a static route (e.g. for Docker containers)           |
 | `portless alias <name> <port> --force`           | Overwrite an existing route                                    |
 | `portless alias <name> <port> --h2c`             | Register an HTTP/2 cleartext upstream route                    |

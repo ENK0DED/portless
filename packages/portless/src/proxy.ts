@@ -1,9 +1,101 @@
 import * as http from "node:http";
 import * as http2 from "node:http2";
 import * as net from "node:net";
+import * as crypto from "node:crypto";
 import type { ProxyServerOptions, RouteInfo, TunnelAlias } from "./types.js";
 import { escapeHtml, formatUrl, matchesPathPrefix, normalizePathPrefix } from "./utils.js";
-import { ARROW_SVG, renderPage } from "./pages.js";
+import { APP_SCRIPT, appList, renderPage } from "./pages.js";
+import {
+  dashboardStateJson,
+  renderAppPicker,
+  renderCertPage,
+  renderDashboard,
+  renderRouteRow,
+} from "./internal-pages.js";
+
+/** Cookie that remembers which app a multiplexed hostname should route to. */
+const SELECTION_COOKIE = "portless_app";
+
+/** Reserved request paths used by the multiplexed-host app picker. */
+const MULTIPLEX_SELECT_PATH = "/__portless/select";
+const MULTIPLEX_SWITCH_PATH = "/__portless/switch";
+
+/** Parse a Cookie header into a name->value map (values URL-decoded). */
+function parseCookieHeader(header: string | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!header) return out;
+  for (const part of header.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq === -1) continue;
+    const name = part.slice(0, eq).trim();
+    if (!name) continue;
+    try {
+      out[name] = decodeURIComponent(part.slice(eq + 1).trim());
+    } catch {
+      out[name] = part.slice(eq + 1).trim();
+    }
+  }
+  return out;
+}
+
+/** Read the multiplex selection label from the request's cookies. */
+function readSelectionCookie(req: http.IncomingMessage): string | undefined {
+  return parseCookieHeader(req.headers.cookie)[SELECTION_COOKIE] || undefined;
+}
+
+/** Format a CA SHA-256 fingerprint as colon-separated uppercase byte pairs. */
+function formatFingerprint(ca: Buffer): string {
+  return crypto
+    .createHash("sha256")
+    .update(ca)
+    .digest("hex")
+    .toUpperCase()
+    .replace(/(.{2})(?=.)/g, "$1:");
+}
+
+/** Stable signature of the route table, used for the dashboard's live refresh. */
+function routeSignature(routes: RouteInfo[]): string {
+  return routes
+    .map(
+      (r) =>
+        `${r.hostname}|${normalizePathPrefix(r.pathPrefix)}|${r.port}|${r.label ?? ""}|${r.protocol ?? ""}|${[
+          r.tailscaleUrl,
+          r.tailscaleServiceUrl,
+          r.tailscaleFunnel ? "f" : "",
+          r.ngrokUrl,
+          r.tunnelUrl,
+          r.netbirdUrl,
+        ]
+          .filter(Boolean)
+          .join(",")}`
+    )
+    .sort()
+    .join("\n");
+}
+
+/**
+ * Members sharing one hostname (multiplex). Returns the set only when more than
+ * one live route occupies the same hostname + winning (longest) path prefix;
+ * otherwise an empty array, so single-owner routing is completely unaffected.
+ */
+function multiplexMembersFor(routes: RouteInfo[], host: string, requestPath: string): RouteInfo[] {
+  const candidates = routes.filter(
+    (r) => r.hostname === host && matchesPathPrefix(requestPath, normalizePathPrefix(r.pathPrefix))
+  );
+  if (candidates.length < 2) return [];
+  let longest = -1;
+  for (const c of candidates) {
+    const len = normalizePathPrefix(c.pathPrefix).length;
+    if (len > longest) longest = len;
+  }
+  const members = candidates.filter((c) => normalizePathPrefix(c.pathPrefix).length === longest);
+  return members.length > 1 ? members : [];
+}
+
+/** Pick a deterministic default member (lowest label) for non-interactive requests. */
+function defaultMember(members: RouteInfo[]): RouteInfo {
+  return members.slice().sort((a, b) => (a.label ?? "").localeCompare(b.label ?? ""))[0];
+}
 
 /** Response header used to identify a portless proxy (for health checks). */
 export const PORTLESS_HEADER = "X-Portless";
@@ -346,9 +438,177 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     strict = true,
     onError = (msg: string) => console.error(msg),
     tls,
+    internalPages = true,
+    getCaTrusted,
   } = options;
   const tldSuffix = `.${tld}`;
   const h2cSessions: H2cSessionCache = new Map();
+
+  // Reserved internal hostnames. Intercepted before route dispatch so a user
+  // app can never shadow them, and derived from the live suffix so they follow
+  // a custom PORTLESS_SUFFIX (e.g. portless.test / cert.test).
+  const dashboardHost = `portless${tldSuffix}`;
+  const certHost = `cert${tldSuffix}`;
+  const caFingerprint = tls?.ca ? formatFingerprint(tls.ca) : undefined;
+
+  const hostPort = (reqTls: boolean): string =>
+    proxyPort === (reqTls ? 443 : 80) ? "" : `:${proxyPort}`;
+
+  /**
+   * Serve portless's own pages (dashboard, certificate trust + CA download) at
+   * the reserved hostnames. Returns true when the request was handled.
+   */
+  const serveInternalPage = (
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    host: string,
+    reqTls: boolean
+  ): boolean => {
+    if (!internalPages) return false;
+    if (host !== dashboardHost && host !== certHost) return false;
+
+    const method = req.method || "GET";
+    if (method !== "GET" && method !== "HEAD") {
+      res.writeHead(405, { "Content-Type": "text/plain", Allow: "GET, HEAD" });
+      res.end("Method Not Allowed\n");
+      return true;
+    }
+    const isHead = method === "HEAD";
+    const url = req.url || "/";
+    const pathname = url.split(/[?#]/, 1)[0] || "/";
+
+    if (host === certHost) {
+      if (pathname === "/portless-ca.pem" || pathname === "/ca.pem") {
+        if (!tls?.ca) {
+          res.writeHead(404, { "Content-Type": "text/plain" });
+          res.end("No CA certificate available (the proxy is running without HTTPS).\n");
+          return true;
+        }
+        res.writeHead(200, {
+          "Content-Type": "application/x-x509-ca-cert",
+          "Content-Disposition": 'attachment; filename="portless-ca.pem"',
+          "Cache-Control": "no-store",
+        });
+        res.end(isHead ? undefined : tls.ca);
+        return true;
+      }
+      const body = renderCertPage({
+        suffix: tld,
+        downloadPath: "/portless-ca.pem",
+        fingerprint: caFingerprint,
+        trustedHere: getCaTrusted?.(),
+        dashboardUrl: `${reqTls ? "https" : "http"}://${dashboardHost}${hostPort(reqTls)}/`,
+      });
+      res.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store",
+      });
+      res.end(isHead ? undefined : body);
+      return true;
+    }
+
+    // Dashboard host
+    const routes = getRoutes();
+    const signature = routeSignature(routes);
+    if (pathname === "/__portless/state.json") {
+      res.writeHead(200, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "no-store",
+      });
+      res.end(isHead ? undefined : dashboardStateJson({ routes, signature }));
+      return true;
+    }
+    const body = renderDashboard({
+      routes,
+      proxyPort,
+      tls: reqTls,
+      suffix: tld,
+      caTrusted: getCaTrusted?.(),
+      certHost,
+      signature,
+    });
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+    res.end(isHead ? undefined : body);
+    return true;
+  };
+
+  /**
+   * Resolve a multiplexed hostname to a single member route. Returns the chosen
+   * route, or undefined when this call already served a picker page / redirect
+   * (the caller must then stop). portless never mutates app responses — the
+   * selection lives entirely in our own interstitial responses.
+   */
+  const resolveMultiplex = (
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    members: RouteInfo[],
+    host: string,
+    requestPath: string,
+    reqTls: boolean
+  ): RouteInfo | undefined => {
+    const pathname = requestPath.split(/[?#]/, 1)[0] || "/";
+    const base = `${reqTls ? "https" : "http"}://${host}${hostPort(reqTls)}`;
+    const liveLabels = new Set(members.map((m) => m.label).filter(Boolean) as string[]);
+    const selected = readSelectionCookie(req);
+
+    const servePicker = (): void => {
+      const body = renderAppPicker({
+        host,
+        members: members.map((m) => ({
+          label: m.label || `:${m.port}`,
+          port: m.port,
+          protocol: m.protocol,
+        })),
+        selectPath: MULTIPLEX_SELECT_PATH,
+        current: selected && liveLabels.has(selected) ? selected : undefined,
+        suffix: tld,
+        proxyPort,
+        tls: reqTls,
+        caTrusted: getCaTrusted?.(),
+        certHost,
+      });
+      res.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store",
+      });
+      res.end(body);
+    };
+
+    if (pathname === MULTIPLEX_SELECT_PATH) {
+      const qIndex = requestPath.indexOf("?");
+      const params = new URLSearchParams(qIndex === -1 ? "" : requestPath.slice(qIndex + 1));
+      const label = params.get("label") || "";
+      if (label && liveLabels.has(label)) {
+        res.writeHead(302, {
+          Location: `${base}/`,
+          "Set-Cookie": `${SELECTION_COOKIE}=${encodeURIComponent(label)}; Path=/; Max-Age=31536000; SameSite=Lax${reqTls ? "; Secure" : ""}`,
+          "Cache-Control": "no-store",
+        });
+        res.end();
+        return undefined;
+      }
+      servePicker();
+      return undefined;
+    }
+
+    if (pathname === MULTIPLEX_SWITCH_PATH) {
+      servePicker();
+      return undefined;
+    }
+
+    if (selected && liveLabels.has(selected)) {
+      return members.find((m) => m.label === selected);
+    }
+
+    // No valid selection yet. Show the picker for page navigations; for
+    // sub-resources (assets, XHR) fall back to a deterministic member so the
+    // page the user eventually picks still resolves its requests.
+    if (wantsHtml(req)) {
+      servePicker();
+      return undefined;
+    }
+    return defaultMember(members);
+  };
 
   const handleRequest = (req: http.IncomingMessage, res: http.ServerResponse) => {
     const reqTls = isEncrypted(req);
@@ -364,6 +624,10 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       res.end("Missing Host header");
       return;
     }
+
+    // Reserved portless pages (dashboard, certificate trust) win before any
+    // route lookup or loop detection, so a user app can never shadow them.
+    if (serveInternalPage(req, res, host, reqTls)) return;
 
     const hops = parseInt(req.headers[PORTLESS_HOPS_HEADER] as string, 10) || 0;
     if (hops >= MAX_PROXY_HOPS) {
@@ -400,7 +664,15 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       return;
     }
 
-    const route = findRoute(routes, tunnelAliases, host, req.url || "/", strict);
+    const requestPath = req.url || "/";
+    const members = multiplexMembersFor(routes, host, requestPath);
+    let route: RouteInfo | undefined;
+    if (members.length > 0) {
+      route = resolveMultiplex(req, res, members, host, requestPath, reqTls);
+      if (!route) return; // a picker page or selection redirect was served
+    } else {
+      route = findRoute(routes, tunnelAliases, host, requestPath, strict);
+    }
 
     if (!route) {
       const safeHost = escapeHtml(host);
@@ -426,21 +698,22 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       const linkSuffix = activeAppLinkSuffix(req);
       const routesList =
         routes.length > 0
-          ? `<div class="section"><p class="label">Active apps</p><ul class="card">${routes
-              .map((r) => {
+          ? `<div class="section"><p class="label">Apps <span class="count">${routes.length}</span></p>${appList(
+              routes.map((r) => {
                 const pathPrefix = normalizePathPrefix(r.pathPrefix);
                 const hrefSuffix = pathPrefix === "/" ? linkSuffix : "";
-                const name = pathPrefix === "/" ? r.hostname : `${r.hostname}${pathPrefix}`;
-                return `<li><a href="${escapeHtml(`${formatUrl(r.hostname, proxyPort, reqTls, pathPrefix)}${hrefSuffix}`)}" class="card-link"><span class="name">${escapeHtml(name)}</span><span class="meta"><code class="port">127.0.0.1:${escapeHtml(String(r.port))}</code><span class="arrow">${ARROW_SVG}</span></span></a></li>`;
+                const url = `${formatUrl(r.hostname, proxyPort, reqTls, pathPrefix)}${hrefSuffix}`;
+                return renderRouteRow(r, { url, copyUrl: url, status: "active", newTab: true });
               })
-              .join("")}</ul></div>`
+            )}</div>`
           : '<p class="empty">No apps running.</p>';
       res.writeHead(404, { "Content-Type": "text/html" });
       res.end(
         renderPage(
           404,
           "Not Found",
-          `<div class="content"><p class="desc">No app registered for <strong>${safeHost}</strong></p>${routesList}<div class="section"><div class="terminal"><span class="prompt">$ </span>portless ${safeSuggestion} your-command</div></div></div>`
+          `<div class="content"><p class="desc">No app registered for <strong>${safeHost}</strong></p>${routesList}<div class="section"><div class="terminal"><span class="prompt">$ </span>portless ${safeSuggestion} your-command</div></div></div>`,
+          APP_SCRIPT
         )
       );
       return;
@@ -570,7 +843,25 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     const routes = getRoutes();
     const tunnelAliases = getTunnelAliases();
     const host = getRequestHost(req).split(":")[0];
-    const route = findRoute(routes, tunnelAliases, host, req.url || "/", strict);
+
+    // Reserved internal hosts have no WebSocket surface.
+    if (internalPages && (host === dashboardHost || host === certHost)) {
+      socket.destroy();
+      return;
+    }
+
+    const requestPath = req.url || "/";
+    const members = multiplexMembersFor(routes, host, requestPath);
+    let route: RouteInfo | undefined;
+    if (members.length > 0) {
+      // No picker over WebSockets: honor the selection cookie, else default.
+      const selected = readSelectionCookie(req);
+      route =
+        (selected ? members.find((m) => m.label === selected) : undefined) ??
+        defaultMember(members);
+    } else {
+      route = findRoute(routes, tunnelAliases, host, requestPath, strict);
+    }
 
     if (!route) {
       socket.destroy();

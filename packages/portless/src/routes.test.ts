@@ -664,3 +664,122 @@ describe("RouteStore", () => {
     });
   });
 });
+
+describe("RouteStore multiplex", () => {
+  let tmpDir: string;
+  let store: RouteStore;
+  const sleepers: number[] = [];
+
+  function spawnSleeper(): number {
+    const child = spawn("node", ["-e", "setTimeout(()=>{},60000)"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    child.unref();
+    sleepers.push(child.pid!);
+    return child.pid!;
+  }
+
+  function isAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-mux-test-"));
+    store = new RouteStore(tmpDir);
+  });
+
+  afterEach(() => {
+    for (const pid of sleepers) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // already dead
+      }
+    }
+    sleepers.length = 0;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("lets several labeled members share one hostname", () => {
+    store.addRoute("app.localhost", 4001, spawnSleeper(), false, { label: "main" });
+    store.addRoute("app.localhost", 4002, spawnSleeper(), false, { label: "hotfix" });
+    const routes = store.loadRoutes();
+    expect(routes).toHaveLength(2);
+    expect(routes.map((r) => r.label).sort()).toEqual(["hotfix", "main"]);
+    expect(new Set(routes.map((r) => r.port))).toEqual(new Set([4001, 4002]));
+  });
+
+  it("rejects a sole-owner registration onto a multiplexed hostname", () => {
+    store.addRoute("app.localhost", 4001, spawnSleeper(), false, { label: "main" });
+    expect(() => store.addRoute("app.localhost", 4002, spawnSleeper())).toThrow(RouteConflictError);
+  });
+
+  it("rejects a multiplex registration onto a sole-owned hostname", () => {
+    store.addRoute("app.localhost", 4001, spawnSleeper());
+    expect(() =>
+      store.addRoute("app.localhost", 4002, spawnSleeper(), false, { label: "main" })
+    ).toThrow(RouteConflictError);
+  });
+
+  it("rejects a second member with the same label", () => {
+    store.addRoute("app.localhost", 4001, spawnSleeper(), false, { label: "main" });
+    expect(() =>
+      store.addRoute("app.localhost", 4002, spawnSleeper(), false, { label: "main" })
+    ).toThrow(RouteConflictError);
+  });
+
+  it("force replaces the same-label member and keeps other members", () => {
+    const mainPid = spawnSleeper();
+    store.addRoute("app.localhost", 4001, mainPid, false, { label: "main" });
+    store.addRoute("app.localhost", 4002, spawnSleeper(), false, { label: "hotfix" });
+
+    const killed = store.addRoute("app.localhost", 4003, spawnSleeper(), true, { label: "main" });
+    expect(killed).toBe(mainPid);
+
+    const routes = store.loadRoutes();
+    expect(routes).toHaveLength(2);
+    const main = routes.find((r) => r.label === "main");
+    expect(main?.port).toBe(4003);
+    expect(routes.find((r) => r.label === "hotfix")?.port).toBe(4002);
+  });
+
+  it("removeRoute by owner pid removes only that member", () => {
+    const mainPid = spawnSleeper();
+    store.addRoute("app.localhost", 4001, mainPid, false, { label: "main" });
+    store.addRoute("app.localhost", 4002, spawnSleeper(), false, { label: "hotfix" });
+
+    store.removeRoute("app.localhost", mainPid);
+    const routes = store.loadRoutes();
+    expect(routes).toHaveLength(1);
+    expect(routes[0].label).toBe("hotfix");
+  });
+
+  it("removeRoute by label removes only the matching member", () => {
+    store.addRoute("app.localhost", 4001, spawnSleeper(), false, { label: "main" });
+    store.addRoute("app.localhost", 4002, spawnSleeper(), false, { label: "hotfix" });
+
+    store.removeRoute("app.localhost", undefined, { label: "hotfix" });
+    const routes = store.loadRoutes();
+    expect(routes).toHaveLength(1);
+    expect(routes[0].label).toBe("main");
+  });
+
+  it("persists the label across load", () => {
+    store.addRoute("app.localhost", 4001, spawnSleeper(), false, { label: "main" });
+    const reloaded = new RouteStore(tmpDir).loadRoutes();
+    expect(reloaded[0].label).toBe("main");
+  });
+
+  it("treats an empty label as a sole-owner route", () => {
+    store.addRoute("app.localhost", 4001, spawnSleeper(), false, { label: "   " });
+    const routes = store.loadRoutes();
+    expect(routes[0].label).toBeUndefined();
+    expect(isAlive(sleepers[0])).toBe(true);
+  });
+});
