@@ -196,22 +196,26 @@ The suffix may be a single label such as `test` or a dotted suffix such as `serv
 
 ### Environment variables
 
-| Variable              | Description                                                                 |
-| --------------------- | --------------------------------------------------------------------------- |
-| `PORTLESS_PORT`       | Override the default proxy port (default: 443 with HTTPS, 80 without)       |
-| `PORTLESS_APP_PORT`   | Use a fixed app port; browser-blocked ports are rejected                    |
-| `PORTLESS_HTTPS`      | HTTPS on by default; set to `0` to disable (same as `--no-tls`)             |
-| `PORTLESS_LAN`        | Set to `1` to always enable LAN mode (auto-detects LAN IP)                  |
-| `PORTLESS_LAN_IP`     | Pin a specific LAN IP for LAN mode                                          |
-| `PORTLESS_SUFFIX`     | Use a custom suffix instead of localhost (e.g. test, acme.com)              |
-| `PORTLESS_TLD`        | Compatibility alias for `PORTLESS_SUFFIX`                                   |
-| `PORTLESS_WILDCARD`   | Set to `1` to allow unregistered subdomains to fall back to parent          |
-| `PORTLESS_SYNC_HOSTS` | Set to `0` to disable auto-sync of /etc/hosts (on by default)               |
-| `PORTLESS_TAILSCALE`  | Set to `1` to share apps on your Tailscale network (same as `--tailscale`)  |
-| `PORTLESS_FUNNEL`     | Set to `1` to share apps publicly via Tailscale Funnel (same as `--funnel`) |
-| `PORTLESS_NGROK`      | Set to `1` to share apps publicly via ngrok (same as `--ngrok`)             |
-| `PORTLESS_STATE_DIR`  | Override the state directory                                                |
-| `PORTLESS=0`          | Bypass the proxy, run the command directly                                  |
+| Variable                    | Description                                                                 |
+| --------------------------- | --------------------------------------------------------------------------- |
+| `PORTLESS_PORT`             | Override the default proxy port (default: 443 with HTTPS, 80 without)       |
+| `PORTLESS_APP_PORT`         | Use a fixed app port; browser-blocked ports are rejected                    |
+| `PORTLESS_HTTPS`            | HTTPS on by default; set to `0` to disable (same as `--no-tls`)             |
+| `PORTLESS_LAN`              | Set to `1` to always enable LAN mode (auto-detects LAN IP)                  |
+| `PORTLESS_LAN_IP`           | Pin a specific LAN IP for LAN mode                                          |
+| `PORTLESS_SUFFIX`           | Use a custom suffix instead of localhost (e.g. test, acme.com)              |
+| `PORTLESS_TLD`              | Compatibility alias for `PORTLESS_SUFFIX`                                   |
+| `PORTLESS_WILDCARD`         | Set to `1` to allow unregistered subdomains to fall back to parent          |
+| `PORTLESS_SYNC_HOSTS`       | Set to `0` to disable auto-sync of /etc/hosts (on by default)               |
+| `PORTLESS_TAILSCALE`        | Set to `1` to share apps on your Tailscale network (same as `--tailscale`)  |
+| `PORTLESS_FUNNEL`           | Set to `1` to share apps publicly via Tailscale Funnel (same as `--funnel`) |
+| `PORTLESS_NGROK`            | Set to `1` to share apps publicly via ngrok (same as `--ngrok`)             |
+| `PORTLESS_NETBIRD`          | Set to `1` to share apps publicly via NetBird (same as `--netbird`)         |
+| `PORTLESS_NETBIRD_PASSWORD` | Require a password for the NetBird public URL                               |
+| `PORTLESS_NETBIRD_PIN`      | Require a PIN for the NetBird public URL                                    |
+| `PORTLESS_NETBIRD_GROUPS`   | Restrict the NetBird public URL to comma-separated user groups              |
+| `PORTLESS_STATE_DIR`        | Override the state directory                                                |
+| `PORTLESS=0`                | Bypass the proxy, run the command directly                                  |
 
 ### HTTP/2 + HTTPS
 
@@ -280,6 +284,29 @@ portless myapp --ngrok next dev
 
 Set `PORTLESS_NGROK=1` to enable ngrok by default when portless runs an app. `portless list` shows both local and ngrok URLs. The ngrok tunnel is cleaned up when the app exits. Requires the `ngrok` CLI to be installed and authenticated with `ngrok config add-authtoken <token>`.
 
+### NetBird sharing
+
+Expose a dev server to the public internet with NetBird Peer Expose using `--netbird`:
+
+```bash
+portless myapp --netbird next dev
+# -> https://myapp.localhost            (local)
+# -> https://myapp-a1b2c3.netbird.cloud (public internet)
+```
+
+NetBird URLs are public reverse proxy URLs. Prefer restricted exposure for public prod-like servers:
+
+```bash
+portless myapp --netbird --netbird-groups team next dev
+portless myapp --netbird-password secret --netbird-pin 123456 next dev
+```
+
+Set `PORTLESS_NETBIRD=1` to enable NetBird by default when portless runs an app. Setting `PORTLESS_NETBIRD_PASSWORD`, `PORTLESS_NETBIRD_PIN`, or `PORTLESS_NETBIRD_GROUPS` also enables NetBird sharing. `portless list` shows both local and NetBird URLs. The NetBird expose process is cleaned up when the app exits.
+
+Portless keeps the child app bound to `127.0.0.1` by default, even when NetBird sharing is active. Do not broaden the bind address unless the user has explicitly chosen that tradeoff.
+
+Requires the `netbird` CLI to be installed, connected, and allowed to use Peer Expose.
+
 ## OS startup service
 
 Use the service command when users want the proxy to start automatically after reboot:
@@ -342,6 +369,7 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 | `portless <name> --tailscale <cmd>`    | Share the app on your Tailscale network (tailnet)              |
 | `portless <name> --funnel <cmd>`       | Share the app publicly via Tailscale Funnel                    |
 | `portless <name> --ngrok <cmd>`        | Share the app publicly via ngrok                               |
+| `portless <name> --netbird <cmd>`      | Share the app publicly via NetBird Peer Expose                 |
 | `portless <name> --force <cmd>`        | Kill the existing process and take over its route              |
 | `portless --name <name> <cmd>`         | Force `<name>` as app name (bypasses subcommand dispatch)      |
 | `portless <name> KEY=value <cmd>`      | Pass `KEY` only to the child command                           |
@@ -527,6 +555,17 @@ ngrok config add-authtoken <token>    # Configure authentication
 
 Requires the ngrok CLI to be installed (https://ngrok.com/download) and on PATH.
 
+### NetBird not working
+
+If `--netbird` fails:
+
+```bash
+netbird status --json                  # Check if installed and connected
+netbird expose 3000                    # Check whether Peer Expose is allowed
+```
+
+Requires the NetBird CLI to be installed (https://netbird.io/download), connected, and allowed to expose services.
+
 ### Requirements
 
 - Node.js 24+
@@ -534,3 +573,4 @@ Requires the ngrok CLI to be installed (https://ngrok.com/download) and on PATH.
 - `openssl` (for `--https` cert generation; ships with macOS and most Linux distributions; on Windows, install via `winget install -e --id ShiningLight.OpenSSL.Dev` or use the copy bundled with Git for Windows)
 - `tailscale` CLI (optional, for `--tailscale` and `--funnel`)
 - `ngrok` CLI (optional, for `--ngrok`)
+- `netbird` CLI (optional, for `--netbird`)

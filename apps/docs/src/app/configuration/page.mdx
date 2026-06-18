@@ -235,6 +235,26 @@ const stable = await getUrl("backend", { worktree: false });
       <td>off</td>
     </tr>
     <tr>
+      <td>`PORTLESS_NETBIRD`</td>
+      <td>Set to `1` to share apps publicly via NetBird</td>
+      <td>off</td>
+    </tr>
+    <tr>
+      <td>`PORTLESS_NETBIRD_PASSWORD`</td>
+      <td>Require a password for the NetBird public URL</td>
+      <td>unset</td>
+    </tr>
+    <tr>
+      <td>`PORTLESS_NETBIRD_PIN`</td>
+      <td>Require a PIN for the NetBird public URL</td>
+      <td>unset</td>
+    </tr>
+    <tr>
+      <td>`PORTLESS_NETBIRD_GROUPS`</td>
+      <td>Restrict the NetBird public URL to comma-separated user groups</td>
+      <td>unset</td>
+    </tr>
+    <tr>
       <td>`PORTLESS`</td>
       <td>Set to `0` to bypass the proxy</td>
       <td>enabled</td>

@@ -35,6 +35,8 @@ export interface RouteMapping extends RouteInfo {
   tailscaleFunnel?: boolean;
   ngrokUrl?: string;
   ngrokPid?: number;
+  netbirdUrl?: string;
+  netbirdPid?: number;
 }
 
 type RouteMetadataPatch = {
@@ -43,6 +45,8 @@ type RouteMetadataPatch = {
   tailscaleFunnel?: boolean | null;
   ngrokUrl?: string | null;
   ngrokPid?: number | null;
+  netbirdUrl?: string | null;
+  netbirdPid?: number | null;
 };
 
 /** Runtime check that a parsed JSON value is a valid RouteMapping. */
@@ -346,6 +350,14 @@ export class RouteStore {
       if ("ngrokPid" in fields) {
         if (fields.ngrokPid === null) delete route.ngrokPid;
         else if (fields.ngrokPid !== undefined) route.ngrokPid = fields.ngrokPid;
+      }
+      if ("netbirdUrl" in fields) {
+        if (fields.netbirdUrl === null) delete route.netbirdUrl;
+        else if (fields.netbirdUrl !== undefined) route.netbirdUrl = fields.netbirdUrl;
+      }
+      if ("netbirdPid" in fields) {
+        if (fields.netbirdPid === null) delete route.netbirdPid;
+        else if (fields.netbirdPid !== undefined) route.netbirdPid = fields.netbirdPid;
       }
       this.saveRoutes(routes);
     } finally {

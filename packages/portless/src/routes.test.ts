@@ -511,4 +511,36 @@ describe("RouteStore", () => {
       expect(routes[0].ngrokPid).toBeUndefined();
     });
   });
+
+  describe("netbird metadata", () => {
+    it("persists and loads netbird fields via updateRoute", () => {
+      store.addRoute("myapp.localhost", 4123, process.pid);
+      store.updateRoute("myapp.localhost", {
+        netbirdUrl: "https://myapp.proxy.example.com",
+        netbirdPid: 12345,
+      });
+
+      const routes = store.loadRoutes();
+      expect(routes).toHaveLength(1);
+      expect(routes[0].netbirdUrl).toBe("https://myapp.proxy.example.com");
+      expect(routes[0].netbirdPid).toBe(12345);
+    });
+
+    it("clears netbird fields via updateRoute", () => {
+      store.addRoute("myapp.localhost", 4123, process.pid);
+      store.updateRoute("myapp.localhost", {
+        netbirdUrl: "https://myapp.proxy.example.com",
+        netbirdPid: 12345,
+      });
+      store.updateRoute("myapp.localhost", {
+        netbirdUrl: null,
+        netbirdPid: null,
+      });
+
+      const routes = store.loadRoutes();
+      expect(routes).toHaveLength(1);
+      expect(routes[0].netbirdUrl).toBeUndefined();
+      expect(routes[0].netbirdPid).toBeUndefined();
+    });
+  });
 });

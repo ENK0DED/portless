@@ -380,6 +380,29 @@ Set `PORTLESS_NGROK=1` in your shell profile or `.env` to enable ngrok by defaul
 
 Requires the ngrok CLI to be installed and authenticated. If ngrok reports an authentication error, run `ngrok config add-authtoken <token>` and try again.
 
+## NetBird sharing
+
+Expose your dev server to the public internet with [NetBird Peer Expose](https://docs.netbird.io/):
+
+```bash
+portless myapp --netbird next dev
+# -> https://myapp.localhost           (local)
+# -> https://myapp-a1b2c3.netbird.cloud (public)
+```
+
+NetBird URLs are public reverse proxy URLs. Use `--netbird-password`, `--netbird-pin`, or `--netbird-groups` to restrict access:
+
+```bash
+portless myapp --netbird --netbird-groups team next dev
+portless myapp --netbird-password secret --netbird-pin 123456 next dev
+```
+
+Set `PORTLESS_NETBIRD=1` in your shell profile or `.env` to enable NetBird by default when portless runs an app. Setting `PORTLESS_NETBIRD_PASSWORD`, `PORTLESS_NETBIRD_PIN`, or `PORTLESS_NETBIRD_GROUPS` also enables NetBird sharing. `portless list` shows both local and NetBird URLs. The NetBird expose process is cleaned up automatically when the app exits.
+
+Portless keeps the child app bound to `127.0.0.1` by default, even when NetBird sharing is active. The NetBird reverse proxy reaches the assigned local app port while the app itself is not opened on every network interface by portless.
+
+Requires the NetBird CLI to be installed and connected, with Peer Expose enabled and allowed for the active peer.
+
 ## Commands
 
 ```bash
@@ -449,6 +472,10 @@ portless service uninstall       # Remove the startup service
 --tailscale                      Share the app on your Tailscale network (tailnet)
 --funnel                         Share the app publicly via Tailscale Funnel
 --ngrok                          Share the app publicly via ngrok
+--netbird                        Share the app publicly via NetBird Peer Expose
+--netbird-password <string>      Require a password for the NetBird public URL
+--netbird-pin <code>             Require a PIN for the NetBird public URL
+--netbird-groups <csv>           Restrict the NetBird URL to user groups
 --force                          Kill the existing process and take over its route
 --name <name>                    Use <name> as the app name
 ```
@@ -469,6 +496,10 @@ PORTLESS_SYNC_HOSTS=0            Disable auto-sync of /etc/hosts (on by default)
 PORTLESS_TAILSCALE=1             Share apps on your Tailscale network (same as --tailscale)
 PORTLESS_FUNNEL=1                Share apps publicly via Tailscale Funnel (same as --funnel)
 PORTLESS_NGROK=1                 Share apps publicly via ngrok (same as --ngrok)
+PORTLESS_NETBIRD=1               Share apps publicly via NetBird (same as --netbird)
+PORTLESS_NETBIRD_PASSWORD=<s>    Require a password for the NetBird public URL
+PORTLESS_NETBIRD_PIN=<code>      Require a PIN for the NetBird public URL
+PORTLESS_NETBIRD_GROUPS=<csv>    Restrict the NetBird URL to user groups
 PORTLESS_STATE_DIR=<path>        Override the state directory
 
 # Injected into child processes
@@ -478,6 +509,7 @@ HOST                             Usually 127.0.0.1 (omitted for Expo in LAN mode
 PORTLESS_URL                     Public URL (e.g. https://myapp.localhost)
 PORTLESS_TAILSCALE_URL           Tailscale URL of the app (when --tailscale is active)
 PORTLESS_NGROK_URL               ngrok URL of the app (when --ngrok is active)
+PORTLESS_NETBIRD_URL             NetBird URL of the app (when --netbird is active)
 NODE_EXTRA_CA_CERTS              Path to the portless CA (when HTTPS is active)
 ```
 
@@ -599,3 +631,4 @@ See [FORK.md](./FORK.md) for the full list of fork-owned invariants and the upst
 - macOS, Linux, or Windows
 - Tailscale CLI (optional, for `--tailscale` and `--funnel`)
 - ngrok CLI (optional, for `--ngrok`)
+- NetBird CLI (optional, for `--netbird`)

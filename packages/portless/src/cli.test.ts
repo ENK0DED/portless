@@ -2258,4 +2258,61 @@ describe("CLI", () => {
       }
     });
   });
+
+  describe("--netbird flag", () => {
+    it("shows --netbird and auth flags in help output", () => {
+      const { status, stdout } = run(["--help"]);
+      expect(status).toBe(0);
+      expect(stdout).toContain("--netbird");
+      expect(stdout).toContain("--netbird-password");
+      expect(stdout).toContain("--netbird-pin");
+      expect(stdout).toContain("--netbird-groups");
+      expect(stdout).toContain("PORTLESS_NETBIRD");
+      expect(stdout).toContain("PORTLESS_NETBIRD_URL");
+    });
+
+    it("fails with actionable message when netbird is not installed", () => {
+      const { status, stderr } = run(["--netbird", "myapp", "echo", "hello"], {
+        env: { PATH: "/tmp/portless-no-netbird-path" },
+      });
+      expect(status).toBe(1);
+      expect(stderr).toContain("NetBird CLI not found");
+    });
+
+    it("accepts auth flags before app name and implies NetBird sharing", () => {
+      const { status, stderr } = run(
+        [
+          "--netbird-password",
+          "secret",
+          "--netbird-pin",
+          "123456",
+          "--netbird-groups",
+          "devops,Backend",
+          "myapp",
+          "echo",
+          "hello",
+        ],
+        {
+          env: { PATH: "/tmp/portless-no-netbird-path" },
+        }
+      );
+      expect(status).toBe(1);
+      expect(stderr).toContain("NetBird CLI not found");
+    });
+
+    it("accepts --netbird in run subcommand", () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-cli-netbird-run-"));
+      try {
+        fs.writeFileSync(path.join(tmpDir, "package.json"), JSON.stringify({ name: "test-app" }));
+        const { status, stderr } = run(["run", "--netbird", "echo", "hello"], {
+          cwd: tmpDir,
+          env: { PATH: "/tmp/portless-no-netbird-path" },
+        });
+        expect(status).toBe(1);
+        expect(stderr).toContain("NetBird CLI not found");
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+  });
 });

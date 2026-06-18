@@ -24,6 +24,12 @@ import {
 } from "./tailscale.js";
 import { ensureNgrokAvailable, startNgrok, stopNgrok, stopNgrokProcess } from "./ngrok.js";
 import {
+  ensureNetbirdReady,
+  startNetbirdExpose,
+  stopNetbird,
+  stopNetbirdExpose,
+} from "./netbird.js";
+import {
   inferProjectName,
   detectWorktreePrefix,
   truncateLabel,
@@ -421,6 +427,32 @@ function runServiceUninstallWithSudo(reason: string): boolean {
 
 function isEnabledEnv(value: string | undefined): boolean {
   return value === "1" || value === "true";
+}
+
+function hasNetbirdConfigEnv(env: NodeJS.ProcessEnv = process.env): boolean {
+  return !!(
+    env.PORTLESS_NETBIRD_PASSWORD ||
+    env.PORTLESS_NETBIRD_PIN ||
+    env.PORTLESS_NETBIRD_GROUPS
+  );
+}
+
+function parseCsvEnv(value: string | undefined): string[] {
+  if (!value) return [];
+  return value
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function buildNetbirdNamePrefix(hostname: string): string {
+  const prefix = hostname
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 32)
+    .replace(/-+$/g, "");
+  return prefix || "portless";
 }
 
 function formatProcessExitSuffix(code: number | null, signal: NodeJS.Signals | null): string {
@@ -879,6 +911,9 @@ function listRoutes(store: RouteStore, proxyPort: number, tls: boolean, asJson =
     if (route.ngrokUrl) {
       console.log(`    ${colors.gray("ngrok:")} ${colors.green(route.ngrokUrl)}`);
     }
+    if (route.netbirdUrl) {
+      console.log(`    ${colors.gray("netbird:")} ${colors.green(route.netbirdUrl)}`);
+    }
   }
   console.log();
 }
@@ -1053,6 +1088,7 @@ async function runApp(
   const wantsFunnel = isEnabledEnv(process.env.PORTLESS_FUNNEL);
   const wantsTailscale = wantsFunnel || isEnabledEnv(process.env.PORTLESS_TAILSCALE);
   const wantsNgrok = isEnabledEnv(process.env.PORTLESS_NGROK);
+  const wantsNetbird = isEnabledEnv(process.env.PORTLESS_NETBIRD) || hasNetbirdConfigEnv();
   let tsBaseUrl: string | undefined;
 
   if (wantsTailscale) {
@@ -1083,6 +1119,21 @@ async function runApp(
       console.error(colors.red(`Error: ${message}`));
       if (message.includes("not found")) {
         console.error(colors.blue("Install ngrok: https://ngrok.com/download"));
+      }
+      process.exit(1);
+    }
+  }
+
+  if (wantsNetbird) {
+    try {
+      ensureNetbirdReady();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(colors.red(`Error: ${message}`));
+      if (message.includes("not found")) {
+        console.error(colors.blue("Install NetBird: https://netbird.io/download"));
+      } else if (message.includes("not connected")) {
+        console.error(colors.blue("Make sure NetBird is connected before using --netbird."));
       }
       process.exit(1);
     }
@@ -1189,12 +1240,44 @@ async function runApp(
   // Readiness was already checked at the top of runApp().
   let tailscaleHttpsPort: number | undefined;
   let tailscaleUrl: string | undefined;
+  let netbirdUrl: string | undefined;
+  let netbirdProcess: Awaited<ReturnType<typeof startNetbirdExpose>> | undefined;
   let ngrokUrl: string | undefined;
   let ngrokProcess: Awaited<ReturnType<typeof startNgrok>> | undefined;
+  let stoppingNetbird = false;
+  let netbirdRouteReady = false;
+  let netbirdExitHandled = false;
+  let pendingNetbirdExit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
   let stoppingNgrok = false;
   let ngrokRouteReady = false;
   let ngrokExitHandled = false;
   let pendingNgrokExit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+
+  const handleNetbirdExit = (code: number | null, signal: NodeJS.Signals | null) => {
+    if (stoppingNetbird || netbirdExitHandled) return;
+    if (!netbirdRouteReady) {
+      pendingNetbirdExit = { code, signal };
+      return;
+    }
+    netbirdExitHandled = true;
+    netbirdUrl = undefined;
+    console.warn(
+      colors.yellow(
+        `Warning: NetBird expose for ${hostname} stopped${formatProcessExitSuffix(
+          code,
+          signal
+        )}. Removing its public URL from the route list.`
+      )
+    );
+    try {
+      store.updateRoute(hostname, {
+        netbirdUrl: null,
+        netbirdPid: null,
+      });
+    } catch {
+      // Best-effort cleanup; non-fatal
+    }
+  };
 
   const handleNgrokExit = (code: number | null, signal: NodeJS.Signals | null) => {
     if (stoppingNgrok || ngrokExitHandled) return;
@@ -1265,6 +1348,72 @@ async function runApp(
     }
   }
 
+  if (wantsNetbird) {
+    const netbirdGroups = parseCsvEnv(process.env.PORTLESS_NETBIRD_GROUPS);
+    if (
+      !process.env.PORTLESS_NETBIRD_PASSWORD &&
+      !process.env.PORTLESS_NETBIRD_PIN &&
+      netbirdGroups.length === 0
+    ) {
+      console.warn(
+        colors.yellow(
+          "Warning: NetBird will expose this app through a public reverse proxy without NetBird auth restrictions. Use --netbird-password, --netbird-pin, or --netbird-groups to restrict access."
+        )
+      );
+    }
+    try {
+      netbirdProcess = await startNetbirdExpose(port, {
+        namePrefix: buildNetbirdNamePrefix(hostname),
+        password: process.env.PORTLESS_NETBIRD_PASSWORD,
+        pin: process.env.PORTLESS_NETBIRD_PIN,
+        groups: netbirdGroups,
+        onExit: handleNetbirdExit,
+      });
+      netbirdUrl = netbirdProcess.info.url;
+      console.log(chalk.green(`  NetBird -> ${netbirdUrl}`));
+      console.log(chalk.gray("  (accessible from the public internet via NetBird)\n"));
+
+      try {
+        store.updateRoute(hostname, {
+          netbirdUrl,
+          netbirdPid: netbirdProcess.pid,
+        });
+      } catch {
+        // Non-fatal: route display metadata only
+      } finally {
+        netbirdRouteReady = true;
+        if (pendingNetbirdExit) {
+          handleNetbirdExit(pendingNetbirdExit.code, pendingNetbirdExit.signal);
+          pendingNetbirdExit = undefined;
+        }
+      }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(colors.red(`Error: ${message}`));
+      if (message.includes("not found")) {
+        console.error(colors.blue("Install NetBird: https://netbird.io/download"));
+      } else if (message.includes("Peer Expose")) {
+        console.error(
+          colors.blue("Check that NetBird Peer Expose is enabled and allowed for this peer.")
+        );
+      }
+      try {
+        unregisterTailscale({
+          tailscaleHttpsPort,
+          tailscaleFunnel: wantsFunnel || undefined,
+        });
+      } catch {
+        // Best-effort cleanup; non-fatal
+      }
+      try {
+        store.removeRoute(hostname, process.pid);
+      } catch {
+        // Best-effort cleanup; non-fatal
+      }
+      process.exit(1);
+    }
+  }
+
   if (wantsNgrok) {
     try {
       ngrokProcess = await startNgrok(port, {
@@ -1298,6 +1447,8 @@ async function runApp(
         console.error(colors.blue("Configure ngrok authentication:"));
         console.error(colors.cyan("  ngrok config add-authtoken <token>"));
       }
+      stoppingNetbird = true;
+      stopNetbirdExpose(netbirdProcess);
       try {
         unregisterTailscale({
           tailscaleHttpsPort,
@@ -1385,10 +1536,13 @@ async function runApp(
       ...(lanMode ? { PORTLESS_LAN: "1" } : {}),
       ...(tailscaleUrl ? { PORTLESS_TAILSCALE_URL: tailscaleUrl } : {}),
       ...(ngrokUrl ? { PORTLESS_NGROK_URL: ngrokUrl } : {}),
+      ...(netbirdUrl ? { PORTLESS_NETBIRD_URL: netbirdUrl } : {}),
       ...caEnv,
     },
     onCleanup: () => {
+      stoppingNetbird = true;
       stoppingNgrok = true;
+      stopNetbirdExpose(netbirdProcess);
       stopNgrokProcess(ngrokProcess?.child);
       try {
         unregisterTailscale({
@@ -1487,6 +1641,12 @@ function rejectBlockedAppPort(port: number, source: string): void {
   process.exit(1);
 }
 
+const NETBIRD_VALUE_FLAGS: ReadonlyMap<string, string> = new Map([
+  ["--netbird-password", "PORTLESS_NETBIRD_PASSWORD"],
+  ["--netbird-pin", "PORTLESS_NETBIRD_PIN"],
+  ["--netbird-groups", "PORTLESS_NETBIRD_GROUPS"],
+] as const);
+
 function applySharingFlag(flag: string): boolean {
   if (flag === "--tailscale") {
     process.env.PORTLESS_TAILSCALE = "1";
@@ -1501,7 +1661,24 @@ function applySharingFlag(flag: string): boolean {
     process.env.PORTLESS_NGROK = "1";
     return true;
   }
+  if (flag === "--netbird") {
+    process.env.PORTLESS_NETBIRD = "1";
+    return true;
+  }
   return false;
+}
+
+function applyNetbirdValueFlag(args: string[], index: number): number | null {
+  const envKey = NETBIRD_VALUE_FLAGS.get(args[index]);
+  if (!envKey) return null;
+  const value = args[index + 1];
+  if (!value || value.startsWith("-")) {
+    console.error(colors.red(`Error: ${args[index]} requires a value.`));
+    process.exit(1);
+  }
+  process.env.PORTLESS_NETBIRD = "1";
+  process.env[envKey] = value;
+  return index + 1;
 }
 
 function parseEnvAssignment(token: string): [string, string] | null {
@@ -1571,6 +1748,10 @@ ${colors.bold("Options:")}
   --tailscale            Share the app on your Tailscale network (tailnet)
   --funnel               Share the app publicly via Tailscale Funnel
   --ngrok                Share the app publicly via ngrok
+  --netbird              Share the app publicly via NetBird Peer Expose
+  --netbird-password <s> Require a password for the NetBird public URL
+  --netbird-pin <code>   Require a PIN for the NetBird public URL
+  --netbird-groups <csv> Restrict the NetBird URL to user groups
   --help, -h             Show this help
 
 ${colors.bold("Name inference (in order):")}
@@ -1618,13 +1799,18 @@ ${colors.bold("Examples:")}
     } else if (applySharingFlag(args[i])) {
       // handled
     } else {
-      console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
-      console.error(
-        colors.blue(
-          "Known flags: --name, --force, --app-port, --tailscale, --funnel, --ngrok, --help"
-        )
-      );
-      process.exit(1);
+      const consumedIndex = applyNetbirdValueFlag(args, i);
+      if (consumedIndex !== null) {
+        i = consumedIndex;
+      } else {
+        console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
+        console.error(
+          colors.blue(
+            "Known flags: --name, --force, --app-port, --tailscale, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups, --help"
+          )
+        );
+        process.exit(1);
+      }
     }
     i++;
   }
@@ -1667,11 +1853,18 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
     } else if (applySharingFlag(args[i])) {
       // handled
     } else {
-      console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
-      console.error(
-        colors.blue("Known flags: --force, --app-port, --tailscale, --funnel, --ngrok")
-      );
-      process.exit(1);
+      const consumedIndex = applyNetbirdValueFlag(args, i);
+      if (consumedIndex !== null) {
+        i = consumedIndex;
+      } else {
+        console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
+        console.error(
+          colors.blue(
+            "Known flags: --force, --app-port, --tailscale, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups"
+          )
+        );
+        process.exit(1);
+      }
     }
     i++;
   }
@@ -1696,11 +1889,18 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
     } else if (applySharingFlag(args[i])) {
       // handled
     } else {
-      console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
-      console.error(
-        colors.blue("Known flags: --force, --app-port, --tailscale, --funnel, --ngrok")
-      );
-      process.exit(1);
+      const consumedIndex = applyNetbirdValueFlag(args, i);
+      if (consumedIndex !== null) {
+        i = consumedIndex;
+      } else {
+        console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
+        console.error(
+          colors.blue(
+            "Known flags: --force, --app-port, --tailscale, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups"
+          )
+        );
+        process.exit(1);
+      }
     }
     i++;
   }
@@ -1773,6 +1973,7 @@ ${colors.bold("Examples:")}
   portless myapp --tailscale next dev # -> also https://<node>.ts.net (tailnet)
   portless myapp --funnel next dev    # -> also https://<node>.ts.net (public)
   portless myapp --ngrok next dev     # -> also https://<random>.ngrok.app (public)
+  portless myapp --netbird next dev   # -> also https://<name>.netbird.cloud (public)
 
 ${colors.bold("Configuration (portless.json or .config/portless.json):")}
   Optional. Portless works out of the box by running the "dev" script
@@ -1839,6 +2040,15 @@ ${colors.bold("ngrok sharing:")}
   Requires the ngrok CLI to be installed and authenticated.
   ${colors.cyan("portless myapp --ngrok next dev")}
 
+${colors.bold("NetBird sharing:")}
+  Use --netbird to expose your dev server to the public internet with
+  NetBird Peer Expose. Requires the NetBird CLI to be installed, connected,
+  and allowed to expose services.
+  NetBird URLs are public reverse-proxy URLs. Use --netbird-password,
+  --netbird-pin, or --netbird-groups to restrict access.
+  Portless keeps the child app bound to 127.0.0.1 by default.
+  ${colors.cyan("portless myapp --netbird --netbird-groups team next dev")}
+
 ${colors.bold("Options:")}
   run [--name <name>] <cmd>      Infer project name (or override with --name)
                                 Adds worktree prefix in git worktrees
@@ -1862,6 +2072,10 @@ ${colors.bold("Options:")}
   --tailscale                   Share the app on your Tailscale network (tailnet)
   --funnel                      Share the app publicly via Tailscale Funnel
   --ngrok                       Share the app publicly via ngrok
+  --netbird                     Share the app publicly via NetBird Peer Expose
+  --netbird-password <string>   Require a password for the NetBird public URL
+  --netbird-pin <code>          Require a PIN for the NetBird public URL
+  --netbird-groups <csv>        Restrict the NetBird URL to user groups
   --force                       Kill the existing process and take over its route
   --name <name>                 Use <name> as the app name (bypasses subcommand dispatch)
   --                            Stop flag parsing; everything after is passed to the child
@@ -1880,6 +2094,10 @@ ${colors.bold("Environment variables:")}
   PORTLESS_TAILSCALE=1          Share apps on your Tailscale network (same as --tailscale)
   PORTLESS_FUNNEL=1             Share apps publicly via Tailscale Funnel (same as --funnel)
   PORTLESS_NGROK=1              Share apps publicly via ngrok (same as --ngrok)
+  PORTLESS_NETBIRD=1            Share apps publicly via NetBird (same as --netbird)
+  PORTLESS_NETBIRD_PASSWORD=<s> Require a password for the NetBird public URL
+  PORTLESS_NETBIRD_PIN=<code>   Require a PIN for the NetBird public URL
+  PORTLESS_NETBIRD_GROUPS=<csv> Restrict the NetBird URL to user groups
   PORTLESS_STATE_DIR=<path>     Override the state directory
   PORTLESS=0                    Run command directly without proxy
 
@@ -1892,6 +2110,7 @@ ${colors.bold("Child process environment:")}
   PORTLESS_LAN                  Set to 1 when proxy is in LAN mode
   PORTLESS_TAILSCALE_URL        Tailscale URL of the app (when --tailscale is active)
   PORTLESS_NGROK_URL            ngrok URL of the app (when --ngrok is active)
+  PORTLESS_NETBIRD_URL          NetBird URL of the app (when --netbird is active)
   NODE_EXTRA_CA_CERTS           Path to the portless CA (set when HTTPS is active)
 
 ${colors.bold("Command placeholders:")}
@@ -2050,6 +2269,10 @@ ${colors.bold("Options:")}
       stopNgrok(route);
       console.log(colors.green(`Stopped ngrok tunnel for ${route.hostname}.`));
     }
+    if (route.netbirdPid) {
+      stopNetbird(route);
+      console.log(colors.green(`Stopped NetBird expose for ${route.hostname}.`));
+    }
   }
 
   const stateDirs = collectStateDirsForCleanup();
@@ -2142,6 +2365,10 @@ ${colors.bold("Options:")}
     if (route.ngrokPid) {
       stopNgrok(route);
       console.log(`  ${route.hostname} - stopped ngrok tunnel`);
+    }
+    if (route.netbirdPid) {
+      stopNetbird(route);
+      console.log(`  ${route.hostname} - stopped NetBird expose`);
     }
   }
 
@@ -3880,6 +4107,20 @@ async function main() {
   }
   if (stripGlobalFlag("--ngrok", false)) {
     process.env.PORTLESS_NGROK = "1";
+  }
+  if (stripGlobalFlag("--netbird", false)) {
+    process.env.PORTLESS_NETBIRD = "1";
+  }
+  for (const [flag, envKey] of NETBIRD_VALUE_FLAGS) {
+    const value = stripGlobalFlag(flag, true);
+    if (value === false) {
+      console.error(colors.red(`Error: ${flag} requires a value.`));
+      process.exit(1);
+    }
+    if (typeof value === "string") {
+      process.env.PORTLESS_NETBIRD = "1";
+      process.env[envKey] = value;
+    }
   }
 
   // --script flag: override the default "dev" script for zero-arg mode.

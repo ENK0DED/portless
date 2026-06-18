@@ -80,6 +80,22 @@ Supported placeholders are `{PORT}`, `{HOST}`, and `{PORTLESS_URL}`. Portless re
       <td>`--ngrok`</td>
       <td>Share the app publicly via ngrok.</td>
     </tr>
+    <tr>
+      <td>`--netbird`</td>
+      <td>Share the app publicly via NetBird Peer Expose.</td>
+    </tr>
+    <tr>
+      <td>`--netbird-password <string>`</td>
+      <td>Require a password for the NetBird public URL.</td>
+    </tr>
+    <tr>
+      <td>`--netbird-pin <code>`</td>
+      <td>Require a PIN for the NetBird public URL.</td>
+    </tr>
+    <tr>
+      <td>`--netbird-groups <csv>`</td>
+      <td>Restrict the NetBird public URL to user groups.</td>
+    </tr>
   </tbody>
 </table>
 
@@ -87,9 +103,12 @@ Supported placeholders are `{PORT}`, `{HOST}`, and `{PORTLESS_URL}`. Portless re
 portless myapp --tailscale next dev
 portless myapp --funnel next dev
 portless myapp --ngrok next dev
+portless myapp --netbird --netbird-groups team next dev
 ```
 
 Tailscale sharing requires the Tailscale CLI to be connected with MagicDNS and HTTPS certificates enabled on the active tailnet. Funnel also requires Funnel to be enabled for the tailnet and node.
+
+NetBird sharing requires the NetBird CLI to be connected, with Peer Expose enabled and allowed for the active peer. NetBird public URLs should be restricted with `--netbird-password`, `--netbird-pin`, or `--netbird-groups` when exposing production-like services.
 
 ## Get a service URL
 
