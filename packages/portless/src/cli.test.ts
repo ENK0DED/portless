@@ -1033,9 +1033,20 @@ describe("CLI", () => {
       it("stops a live background process gracefully", async () => {
         const appPort = await getFreePort();
         expect(
-          run(["bg", "start", "--name", "stop-web", "--app-port", String(appPort), ...longRunningCommand()], {
-            env: bgEnv(),
-          }).status
+          run(
+            [
+              "bg",
+              "start",
+              "--name",
+              "stop-web",
+              "--app-port",
+              String(appPort),
+              ...longRunningCommand(),
+            ],
+            {
+              env: bgEnv(),
+            }
+          ).status
         ).toBe(0);
         const [entry] = readBgRegistry(tmpDir);
 
@@ -1047,39 +1058,35 @@ describe("CLI", () => {
         expect(readBgRegistry(tmpDir)).toEqual([]);
       });
 
-      it(
-        "keeps the registry entry when graceful stop times out",
-        async () => {
-          const stubborn = spawn(
-            process.execPath,
-            ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"],
-            { detached: true, stdio: "ignore" }
-          );
-          stubborn.unref();
-          const id = "stubborn";
-          writeBgRegistry(tmpDir, [
-            makeBgEntry({
-              id,
-              label: "stubborn",
-              pid: stubborn.pid!,
-              state: "ready",
-            }),
-          ]);
+      it("keeps the registry entry when graceful stop times out", async () => {
+        const stubborn = spawn(
+          process.execPath,
+          ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"],
+          { detached: true, stdio: "ignore" }
+        );
+        stubborn.unref();
+        const id = "stubborn";
+        writeBgRegistry(tmpDir, [
+          makeBgEntry({
+            id,
+            label: "stubborn",
+            pid: stubborn.pid!,
+            state: "ready",
+          }),
+        ]);
 
-          const { status, stderr } = run(["bg", "stop", "stubborn"], { env: bgEnv() });
+        const { status, stderr } = run(["bg", "stop", "stubborn"], { env: bgEnv() });
 
-          expect(status).toBe(1);
-          expect(stderr).toContain("did not exit");
-          expect(readBgRegistry(tmpDir)).toHaveLength(1);
-          killProcessGroup(stubborn.pid!);
-          try {
-            process.kill(-stubborn.pid!, "SIGKILL");
-          } catch {
-            // Process may already be gone.
-          }
-        },
-        8000
-      );
+        expect(status).toBe(1);
+        expect(stderr).toContain("did not exit");
+        expect(readBgRegistry(tmpDir)).toHaveLength(1);
+        killProcessGroup(stubborn.pid!);
+        try {
+          process.kill(-stubborn.pid!, "SIGKILL");
+        } catch {
+          // Process may already be gone.
+        }
+      }, 8000);
 
       it("force stop removes only the exact route owned by the bg pid", async () => {
         const appPort = await getFreePort();
@@ -1114,9 +1121,13 @@ describe("CLI", () => {
           },
         ]);
 
-        expect(run(["bg", "stop", "exact", "--path", "/api", "--force"], { env: bgEnv() }).status).toBe(0);
+        expect(
+          run(["bg", "stop", "exact", "--path", "/api", "--force"], { env: bgEnv() }).status
+        ).toBe(0);
 
-        expect(readRoutesFile(tmpDir)).toEqual([{ hostname: "other.localhost", port: appPort, pid: 0 }]);
+        expect(readRoutesFile(tmpDir)).toEqual([
+          { hostname: "other.localhost", port: appPort, pid: 0 },
+        ]);
       });
 
       it("force stop does not kill unrelated processes on the same port", async () => {
@@ -1127,9 +1138,20 @@ describe("CLI", () => {
         });
         unrelated.unref();
         expect(
-          run(["bg", "start", "--name", "safe-stop", "--app-port", String(appPort), ...longRunningCommand()], {
-            env: bgEnv(),
-          }).status
+          run(
+            [
+              "bg",
+              "start",
+              "--name",
+              "safe-stop",
+              "--app-port",
+              String(appPort),
+              ...longRunningCommand(),
+            ],
+            {
+              env: bgEnv(),
+            }
+          ).status
         ).toBe(0);
 
         expect(run(["bg", "stop", "safe-stop", "--force"], { env: bgEnv() }).status).toBe(0);
@@ -1176,9 +1198,20 @@ describe("CLI", () => {
       it("bg clean removes dead entries and their logs", async () => {
         const appPort = await getFreePort();
         expect(
-          run(["bg", "start", "--name", "dead-clean", "--app-port", String(appPort), ...longRunningCommand()], {
-            env: bgEnv(),
-          }).status
+          run(
+            [
+              "bg",
+              "start",
+              "--name",
+              "dead-clean",
+              "--app-port",
+              String(appPort),
+              ...longRunningCommand(),
+            ],
+            {
+              env: bgEnv(),
+            }
+          ).status
         ).toBe(0);
         const [entry] = readBgRegistry(tmpDir);
         const logs = getBgLogPaths(tmpDir, entry.id);
@@ -1194,9 +1227,20 @@ describe("CLI", () => {
       it("bg clean does not stop live entries", async () => {
         const appPort = await getFreePort();
         expect(
-          run(["bg", "start", "--name", "live-clean", "--app-port", String(appPort), ...longRunningCommand()], {
-            env: bgEnv(),
-          }).status
+          run(
+            [
+              "bg",
+              "start",
+              "--name",
+              "live-clean",
+              "--app-port",
+              String(appPort),
+              ...longRunningCommand(),
+            ],
+            {
+              env: bgEnv(),
+            }
+          ).status
         ).toBe(0);
         const [entry] = readBgRegistry(tmpDir);
 
@@ -1209,9 +1253,20 @@ describe("CLI", () => {
       it("portless clean stops bg entries before removing state", async () => {
         const appPort = await getFreePort();
         expect(
-          run(["bg", "start", "--name", "clean-all", "--app-port", String(appPort), ...longRunningCommand()], {
-            env: bgEnv(),
-          }).status
+          run(
+            [
+              "bg",
+              "start",
+              "--name",
+              "clean-all",
+              "--app-port",
+              String(appPort),
+              ...longRunningCommand(),
+            ],
+            {
+              env: bgEnv(),
+            }
+          ).status
         ).toBe(0);
         const [entry] = readBgRegistry(tmpDir);
 
@@ -1225,14 +1280,36 @@ describe("CLI", () => {
         const livePort = await getFreePort();
         const deadPort = await getFreePort();
         expect(
-          run(["bg", "start", "--name", "live-prune", "--app-port", String(livePort), ...longRunningCommand()], {
-            env: bgEnv(),
-          }).status
+          run(
+            [
+              "bg",
+              "start",
+              "--name",
+              "live-prune",
+              "--app-port",
+              String(livePort),
+              ...longRunningCommand(),
+            ],
+            {
+              env: bgEnv(),
+            }
+          ).status
         ).toBe(0);
         expect(
-          run(["bg", "start", "--name", "dead-prune", "--app-port", String(deadPort), ...longRunningCommand()], {
-            env: bgEnv(),
-          }).status
+          run(
+            [
+              "bg",
+              "start",
+              "--name",
+              "dead-prune",
+              "--app-port",
+              String(deadPort),
+              ...longRunningCommand(),
+            ],
+            {
+              env: bgEnv(),
+            }
+          ).status
         ).toBe(0);
         const entries = readBgRegistry(tmpDir);
         const live = entries.find((entry) => entry.label === "live-prune")!;
