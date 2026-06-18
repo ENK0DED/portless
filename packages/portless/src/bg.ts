@@ -134,12 +134,53 @@ ${colors.bold("Background options:")}
 `);
 }
 
-function printSubcommandStubHelp(subcommand: string): void {
+function printBgStopHelp(): void {
   console.log(`
-${colors.bold(`portless bg ${subcommand}`)} - Background app management command.
+${colors.bold("portless bg stop")} - Stop a background app.
 
-This command is part of the background app management surface. Its runtime
-behavior is implemented by the follow-up lifecycle commits in this branch.
+${colors.bold("Usage:")}
+  ${colors.cyan("portless bg stop [name] [--path <prefix>] [--force] [--json]")}
+
+${colors.bold("Options:")}
+  --path <prefix>               Resolve a path-scoped background route
+  --force                       Send SIGKILL after graceful stop and clean exact owned route state
+  --json                        Print machine-readable output
+  --help, -h                    Show this help
+`);
+}
+
+function printBgRestartHelp(): void {
+  console.log(`
+${colors.bold("portless bg restart")} - Restart a background app.
+
+${colors.bold("Usage:")}
+  ${colors.cyan("portless bg restart [name] [--path <prefix>] [--force] [--wait [seconds]]")}
+  ${colors.cyan("portless bg restart [name] --no-wait")}
+
+${colors.bold("Options:")}
+  --path <prefix>               Resolve a path-scoped background route
+  --force                       Take over an existing portless-owned route
+  --wait [seconds]              Wait for readiness before returning (default: 30)
+  --no-wait                     Return after spawning without waiting for readiness
+  --keep                        Keep a timed-out child running
+  --json                        Print machine-readable output
+  --help, -h                    Show this help
+`);
+}
+
+function printBgCleanHelp(): void {
+  console.log(`
+${colors.bold("portless bg clean")} - Remove dead background entries.
+
+${colors.bold("Usage:")}
+  ${colors.cyan("portless bg clean [name] [--path <prefix>] [--json]")}
+  ${colors.cyan("portless bg clean --all [--json]")}
+
+${colors.bold("Options:")}
+  --path <prefix>               Resolve a path-scoped background route
+  --all                         Remove all dead background entries and their private logs
+  --json                        Print machine-readable output
+  --help, -h                    Show this help
 `);
 }
 
@@ -813,7 +854,7 @@ function parseStopArgs(args: string[]): {
 
 async function handleBgStop(args: string[]): Promise<void> {
   if (args[2] === "--help" || args[2] === "-h") {
-    printSubcommandStubHelp("stop");
+    printBgStopHelp();
     return;
   }
   let parsed: ReturnType<typeof parseStopArgs>;
@@ -892,7 +933,7 @@ async function handleBgRestart(
   options: { entryScript: string }
 ): Promise<void> {
   if (args[2] === "--help" || args[2] === "-h") {
-    printSubcommandStubHelp("restart");
+    printBgRestartHelp();
     return;
   }
   let parsed: ReturnType<typeof parseRestartArgs>;
@@ -962,7 +1003,7 @@ function parseCleanArgs(args: string[]): {
 
 async function handleBgClean(args: string[]): Promise<void> {
   if (args[2] === "--help" || args[2] === "-h") {
-    printSubcommandStubHelp("clean");
+    printBgCleanHelp();
     return;
   }
   let parsed: ReturnType<typeof parseCleanArgs>;

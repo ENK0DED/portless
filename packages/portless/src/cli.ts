@@ -2934,7 +2934,12 @@ ${colors.bold("Usage:")}
   ${colors.cyan("portless proxy stop")}              Stop the proxy
   ${colors.cyan("portless service install")}         Start proxy automatically when the OS starts
   ${colors.cyan("portless bg start")}                Start an app in the background
-  ${colors.cyan("portless bg stop <name>")}          Stop a background app
+  ${colors.cyan("portless bg status [name]")}        Show background app status
+  ${colors.cyan("portless bg list")}                 List background apps
+  ${colors.cyan("portless bg logs [name]")}          Print background app logs
+  ${colors.cyan("portless bg stop [name]")}          Stop a background app
+  ${colors.cyan("portless bg restart [name]")}       Restart a background app
+  ${colors.cyan("portless bg clean [name]")}         Remove dead background entries
   ${colors.cyan("portless get <name>")}              Print URL for a service (for cross-service refs)
   ${colors.cyan("portless get <name> --json")}       Print service info as JSON
   ${colors.cyan("portless url <name>")}              Alias for portless get
@@ -3004,6 +3009,22 @@ ${colors.bold("How it works:")}
   5. Frameworks that ignore PORT (Vite, VitePlus, VitePress, Astro,
      React Router, Angular, Laravel, Expo, React Native, Wrangler) get --port and, when needed,
      --host or --ip flags injected automatically
+
+${colors.bold("Background apps:")}
+  Use portless bg start for long-lived local servers that should keep running
+  after the command returns. macOS and Linux are supported in this release.
+  It waits up to 30 seconds for route readiness by default. Use --wait <seconds>
+  to customize that timeout or --no-wait to return immediately after spawning.
+  Normal run flags are preserved, including --path, --h2c, --tunnel,
+  --tailscale-service, --ngrok, and --netbird.
+  Background mode does not widen child app binds or enable public sharing by
+  itself. Public exposure still requires explicit sharing flags.
+  Private stdout, stderr, and lifecycle logs are stored under
+  PORTLESS_STATE_DIR/bg/logs with owner-only permissions.
+  ${colors.cyan("portless bg start --name web bun run dev")}
+  ${colors.cyan("portless bg status web")}
+  ${colors.cyan("portless bg logs web --tail 100")}
+  ${colors.cyan("portless bg stop web")}
 
 ${colors.bold("HTTP/2 + HTTPS (default):")}
   HTTPS with HTTP/2 multiplexing is enabled by default (faster page loads).
@@ -3097,6 +3118,11 @@ ${colors.bold("Options:")}
   --netbird-password <string>   Require a password for the NetBird public URL
   --netbird-pin <code>          Require a PIN for the NetBird public URL
   --netbird-groups <csv>        Restrict the NetBird URL to user groups
+  bg start --wait [seconds]     Wait for background readiness (default: 30)
+  bg start --no-wait            Return after spawning a background app
+  bg start --keep               Keep a timed-out background app running
+  bg logs --tail <lines>        Print the last N background log lines
+  bg stop --force               Force-stop the exact registered background app
   --force                       Kill the existing process and take over its route
   --name <name>                 Use <name> as the app name (bypasses subcommand dispatch)
   --                            Stop flag parsing; everything after is passed to the child

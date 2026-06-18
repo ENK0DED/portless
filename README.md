@@ -466,6 +466,27 @@ Portless keeps the child app bound to `127.0.0.1` by default, even when NetBird 
 
 Requires the NetBird CLI to be installed and connected, with Peer Expose enabled and allowed for the active peer.
 
+## Background apps
+
+Use `portless bg start` when a dev server should keep running after the shell command returns, such as agent workflows or long-lived local services:
+
+```bash
+portless bg start --name web bun run dev
+portless bg status web
+portless bg logs web --tail 100
+portless bg stop web
+```
+
+Background app management currently supports macOS and Linux. Windows support needs a separate process-group implementation.
+
+`bg start` waits up to 30 seconds for the route to become ready by default. Use `--wait <seconds>` to customize the timeout, `--no-wait` to return immediately after spawning, or `--keep` to leave a timed-out child running for manual inspection. A timed-out child is stopped by default so stale routes are not left behind accidentally.
+
+Background apps preserve the normal `portless run` feature set, including `--path`, `--h2c`, `--tunnel`, `--tailscale-service`, `--ngrok`, and `--netbird`. Backgrounding is not a sharing feature by itself: child apps still bind to loopback by default, and public exposure still requires explicit sharing flags.
+
+Private stdout, stderr, and lifecycle logs are stored under `${PORTLESS_STATE_DIR:-~/.portless}/bg/logs` with owner-only permissions. Prefer `portless bg logs` over reading those files directly because logs can contain tokens, cookies, request bodies, stack traces, or private URLs.
+
+Use `portless bg list` to see all registered background apps, `portless bg status [name]` for one app, `portless bg logs [name]` for logs, `portless bg restart [name]` to restart from the stored command intent, and `portless bg clean [name|--all]` to remove dead entries and their logs. `portless clean` stops registered background apps before removing state, and `portless prune` removes dead background entries without stopping live ones.
+
 ## Commands
 
 ```bash
@@ -481,6 +502,13 @@ portless alias --remove <name>   # Remove a static route
 portless tunnel map <route> <host>  # Map an exact public tunnel host
 portless tunnel list             # Show public tunnel aliases
 portless tunnel unmap <host>     # Remove a public tunnel alias
+portless bg start [cmd]          # Start an app in the background
+portless bg status [name]        # Show background app status
+portless bg list                 # List background apps
+portless bg logs [name]          # Print background app logs
+portless bg stop [name]          # Stop a background app
+portless bg restart [name]       # Restart a background app
+portless bg clean [name]         # Remove dead background entries
 portless get <name>              # Print URL for a service
 portless get <name> --json       # Print service info as JSON
 portless url <name>              # Alias for portless get
@@ -554,6 +582,11 @@ portless service uninstall       # Remove the startup service
 --netbird-password <string>      Require a password for the NetBird public URL
 --netbird-pin <code>             Require a PIN for the NetBird public URL
 --netbird-groups <csv>           Restrict the NetBird URL to user groups
+bg start --wait [seconds]        Wait for background readiness (default: 30)
+bg start --no-wait               Return after spawning a background app
+bg start --keep                  Keep a timed-out background app running
+bg logs --tail <lines>           Print the last N background log lines
+bg stop --force                  Force-stop the exact registered background app
 --force                          Kill the existing process and take over its route
 --name <name>                    Use <name> as the app name
 ```
@@ -604,7 +637,7 @@ Command args can use exact placeholders `{PORT}`, `{HOST}`, and `{PORTLESS_URL}`
 
 Prefer `PORTLESS_SUFFIX` for new configuration. It accepts single-label suffixes such as `test` and dotted suffixes such as `acme.com` or `server01.acme.com`. `PORTLESS_TLD` is only a compatibility alias and is ignored when `PORTLESS_SUFFIX` is set.
 
-> **Reserved names:** `run`, `get`, `url`, `alias`, `tunnel`, `hosts`, `list`, `ls`, `status`, `trust`, `clean`, `prune`, `proxy`, `service`, and `completion` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name from your project, or `portless --name <name> <cmd>` to force any name including reserved ones.
+> **Reserved names:** `run`, `get`, `url`, `alias`, `tunnel`, `hosts`, `list`, `ls`, `status`, `trust`, `clean`, `prune`, `proxy`, `bg`, `service`, and `completion` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name from your project, or `portless --name <name> <cmd>` to force any name including reserved ones.
 
 ## Shell completion
 

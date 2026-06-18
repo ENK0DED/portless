@@ -159,6 +159,23 @@ Set `PORTLESS=0` to run the command directly without the proxy:
 PORTLESS=0 bun dev    # Bypasses proxy, uses default port
 ```
 
+### Persistent background apps
+
+Prefer `portless bg start` when an agent needs a dev server to keep running after the setup command returns:
+
+```bash
+portless bg start --name web bun run dev
+portless bg status web --json
+portless bg logs web --tail 200
+portless bg stop web
+```
+
+Background app management currently supports macOS and Linux. Do not use it on Windows until portless has a Windows process-group design.
+
+`bg start` waits up to 30 seconds for route readiness by default. Use `--wait <seconds>` for a longer known startup, `--no-wait` only when fire-and-forget behavior is acceptable, and `--keep` only when a timed-out process should be left running for inspection. Logs are private files under `PORTLESS_STATE_DIR/bg/logs`; use `portless bg logs` instead of scraping paths directly.
+
+Background mode is not a public sharing feature. It keeps the same loopback-first binding behavior as foreground `portless run`. Public exposure still requires explicit flags such as `--tunnel`, `--tailscale-service`, `--ngrok`, or `--netbird`, and the same `--path` and `--h2c` route semantics apply.
+
 ## How It Works
 
 1. `portless proxy start` starts an HTTPS reverse proxy on port 443 as a background daemon. Auto-elevates with sudo on macOS/Linux; falls back to port 1355 if sudo is unavailable. Use `--no-tls` for plain HTTP on port 80. Configurable with `-p` / `--port` or the `PORTLESS_PORT` env var. The proxy also auto-starts when you run an app.
@@ -423,6 +440,13 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 | `portless service install --wildcard`            | Persist wildcard routing in the startup service                |
 | `portless service status`                        | Show service and proxy status                                  |
 | `portless service uninstall`                     | Remove the startup service                                     |
+| `portless bg start [cmd]`                         | Start an app in the background                                 |
+| `portless bg status [name] --json`                | Show background app status for scripts and agents              |
+| `portless bg list`                                | List background apps                                           |
+| `portless bg logs [name] --tail 200`              | Print recent background app logs                               |
+| `portless bg stop [name]`                         | Stop a background app                                          |
+| `portless bg restart [name]`                      | Restart a background app from stored command intent            |
+| `portless bg clean [name]`                        | Remove dead background entries and their private logs          |
 | `portless alias <name> <port>`                   | Register a static route (e.g. for Docker containers)           |
 | `portless alias <name> <port> --force`           | Overwrite an existing route                                    |
 | `portless alias <name> <port> --h2c`             | Register an HTTP/2 cleartext upstream route                    |
@@ -452,7 +476,7 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 | `portless run --help`                            | Show help for a subcommand (also: alias, hosts, clean)         |
 | `portless --version` / `-v`                      | Show version                                                   |
 
-**Reserved names:** `run`, `get`, `url`, `alias`, `tunnel`, `hosts`, `list`, `ls`, `status`, `trust`, `clean`, `prune`, `proxy`, `service`, and `completion` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name, or `portless --name <name> <cmd>` to force any name including reserved ones.
+**Reserved names:** `run`, `get`, `url`, `alias`, `tunnel`, `hosts`, `list`, `ls`, `status`, `trust`, `clean`, `prune`, `proxy`, `bg`, `service`, and `completion` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name, or `portless --name <name> <cmd>` to force any name including reserved ones.
 
 ### Shell completion
 

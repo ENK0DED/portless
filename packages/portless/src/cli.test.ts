@@ -292,6 +292,11 @@ describe("CLI", () => {
       expect(stdout).toContain("service install");
       expect(stdout).toContain("portless run");
       expect(stdout).toContain("portless get");
+      expect(stdout).toContain("portless bg start");
+      expect(stdout).toContain("portless bg status");
+      expect(stdout).toContain("portless bg logs");
+      expect(stdout).toContain("portless bg restart");
+      expect(stdout).toContain("--no-wait");
       expect(stdout).toContain("portless completion <shell>");
       expect(stdout).toContain("run [--name <name>]");
       expect(stdout).toContain("--port");
@@ -599,6 +604,24 @@ describe("CLI", () => {
       expect(stdout).toContain("portless bg");
       expect(stdout).toContain("bg start");
       expect(stdout).toContain("bg stop");
+      expect(stdout).toContain("bg restart");
+      expect(stdout).toContain("bg logs");
+      expect(stdout).toContain("bg clean");
+    });
+
+    it("prints implemented lifecycle help", () => {
+      const cases = [
+        ["stop", "--force"],
+        ["restart", "--no-wait"],
+        ["clean", "--all"],
+      ] as const;
+      for (const [subcommand, expectedFlag] of cases) {
+        const { status, stdout } = run(["bg", subcommand, "--help"]);
+        expect(status).toBe(0);
+        expect(stdout).toContain(`portless bg ${subcommand}`);
+        expect(stdout).toContain(expectedFlag);
+        expect(stdout).not.toContain("follow-up lifecycle commits");
+      }
     });
 
     it("still dispatches bg help when PORTLESS=0", () => {
