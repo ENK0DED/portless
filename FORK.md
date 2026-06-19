@@ -284,9 +284,9 @@ Rechecked against upstream on 2026-06-18: GitHub reported 48 open PRs. Every ope
 - Path routing uses strict segment boundaries and forwards full paths unchanged.
 - Public tunnel traffic routes only through exact managed aliases. Arbitrary public Host passthrough remains rejected.
 
-### Retired Implementation Plans
+### Retained Source And Coverage Notes
 
-The historical plan files under `docs/superpowers/plans/` were execution scaffolding for the 2026-06-18 upstream PR pass. Their lasting decisions are consolidated in this section, and the plan files were removed after implementation completed.
+The following source assessments and coverage anchors are part of the permanent upstream PR ledger for the 2026-06-18 implementation pass.
 
 Retained source assessment:
 
