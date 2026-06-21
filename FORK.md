@@ -79,6 +79,8 @@ Current fork-owned commits and what they protect:
 | `da69f4f` | Clarified fork-only ledger maintenance expectations.                                                                                                                                               |
 | `62ef55c` | Consolidated upstream open PR triage into one canonical fork ledger and removed retired execution scaffolding.                                                                                     |
 | `2a40cff` | Removed obsolete execution-plan references from fork documentation.                                                                                                                                |
+| `9167707` | Updated the fork-only ledger with recent documentation maintenance commits before adding automated enforcement.                                                                                    |
+| `6a942d2` | Added a tested fork-only ledger freshness checker and CI enforcement.                                                                                                                              |
 
 ## Fork-Owned Invariants
 
