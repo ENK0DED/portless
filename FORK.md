@@ -88,6 +88,8 @@ Current fork-owned commits and what they protect:
 | `5131bb2` | Prepared fork release `0.14.1002` for the upstream PR backport pass.                                                                                                                               |
 | `5d98e81` | Updated the fork-only ledger for the release preparation commit.                                                                                                                                   |
 | `68c17ff` | Fixed Windows child command spawning for package-manager and tunnel shims while keeping unsupported background lifecycle tests scoped to macOS and Linux.                                          |
+| `b4fdaa1` | Updated the fork-only ledger for the Windows child-spawning portability fix.                                                                                                                       |
+| `ab5e32f` | Preserved Windows `Path` inheritance in CLI fixtures that prepend shim directories for child command tests.                                                                                        |
 
 ## Fork-Owned Invariants
 
