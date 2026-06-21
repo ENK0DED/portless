@@ -98,6 +98,8 @@ Current fork-owned commits and what they protect:
 | `9c2eb09` | Hardened Windows process-spawn-heavy tests and OpenSSL certificate generation timeouts for slow CI hosts.                                                                                          |
 | `e8b0fe9` | Updated the fork-only ledger for the Windows timeout hardening commit.                                                                                                                             |
 | `de166e0` | Added Windows managed tunnel and OpenSSL reliability notes to the `0.14.1002` release changelogs.                                                                                                  |
+| `ab250bd` | Updated the fork-only ledger for the Windows reliability release-note commit.                                                                                                                      |
+| `f22e276` | Merged the signed `prepare-v0.14.1002` release branch into `main` while preserving the upstream PR coverage and release preparation history.                                                       |
 
 ## Fork-Owned Invariants
 
