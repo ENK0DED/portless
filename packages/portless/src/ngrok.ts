@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
+import { isWindows, resolveWindowsCommandInvocation } from "./cli-utils.js";
 
 const NGROK_BINARY = "ngrok";
 const NGROK_START_TIMEOUT_MS = 30_000;
@@ -40,17 +41,38 @@ export interface StartedNgrok {
 }
 
 function defaultSpawner(args: string[]): NgrokChildProcess {
-  return spawn(NGROK_BINARY, args, {
+  const invocation = isWindows
+    ? resolveWindowsCommandInvocation(
+        NGROK_BINARY,
+        args,
+        process.env.PATH ?? process.env.Path ?? ""
+      )
+    : null;
+  return spawn(invocation?.command ?? NGROK_BINARY, invocation?.args ?? args, {
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
+    ...(invocation?.windowsVerbatimArguments
+      ? { windowsVerbatimArguments: invocation.windowsVerbatimArguments }
+      : {}),
   }) as NgrokChildProcess;
 }
 
 function defaultRunner(args: string[]): NgrokCommandResult {
-  const result = spawnSync(NGROK_BINARY, args, {
+  const invocation = isWindows
+    ? resolveWindowsCommandInvocation(
+        NGROK_BINARY,
+        args,
+        process.env.PATH ?? process.env.Path ?? ""
+      )
+    : null;
+  const result = spawnSync(invocation?.command ?? NGROK_BINARY, invocation?.args ?? args, {
     encoding: "utf-8",
     killSignal: "SIGKILL",
     timeout: NGROK_COMMAND_TIMEOUT_MS,
+    windowsHide: true,
+    ...(invocation?.windowsVerbatimArguments
+      ? { windowsVerbatimArguments: invocation.windowsVerbatimArguments }
+      : {}),
   });
   return {
     status: result.status,

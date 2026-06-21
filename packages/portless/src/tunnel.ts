@@ -1,7 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
-import path from "node:path";
 import type { TunnelProviderName } from "./types.js";
-import { isWindows, quoteWindowsCmdArg, resolveWindowsExecutable } from "./cli-utils.js";
+import { isWindows, resolveWindowsCommandInvocation } from "./cli-utils.js";
 import { ensureNgrokAvailable, startNgrok, type NgrokChildProcess } from "./ngrok.js";
 
 const CLOUDFLARED_BINARY = "cloudflared";
@@ -42,21 +41,18 @@ export interface TunnelProvider {
 
 function defaultSpawner(command: string, args: string[]): TunnelChildProcess {
   if (isWindows) {
-    const resolved = resolveWindowsExecutable(command, process.env.PATH ?? process.env.Path ?? "");
-    if (resolved) {
-      const ext = path.extname(resolved).toLowerCase();
-      if (ext === ".cmd" || ext === ".bat") {
-        const cmdline = [resolved, ...args].map(quoteWindowsCmdArg).join(" ");
-        return spawn("cmd.exe", ["/d", "/s", "/c", cmdline], {
-          stdio: ["ignore", "pipe", "pipe"],
-          windowsHide: true,
-          windowsVerbatimArguments: true,
-        }) as TunnelChildProcess;
-      }
-
-      return spawn(resolved, args, {
+    const invocation = resolveWindowsCommandInvocation(
+      command,
+      args,
+      process.env.PATH ?? process.env.Path ?? ""
+    );
+    if (invocation) {
+      return spawn(invocation.command, invocation.args, {
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
+        ...(invocation.windowsVerbatimArguments
+          ? { windowsVerbatimArguments: invocation.windowsVerbatimArguments }
+          : {}),
       }) as TunnelChildProcess;
     }
   }
@@ -245,11 +241,27 @@ export function ensureTunnelProviderAvailable(provider: TunnelProviderName): voi
     return;
   }
 
-  const result = spawnSync(CLOUDFLARED_BINARY, ["version"], {
-    encoding: "utf-8",
-    killSignal: "SIGKILL",
-    timeout: TUNNEL_COMMAND_TIMEOUT_MS,
-  });
+  const cloudflaredVersionArgs = ["version"];
+  const invocation = isWindows
+    ? resolveWindowsCommandInvocation(
+        CLOUDFLARED_BINARY,
+        cloudflaredVersionArgs,
+        process.env.PATH ?? process.env.Path ?? ""
+      )
+    : null;
+  const result = spawnSync(
+    invocation?.command ?? CLOUDFLARED_BINARY,
+    invocation?.args ?? cloudflaredVersionArgs,
+    {
+      encoding: "utf-8",
+      killSignal: "SIGKILL",
+      timeout: TUNNEL_COMMAND_TIMEOUT_MS,
+      windowsHide: true,
+      ...(invocation?.windowsVerbatimArguments
+        ? { windowsVerbatimArguments: invocation.windowsVerbatimArguments }
+        : {}),
+    }
+  );
   if (result.error) {
     throw formatSpawnError(
       "cloudflared",

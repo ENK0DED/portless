@@ -929,6 +929,35 @@ export function quoteWindowsCmdArg(arg: string): string {
   return `"${arg.replace(/"/g, '\\"')}"`;
 }
 
+export interface WindowsCommandInvocation {
+  command: string;
+  args: string[];
+  windowsVerbatimArguments?: true;
+}
+
+export function resolveWindowsCommandInvocation(
+  command: string,
+  args: string[],
+  pathValue: string
+): WindowsCommandInvocation | null {
+  const resolved = resolveWindowsExecutable(command, pathValue);
+  if (!resolved) return null;
+
+  const ext = path.extname(resolved).toLowerCase();
+  if (ext === ".cmd" || ext === ".bat") {
+    return {
+      command: "cmd.exe",
+      args: ["/d", "/s", "/c", [resolved, ...args].map(quoteWindowsCmdArg).join(" ")],
+      windowsVerbatimArguments: true,
+    };
+  }
+
+  return {
+    command: resolved,
+    args,
+  };
+}
+
 /**
  * Spawn a command with proper signal forwarding, error handling, and exit
  * code propagation. Prepends node_modules/.bin to PATH so local project
