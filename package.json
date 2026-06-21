@@ -9,6 +9,7 @@
   },
   "scripts": {
     "build": "turbo build",
+    "check:fork-ledger": "bun run scripts/check-fork-ledger.ts",
     "dev": "turbo dev",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
@@ -16,6 +17,7 @@
     "lint:fix": "turbo lint:fix",
     "test": "turbo test",
     "test:e2e": "turbo test:e2e",
+    "test:fork-ledger": "bun test scripts/check-fork-ledger.test.ts",
     "test:coverage": "turbo test:coverage",
     "test:watch": "turbo test:watch",
     "type-check": "turbo type-check",
