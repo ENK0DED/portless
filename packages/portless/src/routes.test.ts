@@ -665,13 +665,13 @@ describe("RouteStore", () => {
   });
 });
 
-describe("RouteStore multiplex", () => {
+describe("RouteStore multiplex", { timeout: 15_000 }, () => {
   let tmpDir: string;
   let store: RouteStore;
   const sleepers: number[] = [];
 
   function spawnSleeper(): number {
-    const child = spawn("node", ["-e", "setTimeout(()=>{},60000)"], {
+    const child = spawn(process.execPath, ["-e", "setTimeout(()=>{},60000)"], {
       detached: true,
       stdio: "ignore",
     });

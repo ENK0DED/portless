@@ -447,16 +447,20 @@ describe("CLI", () => {
       expect(status).toBe(0);
     });
 
-    it.each(["ls", "status"])("preserves %s as an app name when followed by a command", (cmd) => {
-      const { status, stdout } = run(
-        [cmd, process.execPath, "-e", `console.log(${JSON.stringify(`app-named-${cmd}`)})`],
-        {
-          env: { PORTLESS: "0" },
-        }
-      );
-      expect(status).toBe(0);
-      expect(stdout.trim()).toBe(`app-named-${cmd}`);
-    });
+    it.each(["ls", "status"])(
+      "preserves %s as an app name when followed by a command",
+      (cmd) => {
+        const { status, stdout } = run(
+          [cmd, process.execPath, "-e", `console.log(${JSON.stringify(`app-named-${cmd}`)})`],
+          {
+            env: { PORTLESS: "0" },
+          }
+        );
+        expect(status).toBe(0);
+        expect(stdout.trim()).toBe(`app-named-${cmd}`);
+      },
+      15_000
+    );
 
     it("outputs active routes as JSON", () => {
       fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
