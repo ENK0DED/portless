@@ -94,6 +94,8 @@ Current fork-owned commits and what they protect:
 | `474fbce` | Normalized CLI test harness PATH casing on Windows so shim-based child command fixtures use the intended test PATH.                                                                                |
 | `75b65f8` | Updated the fork-only ledger for the Windows CLI fixture PATH normalization commit.                                                                                                                |
 | `01f4dfa` | Resolved managed tunnel `.cmd` and `.bat` shims for Windows Cloudflare and ngrok preflight checks and startup.                                                                                     |
+| `be97903` | Updated the fork-only ledger for the managed tunnel Windows shim fix.                                                                                                                              |
+| `9c2eb09` | Hardened Windows process-spawn-heavy tests and OpenSSL certificate generation timeouts for slow CI hosts.                                                                                          |
 
 ## Fork-Owned Invariants
 
