@@ -50,6 +50,7 @@ function run(args: string[], options?: { env?: Record<string, string | undefined
       delete env[key];
     }
   }
+  delete env.NODE_EXTRA_CA_CERTS;
   Object.assign(env, options?.env);
   // Test runners may set package-manager env vars; strip the pnpm/npm ones so
   // the CLI child does not look like pnpm dlx or npx.
@@ -84,6 +85,10 @@ function runGit(cwd: string, args: string[]): void {
 function writeJson(filePath: string, value: unknown): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, JSON.stringify(value, null, 2) + "\n");
+}
+
+function nodePrintScript(text: string): string {
+  return `${JSON.stringify(process.execPath)} -e "console.log(process.argv[1])" ${text}`;
 }
 
 interface TestBgEntry {
@@ -639,7 +644,7 @@ describe("CLI", () => {
       expect(stderr).toContain('Unknown bg subcommand "unknown"');
     });
 
-    describe("start", () => {
+    describe.skipIf(process.platform === "win32")("start", () => {
       let tmpDir: string;
       let proxyPort: number;
 
@@ -2818,7 +2823,11 @@ describe("CLI", () => {
     it("portless (no args) runs dev script without portless.json", () => {
       fs.writeFileSync(
         path.join(tmpDir, "package.json"),
-        JSON.stringify({ name: "test-app", scripts: { dev: "echo hello" } })
+        JSON.stringify({
+          name: "test-app",
+          packageManager: "bun@1.3.14",
+          scripts: { dev: nodePrintScript("hello") },
+        })
       );
       const { status, stdout } = run([], {
         cwd: tmpDir,
@@ -2842,7 +2851,8 @@ describe("CLI", () => {
           path.join(tmpDir, "package.json"),
           JSON.stringify({
             name: "test-app",
-            scripts: { dev: `${process.execPath} -e "process.exit(0)"` },
+            packageManager: "bun@1.3.14",
+            scripts: { dev: nodePrintScript("ready") },
             portless: { name: "pkg-name" },
           })
         );
@@ -3215,7 +3225,11 @@ describe("CLI", () => {
     it("portless run (no command) with portless.json resolves dev script", () => {
       fs.writeFileSync(
         path.join(tmpDir, "package.json"),
-        JSON.stringify({ name: "test-app", scripts: { dev: "echo config-dev" } })
+        JSON.stringify({
+          name: "test-app",
+          packageManager: "bun@1.3.14",
+          scripts: { dev: nodePrintScript("config-dev") },
+        })
       );
       fs.writeFileSync(path.join(tmpDir, "portless.json"), JSON.stringify({ name: "myapp" }));
       const { stdout } = run(["run"], {
@@ -3228,7 +3242,11 @@ describe("CLI", () => {
     it("portless run (no command) with .config/portless.json resolves dev script", () => {
       fs.writeFileSync(
         path.join(tmpDir, "package.json"),
-        JSON.stringify({ name: "test-app", scripts: { dev: "echo config-dir-dev" } })
+        JSON.stringify({
+          name: "test-app",
+          packageManager: "bun@1.3.14",
+          scripts: { dev: nodePrintScript("config-dir-dev") },
+        })
       );
       fs.mkdirSync(path.join(tmpDir, ".config"), { recursive: true });
       fs.writeFileSync(
@@ -3245,7 +3263,11 @@ describe("CLI", () => {
     it("portless run (no command) without portless.json resolves dev script", () => {
       fs.writeFileSync(
         path.join(tmpDir, "package.json"),
-        JSON.stringify({ name: "test-app", scripts: { dev: "echo hello" } })
+        JSON.stringify({
+          name: "test-app",
+          packageManager: "bun@1.3.14",
+          scripts: { dev: nodePrintScript("hello") },
+        })
       );
       const { stdout } = run(["run"], {
         cwd: tmpDir,
@@ -3257,7 +3279,11 @@ describe("CLI", () => {
     it("portless run with explicit command ignores config script", () => {
       fs.writeFileSync(
         path.join(tmpDir, "package.json"),
-        JSON.stringify({ name: "test-app", scripts: { dev: "echo from-config" } })
+        JSON.stringify({
+          name: "test-app",
+          packageManager: "bun@1.3.14",
+          scripts: { dev: nodePrintScript("from-config") },
+        })
       );
       fs.writeFileSync(
         path.join(tmpDir, "portless.json"),
@@ -3276,7 +3302,8 @@ describe("CLI", () => {
         path.join(tmpDir, "package.json"),
         JSON.stringify({
           name: "test-app",
-          scripts: { dev: "echo from-dev", start: "echo from-start" },
+          packageManager: "bun@1.3.14",
+          scripts: { dev: nodePrintScript("from-dev"), start: nodePrintScript("from-start") },
         })
       );
       fs.writeFileSync(
@@ -3295,7 +3322,8 @@ describe("CLI", () => {
         path.join(tmpDir, "package.json"),
         JSON.stringify({
           name: "test-app",
-          scripts: { dev: "echo from-dev", start: "echo from-start" },
+          packageManager: "bun@1.3.14",
+          scripts: { dev: nodePrintScript("from-dev"), start: nodePrintScript("from-start") },
         })
       );
       fs.writeFileSync(path.join(tmpDir, "portless.json"), JSON.stringify({ script: "start" }));
@@ -3317,7 +3345,8 @@ describe("CLI", () => {
         path.join(tmpDir, "package.json"),
         JSON.stringify({
           name: "test-app",
-          scripts: { dev: "echo from-dev", start: "echo from-start" },
+          packageManager: "bun@1.3.14",
+          scripts: { dev: nodePrintScript("from-dev"), start: nodePrintScript("from-start") },
         })
       );
       fs.writeFileSync(

@@ -42,7 +42,9 @@ describe("bg ready file", () => {
       const mode = fs.statSync(readyPath).mode & 0o777;
 
       expect(parsed.bgId).toBe("bg-test");
-      expect(mode).toBe(0o600);
+      if (process.platform !== "win32") {
+        expect(mode).toBe(0o600);
+      }
       expect(
         fs.readdirSync(path.dirname(readyPath)).filter((name) => name.endsWith(".tmp"))
       ).toEqual([]);

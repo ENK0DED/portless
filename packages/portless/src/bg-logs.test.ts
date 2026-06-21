@@ -26,8 +26,10 @@ describe("bg logs", () => {
     appendBgLifecycleLog(logs, "started");
 
     expect(logs.stdout).toBe(path.join(tmpDir, "bg", "logs", "bg_01.stdout.log"));
-    expect(fs.statSync(path.dirname(logs.bg)).mode & 0o777).toBe(0o700);
-    expect(fs.statSync(logs.bg).mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32") {
+      expect(fs.statSync(path.dirname(logs.bg)).mode & 0o777).toBe(0o700);
+      expect(fs.statSync(logs.bg).mode & 0o777).toBe(0o600);
+    }
   });
 
   it("uses filenames derived from a safe generated id", () => {

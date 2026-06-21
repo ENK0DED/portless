@@ -53,8 +53,10 @@ describe("BgStore", () => {
 
     const paths = store.getPaths();
     expect(store.loadEntries()).toEqual([sampleEntry()]);
-    expect(fs.statSync(paths.rootDir).mode & 0o777).toBe(0o700);
-    expect(fs.statSync(paths.registryPath).mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32") {
+      expect(fs.statSync(paths.rootDir).mode & 0o777).toBe(0o700);
+      expect(fs.statSync(paths.registryPath).mode & 0o777).toBe(0o600);
+    }
   });
 
   it("updates by id without replacing unrelated entries", () => {

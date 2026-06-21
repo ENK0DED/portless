@@ -1,5 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
+import path from "node:path";
 import type { TunnelProviderName } from "./types.js";
+import { isWindows, quoteWindowsCmdArg, resolveWindowsExecutable } from "./cli-utils.js";
 import { ensureNgrokAvailable, startNgrok, type NgrokChildProcess } from "./ngrok.js";
 
 const CLOUDFLARED_BINARY = "cloudflared";
@@ -39,6 +41,26 @@ export interface TunnelProvider {
 }
 
 function defaultSpawner(command: string, args: string[]): TunnelChildProcess {
+  if (isWindows) {
+    const resolved = resolveWindowsExecutable(command, process.env.PATH ?? process.env.Path ?? "");
+    if (resolved) {
+      const ext = path.extname(resolved).toLowerCase();
+      if (ext === ".cmd" || ext === ".bat") {
+        const cmdline = [resolved, ...args].map(quoteWindowsCmdArg).join(" ");
+        return spawn("cmd.exe", ["/d", "/s", "/c", cmdline], {
+          stdio: ["ignore", "pipe", "pipe"],
+          windowsHide: true,
+          windowsVerbatimArguments: true,
+        }) as TunnelChildProcess;
+      }
+
+      return spawn(resolved, args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      }) as TunnelChildProcess;
+    }
+  }
+
   return spawn(command, args, {
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,

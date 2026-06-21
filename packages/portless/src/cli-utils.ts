@@ -924,7 +924,7 @@ export function resolveWindowsExecutable(cmd: string, pathStr: string): string |
   return null;
 }
 
-function quoteWindowsCmdArg(arg: string): string {
+export function quoteWindowsCmdArg(arg: string): string {
   if (!/[\s"&|<>^()%!]/.test(arg)) return arg;
   return `"${arg.replace(/"/g, '\\"')}"`;
 }

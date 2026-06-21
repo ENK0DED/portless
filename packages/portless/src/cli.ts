@@ -86,6 +86,7 @@ import {
   readTldFromDir,
   readTlsMarker,
   readWildcardMarker,
+  quoteWindowsCmdArg,
   resolveWindowsExecutable,
   resolveStateDir,
   replacePlaceholders,
@@ -1900,6 +1901,9 @@ async function runApp(
   const baseChildEnv: NodeJS.ProcessEnv = { ...process.env };
   delete baseChildEnv[PORTLESS_BG_ID_ENV];
   delete baseChildEnv[PORTLESS_BG_READY_PATH_ENV];
+  if (!hostBind && childEnv.HOST === undefined) {
+    delete baseChildEnv.HOST;
+  }
   const inheritedChildEnv = { ...baseChildEnv, ...childEnv };
   const caEnv: Record<string, string> = {};
   if (tls && !inheritedChildEnv.NODE_EXTRA_CA_CERTS) {
@@ -4791,6 +4795,28 @@ function spawnChildProcess(
   env: Record<string, string | undefined>,
   cwd: string
 ): ReturnType<typeof spawn> {
+  if (isWindows) {
+    const resolved = resolveWindowsExecutable(commandArgs[0], env.PATH ?? env.Path ?? "");
+    if (resolved) {
+      const ext = path.extname(resolved).toLowerCase();
+      if (ext === ".cmd" || ext === ".bat") {
+        const cmdline = [resolved, ...commandArgs.slice(1)].map(quoteWindowsCmdArg).join(" ");
+        return spawn("cmd.exe", ["/d", "/s", "/c", cmdline], {
+          stdio: ["ignore", "pipe", "pipe"],
+          env,
+          cwd,
+          windowsVerbatimArguments: true,
+        });
+      }
+
+      return spawn(resolved, commandArgs.slice(1), {
+        stdio: ["ignore", "pipe", "pipe"],
+        env,
+        cwd,
+      });
+    }
+  }
+
   return spawn(commandArgs[0], commandArgs.slice(1), {
     stdio: ["ignore", "pipe", "pipe"],
     env,
