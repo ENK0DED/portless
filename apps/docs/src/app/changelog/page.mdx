@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.14.1002
+
+### New Features
+
+- **Background app management**: Adds `portless bg` commands for long-lived local servers, with private logs, readiness tracking, status, restart, stop, clean, and prune integration
+- **Public sharing and route modes**: Adds Tailscale Service sharing, NetBird sharing, managed Cloudflare and ngrok tunnel aliases, path-scoped routes, and explicit h2c upstream routing for local HTTP/2 cleartext services
+- **Local browser surfaces**: Adds the read-only dashboard, public CA download page, and opt-in multiplexed hostname picker without rewriting app HTML or response headers
+- **HTTP/2 WebSockets**: Supports browser HMR WebSockets over HTTPS HTTP/2 using Extended CONNECT while validating backend WebSocket accept headers before forwarding payload
+- **Developer ergonomics**: Adds shell completions, JSON route and URL inspection, package config source reporting, and the programmatic `getUrl()` API
+
+### Security
+
+- **Public exposure defaults**: Sharing features keep child apps loopback-bound by default, require explicit public exposure flags, and clean up managed public aliases or process metadata
+- **Safe internal pages**: The dashboard is read-only, reserved internal hostnames cannot be claimed by apps, and the certificate page serves only the public CA certificate
+- **Background process safety**: Background app state and logs use owner-only permissions, readiness uses an internal file handshake, and cleanup removes only exact owned routes
+- **Fork ledger enforcement**: CI now checks that `FORK.md` records every fork-only commit except the current ledger-maintenance commit
+
+### Maintenance
+
+- **Open upstream PR coverage**: Documents every open upstream PR as implemented, implemented differently, or won't implement in the fork ledger
+- **Docs sweep**: Updates README, docs pages, CLI help, and the portless agent skill for the current command surface and security defaults
+
 ## 0.14.1001
 
 ### Bug Fixes
