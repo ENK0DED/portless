@@ -86,6 +86,8 @@ Current fork-owned commits and what they protect:
 | `33f013c` | Recorded the docs sweep commits in the fork-only ledger.                                                                                                                                           |
 | `1f4e6f9` | Updated the fork-only ledger after the final docs sweep.                                                                                                                                           |
 | `5131bb2` | Prepared fork release `0.14.1002` for the upstream PR backport pass.                                                                                                                               |
+| `5d98e81` | Updated the fork-only ledger for the release preparation commit.                                                                                                                                   |
+| `68c17ff` | Fixed Windows child command spawning for package-manager and tunnel shims while keeping unsupported background lifecycle tests scoped to macOS and Linux.                                          |
 
 ## Fork-Owned Invariants
 
