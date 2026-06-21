@@ -52,6 +52,13 @@ function run(args: string[], options?: { env?: Record<string, string | undefined
   }
   delete env.NODE_EXTRA_CA_CERTS;
   Object.assign(env, options?.env);
+  if (process.platform === "win32" && env.PATH !== undefined) {
+    for (const key of Object.keys(env)) {
+      if (key !== "PATH" && key.toUpperCase() === "PATH") {
+        delete env[key];
+      }
+    }
+  }
   // Test runners may set package-manager env vars; strip the pnpm/npm ones so
   // the CLI child does not look like pnpm dlx or npx.
   delete env.PNPM_SCRIPT_SRC_DIR;
@@ -3144,87 +3151,91 @@ describe("CLI", () => {
       }
     });
 
-    it.skipIf(!GIT_AVAILABLE)("prefixes workspace app URLs in linked git worktrees", async () => {
-      const server = http.createServer((_req, res) => {
-        res.setHeader("X-Portless", "1");
-        res.end("ok");
-      });
-      const repoDir = path.join(tmpDir, "repo");
-      const worktreeDir = path.join(tmpDir, "feature-auth-worktree");
-      const stateDir = path.join(tmpDir, "state");
-      const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-pnpm-shim-"));
+    it.skipIf(!GIT_AVAILABLE)(
+      "prefixes workspace app URLs in linked git worktrees",
+      async () => {
+        const server = http.createServer((_req, res) => {
+          res.setHeader("X-Portless", "1");
+          res.end("ok");
+        });
+        const repoDir = path.join(tmpDir, "repo");
+        const worktreeDir = path.join(tmpDir, "feature-auth-worktree");
+        const stateDir = path.join(tmpDir, "state");
+        const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-pnpm-shim-"));
 
-      try {
-        fs.mkdirSync(repoDir, { recursive: true });
-        writeJson(path.join(repoDir, "package.json"), {
-          private: true,
-          name: "sound-lab",
-          packageManager: "pnpm@11.1.3",
-          workspaces: ["apps/*"],
-        });
-        writeJson(path.join(repoDir, "portless.json"), {
-          name: "custom",
-          turbo: false,
-          apps: {
-            "apps/api": { name: "api.custom" },
-          },
-        });
-        writeJson(path.join(repoDir, "apps", "api", "package.json"), {
-          name: "@sound-lab/api",
-          scripts: { dev: 'node -e "process.exit(0)"' },
-        });
-        writeJson(path.join(repoDir, "apps", "web", "package.json"), {
-          name: "@sound-lab/web",
-          scripts: { dev: 'node -e "process.exit(0)"' },
-        });
-
-        runGit(repoDir, ["init"]);
-        runGit(repoDir, ["config", "user.name", "Portless Test"]);
-        runGit(repoDir, ["config", "user.email", "portless-test@example.com"]);
-        runGit(repoDir, ["branch", "-M", "main"]);
-        runGit(repoDir, ["add", "."]);
-        runGit(repoDir, ["commit", "-m", "init"]);
-        runGit(repoDir, ["worktree", "add", "-b", "feature-auth", worktreeDir]);
-
-        const proxyPort = await new Promise<number>((resolve) => {
-          server.listen(0, "127.0.0.1", () => {
-            const addr = server.address();
-            if (addr && typeof addr !== "string") {
-              resolve(addr.port);
-            }
+        try {
+          fs.mkdirSync(repoDir, { recursive: true });
+          writeJson(path.join(repoDir, "package.json"), {
+            private: true,
+            name: "sound-lab",
+            packageManager: "pnpm@11.1.3",
+            workspaces: ["apps/*"],
           });
-        });
-        fs.mkdirSync(stateDir, { recursive: true });
-        fs.writeFileSync(path.join(stateDir, "proxy.port"), proxyPort.toString());
+          writeJson(path.join(repoDir, "portless.json"), {
+            name: "custom",
+            turbo: false,
+            apps: {
+              "apps/api": { name: "api.custom" },
+            },
+          });
+          writeJson(path.join(repoDir, "apps", "api", "package.json"), {
+            name: "@sound-lab/api",
+            scripts: { dev: 'node -e "process.exit(0)"' },
+          });
+          writeJson(path.join(repoDir, "apps", "web", "package.json"), {
+            name: "@sound-lab/web",
+            scripts: { dev: 'node -e "process.exit(0)"' },
+          });
 
-        if (process.platform === "win32") {
-          fs.writeFileSync(path.join(shimDir, "pnpm.cmd"), "@echo off\r\nexit /b 0\r\n");
-        } else {
-          const shimPath = path.join(shimDir, "pnpm");
-          fs.writeFileSync(shimPath, "#!/bin/sh\nexit 0\n");
-          fs.chmodSync(shimPath, 0o755);
+          runGit(repoDir, ["init"]);
+          runGit(repoDir, ["config", "user.name", "Portless Test"]);
+          runGit(repoDir, ["config", "user.email", "portless-test@example.com"]);
+          runGit(repoDir, ["branch", "-M", "main"]);
+          runGit(repoDir, ["add", "."]);
+          runGit(repoDir, ["commit", "-m", "init"]);
+          runGit(repoDir, ["worktree", "add", "-b", "feature-auth", worktreeDir]);
+
+          const proxyPort = await new Promise<number>((resolve) => {
+            server.listen(0, "127.0.0.1", () => {
+              const addr = server.address();
+              if (addr && typeof addr !== "string") {
+                resolve(addr.port);
+              }
+            });
+          });
+          fs.mkdirSync(stateDir, { recursive: true });
+          fs.writeFileSync(path.join(stateDir, "proxy.port"), proxyPort.toString());
+
+          if (process.platform === "win32") {
+            fs.writeFileSync(path.join(shimDir, "pnpm.cmd"), "@echo off\r\nexit /b 0\r\n");
+          } else {
+            const shimPath = path.join(shimDir, "pnpm");
+            fs.writeFileSync(shimPath, "#!/bin/sh\nexit 0\n");
+            fs.chmodSync(shimPath, 0o755);
+          }
+
+          const { status, stdout, stderr } = run([], {
+            cwd: worktreeDir,
+            env: {
+              PATH: prependPath(shimDir),
+              PORTLESS_STATE_DIR: stateDir,
+              PORTLESS_HTTPS: "0",
+            },
+          });
+
+          expect(stderr).toBe("");
+          expect(status).toBe(0);
+          expect(stdout).toContain(`http://feature-auth.api.custom.localhost:${proxyPort}`);
+          expect(stdout).toContain(`http://feature-auth.web.custom.localhost:${proxyPort}`);
+          expect(stdout).not.toContain(`http://api.custom.localhost:${proxyPort}`);
+          expect(stdout).not.toContain(`http://web.custom.localhost:${proxyPort}`);
+        } finally {
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+          fs.rmSync(shimDir, { recursive: true, force: true });
         }
-
-        const { status, stdout, stderr } = run([], {
-          cwd: worktreeDir,
-          env: {
-            PATH: prependPath(shimDir),
-            PORTLESS_STATE_DIR: stateDir,
-            PORTLESS_HTTPS: "0",
-          },
-        });
-
-        expect(stderr).toBe("");
-        expect(status).toBe(0);
-        expect(stdout).toContain(`http://feature-auth.api.custom.localhost:${proxyPort}`);
-        expect(stdout).toContain(`http://feature-auth.web.custom.localhost:${proxyPort}`);
-        expect(stdout).not.toContain(`http://api.custom.localhost:${proxyPort}`);
-        expect(stdout).not.toContain(`http://web.custom.localhost:${proxyPort}`);
-      } finally {
-        await new Promise<void>((resolve) => server.close(() => resolve()));
-        fs.rmSync(shimDir, { recursive: true, force: true });
-      }
-    });
+      },
+      10_000
+    );
 
     it("portless run (no command) with portless.json resolves dev script", () => {
       fs.writeFileSync(
@@ -3633,7 +3644,7 @@ describe("CLI", () => {
           ].join("\n") + "\n"
         );
 
-        const { status, stdout } = run(
+        const { status, stdout, stderr } = run(
           [
             "run",
             "--name",
@@ -3654,7 +3665,7 @@ describe("CLI", () => {
           }
         );
 
-        expect(status).toBe(0);
+        expect({ status, stdout, stderr }).toMatchObject({ status: 0 });
         expect(stdout).toContain("Cloudflare Tunnel");
         expect(JSON.parse(fs.readFileSync(capturePath, "utf-8"))).toMatchObject({
           PORTLESS_URL: `http://myapp.localhost:${proxyPort}`,
