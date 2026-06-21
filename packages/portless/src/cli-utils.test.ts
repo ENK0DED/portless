@@ -34,6 +34,7 @@ import {
   readTldFromDir,
   readWildcardMarker,
   replacePlaceholders,
+  resolveWindowsCommandInvocation,
   resolveWindowsExecutable,
   resolveStateDir,
   validateTld,
@@ -1461,5 +1462,53 @@ describe("resolveWindowsExecutable", () => {
   it("treats slash-containing input as path-like", () => {
     expect(resolveWindowsExecutable("./bin/missing", "")).toBeNull();
     expect(resolveWindowsExecutable(".\\bin\\missing", "")).toBeNull();
+  });
+});
+
+describe("resolveWindowsCommandInvocation", () => {
+  let tmpDir: string;
+  let prevPathext: string | undefined;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-resolve-invocation-test-"));
+    prevPathext = process.env.PATHEXT;
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    if (prevPathext === undefined) {
+      delete process.env.PATHEXT;
+    } else {
+      process.env.PATHEXT = prevPathext;
+    }
+  });
+
+  it("wraps cmd shims through cmd.exe with one quoted command line", () => {
+    process.env.PATHEXT = ".COM;.EXE;.BAT;.CMD";
+    const binDir = path.join(tmpDir, "bin dir");
+    fs.mkdirSync(binDir);
+    const shim = path.join(binDir, "cloudflared.cmd");
+    fs.writeFileSync(shim, "");
+
+    expect(resolveWindowsCommandInvocation("cloudflared", ["version"], binDir)).toEqual({
+      command: "cmd.exe",
+      args: ["/d", "/s", "/c", `"${shim}" version`],
+      windowsVerbatimArguments: true,
+    });
+  });
+
+  it("returns a direct executable invocation for exe files", () => {
+    process.env.PATHEXT = ".COM;.EXE;.BAT;.CMD";
+    const exe = path.join(tmpDir, "cloudflared.exe");
+    fs.writeFileSync(exe, "");
+
+    expect(resolveWindowsCommandInvocation("cloudflared", ["version"], tmpDir)).toEqual({
+      command: exe,
+      args: ["version"],
+    });
+  });
+
+  it("returns null when the command cannot be resolved", () => {
+    expect(resolveWindowsCommandInvocation("cloudflared", ["version"], tmpDir)).toBeNull();
   });
 });

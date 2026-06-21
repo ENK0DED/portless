@@ -84,6 +84,20 @@ Current fork-owned commits and what they protect:
 | `72fd965` | Recorded the fork-only ledger guard commits so automated ledger enforcement had a current baseline.                                                                                                |
 | `b6ab543` | Aligned the docs-site service install documentation with preferred suffix terminology.                                                                                                             |
 | `33f013c` | Recorded the docs sweep commits in the fork-only ledger.                                                                                                                                           |
+| `1f4e6f9` | Updated the fork-only ledger after the final docs sweep.                                                                                                                                           |
+| `5131bb2` | Prepared fork release `0.14.1002` for the upstream PR backport pass.                                                                                                                               |
+| `5d98e81` | Updated the fork-only ledger for the release preparation commit.                                                                                                                                   |
+| `68c17ff` | Fixed Windows child command spawning for package-manager and tunnel shims while keeping unsupported background lifecycle tests scoped to macOS and Linux.                                          |
+| `b4fdaa1` | Updated the fork-only ledger for the Windows child-spawning portability fix.                                                                                                                       |
+| `ab5e32f` | Preserved Windows `Path` inheritance in CLI fixtures that prepend shim directories for child command tests.                                                                                        |
+| `69f3d9b` | Updated the fork-only ledger for the Windows path fixture preservation commit.                                                                                                                     |
+| `474fbce` | Normalized CLI test harness PATH casing on Windows so shim-based child command fixtures use the intended test PATH.                                                                                |
+| `75b65f8` | Updated the fork-only ledger for the Windows CLI fixture PATH normalization commit.                                                                                                                |
+| `01f4dfa` | Resolved managed tunnel `.cmd` and `.bat` shims for Windows Cloudflare and ngrok preflight checks and startup.                                                                                     |
+| `be97903` | Updated the fork-only ledger for the managed tunnel Windows shim fix.                                                                                                                              |
+| `9c2eb09` | Hardened Windows process-spawn-heavy tests and OpenSSL certificate generation timeouts for slow CI hosts.                                                                                          |
+| `e8b0fe9` | Updated the fork-only ledger for the Windows timeout hardening commit.                                                                                                                             |
+| `de166e0` | Added Windows managed tunnel and OpenSSL reliability notes to the `0.14.1002` release changelogs.                                                                                                  |
 
 ## Fork-Owned Invariants
 
@@ -121,7 +135,7 @@ Examples:
 
 This avoids prerelease semantics and keeps room for local-only releases between upstream syncs.
 
-The current fork release `0.14.1001` tracks upstream `0.14.0` plus local fork fixes and maintenance updates. If upstream publishes `0.14.1`, the first synced fork release should be `0.14.2000`. If the fork ships another local-only change before the next upstream patch, use `0.14.1002`.
+The current fork release `0.14.1002` tracks upstream `0.14.0` plus local fork fixes and maintenance updates. If upstream publishes `0.14.1`, the first synced fork release should be `0.14.2000`. If the fork ships another local-only change before the next upstream patch, use `0.14.1003`.
 
 ### Package Manager
 

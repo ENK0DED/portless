@@ -1254,6 +1254,7 @@ export function parseBgStartArgs(tokens: string[]): ParsedBgStartArgs {
 
 export async function handleBg(args: string[], options: { entryScript: string }): Promise<void> {
   const subcommand = args[1];
+  const isSubcommandHelp = args[2] === "--help" || args[2] === "-h";
 
   if (!subcommand || subcommand === "--help" || subcommand === "-h") {
     printBgHelp();
@@ -1274,7 +1275,7 @@ export async function handleBg(args: string[], options: { entryScript: string })
   }
 
   if (subcommand === "status") {
-    if (isWindows) {
+    if (isWindows && !isSubcommandHelp) {
       console.error(colors.red("Error: portless bg currently supports macOS and Linux."));
       process.exit(1);
     }
@@ -1283,7 +1284,7 @@ export async function handleBg(args: string[], options: { entryScript: string })
   }
 
   if (subcommand === "list") {
-    if (isWindows) {
+    if (isWindows && !isSubcommandHelp) {
       console.error(colors.red("Error: portless bg currently supports macOS and Linux."));
       process.exit(1);
     }
@@ -1292,7 +1293,7 @@ export async function handleBg(args: string[], options: { entryScript: string })
   }
 
   if (subcommand === "logs") {
-    if (isWindows) {
+    if (isWindows && !isSubcommandHelp) {
       console.error(colors.red("Error: portless bg currently supports macOS and Linux."));
       process.exit(1);
     }
@@ -1301,7 +1302,7 @@ export async function handleBg(args: string[], options: { entryScript: string })
   }
 
   if (subcommand === "stop") {
-    if (isWindows) {
+    if (isWindows && !isSubcommandHelp) {
       console.error(colors.red("Error: portless bg currently supports macOS and Linux."));
       process.exit(1);
     }
@@ -1310,7 +1311,7 @@ export async function handleBg(args: string[], options: { entryScript: string })
   }
 
   if (subcommand === "restart") {
-    if (isWindows) {
+    if (isWindows && !isSubcommandHelp) {
       console.error(colors.red("Error: portless bg currently supports macOS and Linux."));
       process.exit(1);
     }
@@ -1319,7 +1320,7 @@ export async function handleBg(args: string[], options: { entryScript: string })
   }
 
   if (subcommand === "clean") {
-    if (isWindows) {
+    if (isWindows && !isSubcommandHelp) {
       console.error(colors.red("Error: portless bg currently supports macOS and Linux."));
       process.exit(1);
     }

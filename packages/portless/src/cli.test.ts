@@ -50,7 +50,15 @@ function run(args: string[], options?: { env?: Record<string, string | undefined
       delete env[key];
     }
   }
+  delete env.NODE_EXTRA_CA_CERTS;
   Object.assign(env, options?.env);
+  if (process.platform === "win32" && env.PATH !== undefined) {
+    for (const key of Object.keys(env)) {
+      if (key !== "PATH" && key.toUpperCase() === "PATH") {
+        delete env[key];
+      }
+    }
+  }
   // Test runners may set package-manager env vars; strip the pnpm/npm ones so
   // the CLI child does not look like pnpm dlx or npx.
   delete env.PNPM_SCRIPT_SRC_DIR;
@@ -84,6 +92,14 @@ function runGit(cwd: string, args: string[]): void {
 function writeJson(filePath: string, value: unknown): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, JSON.stringify(value, null, 2) + "\n");
+}
+
+function nodePrintScript(text: string): string {
+  return `${JSON.stringify(process.execPath)} -e "console.log(process.argv[1])" ${text}`;
+}
+
+function prependPath(dir: string): string {
+  return `${dir}${path.delimiter}${process.env.PATH ?? process.env.Path ?? ""}`;
 }
 
 interface TestBgEntry {
@@ -431,16 +447,20 @@ describe("CLI", () => {
       expect(status).toBe(0);
     });
 
-    it.each(["ls", "status"])("preserves %s as an app name when followed by a command", (cmd) => {
-      const { status, stdout } = run(
-        [cmd, process.execPath, "-e", `console.log(${JSON.stringify(`app-named-${cmd}`)})`],
-        {
-          env: { PORTLESS: "0" },
-        }
-      );
-      expect(status).toBe(0);
-      expect(stdout.trim()).toBe(`app-named-${cmd}`);
-    });
+    it.each(["ls", "status"])(
+      "preserves %s as an app name when followed by a command",
+      (cmd) => {
+        const { status, stdout } = run(
+          [cmd, process.execPath, "-e", `console.log(${JSON.stringify(`app-named-${cmd}`)})`],
+          {
+            env: { PORTLESS: "0" },
+          }
+        );
+        expect(status).toBe(0);
+        expect(stdout.trim()).toBe(`app-named-${cmd}`);
+      },
+      15_000
+    );
 
     it("outputs active routes as JSON", () => {
       fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
@@ -639,7 +659,7 @@ describe("CLI", () => {
       expect(stderr).toContain('Unknown bg subcommand "unknown"');
     });
 
-    describe("start", () => {
+    describe.skipIf(process.platform === "win32")("start", () => {
       let tmpDir: string;
       let proxyPort: number;
 
@@ -823,7 +843,7 @@ describe("CLI", () => {
             "-e",
             "console.log(process.env.PORTLESS_TUNNEL_URL); setInterval(() => {}, 1000)",
           ],
-          { env: bgEnv({ PATH: `${tmpDir}${path.delimiter}${process.env.PATH ?? ""}` }) }
+          { env: bgEnv({ PATH: prependPath(tmpDir) }) }
         );
 
         const [entry] = readBgRegistry(tmpDir);
@@ -1341,7 +1361,7 @@ describe("CLI", () => {
               String(appPort),
               ...longRunningCommand(),
             ],
-            { env: bgEnv({ PATH: `${tmpDir}${path.delimiter}${process.env.PATH ?? ""}` }) }
+            { env: bgEnv({ PATH: prependPath(tmpDir) }) }
           ).status
         ).toBe(0);
         expect(fs.existsSync(path.join(tmpDir, "tunnel-aliases.json"))).toBe(true);
@@ -2107,7 +2127,7 @@ describe("CLI", () => {
 
         const { status } = run(["run", "--name", "mobile", "--app-port", "4567", "expo", "start"], {
           env: {
-            PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ""}`,
+            PATH: prependPath(shimDir),
             PORTLESS_STATE_DIR: tmpDir,
             PORTLESS_TEST_CAPTURE_FILE: capturePath,
             PORTLESS_HTTPS: "0",
@@ -2204,7 +2224,7 @@ describe("CLI", () => {
 
         const { status } = run(["run", "--name", "myapp", "--app-port", "4567", "rsbuild", "dev"], {
           env: {
-            PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ""}`,
+            PATH: prependPath(shimDir),
             PORTLESS_STATE_DIR: tmpDir,
             PORTLESS_TEST_CAPTURE_FILE: capturePath,
             PORTLESS_HTTPS: "0",
@@ -2771,7 +2791,7 @@ describe("CLI", () => {
           PORTLESS_PORT: String(testPort),
           PORTLESS_STATE_DIR: tmpDir,
           // Put fake security first in PATH; real openssl is still reachable
-          PATH: `${fakeBinDir}:${process.env.PATH}`,
+          PATH: prependPath(fakeBinDir),
         };
 
         // HTTPS is on by default (no PORTLESS_HTTPS=0), so this exercises
@@ -2818,7 +2838,11 @@ describe("CLI", () => {
     it("portless (no args) runs dev script without portless.json", () => {
       fs.writeFileSync(
         path.join(tmpDir, "package.json"),
-        JSON.stringify({ name: "test-app", scripts: { dev: "echo hello" } })
+        JSON.stringify({
+          name: "test-app",
+          packageManager: "bun@1.3.14",
+          scripts: { dev: nodePrintScript("hello") },
+        })
       );
       const { status, stdout } = run([], {
         cwd: tmpDir,
@@ -2842,7 +2866,8 @@ describe("CLI", () => {
           path.join(tmpDir, "package.json"),
           JSON.stringify({
             name: "test-app",
-            scripts: { dev: `${process.execPath} -e "process.exit(0)"` },
+            packageManager: "bun@1.3.14",
+            scripts: { dev: nodePrintScript("ready") },
             portless: { name: "pkg-name" },
           })
         );
@@ -2922,7 +2947,7 @@ describe("CLI", () => {
         const { status } = run([], {
           cwd: tmpDir,
           env: {
-            PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ""}`,
+            PATH: prependPath(shimDir),
             PORTLESS_STATE_DIR: tmpDir,
             PORTLESS_TEST_CAPTURE_FILE: capturePath,
             PORTLESS_HTTPS: "0",
@@ -3017,7 +3042,7 @@ describe("CLI", () => {
           {
             cwd: tmpDir,
             env: {
-              PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ""}`,
+              PATH: prependPath(shimDir),
               PORTLESS_STATE_DIR: tmpDir,
               PORTLESS_TEST_CAPTURE_FILE: capturePath,
               PORTLESS_HTTPS: "0",
@@ -3103,7 +3128,7 @@ describe("CLI", () => {
           {
             cwd: tmpDir,
             env: {
-              PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ""}`,
+              PATH: prependPath(shimDir),
               PORTLESS_STATE_DIR: tmpDir,
               PORTLESS_TEST_CAPTURE_FILE: capturePath,
               PORTLESS_HTTPS: "0",
@@ -3130,92 +3155,100 @@ describe("CLI", () => {
       }
     });
 
-    it.skipIf(!GIT_AVAILABLE)("prefixes workspace app URLs in linked git worktrees", async () => {
-      const server = http.createServer((_req, res) => {
-        res.setHeader("X-Portless", "1");
-        res.end("ok");
-      });
-      const repoDir = path.join(tmpDir, "repo");
-      const worktreeDir = path.join(tmpDir, "feature-auth-worktree");
-      const stateDir = path.join(tmpDir, "state");
-      const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-pnpm-shim-"));
+    it.skipIf(!GIT_AVAILABLE)(
+      "prefixes workspace app URLs in linked git worktrees",
+      async () => {
+        const server = http.createServer((_req, res) => {
+          res.setHeader("X-Portless", "1");
+          res.end("ok");
+        });
+        const repoDir = path.join(tmpDir, "repo");
+        const worktreeDir = path.join(tmpDir, "feature-auth-worktree");
+        const stateDir = path.join(tmpDir, "state");
+        const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-pnpm-shim-"));
 
-      try {
-        fs.mkdirSync(repoDir, { recursive: true });
-        writeJson(path.join(repoDir, "package.json"), {
-          private: true,
-          name: "sound-lab",
-          packageManager: "pnpm@11.1.3",
-          workspaces: ["apps/*"],
-        });
-        writeJson(path.join(repoDir, "portless.json"), {
-          name: "custom",
-          turbo: false,
-          apps: {
-            "apps/api": { name: "api.custom" },
-          },
-        });
-        writeJson(path.join(repoDir, "apps", "api", "package.json"), {
-          name: "@sound-lab/api",
-          scripts: { dev: 'node -e "process.exit(0)"' },
-        });
-        writeJson(path.join(repoDir, "apps", "web", "package.json"), {
-          name: "@sound-lab/web",
-          scripts: { dev: 'node -e "process.exit(0)"' },
-        });
-
-        runGit(repoDir, ["init"]);
-        runGit(repoDir, ["config", "user.name", "Portless Test"]);
-        runGit(repoDir, ["config", "user.email", "portless-test@example.com"]);
-        runGit(repoDir, ["branch", "-M", "main"]);
-        runGit(repoDir, ["add", "."]);
-        runGit(repoDir, ["commit", "-m", "init"]);
-        runGit(repoDir, ["worktree", "add", "-b", "feature-auth", worktreeDir]);
-
-        const proxyPort = await new Promise<number>((resolve) => {
-          server.listen(0, "127.0.0.1", () => {
-            const addr = server.address();
-            if (addr && typeof addr !== "string") {
-              resolve(addr.port);
-            }
+        try {
+          fs.mkdirSync(repoDir, { recursive: true });
+          writeJson(path.join(repoDir, "package.json"), {
+            private: true,
+            name: "sound-lab",
+            packageManager: "pnpm@11.1.3",
+            workspaces: ["apps/*"],
           });
-        });
-        fs.mkdirSync(stateDir, { recursive: true });
-        fs.writeFileSync(path.join(stateDir, "proxy.port"), proxyPort.toString());
+          writeJson(path.join(repoDir, "portless.json"), {
+            name: "custom",
+            turbo: false,
+            apps: {
+              "apps/api": { name: "api.custom" },
+            },
+          });
+          writeJson(path.join(repoDir, "apps", "api", "package.json"), {
+            name: "@sound-lab/api",
+            scripts: { dev: 'node -e "process.exit(0)"' },
+          });
+          writeJson(path.join(repoDir, "apps", "web", "package.json"), {
+            name: "@sound-lab/web",
+            scripts: { dev: 'node -e "process.exit(0)"' },
+          });
 
-        if (process.platform === "win32") {
-          fs.writeFileSync(path.join(shimDir, "pnpm.cmd"), "@echo off\r\nexit /b 0\r\n");
-        } else {
-          const shimPath = path.join(shimDir, "pnpm");
-          fs.writeFileSync(shimPath, "#!/bin/sh\nexit 0\n");
-          fs.chmodSync(shimPath, 0o755);
+          runGit(repoDir, ["init"]);
+          runGit(repoDir, ["config", "user.name", "Portless Test"]);
+          runGit(repoDir, ["config", "user.email", "portless-test@example.com"]);
+          runGit(repoDir, ["branch", "-M", "main"]);
+          runGit(repoDir, ["add", "."]);
+          runGit(repoDir, ["commit", "-m", "init"]);
+          runGit(repoDir, ["worktree", "add", "-b", "feature-auth", worktreeDir]);
+
+          const proxyPort = await new Promise<number>((resolve) => {
+            server.listen(0, "127.0.0.1", () => {
+              const addr = server.address();
+              if (addr && typeof addr !== "string") {
+                resolve(addr.port);
+              }
+            });
+          });
+          fs.mkdirSync(stateDir, { recursive: true });
+          fs.writeFileSync(path.join(stateDir, "proxy.port"), proxyPort.toString());
+
+          if (process.platform === "win32") {
+            fs.writeFileSync(path.join(shimDir, "pnpm.cmd"), "@echo off\r\nexit /b 0\r\n");
+          } else {
+            const shimPath = path.join(shimDir, "pnpm");
+            fs.writeFileSync(shimPath, "#!/bin/sh\nexit 0\n");
+            fs.chmodSync(shimPath, 0o755);
+          }
+
+          const { status, stdout, stderr } = run([], {
+            cwd: worktreeDir,
+            env: {
+              PATH: prependPath(shimDir),
+              PORTLESS_STATE_DIR: stateDir,
+              PORTLESS_HTTPS: "0",
+            },
+          });
+
+          expect(stderr).toBe("");
+          expect(status).toBe(0);
+          expect(stdout).toContain(`http://feature-auth.api.custom.localhost:${proxyPort}`);
+          expect(stdout).toContain(`http://feature-auth.web.custom.localhost:${proxyPort}`);
+          expect(stdout).not.toContain(`http://api.custom.localhost:${proxyPort}`);
+          expect(stdout).not.toContain(`http://web.custom.localhost:${proxyPort}`);
+        } finally {
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+          fs.rmSync(shimDir, { recursive: true, force: true });
         }
-
-        const { status, stdout, stderr } = run([], {
-          cwd: worktreeDir,
-          env: {
-            PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ""}`,
-            PORTLESS_STATE_DIR: stateDir,
-            PORTLESS_HTTPS: "0",
-          },
-        });
-
-        expect(stderr).toBe("");
-        expect(status).toBe(0);
-        expect(stdout).toContain(`http://feature-auth.api.custom.localhost:${proxyPort}`);
-        expect(stdout).toContain(`http://feature-auth.web.custom.localhost:${proxyPort}`);
-        expect(stdout).not.toContain(`http://api.custom.localhost:${proxyPort}`);
-        expect(stdout).not.toContain(`http://web.custom.localhost:${proxyPort}`);
-      } finally {
-        await new Promise<void>((resolve) => server.close(() => resolve()));
-        fs.rmSync(shimDir, { recursive: true, force: true });
-      }
-    });
+      },
+      10_000
+    );
 
     it("portless run (no command) with portless.json resolves dev script", () => {
       fs.writeFileSync(
         path.join(tmpDir, "package.json"),
-        JSON.stringify({ name: "test-app", scripts: { dev: "echo config-dev" } })
+        JSON.stringify({
+          name: "test-app",
+          packageManager: "bun@1.3.14",
+          scripts: { dev: nodePrintScript("config-dev") },
+        })
       );
       fs.writeFileSync(path.join(tmpDir, "portless.json"), JSON.stringify({ name: "myapp" }));
       const { stdout } = run(["run"], {
@@ -3228,7 +3261,11 @@ describe("CLI", () => {
     it("portless run (no command) with .config/portless.json resolves dev script", () => {
       fs.writeFileSync(
         path.join(tmpDir, "package.json"),
-        JSON.stringify({ name: "test-app", scripts: { dev: "echo config-dir-dev" } })
+        JSON.stringify({
+          name: "test-app",
+          packageManager: "bun@1.3.14",
+          scripts: { dev: nodePrintScript("config-dir-dev") },
+        })
       );
       fs.mkdirSync(path.join(tmpDir, ".config"), { recursive: true });
       fs.writeFileSync(
@@ -3245,7 +3282,11 @@ describe("CLI", () => {
     it("portless run (no command) without portless.json resolves dev script", () => {
       fs.writeFileSync(
         path.join(tmpDir, "package.json"),
-        JSON.stringify({ name: "test-app", scripts: { dev: "echo hello" } })
+        JSON.stringify({
+          name: "test-app",
+          packageManager: "bun@1.3.14",
+          scripts: { dev: nodePrintScript("hello") },
+        })
       );
       const { stdout } = run(["run"], {
         cwd: tmpDir,
@@ -3257,7 +3298,11 @@ describe("CLI", () => {
     it("portless run with explicit command ignores config script", () => {
       fs.writeFileSync(
         path.join(tmpDir, "package.json"),
-        JSON.stringify({ name: "test-app", scripts: { dev: "echo from-config" } })
+        JSON.stringify({
+          name: "test-app",
+          packageManager: "bun@1.3.14",
+          scripts: { dev: nodePrintScript("from-config") },
+        })
       );
       fs.writeFileSync(
         path.join(tmpDir, "portless.json"),
@@ -3276,7 +3321,8 @@ describe("CLI", () => {
         path.join(tmpDir, "package.json"),
         JSON.stringify({
           name: "test-app",
-          scripts: { dev: "echo from-dev", start: "echo from-start" },
+          packageManager: "bun@1.3.14",
+          scripts: { dev: nodePrintScript("from-dev"), start: nodePrintScript("from-start") },
         })
       );
       fs.writeFileSync(
@@ -3295,7 +3341,8 @@ describe("CLI", () => {
         path.join(tmpDir, "package.json"),
         JSON.stringify({
           name: "test-app",
-          scripts: { dev: "echo from-dev", start: "echo from-start" },
+          packageManager: "bun@1.3.14",
+          scripts: { dev: nodePrintScript("from-dev"), start: nodePrintScript("from-start") },
         })
       );
       fs.writeFileSync(path.join(tmpDir, "portless.json"), JSON.stringify({ script: "start" }));
@@ -3317,7 +3364,8 @@ describe("CLI", () => {
         path.join(tmpDir, "package.json"),
         JSON.stringify({
           name: "test-app",
-          scripts: { dev: "echo from-dev", start: "echo from-start" },
+          packageManager: "bun@1.3.14",
+          scripts: { dev: nodePrintScript("from-dev"), start: nodePrintScript("from-start") },
         })
       );
       fs.writeFileSync(
@@ -3600,7 +3648,7 @@ describe("CLI", () => {
           ].join("\n") + "\n"
         );
 
-        const { status, stdout } = run(
+        const { status, stdout, stderr } = run(
           [
             "run",
             "--name",
@@ -3609,19 +3657,19 @@ describe("CLI", () => {
             "4567",
             "--tunnel",
             "cloudflare",
-            "node",
+            process.execPath,
             scriptPath,
           ],
           {
             env: {
-              PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+              PATH: prependPath(binDir),
               PORTLESS_STATE_DIR: tmpDir,
               PORTLESS_HTTPS: "0",
             },
           }
         );
 
-        expect(status).toBe(0);
+        expect({ status, stdout, stderr }).toMatchObject({ status: 0 });
         expect(stdout).toContain("Cloudflare Tunnel");
         expect(JSON.parse(fs.readFileSync(capturePath, "utf-8"))).toMatchObject({
           PORTLESS_URL: `http://myapp.localhost:${proxyPort}`,

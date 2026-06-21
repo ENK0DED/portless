@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import type { TunnelProviderName } from "./types.js";
+import { isWindows, resolveWindowsCommandInvocation } from "./cli-utils.js";
 import { ensureNgrokAvailable, startNgrok, type NgrokChildProcess } from "./ngrok.js";
 
 const CLOUDFLARED_BINARY = "cloudflared";
@@ -39,6 +40,23 @@ export interface TunnelProvider {
 }
 
 function defaultSpawner(command: string, args: string[]): TunnelChildProcess {
+  if (isWindows) {
+    const invocation = resolveWindowsCommandInvocation(
+      command,
+      args,
+      process.env.PATH ?? process.env.Path ?? ""
+    );
+    if (invocation) {
+      return spawn(invocation.command, invocation.args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+        ...(invocation.windowsVerbatimArguments
+          ? { windowsVerbatimArguments: invocation.windowsVerbatimArguments }
+          : {}),
+      }) as TunnelChildProcess;
+    }
+  }
+
   return spawn(command, args, {
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
@@ -223,11 +241,27 @@ export function ensureTunnelProviderAvailable(provider: TunnelProviderName): voi
     return;
   }
 
-  const result = spawnSync(CLOUDFLARED_BINARY, ["version"], {
-    encoding: "utf-8",
-    killSignal: "SIGKILL",
-    timeout: TUNNEL_COMMAND_TIMEOUT_MS,
-  });
+  const cloudflaredVersionArgs = ["version"];
+  const invocation = isWindows
+    ? resolveWindowsCommandInvocation(
+        CLOUDFLARED_BINARY,
+        cloudflaredVersionArgs,
+        process.env.PATH ?? process.env.Path ?? ""
+      )
+    : null;
+  const result = spawnSync(
+    invocation?.command ?? CLOUDFLARED_BINARY,
+    invocation?.args ?? cloudflaredVersionArgs,
+    {
+      encoding: "utf-8",
+      killSignal: "SIGKILL",
+      timeout: TUNNEL_COMMAND_TIMEOUT_MS,
+      windowsHide: true,
+      ...(invocation?.windowsVerbatimArguments
+        ? { windowsVerbatimArguments: invocation.windowsVerbatimArguments }
+        : {}),
+    }
+  );
   if (result.error) {
     throw formatSpawnError(
       "cloudflared",
