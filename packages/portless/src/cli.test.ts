@@ -91,6 +91,10 @@ function nodePrintScript(text: string): string {
   return `${JSON.stringify(process.execPath)} -e "console.log(process.argv[1])" ${text}`;
 }
 
+function prependPath(dir: string): string {
+  return `${dir}${path.delimiter}${process.env.PATH ?? process.env.Path ?? ""}`;
+}
+
 interface TestBgEntry {
   id: string;
   label: string;
@@ -828,7 +832,7 @@ describe("CLI", () => {
             "-e",
             "console.log(process.env.PORTLESS_TUNNEL_URL); setInterval(() => {}, 1000)",
           ],
-          { env: bgEnv({ PATH: `${tmpDir}${path.delimiter}${process.env.PATH ?? ""}` }) }
+          { env: bgEnv({ PATH: prependPath(tmpDir) }) }
         );
 
         const [entry] = readBgRegistry(tmpDir);
@@ -1346,7 +1350,7 @@ describe("CLI", () => {
               String(appPort),
               ...longRunningCommand(),
             ],
-            { env: bgEnv({ PATH: `${tmpDir}${path.delimiter}${process.env.PATH ?? ""}` }) }
+            { env: bgEnv({ PATH: prependPath(tmpDir) }) }
           ).status
         ).toBe(0);
         expect(fs.existsSync(path.join(tmpDir, "tunnel-aliases.json"))).toBe(true);
@@ -2112,7 +2116,7 @@ describe("CLI", () => {
 
         const { status } = run(["run", "--name", "mobile", "--app-port", "4567", "expo", "start"], {
           env: {
-            PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ""}`,
+            PATH: prependPath(shimDir),
             PORTLESS_STATE_DIR: tmpDir,
             PORTLESS_TEST_CAPTURE_FILE: capturePath,
             PORTLESS_HTTPS: "0",
@@ -2209,7 +2213,7 @@ describe("CLI", () => {
 
         const { status } = run(["run", "--name", "myapp", "--app-port", "4567", "rsbuild", "dev"], {
           env: {
-            PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ""}`,
+            PATH: prependPath(shimDir),
             PORTLESS_STATE_DIR: tmpDir,
             PORTLESS_TEST_CAPTURE_FILE: capturePath,
             PORTLESS_HTTPS: "0",
@@ -2776,7 +2780,7 @@ describe("CLI", () => {
           PORTLESS_PORT: String(testPort),
           PORTLESS_STATE_DIR: tmpDir,
           // Put fake security first in PATH; real openssl is still reachable
-          PATH: `${fakeBinDir}:${process.env.PATH}`,
+          PATH: prependPath(fakeBinDir),
         };
 
         // HTTPS is on by default (no PORTLESS_HTTPS=0), so this exercises
@@ -2932,7 +2936,7 @@ describe("CLI", () => {
         const { status } = run([], {
           cwd: tmpDir,
           env: {
-            PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ""}`,
+            PATH: prependPath(shimDir),
             PORTLESS_STATE_DIR: tmpDir,
             PORTLESS_TEST_CAPTURE_FILE: capturePath,
             PORTLESS_HTTPS: "0",
@@ -3027,7 +3031,7 @@ describe("CLI", () => {
           {
             cwd: tmpDir,
             env: {
-              PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ""}`,
+              PATH: prependPath(shimDir),
               PORTLESS_STATE_DIR: tmpDir,
               PORTLESS_TEST_CAPTURE_FILE: capturePath,
               PORTLESS_HTTPS: "0",
@@ -3113,7 +3117,7 @@ describe("CLI", () => {
           {
             cwd: tmpDir,
             env: {
-              PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ""}`,
+              PATH: prependPath(shimDir),
               PORTLESS_STATE_DIR: tmpDir,
               PORTLESS_TEST_CAPTURE_FILE: capturePath,
               PORTLESS_HTTPS: "0",
@@ -3204,7 +3208,7 @@ describe("CLI", () => {
         const { status, stdout, stderr } = run([], {
           cwd: worktreeDir,
           env: {
-            PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ""}`,
+            PATH: prependPath(shimDir),
             PORTLESS_STATE_DIR: stateDir,
             PORTLESS_HTTPS: "0",
           },
@@ -3638,12 +3642,12 @@ describe("CLI", () => {
             "4567",
             "--tunnel",
             "cloudflare",
-            "node",
+            process.execPath,
             scriptPath,
           ],
           {
             env: {
-              PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+              PATH: prependPath(binDir),
               PORTLESS_STATE_DIR: tmpDir,
               PORTLESS_HTTPS: "0",
             },
