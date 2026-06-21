@@ -96,6 +96,8 @@ Current fork-owned commits and what they protect:
 | `01f4dfa` | Resolved managed tunnel `.cmd` and `.bat` shims for Windows Cloudflare and ngrok preflight checks and startup.                                                                                     |
 | `be97903` | Updated the fork-only ledger for the managed tunnel Windows shim fix.                                                                                                                              |
 | `9c2eb09` | Hardened Windows process-spawn-heavy tests and OpenSSL certificate generation timeouts for slow CI hosts.                                                                                          |
+| `e8b0fe9` | Updated the fork-only ledger for the Windows timeout hardening commit.                                                                                                                             |
+| `de166e0` | Added Windows managed tunnel and OpenSSL reliability notes to the `0.14.1002` release changelogs.                                                                                                  |
 
 ## Fork-Owned Invariants
 
