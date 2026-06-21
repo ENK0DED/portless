@@ -81,6 +81,8 @@ Current fork-owned commits and what they protect:
 | `2a40cff` | Removed obsolete execution-plan references from fork documentation.                                                                                                                                |
 | `9167707` | Updated the fork-only ledger with recent documentation maintenance commits before adding automated enforcement.                                                                                    |
 | `6a942d2` | Added a tested fork-only ledger freshness checker and CI enforcement.                                                                                                                              |
+| `72fd965` | Recorded the fork-only ledger guard commits so automated ledger enforcement had a current baseline.                                                                                                |
+| `b6ab543` | Aligned the docs-site service install documentation with preferred suffix terminology.                                                                                                             |
 
 ## Fork-Owned Invariants
 
