@@ -76,6 +76,9 @@ Current fork-owned commits and what they protect:
 | `cb0d38b` | Refreshed fork sweep records, upstream PR coverage checks, Bun docs drift, and HTTP/2 Extended CONNECT docs-site coverage.                                                                         |
 | `29fb586` | Restored the fork verification gate by fixing TypeScript-only test and WSL runtime dependency-injection types.                                                                                     |
 | `7f5a036` | Normalized background app source formatting so the repository Prettier gate stays green.                                                                                                           |
+| `da69f4f` | Clarified fork-only ledger maintenance expectations.                                                                                                                                               |
+| `62ef55c` | Consolidated upstream open PR triage into one canonical fork ledger and removed retired execution scaffolding.                                                                                     |
+| `2a40cff` | Removed obsolete execution-plan references from fork documentation.                                                                                                                                |
 
 ## Fork-Owned Invariants
 
