@@ -84,6 +84,8 @@ Current fork-owned commits and what they protect:
 | `72fd965` | Recorded the fork-only ledger guard commits so automated ledger enforcement had a current baseline.                                                                                                |
 | `b6ab543` | Aligned the docs-site service install documentation with preferred suffix terminology.                                                                                                             |
 | `33f013c` | Recorded the docs sweep commits in the fork-only ledger.                                                                                                                                           |
+| `1f4e6f9` | Updated the fork-only ledger after the final docs sweep.                                                                                                                                           |
+| `5131bb2` | Prepared fork release `0.14.1002` for the upstream PR backport pass.                                                                                                                               |
 
 ## Fork-Owned Invariants
 
@@ -121,7 +123,7 @@ Examples:
 
 This avoids prerelease semantics and keeps room for local-only releases between upstream syncs.
 
-The current fork release `0.14.1001` tracks upstream `0.14.0` plus local fork fixes and maintenance updates. If upstream publishes `0.14.1`, the first synced fork release should be `0.14.2000`. If the fork ships another local-only change before the next upstream patch, use `0.14.1002`.
+The current fork release `0.14.1002` tracks upstream `0.14.0` plus local fork fixes and maintenance updates. If upstream publishes `0.14.1`, the first synced fork release should be `0.14.2000`. If the fork ships another local-only change before the next upstream patch, use `0.14.1003`.
 
 ### Package Manager
 
