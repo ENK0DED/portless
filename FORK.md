@@ -90,6 +90,8 @@ Current fork-owned commits and what they protect:
 | `68c17ff` | Fixed Windows child command spawning for package-manager and tunnel shims while keeping unsupported background lifecycle tests scoped to macOS and Linux.                                          |
 | `b4fdaa1` | Updated the fork-only ledger for the Windows child-spawning portability fix.                                                                                                                       |
 | `ab5e32f` | Preserved Windows `Path` inheritance in CLI fixtures that prepend shim directories for child command tests.                                                                                        |
+| `69f3d9b` | Updated the fork-only ledger for the Windows path fixture preservation commit.                                                                                                                     |
+| `474fbce` | Normalized CLI test harness PATH casing on Windows so shim-based child command fixtures use the intended test PATH.                                                                                |
 
 ## Fork-Owned Invariants
 
