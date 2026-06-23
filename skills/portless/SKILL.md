@@ -48,7 +48,7 @@ portless myapp next dev
 # -> https://myapp.localhost
 ```
 
-The proxy auto-starts when you run an app. You can also start it explicitly with `portless proxy start`. Auto-start reuses the configuration (port, TLS, suffix) from the most recent proxy run, so a restart or reboot does not silently revert to defaults. Explicit env vars always take priority.
+The proxy auto-starts when you run an app. You can also start it explicitly with `portless proxy start`. Auto-start reuses the configuration (port, TLS, suffix) from the most recent proxy run, so a restart or reboot does not silently revert to defaults. Generated CA and server certificates are stored in the resolved state directory and reused across restarts. Explicit env vars always take priority.
 
 In non-interactive environments (no TTY, or `CI=1`), portless exits with a descriptive error instead of prompting. Task runners like turborepo should pre-start the proxy.
 
@@ -207,9 +207,9 @@ Portless replaces only whole arguments matching `{PORT}`, `{HOST}`, or `{PORTLES
 
 ### State directory
 
-Portless stores its state (routes, PID file, port file) in `~/.portless`. Override with the `PORTLESS_STATE_DIR` environment variable.
+Portless stores its state in `~/.portless`: routes, PID and port files, TLS markers, the generated local CA, server certificates, and cached per-host certificates. Override with the `PORTLESS_STATE_DIR` environment variable.
 
-Auto-elevated proxy starts pass the resolved `PORTLESS_STATE_DIR` through `sudo`, so a root-owned proxy uses the same per-user state and suffix settings as the command that started it. Set `PORTLESS_STATE_DIR` explicitly before running portless if a separate proxy state directory is required.
+Auto-elevated proxy starts pass the resolved `PORTLESS_STATE_DIR` and proxy flags such as `--skip-trust` through `sudo`, so a root-owned proxy uses the same per-user state, suffix settings, and trust choice as the command that started it. Set `PORTLESS_STATE_DIR` explicitly before running portless if a separate proxy state directory is required.
 
 ### Custom suffixes
 
@@ -256,12 +256,13 @@ The suffix may be a single label such as `test` or a dotted suffix such as `serv
 
 ### HTTP/2 + HTTPS
 
-HTTPS with HTTP/2 is enabled by default (faster page loads for dev servers with many files). First run generates a local CA and adds it to the system trust store. After that, no prompts and no browser warnings.
+HTTPS with HTTP/2 is enabled by default (faster page loads for dev servers with many files). First run generates a local CA and adds it to the system trust store. Generated certificates are stored under the resolved state directory and reused across proxy restarts. They are regenerated only when removed or cleaned. After trust succeeds, there are no prompts and no browser warnings.
 
-Modern browser HMR WebSockets over HTTPS use HTTP/2 Extended CONNECT. Current portless supports that path. Do not work around HMR failures by disabling TLS first; check route state, proxy logs, and whether the app is actually running before changing TLS settings.
+Modern browser HMR WebSockets over HTTPS use HTTP/2 Extended CONNECT. Current portless supports that path, including negotiated subprotocols such as Vite's `vite-hmr`. Do not work around HMR failures by disabling TLS first; check route state, proxy logs, the negotiated WebSocket subprotocol, and whether the app is actually running before changing TLS settings.
 
 ```bash
 portless proxy start --cert ./c.pem --key ./k.pem  # Use custom certs
+portless proxy start --skip-trust                   # Do not add the CA to trust
 portless proxy start --no-tls                       # Disable HTTPS (plain HTTP)
 portless trust                                      # Add CA to trust store later
 ```
@@ -454,6 +455,7 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 | `portless proxy start --no-tls`                  | Start without HTTPS (plain HTTP on port 80)                    |
 | `portless proxy start --lan`                     | Start in LAN mode (mDNS `.local`, auto-follows LAN IP changes) |
 | `portless proxy start -p <number>`               | Start the proxy on a custom port                               |
+| `portless proxy start --skip-trust`              | Generate or reuse certs without adding the CA to trust         |
 | `portless proxy start --suffix test`             | Use .test instead of .localhost                                |
 | `portless proxy start --tld test`                | Compatibility alias for `--suffix`                             |
 | `portless proxy start --foreground`              | Start the proxy in foreground (for debugging)                  |
@@ -636,7 +638,7 @@ The local CA may not be trusted yet. Run:
 portless trust
 ```
 
-This adds the portless local CA to your system trust store. After that, restart the browser.
+This adds the portless local CA to your system trust store. After that, restart the browser. If the user intentionally does not want trust changes, use `portless proxy start --skip-trust` and expect browser warnings until the CA is trusted manually.
 
 ### Remove portless from the machine
 
@@ -644,7 +646,7 @@ This adds the portless local CA to your system trust store. After that, restart 
 portless clean
 ```
 
-Stops the proxy if needed, removes the portless CA from the trust store (when portless added it), deletes known files under state directories, and removes the portless `/etc/hosts` block. May require `sudo` on macOS/Linux.
+Stops the proxy if needed, removes the portless CA from the trust store (when portless added it), deletes known files under state directories, and removes the portless `/etc/hosts` block. This deletes generated CA, server, and cached host certs, so the next HTTPS proxy start generates a new local CA. May require `sudo` on macOS/Linux.
 
 ### Proxy loop (508 Loop Detected)
 

@@ -3097,10 +3097,14 @@ ${colors.bold("Background apps:")}
 
 ${colors.bold("HTTP/2 + HTTPS (default):")}
   HTTPS with HTTP/2 multiplexing is enabled by default (faster page loads).
-  Modern HMR WebSockets over HTTP/2 are supported via Extended CONNECT.
+  Modern HMR WebSockets over HTTP/2 are supported via Extended CONNECT,
+  including negotiated subprotocols such as vite-hmr.
   On first use, portless generates a local CA and adds it to your
-  system trust store. In WSL, the CA is also added to the Windows user
-  trust store for Windows browsers. No browser warnings. Disable with --no-tls.
+  system trust store. Generated certs are stored in the state directory
+  and reused across restarts. In WSL, the CA is also added to the Windows
+  user trust store for Windows browsers. No browser warnings.
+  Use --skip-trust to skip adding the CA to the trust store.
+  Disable with --no-tls.
 
 ${colors.bold("LAN mode:")}
   Use --lan to make services accessible from other devices (phones,
@@ -3179,6 +3183,7 @@ ${colors.bold("Options:")}
                                 Standard ports auto-elevate with sudo on macOS/Linux
   --no-tls                      Disable HTTPS (use plain HTTP on port 80)
   --https                       Enable HTTPS (default, accepted for compatibility)
+  --skip-trust                  Generate or reuse certs without adding the CA to trust
   --lan                         Enable LAN mode (mDNS .local, for real device testing)
   --ip <address>                Pin a specific LAN IP (disables auto-follow; use with --lan)
   --cert <path>                 Use a custom TLS certificate
@@ -4142,6 +4147,7 @@ ${colors.bold("Usage:")}
   ${colors.cyan("portless proxy start")}                Start the HTTPS proxy on port 443 (daemon)
   ${colors.cyan("portless proxy start --no-tls")}       Start without HTTPS (port 80)
   ${colors.cyan("portless proxy start --lan")}          Enable LAN mode (mDNS, .local suffix)
+  ${colors.cyan("portless proxy start --skip-trust")}   Skip adding the generated CA to trust
   ${colors.cyan("portless proxy start --foreground")}   Start in foreground (for debugging)
   ${colors.cyan("portless proxy start -p 1355")}        Start on a custom port (no sudo)
   ${colors.cyan("portless proxy start --suffix test")}  Use .test instead of .localhost
@@ -4433,6 +4439,7 @@ ${colors.bold("LAN mode (--lan):")}
         foreground: isForeground,
         includePort: true,
         proxyPort,
+        skipTrust,
       }).args,
     ];
     const fallbackCommand = formatProxyStartCommand(FALLBACK_PROXY_PORT, resolvedConfig);

@@ -2,11 +2,11 @@
 
 HTTP/2 + TLS is enabled by default for faster dev server page loads. Browsers limit HTTP/1.1 to 6 connections per host, which bottlenecks dev servers serving many unbundled files. HTTP/2 multiplexes all requests over a single connection.
 
-First run generates a local CA and server certs, then adds the CA to your system trust store. After that, no prompts, no browser warnings.
+First run generates a local CA and server certs, then adds the CA to your system trust store. Generated CA and server certificates are stored in the resolved state directory and reused across proxy restarts and machine reboots. They are regenerated only when removed or cleaned. After the CA is trusted, there are no prompts and no browser warnings.
 
 In WSL, portless also installs the CA into the Windows CurrentUser Root store so Windows browsers trust portless HTTPS URLs served from WSL.
 
-Modern browser HMR WebSockets over HTTPS use HTTP/2 Extended CONNECT. Portless supports that path, so Next.js Turbopack, Vite, and similar dev servers can keep hot reloading while HTTPS and HTTP/2 stay enabled.
+Modern browser HMR WebSockets over HTTPS use HTTP/2 Extended CONNECT. Portless supports that path, including negotiated WebSocket subprotocols such as Vite's `vite-hmr`, so Next.js Turbopack, Vite, Nuxt, and similar dev servers can keep hot reloading while HTTPS and HTTP/2 stay enabled.
 
 ## Custom certificates
 
@@ -22,6 +22,12 @@ If you skipped the trust prompt on first run:
 
 ```bash
 portless trust
+```
+
+To generate or reuse certificates without adding the CA to the trust store:
+
+```bash
+portless proxy start --skip-trust
 ```
 
 ## Trust the CA on other devices

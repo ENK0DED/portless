@@ -429,6 +429,21 @@ interface H2WebSocketRouteSelection {
   rejectReason?: "missing-host" | "internal-host" | "loop" | "missing-route" | "h2c-route";
 }
 
+function singleHeaderValue(value: string | string[] | number | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  if (Array.isArray(value)) return value.map(String).join(", ");
+  return String(value);
+}
+
+function h2WebSocketResponseHeaders(headers: http2.IncomingHttpHeaders): http2.OutgoingHttpHeaders {
+  const responseHeaders: http2.OutgoingHttpHeaders = { ":status": 200 };
+  const protocol = singleHeaderValue(headers["sec-websocket-protocol"]);
+  if (protocol && !protocol.includes(",")) {
+    responseHeaders["sec-websocket-protocol"] = protocol;
+  }
+  return responseHeaders;
+}
+
 /** Server type returned by createProxyServer (plain HTTP/1.1 or net.Server TLS wrapper). */
 export type ProxyServer = http.Server | net.Server;
 
@@ -680,8 +695,10 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     headers: http2.IncomingHttpHeaders
   ): void => {
     stream.on("error", () => stream.destroy());
+    const responseHeaders = h2WebSocketResponseHeaders(headers);
+    const responseProtocol = singleHeaderValue(responseHeaders["sec-websocket-protocol"]);
     try {
-      stream.respond({ ":status": 200 }, { endStream: false });
+      stream.respond(responseHeaders, { endStream: false });
     } catch {
       stream.destroy();
       return;
@@ -749,6 +766,10 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       const parsed = parseWebSocketUpgradeResponse(handshakeBuffer, serialized.expectedAccept);
       if (!parsed.ok && parsed.reason === "incomplete") return;
       if (!parsed.ok) {
+        cleanup();
+        return;
+      }
+      if (responseProtocol && parsed.headers["sec-websocket-protocol"] !== responseProtocol) {
         cleanup();
         return;
       }

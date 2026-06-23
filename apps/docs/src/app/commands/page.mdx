@@ -335,7 +335,7 @@ Disable the dashboard with `PORTLESS_DASHBOARD=0`.
 portless trust
 ```
 
-Adds the portless certificate authority to your system trust store. Required once for HTTPS with auto-generated certs.
+Adds the portless certificate authority to your system trust store. Required once for HTTPS with auto-generated certs. Use `portless proxy start --skip-trust` to generate or reuse certs without adding the CA to the trust store.
 
 ## Clean up
 
@@ -343,7 +343,7 @@ Adds the portless certificate authority to your system trust store. Required onc
 portless clean
 ```
 
-Stops the proxy if it is running, removes the portless CA from the OS trust store when portless installed it, deletes allowlisted files under `~/.portless`, the system state directory, and `PORTLESS_STATE_DIR` when set, and removes the portless block from `/etc/hosts`. May prompt for elevated privileges. Custom `--cert` / `--key` paths are not removed.
+Stops the proxy if it is running, removes the portless CA from the OS trust store when portless installed it, deletes allowlisted files under `~/.portless`, the system state directory, and `PORTLESS_STATE_DIR` when set, and removes the portless block from `/etc/hosts`. This includes generated CA, server, and cached host certificates, so the next HTTPS proxy start generates a new local CA. May prompt for elevated privileges. Custom `--cert` / `--key` paths are not removed.
 
 ## Prune orphans
 
@@ -397,6 +397,10 @@ portless proxy start
     <tr>
       <td>`--https`</td>
       <td>Enable HTTPS (default, accepted for compatibility)</td>
+    </tr>
+    <tr>
+      <td>`--skip-trust`</td>
+      <td>Generate or reuse TLS certificates without adding the CA to the system trust store. Preserved through implicit sudo.</td>
     </tr>
     <tr>
       <td>`--lan`</td>

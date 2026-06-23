@@ -1,8 +1,27 @@
 # Changelog
 
-## 0.14.1002
+## 0.14.1003
 
 <!-- release:start -->
+
+### Bug Fixes
+
+- **Vite and Nuxt HMR over HTTP/2**: HTTP/2 Extended CONNECT WebSocket responses now include the negotiated `Sec-WebSocket-Protocol` header, so Vite's `vite-hmr` subprotocol works through the HTTPS proxy.
+- **Auto-elevated trust flags**: `portless proxy start --skip-trust` is now preserved through the implicit sudo re-exec path, so privileged proxy starts do not add the CA to the trust store when the user opted out.
+- **CLI test isolation**: CLI tests that exercise `portless clean` now isolate their home directory, preventing full-suite runs from deleting a developer's live `~/.portless` state.
+
+### Documentation
+
+- **CA and state behavior**: Clarifies that generated CA and server certificates live under the resolved state directory, are reused across proxy restarts, and are regenerated only when removed or cleaned.
+- **Fork invariants**: Updates `FORK.md`, README, docs pages, CLI help, and the portless agent skill with the HMR subprotocol and privileged `--skip-trust` invariants.
+
+### Contributors
+
+- @enk0ded
+
+<!-- release:end -->
+
+## 0.14.1002
 
 ### New Features
 
@@ -28,8 +47,6 @@
 ### Contributors
 
 - @enk0ded
-
-<!-- release:end -->
 
 ## 0.14.1001
 

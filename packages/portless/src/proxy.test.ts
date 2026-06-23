@@ -1524,6 +1524,7 @@ describe("createProxyServer with TLS (HTTP/2)", () => {
     onResponse?: (stream: http2.ClientHttp2Stream) => void
   ): Promise<{
     status: number;
+    headers: http2.IncomingHttpHeaders;
     data: Buffer;
     closed: boolean;
   }> {
@@ -1534,7 +1535,12 @@ describe("createProxyServer with TLS (HTTP/2)", () => {
         rejectUnauthorized: false,
       });
       let settled = false;
-      const finish = (result: { status: number; data: Buffer; closed: boolean }) => {
+      const finish = (result: {
+        status: number;
+        headers: http2.IncomingHttpHeaders;
+        data: Buffer;
+        closed: boolean;
+      }) => {
         if (settled) return;
         settled = true;
         clearTimeout(timeout);
@@ -1542,7 +1548,7 @@ describe("createProxyServer with TLS (HTTP/2)", () => {
         resolve(result);
       };
       const timeout = setTimeout(() => {
-        finish({ status: 0, data: Buffer.alloc(0), closed: false });
+        finish({ status: 0, headers: {}, data: Buffer.alloc(0), closed: false });
       }, 3000);
 
       client.on("error", reject);
@@ -1567,15 +1573,17 @@ describe("createProxyServer with TLS (HTTP/2)", () => {
           return;
         }
         let status = 0;
+        let receivedHeaders: http2.IncomingHttpHeaders = {};
         const chunks: Buffer[] = [];
-        stream.on("response", (responseHeaders) => {
-          status = Number(responseHeaders[":status"]) || 0;
+        stream.on("response", (headers) => {
+          status = Number(headers[":status"]) || 0;
+          receivedHeaders = headers;
           onResponse?.(stream);
         });
         stream.on("data", (chunk: Buffer) => chunks.push(chunk));
         stream.on("error", () => {});
         stream.on("close", () => {
-          finish({ status, data: Buffer.concat(chunks), closed: true });
+          finish({ status, headers: receivedHeaders, data: Buffer.concat(chunks), closed: true });
         });
       });
     });
@@ -1591,6 +1599,9 @@ describe("createProxyServer with TLS (HTTP/2)", () => {
           "Upgrade: websocket\r\n" +
           "Connection: Upgrade\r\n" +
           `Sec-WebSocket-Accept: ${computeWebSocketAccept(key)}\r\n` +
+          (req.headers["sec-websocket-protocol"]
+            ? `Sec-WebSocket-Protocol: ${req.headers["sec-websocket-protocol"]}\r\n`
+            : "") +
           "\r\n"
       );
       socket.on("data", (chunk: Buffer) => socket.write(chunk));
@@ -1939,6 +1950,36 @@ describe("createProxyServer with TLS (HTTP/2)", () => {
 
       expect(result.status).toBe(200);
       expect(result.data.toString("utf8")).toContain("ping");
+    });
+
+    it("forwards negotiated WebSocket subprotocol in Extended CONNECT response", async () => {
+      const backend = websocketEchoBackend();
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const routes: RouteInfo[] = [{ hostname: "ws.localhost", port: backendAddr.port }];
+      const server = trackServer(
+        createProxyServer({
+          getRoutes: () => routes,
+          proxyPort: TEST_PROXY_PORT,
+          tls: { cert: tlsCert, key: tlsKey },
+        })
+      );
+      await listen(server);
+
+      const result = await openH2WebSocket(
+        server,
+        {
+          ":path": "/hmr",
+          ":authority": "ws.localhost",
+          "sec-websocket-protocol": "vite-hmr",
+        },
+        (stream) => setTimeout(() => stream.close(), 25)
+      );
+
+      expect(result.status).toBe(200);
+      expect(result.headers["sec-websocket-protocol"]).toBe("vite-hmr");
     });
 
     it("selects path-scoped routes and forwards the full path unchanged", async () => {

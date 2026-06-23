@@ -309,7 +309,9 @@ const stable = await getUrl("backend", { worktree: false });
 
 ## State directory
 
-Portless stores state (routes, PID file, port file, TLS marker) in `~/.portless` on all platforms. Override with `PORTLESS_STATE_DIR`.
+Portless stores state in `~/.portless` on all platforms: routes, PID and port files, TLS markers, the generated local CA, server certificates, and cached per-host certificates. Override with `PORTLESS_STATE_DIR`.
+
+Auto-elevated proxy starts pass the resolved `PORTLESS_STATE_DIR` and proxy flags such as `--skip-trust` through sudo, so a root-owned proxy uses the same per-user state and trust choice as the command that started it. Generated certificates are reused across proxy restarts and regenerated only when removed or cleaned.
 
 ## State files
 
@@ -344,6 +346,20 @@ Portless stores state (routes, PID file, port file, TLS marker) in `~/.portless`
     <tr>
       <td>`proxy.lan`</td>
       <td>Remembers LAN mode and stores the last known LAN IP</td>
+    </tr>
+    <tr>
+      <td>`ca.pem`, `ca-key.pem`</td>
+      <td>
+        Generated local certificate authority used for HTTPS unless custom certs are configured
+      </td>
+    </tr>
+    <tr>
+      <td>`server.pem`, `server-key.pem`</td>
+      <td>Generated default proxy server certificate</td>
+    </tr>
+    <tr>
+      <td>`host-certs/`</td>
+      <td>Cached per-host certificates generated from the local CA</td>
     </tr>
   </tbody>
 </table>

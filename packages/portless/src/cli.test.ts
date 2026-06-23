@@ -1273,6 +1273,7 @@ describe("CLI", () => {
 
       it("portless clean stops bg entries before removing state", async () => {
         const appPort = await getFreePort();
+        const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-cli-home-"));
         expect(
           run(
             [
@@ -1291,7 +1292,13 @@ describe("CLI", () => {
         ).toBe(0);
         const [entry] = readBgRegistry(tmpDir);
 
-        expect(run(["clean"], { env: bgEnv() }).status).toBe(0);
+        try {
+          expect(
+            run(["clean"], { env: bgEnv({ HOME: homeDir, USERPROFILE: homeDir }) }).status
+          ).toBe(0);
+        } finally {
+          fs.rmSync(homeDir, { recursive: true, force: true });
+        }
 
         await expect(waitForPidGone(entry.pid)).resolves.toBe(true);
         expect(fs.existsSync(path.join(tmpDir, "bg"))).toBe(false);
@@ -1846,13 +1853,17 @@ describe("CLI", () => {
 
     it("does not bypass when PORTLESS=0 is set", () => {
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-bypass-clean-"));
+      const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-clean-home-"));
       const { stderr } = run(["clean"], {
         env: {
           PORTLESS: "0",
           PORTLESS_STATE_DIR: tmpDir,
+          HOME: homeDir,
+          USERPROFILE: homeDir,
         },
       });
       fs.rmSync(tmpDir, { recursive: true, force: true });
+      fs.rmSync(homeDir, { recursive: true, force: true });
       expect(stderr).not.toContain("ENOENT");
     });
 
@@ -2745,6 +2756,37 @@ describe("CLI", () => {
         "server01.acme.com"
       );
     });
+
+    it.skipIf(process.platform === "win32" || (process.getuid?.() ?? 0) === 0)(
+      "passes --skip-trust through sudo re-exec",
+      () => {
+        const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-sudo-shim-"));
+        const capturePath = path.join(shimDir, "sudo-args.txt");
+        try {
+          const sudoPath = path.join(shimDir, "sudo");
+          fs.writeFileSync(
+            sudoPath,
+            '#!/bin/sh\nprintf "%s\\n" "$@" > "$PORTLESS_TEST_CAPTURE_FILE"\nexit 1\n'
+          );
+          fs.chmodSync(sudoPath, 0o755);
+
+          const start = run(["proxy", "start", "--port", "1", "--https", "--skip-trust"], {
+            env: {
+              PATH: prependPath(shimDir),
+              PORTLESS_STATE_DIR: tmpDir,
+              PORTLESS_TEST_CAPTURE_FILE: capturePath,
+            },
+          });
+
+          expect(start.status).toBe(1);
+          const sudoArgs = fs.readFileSync(capturePath, "utf-8").trim().split("\n");
+          expect(sudoArgs).toContain(`PORTLESS_STATE_DIR=${tmpDir}`);
+          expect(sudoArgs).toContain("--skip-trust");
+        } finally {
+          fs.rmSync(shimDir, { recursive: true, force: true });
+        }
+      }
+    );
 
     it("persists wildcard mode while the proxy runs and clears it on stop", () => {
       const start = run(["proxy", "start", "--wildcard"], { env: proxyEnv() });

@@ -32,7 +32,7 @@ portless myapp next dev
 # -> https://myapp.localhost
 ```
 
-HTTPS with HTTP/2 is enabled by default. On first run, portless generates a local CA, trusts it, and binds port 443 (auto-elevates with sudo on macOS/Linux). Use `--no-tls` for plain HTTP.
+HTTPS with HTTP/2 is enabled by default. On first run, portless generates a local CA, trusts it, and binds port 443 (auto-elevates with sudo on macOS/Linux). Generated CA and server certificates are stored in the resolved state directory and reused across restarts. Use `--skip-trust` when you want certificate files without adding the CA to the trust store, or `--no-tls` for plain HTTP.
 
 The proxy auto-starts when you run an app. A random port in the 4000 to 4999 range that is free on `127.0.0.1` is assigned via the `PORT` environment variable. Portless skips browser-blocked ports during auto-assignment and rejects them for fixed app ports. Most frameworks (Next.js, Express, Nuxt, etc.) respect this automatically. For frameworks that ignore `PORT` (Vite, VitePlus, VitePress, Astro, React Router, Angular, Laravel, Expo, React Native, Wrangler), portless auto-injects the right `--port` flag and, when needed, a matching `--host` flag or Wrangler's `--ip` flag.
 
@@ -248,7 +248,7 @@ portless myapp next dev
 
 Suffix values are lowercased and validated as DNS labels: each label may contain lowercase letters, digits, and hyphens, must start and end with a letter or digit, and must be 63 characters or less. Leading dots, trailing dots, and consecutive dots are rejected.
 
-Auto-elevated proxy starts pass the resolved `PORTLESS_STATE_DIR` through `sudo`, so a root-owned proxy uses the same per-user state and suffix settings as the command that started it. Set `PORTLESS_STATE_DIR` explicitly before running portless if you want a separate proxy state directory.
+Auto-elevated proxy starts pass the resolved `PORTLESS_STATE_DIR` and proxy flags such as `--skip-trust` through `sudo`, so a root-owned proxy uses the same per-user state, suffix settings, and trust choice as the command that started it. Set `PORTLESS_STATE_DIR` explicitly before running portless if you want a separate proxy state directory.
 
 The proxy auto-syncs `/etc/hosts` for route hostnames, so `.test`, `.server01.acme.com`, and other configured suffixes resolve on your machine.
 
@@ -276,13 +276,16 @@ flowchart TD
 
 HTTPS with HTTP/2 is enabled by default. Browsers limit HTTP/1.1 to 6 connections per host, which bottlenecks dev servers that serve many unbundled files (Vite, Nuxt, etc.). HTTP/2 multiplexes all requests over a single connection.
 
-Portless also supports modern browser HMR WebSockets over HTTP/2 using RFC 8441 Extended CONNECT, so Next.js Turbopack, Vite, and similar dev servers can keep hot reloading while HTTPS/HTTP/2 is enabled.
+Portless also supports modern browser HMR WebSockets over HTTP/2 using RFC 8441 Extended CONNECT, including negotiated WebSocket subprotocols such as Vite's `vite-hmr`, so Next.js Turbopack, Vite, Nuxt, and similar dev servers can keep hot reloading while HTTPS/HTTP/2 is enabled.
 
-On first run, portless generates a local CA and adds it to your system trust store. No browser warnings. No manual setup.
+On first run, portless generates a local CA and adds it to your system trust store. The generated CA, server certificate, and per-host certificates live under `~/.portless` by default and are reused across proxy restarts and machine reboots. They are regenerated only when removed or cleaned. No browser warnings. No manual setup.
 
 ```bash
 # Use your own certs (e.g., from mkcert)
 portless proxy start --cert ./cert.pem --key ./key.pem
+
+# Generate or reuse certs without adding the CA to the trust store
+portless proxy start --skip-trust
 
 # Disable HTTPS (plain HTTP on port 80)
 portless proxy start --no-tls
@@ -720,13 +723,13 @@ const stable = await getUrl("cms", { worktree: false });
 
 ## Uninstall / reset
 
-To remove portless data from your machine (proxy state under `~/.portless` and the system state directory, the local CA from the OS trust store when portless installed it, and the portless block in `/etc/hosts`):
+To remove portless data from your machine (proxy state under `~/.portless` and the system state directory, generated CA and certificate files, the local CA from the OS trust store when portless installed it, and the portless block in `/etc/hosts`):
 
 ```bash
 portless clean
 ```
 
-macOS/Linux may prompt for `sudo`. Custom certificate paths passed with `--cert` and `--key` are not deleted.
+macOS/Linux may prompt for `sudo`. Custom certificate paths passed with `--cert` and `--key` are not deleted. After `portless clean` or manual certificate deletion, the next HTTPS proxy start generates a new local CA.
 
 ## Safari / DNS
 
@@ -799,6 +802,8 @@ This fork intentionally differs from upstream in a few areas:
 - Fork releases use high patch ranges, such as `0.14.1000`, to stay semver-compatible without colliding with upstream versions.
 - Repository development uses Bun workspaces, `bun.lock`, Bun-powered CI, and Bun-based Windows debugging scripts.
 - Custom domain configuration uses suffix terminology. `PORTLESS_SUFFIX` is the preferred environment variable, dotted suffixes are supported, and `PORTLESS_TLD` remains a compatibility alias.
+- Auto-elevated proxy lifecycle commands preserve the invoking user's state directory and trust flags, including `--skip-trust`.
+- HTTP/2 Extended CONNECT WebSockets preserve negotiated HMR subprotocols such as Vite's `vite-hmr`.
 - Local dependency detection checks `node_modules/@enk0ded/portless` so one-off `npx` or `pnpm dlx` downloads are still rejected.
 
 See [FORK.md](./FORK.md) for the full list of fork-owned invariants and the upstream sync checklist.
