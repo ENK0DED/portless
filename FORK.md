@@ -100,6 +100,8 @@ Current fork-owned commits and what they protect:
 | `de166e0` | Added Windows managed tunnel and OpenSSL reliability notes to the `0.14.1002` release changelogs.                                                                                                  |
 | `ab250bd` | Updated the fork-only ledger for the Windows reliability release-note commit.                                                                                                                      |
 | `f22e276` | Merged the signed `prepare-v0.14.1002` release branch into `main` while preserving the upstream PR coverage and release preparation history.                                                       |
+| `fa79183` | Updated the fork-only ledger for the signed `prepare-v0.14.1002` release merge commit.                                                                                                             |
+| `16d85ed` | Prepared fork release `0.14.1003` with HMR subprotocol forwarding, privileged `--skip-trust` propagation, CA reuse documentation, and release metadata.                                            |
 
 ## Fork-Owned Invariants
 
