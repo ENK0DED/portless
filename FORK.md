@@ -104,6 +104,7 @@ Current fork-owned commits and what they protect:
 | `16d85ed` | Prepared fork release `0.14.1003` with HMR subprotocol forwarding, privileged `--skip-trust` propagation, CA reuse documentation, and release metadata.                                            |
 | `b729e1f` | Updated the fork-only ledger with the release merge and the `0.14.1003` preparation commit.                                                                                                        |
 | `e3c746e` | Merged upstream v0.15.5 at `326e893` while preserving fork identity, version mapping, Bun, suffix behavior, docs, tests, release workflow, Windows debugging, and the fork sync skill.             |
+| `05b2c69` | Prepared fork release `0.15.6000` for the post-merge feature batch.                                                                                                                                |
 
 ## Fork-Owned Invariants
 
