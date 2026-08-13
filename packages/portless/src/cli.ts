@@ -61,7 +61,7 @@ import {
   INTERNAL_LAN_IP_ENV,
   INTERNAL_LAN_IP_FLAG,
   PRIVILEGED_PORT_THRESHOLD,
-  RISKY_TLDS,
+  getRiskyTldReason,
   WAIT_FOR_PROXY_INTERVAL_MS,
   WAIT_FOR_PROXY_MAX_ATTEMPTS,
   discoverState,
@@ -99,7 +99,11 @@ import {
   writeTlsMarker,
   writeWildcardMarker,
 } from "./cli-utils.js";
-import { collectStateDirsForCleanup, removePortlessStateFiles } from "./clean-utils.js";
+import {
+  attemptCATrustRemovalForCleanup,
+  collectStateDirsForCleanup,
+  removePortlessStateFiles,
+} from "./clean-utils.js";
 import {
   getLocalNetworkIp,
   isMdnsSupported,
@@ -3094,6 +3098,7 @@ ${colors.bold("Background apps:")}
   ${colors.cyan("portless bg status web")}
   ${colors.cyan("portless bg logs web --tail 100")}
   ${colors.cyan("portless bg stop web")}
+  Elevated proxy processes keep the invoking user's ~/.portless state directory.
 
 ${colors.bold("HTTP/2 + HTTPS (default):")}
   HTTPS with HTTP/2 multiplexing is enabled by default (faster page loads).
@@ -3191,6 +3196,7 @@ ${colors.bold("Options:")}
   --foreground                  Run proxy in foreground (for debugging)
   --suffix <suffix>             Use a custom suffix instead of .localhost (e.g. test, acme.com)
   --tld <tld>                   Compatibility alias for --suffix
+                                 DNS limits: 63 characters per label, 253 total
   --wildcard                    Allow unregistered subdomains to fall back to parent route
                                 Local proxy mode only; mDNS LAN mode cannot resolve wildcards
                                 Proxy-level only; restart proxy to change this mode
@@ -3363,7 +3369,8 @@ directory, and PORTLESS_STATE_DIR when set), and removes the portless block
 from ${HOSTS_DISPLAY}.
 
 Only allowlisted filenames under each state directory are deleted. Custom
-certificate paths from --cert and --key are never removed.
+certificate paths from --cert and --key are never removed. If trust removal
+fails, the CA certificate and key are retained so clean can safely retry.
 
 macOS/Linux may prompt for sudo when the proxy, trust store, or ${HOSTS_DISPLAY}
 require elevated privileges. On Windows, run as Administrator if needed.
@@ -3464,18 +3471,16 @@ ${colors.bold("Options:")}
     }
   }
 
-  for (const stateDir of stateDirs) {
-    const caPath = path.join(stateDir, "ca.pem");
-    if (!fs.existsSync(caPath)) continue;
-    const wasTrusted = isCATrusted(stateDir);
-    if (!wasTrusted) continue;
-    const untrustResult = untrustCA(stateDir);
+  const failedCAStateDirs = new Set<string>();
+  const caRemovalResults = attemptCATrustRemovalForCleanup(stateDirs, untrustCA);
+  for (const [stateDir, untrustResult] of caRemovalResults) {
     if (untrustResult.removed) {
       console.log(colors.green("Removed local CA from the system trust store."));
-    } else if (untrustResult.error) {
+    } else {
+      failedCAStateDirs.add(stateDir);
       console.warn(
         colors.yellow(
-          `Could not remove CA from trust store: ${untrustResult.error}\n` +
+          `Could not remove CA from trust store: ${untrustResult.error ?? "unknown error"}\n` +
             `Try: sudo portless clean (Linux), or delete the certificate manually.`
         )
       );
@@ -3484,9 +3489,16 @@ ${colors.bold("Options:")}
 
   for (const stateDir of stateDirs) {
     if (bgStopFailedStateDirs.has(stateDir)) continue;
-    removePortlessStateFiles(stateDir);
+    removePortlessStateFiles(stateDir, {
+      preserveCAIdentity: failedCAStateDirs.has(stateDir),
+    });
   }
   console.log(colors.green("Removed portless state files from known state directories."));
+  if (failedCAStateDirs.size > 0) {
+    console.warn(
+      colors.yellow("Retained CA identity files so trust removal can be retried safely.")
+    );
+  }
 
   if (cleanHostsFile()) {
     console.log(colors.green(`Removed portless entries from ${HOSTS_DISPLAY}.`));
@@ -4332,7 +4344,7 @@ ${colors.bold("LAN mode (--lan):")}
     );
   }
 
-  const riskyReason = RISKY_TLDS.get(tld);
+  const riskyReason = getRiskyTldReason(tld);
   if (riskyReason && !lanMode) {
     console.warn(colors.yellow(`Warning: .${tld}: ${riskyReason}`));
   }

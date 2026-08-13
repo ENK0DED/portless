@@ -7,6 +7,7 @@ import * as path from "node:path";
 import * as readline from "node:readline";
 import { execSync, spawn } from "node:child_process";
 import { LOOPBACK_DIAL_OPTIONS, PORTLESS_HEADER, PORTLESS_LISTENER_PORT_HEADER } from "./proxy.js";
+import { resolveUserHome } from "./utils.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -42,7 +43,7 @@ export const LEGACY_SYSTEM_STATE_DIR = isWindows
   : "/tmp/portless";
 
 /** Per-user state directory. All proxy state lives here regardless of port. */
-export const USER_STATE_DIR = path.join(os.homedir(), ".portless");
+export const USER_STATE_DIR = path.join(resolveUserHome(), ".portless");
 
 /** Minimum app port when finding a free port. */
 const MIN_APP_PORT = 4000;
@@ -266,60 +267,66 @@ export const LEGACY_TLD_ENV = "PORTLESS_TLD";
 export const RISKY_TLDS = new Map<string, string>([
   ["local", "conflicts with mDNS/Bonjour on macOS"],
   ["dev", "Google-owned; browsers force HTTPS via preloaded HSTS"],
+  ["app", "Google-owned; browsers force HTTPS via preloaded HSTS"],
   ["com", "public TLD; DNS requests will leak to the internet"],
   ["org", "public TLD; DNS requests will leak to the internet"],
   ["net", "public TLD; DNS requests will leak to the internet"],
   ["io", "public TLD; DNS requests will leak to the internet"],
-  ["app", "public TLD; DNS requests will leak to the internet"],
   ["edu", "public TLD; DNS requests will leak to the internet"],
   ["gov", "public TLD; DNS requests will leak to the internet"],
   ["mil", "public TLD; DNS requests will leak to the internet"],
   ["int", "public TLD; DNS requests will leak to the internet"],
 ]);
 
-function validateDomainLabel(label: string): string | null {
-  if (!/^[a-z0-9-]+$/.test(label)) {
-    return "must contain only lowercase letters, digits, and hyphens";
+/**
+ * Risky TLDs whose failure mode applies to the whole suffix tree, so
+ * multi-segment TLDs under them inherit the risk: mDNS claims all of
+ * `*.local`, and the `.dev`/`.app` HSTS preload entries carry
+ * includeSubDomains. Ownership-class entries (com, org, ...) only matter
+ * for a bare TLD — a multi-segment TLD under a domain the user owns is
+ * the recommended setup, not a pitfall.
+ */
+const SUFFIX_RISKY_TLDS = new Set(["local", "dev", "app"]);
+
+/**
+ * Look up the risky-TLD warning for a configured TLD. Matches exact entries
+ * ("dev"), plus multi-segment TLDs whose suffix carries a tree-wide risk
+ * ("example.dev" inherits the HSTS preload).
+ */
+export function getRiskyTldReason(tld: string): string | undefined {
+  const exact = RISKY_TLDS.get(tld);
+  if (exact) return exact;
+  for (const risky of SUFFIX_RISKY_TLDS) {
+    if (tld.endsWith(`.${risky}`)) return RISKY_TLDS.get(risky);
   }
-  if (!/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label)) {
-    return "labels must start and end with a letter or digit";
-  }
-  if (label.length > 63) {
-    return "labels must be 63 characters or less";
-  }
-  return null;
+  return undefined;
 }
 
 /**
- * Validate a configured suffix. Returns an error message if invalid, or
- * null if OK. Accepts single-label values like "test" and dotted values like
- * "acme.com" or "server01.acme.com".
- *
- * Does not check for risky public suffixes (those produce warnings, not errors).
+ * Validate a TLD string. Returns an error message if invalid, or null if OK.
+ * Does not check for risky TLDs (those produce warnings, not errors).
  */
 export function validateTld(tld: string): string | null {
-  if (!tld) return "suffix cannot be empty";
-  if (tld.startsWith(".") || tld.endsWith(".")) {
-    return `Invalid suffix "${tld}": must not start or end with a dot`;
-  }
-  if (tld.includes("..")) {
-    return `Invalid suffix "${tld}": consecutive dots are not allowed`;
+  if (!tld) return "TLD cannot be empty";
+  if (tld.length > 253) {
+    return `Invalid TLD "${tld}": exceeds 253-character DNS limit`;
   }
 
+  const labelRe = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
   const labels = tld.split(".");
   for (const label of labels) {
-    const labelError = validateDomainLabel(label);
-    if (labelError) {
-      return `Invalid suffix "${tld}": ${labelError}`;
+    if (!label) {
+      return `Invalid TLD "${tld}": labels cannot be empty`;
+    }
+    if (label.length > 63) {
+      return `Invalid TLD "${tld}": label "${label}" exceeds 63-character DNS limit`;
+    }
+    if (!labelRe.test(label)) {
+      return `Invalid TLD "${tld}": labels must contain only lowercase letters, digits, and interior hyphens`;
     }
   }
 
   return null;
-}
-
-/** Return the terminal public suffix label of a configured suffix. */
-export function getRiskyTld(tld: string): string | undefined {
-  return tld.split(".").at(-1);
 }
 
 /** Name of the file that stores the proxy's active TLD. */
@@ -329,7 +336,15 @@ const TLD_FILE = "proxy.tld";
 export function readTldFromDir(dir: string): string {
   try {
     const raw = fs.readFileSync(path.join(dir, TLD_FILE), "utf-8").trim();
-    return raw || DEFAULT_TLD;
+    if (!raw) return DEFAULT_TLD;
+
+    const error = validateTld(raw);
+    if (error) {
+      console.warn(`Warning: ignoring invalid TLD entry in ${TLD_FILE}: ${error}`);
+      return DEFAULT_TLD;
+    }
+
+    return raw;
   } catch {
     return DEFAULT_TLD;
   }

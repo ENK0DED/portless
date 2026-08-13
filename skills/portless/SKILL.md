@@ -209,7 +209,7 @@ Portless replaces only whole arguments matching `{PORT}`, `{HOST}`, or `{PORTLES
 
 Portless stores its state in `~/.portless`: routes, PID and port files, TLS markers, the generated local CA, server certificates, and cached per-host certificates. Override with the `PORTLESS_STATE_DIR` environment variable.
 
-Auto-elevated proxy starts pass the resolved `PORTLESS_STATE_DIR` and proxy flags such as `--skip-trust` through `sudo`, so a root-owned proxy uses the same per-user state, suffix settings, and trust choice as the command that started it. Set `PORTLESS_STATE_DIR` explicitly before running portless if a separate proxy state directory is required.
+Auto-elevated proxy starts pass the resolved `PORTLESS_STATE_DIR` and proxy flags such as `--skip-trust` through `sudo`, so a root-owned proxy uses the same per-user state, suffix settings, and trust choice as the command that started it. Direct `sudo portless ...` invocations resolve `SUDO_USER` back to the invoking user's home for the same reason. Set `PORTLESS_STATE_DIR` explicitly before running portless if a separate proxy state directory is required.
 
 ### Custom suffixes
 
@@ -220,7 +220,7 @@ portless proxy start --suffix test
 PORTLESS_SUFFIX=server01.acme.com portless proxy start
 ```
 
-The suffix may be a single label such as `test` or a dotted suffix such as `server01.acme.com`. Values are trimmed, lowercased, and validated as DNS labels. `PORTLESS_SUFFIX` is preferred over the legacy `PORTLESS_TLD` variable, and `--tld <tld>` remains accepted as a compatibility alias.
+The suffix may be a single label such as `test` or a dotted suffix such as `server01.acme.com`. Values are trimmed, lowercased, and validated as DNS names. Each label is limited to 63 characters, and the full suffix and generated hostname are limited to 253 characters. `PORTLESS_SUFFIX` is preferred over the legacy `PORTLESS_TLD` variable, and `--tld <tld>` remains accepted as a compatibility alias.
 
 ### Environment variables
 
@@ -646,7 +646,7 @@ This adds the portless local CA to your system trust store. After that, restart 
 portless clean
 ```
 
-Stops the proxy if needed, removes the portless CA from the trust store (when portless added it), deletes known files under state directories, and removes the portless `/etc/hosts` block. This deletes generated CA, server, and cached host certs, so the next HTTPS proxy start generates a new local CA. May require `sudo` on macOS/Linux.
+Stops the proxy if needed, removes the portless CA from the trust store (when portless added it), deletes known files under state directories, and removes the portless `/etc/hosts` block. If trust-store removal fails, portless retains its CA certificate and key so a later `portless clean` can safely retry. After successful cleanup, the next HTTPS proxy start generates a new local CA. May require `sudo` on macOS/Linux.
 
 ### Proxy loop (508 Loop Detected)
 

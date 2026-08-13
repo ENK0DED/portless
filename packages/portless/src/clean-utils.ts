@@ -15,6 +15,8 @@ const PORTLESS_STATE_FILES = [
   "proxy.tld",
   "proxy.lan",
   "proxy.wildcard",
+  "ca.trusted",
+  "ca.trust-refresh-pending",
   "ca-key.pem",
   "ca.pem",
   "server-key.pem",
@@ -26,6 +28,16 @@ const PORTLESS_STATE_FILES = [
 
 const HOST_CERTS_DIR = "host-certs";
 const BG_STATE_DIR = "bg";
+const CA_IDENTITY_FILES = new Set(["ca-key.pem", "ca.pem", "ca.trust-refresh-pending"]);
+
+export type RemovePortlessStateFilesOptions = {
+  preserveCAIdentity?: boolean;
+};
+
+export type CATrustRemovalResult = {
+  removed: boolean;
+  error?: string;
+};
 
 /**
  * Unique existing state directories to consider for cleanup: user dir, system
@@ -45,12 +57,29 @@ export function collectStateDirsForCleanup(): string[] {
   return [...dirs];
 }
 
+/** Attempt CA trust removal wherever cleanup finds a CA certificate. */
+export function attemptCATrustRemovalForCleanup(
+  stateDirs: string[],
+  untrust: (stateDir: string) => CATrustRemovalResult
+): Map<string, CATrustRemovalResult> {
+  const results = new Map<string, CATrustRemovalResult>();
+  for (const stateDir of stateDirs) {
+    if (!fs.existsSync(path.join(stateDir, "ca.pem"))) continue;
+    results.set(stateDir, untrust(stateDir));
+  }
+  return results;
+}
+
 /**
  * Best-effort removal of portless state files under dir. Only known filenames
  * are deleted; other files in the directory are left intact.
  */
-export function removePortlessStateFiles(dir: string): void {
+export function removePortlessStateFiles(
+  dir: string,
+  options: RemovePortlessStateFilesOptions = {}
+): void {
   for (const f of PORTLESS_STATE_FILES) {
+    if (options.preserveCAIdentity && CA_IDENTITY_FILES.has(f)) continue;
     try {
       fs.unlinkSync(path.join(dir, f));
     } catch {

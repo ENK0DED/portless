@@ -1,5 +1,79 @@
 # Changelog
 
+## 0.15.5
+
+### Bug Fixes
+
+- **Multi-segment custom TLDs**: `--tld` and `PORTLESS_TLD` now accept dotted DNS names such as `dev.example.com`, so local URLs can mirror production structure. `validateTld` checks per-label DNS rules and the 253-character total limit, overlapping TLDs resolve by longest match, and cert cache filenames stay under the filesystem name limit for long hostnames. (#365)
+- **WebSocket over HTTP/2**: Proxy now advertises RFC 8441 extended CONNECT and bridges `:protocol websocket` streams to an HTTP/1.1 upgrade against the backend, fixing dev server HMR for browsers that negotiate h2 over ALPN. Plain-HTTP upgrades on the TLS port are proxied instead of dropped, and a backend that rejects the handshake or answers with a bad `Sec-WebSocket-Accept` now gets a 502 instead of a silently destroyed socket. (#363)
+
+### Contributors
+
+- @Railly
+- @KingPsychopath
+- @erichurkman
+- @sanjevirau
+
+## 0.15.4
+
+### Bug Fixes
+
+- **Loopback-only proxy binding**: Outside LAN mode, the proxy and HTTP redirect listeners now bind only to `127.0.0.1` and `::1`, so Portless routes cannot be reached through LAN, VPN, or other network interfaces. LAN mode still binds to all interfaces explicitly. (#361)
+
+### Contributors
+
+- @ctate
+
+## 0.15.3
+
+### Bug Fixes
+
+- **State directory under sudo**: Portless now resolves per-user state from the original sudo user's home, so an elevated proxy and unprivileged app processes share the same routes instead of writing to separate state directories. (#357)
+- **Windows and WSL CA trust**: On WSL, `portless trust` now installs the local CA in both Linux and Windows trust stores, while `portless clean` removes the exact certificate from both. Failed trust-store cleanup preserves the CA identity for safe retries, including on native Windows. (#357)
+
+### Contributors
+
+- @ctate
+- @gerardbalaoro
+
+## 0.15.2
+
+### Bug Fixes
+
+- **Tailscale funnel routing**: Proxy now routes requests addressed to a route's Tailscale funnel or serve hostname, so `--funnel` and `--tailscale` apps reached at `<device>.ts.net` no longer return a 404, including when several apps share one hostname on different ports. (#352)
+- **IPv6-only dev servers return 502**: Proxy now dials upstreams over both loopback families, fixing 502s when a dev server binds `::1` only, such as Vite on Node 17+. (#353)
+- **Worktree prefix in multi-app mode**: Bare `portless` in a monorepo worktree now applies the branch prefix in multi-app mode as it already did for single apps, so hostnames no longer collide across worktrees. (#355)
+
+### Contributors
+
+- @Railly
+- @ahfoysal
+
+## 0.15.1
+
+### New Features
+
+- **Multi-TLD proxy support**: `--tld` is now repeatable and `PORTLESS_TLD` accepts comma separated values, so one proxy can serve the same app names across multiple TLDs. Routes, TLS, service state, hosts sync, framework environment, and workspace launches now use the full configured TLD list. (#344)
+
+### Contributors
+
+- @ctate
+
+## 0.15.0
+
+### New Features
+
+- **`portless doctor`**: New read only diagnostics command checks Node.js, the state directory, proxy liveness, route entries, hostname resolution, HTTPS CA trust, and LAN prerequisites, then prints suggested fixes. (#337)
+
+### Bug Fixes
+
+- **HTTP/2 Host forwarding**: Proxy now forwards HTTP/2 `:authority` as `Host` to HTTP/1.1 backends, fixing apps that depend on Host and previously saw `127.0.0.1` for browser traffic. (#328)
+- **`--force` takeover cleanup**: Exit cleanup now removes only routes still owned by the exiting process, so a forced takeover does not deregister the new owner's route. (#328)
+
+### Contributors
+
+- @ctate
+
 ## 0.14.1003
 
 <!-- release:start -->

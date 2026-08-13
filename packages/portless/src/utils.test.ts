@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import {
   escapeHtml,
   formatUrl,
@@ -6,7 +6,57 @@ import {
   matchesPathPrefix,
   normalizePathPrefix,
   parseHostname,
+  parseHostnames,
+  resolveUserHome,
 } from "./utils.js";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+describe("resolveUserHome", () => {
+  it("uses the invoking user's home under sudo", () => {
+    expect(
+      resolveUserHome({
+        platform: "linux",
+        env: { SUDO_USER: "alice", HOME: "/root" },
+        homedir: "/root",
+        passwdHome: () => "/home/alice",
+      })
+    ).toBe("/home/alice");
+  });
+
+  it("keeps a preserved non-root home under sudo", () => {
+    expect(
+      resolveUserHome({
+        platform: "darwin",
+        env: { SUDO_USER: "alice", HOME: "/Users/alice" },
+        homedir: "/var/root",
+      })
+    ).toBe("/Users/alice");
+  });
+
+  it("uses the effective user's home without sudo", () => {
+    expect(
+      resolveUserHome({
+        platform: "linux",
+        env: { HOME: "/root" },
+        homedir: "/root",
+      })
+    ).toBe("/root");
+  });
+
+  it("falls back to the platform convention when passwd lookup fails", () => {
+    expect(
+      resolveUserHome({
+        platform: "linux",
+        env: { SUDO_USER: "alice", HOME: "/root" },
+        homedir: "/root",
+        passwdHome: () => null,
+      })
+    ).toBe("/home/alice");
+  });
+});
 
 describe("escapeHtml", () => {
   it("escapes angle brackets", () => {
@@ -231,6 +281,20 @@ describe("parseHostname", () => {
       expect(parseHostname("api.myapp", "test")).toBe("api.myapp.test");
     });
 
+    it("handles multi-segment custom TLDs", () => {
+      expect(parseHostname("myapp", "local.example.dev")).toBe("myapp.local.example.dev");
+      expect(parseHostname("api.myapp", "local.example.dev")).toBe("api.myapp.local.example.dev");
+      expect(parseHostname("myapp.local.example.dev", "local.example.dev")).toBe(
+        "myapp.local.example.dev"
+      );
+    });
+
+    it("rejects a final hostname over 253 characters", () => {
+      const label = "a".repeat(63);
+      const tld = [label, label, label, "b".repeat(60)].join(".");
+      expect(() => parseHostname("myapp", tld)).toThrow("exceeds 253-character DNS limit");
+    });
+
     it("throws on empty input with custom TLD", () => {
       expect(() => parseHostname("", "test")).toThrow("Hostname cannot be empty");
     });
@@ -259,5 +323,48 @@ describe("parseHostname", () => {
     it("treats a bare dotted suffix as empty input", () => {
       expect(() => parseHostname(".acme.com", "acme.com")).toThrow("Hostname cannot be empty");
     });
+  });
+});
+
+describe("parseHostnames", () => {
+  it("builds one hostname per TLD", () => {
+    expect(parseHostnames("myapp", ["localhost", "test"])).toEqual([
+      "myapp.localhost",
+      "myapp.test",
+    ]);
+  });
+
+  it("strips an active TLD before building all hostnames", () => {
+    expect(parseHostnames("api.myapp.test", ["localhost", "test"])).toEqual([
+      "api.myapp.localhost",
+      "api.myapp.test",
+    ]);
+  });
+
+  it("strips the longest matching TLD when configured TLDs overlap", () => {
+    expect(parseHostnames("app.dev.example.com", ["example.com", "dev.example.com"])).toEqual([
+      "app.example.com",
+      "app.dev.example.com",
+    ]);
+  });
+
+  it("deduplicates TLDs", () => {
+    expect(parseHostnames("myapp", ["test", "test"])).toEqual(["myapp.test"]);
+  });
+
+  it("skips a TLD that pushes the hostname past 253 chars and keeps the rest", () => {
+    const label = "a".repeat(62);
+    const longTld = [label, label, label, label].join("."); // 251 chars, valid TLD
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(parseHostnames("myapp", ["localhost", longTld])).toEqual(["myapp.localhost"]);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(longTld));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("still throws when no TLD survives", () => {
+    expect(() => parseHostnames("my..app", ["localhost", "test"])).toThrow(/consecutive dots/);
   });
 });

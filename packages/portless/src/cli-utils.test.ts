@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach, beforeEach } from "vitest";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as net from "node:net";
@@ -24,6 +24,7 @@ import {
   getDefaultPort,
   getDefaultTld,
   getProtocolPort,
+  getRiskyTldReason,
   isHttpsEnvDisabled,
   injectFrameworkFlags,
   isPortListening,
@@ -228,6 +229,35 @@ describe("isPortListening", () => {
   });
 });
 
+describe("isPortListening", () => {
+  const servers: http.Server[] = [];
+
+  afterEach(async () => {
+    for (const s of servers) {
+      await new Promise<void>((resolve) => s.close(() => resolve()));
+    }
+    servers.length = 0;
+  });
+
+  it("returns false when nothing is listening", async () => {
+    expect(await isPortListening(19877)).toBe(false);
+  });
+
+  it("detects a server listening on IPv6 loopback only (issue #320)", async (ctx) => {
+    const server = http.createServer((_req, res) => res.end("ok"));
+    const ipv6Available = await new Promise<boolean>((resolve) => {
+      server.once("error", () => resolve(false));
+      server.listen(0, "::1", () => resolve(true));
+    });
+    if (!ipv6Available) return ctx.skip();
+    servers.push(server);
+    const addr = server.address();
+    if (!addr || typeof addr === "string") throw new Error("no addr");
+
+    expect(await isPortListening(addr.port)).toBe(true);
+  });
+});
+
 describe("resolveStateDir", () => {
   it("returns user dir for all ports", () => {
     expect(resolveStateDir(80)).toBe(USER_STATE_DIR);
@@ -237,6 +267,31 @@ describe("resolveStateDir", () => {
     expect(resolveStateDir(8080)).toBe(USER_STATE_DIR);
     expect(resolveStateDir(3000)).toBe(USER_STATE_DIR);
   });
+
+  it.skipIf(process.platform === "win32")(
+    "uses the invoking user's home when loaded under sudo",
+    async () => {
+      const originalHome = process.env.HOME;
+      const originalSudoUser = process.env.SUDO_USER;
+      const expectedHome = process.platform === "darwin" ? "/Users/alice" : "/home/alice";
+
+      try {
+        process.env.HOME = process.platform === "darwin" ? "/var/root" : "/root";
+        process.env.SUDO_USER = "alice";
+        vi.resetModules();
+
+        const sudoModule = await import("./cli-utils.js");
+        expect(sudoModule.USER_STATE_DIR).toBe(path.join(expectedHome, ".portless"));
+        expect(sudoModule.resolveStateDir(443)).toBe(path.join(expectedHome, ".portless"));
+      } finally {
+        if (originalHome === undefined) delete process.env.HOME;
+        else process.env.HOME = originalHome;
+        if (originalSudoUser === undefined) delete process.env.SUDO_USER;
+        else process.env.SUDO_USER = originalSudoUser;
+        vi.resetModules();
+      }
+    }
+  );
 });
 
 describe("constants", () => {
@@ -1220,6 +1275,18 @@ describe("readTldFromDir / writeTldFile", () => {
     expect(readTldFromDir(tmpDir)).toBe("test");
   });
 
+  it("ignores an invalid persisted TLD with a warning", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    fs.writeFileSync(path.join(tmpDir, "proxy.tld"), "invalid tld");
+
+    expect(readTldFromDir(tmpDir)).toBe(DEFAULT_TLD);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("Warning: ignoring invalid TLD entry in proxy.tld")
+    );
+
+    warn.mockRestore();
+  });
+
   it("removes the file when writing the default TLD", () => {
     writeTldFile(tmpDir, "test");
     expect(fs.existsSync(path.join(tmpDir, "proxy.tld"))).toBe(true);
@@ -1232,6 +1299,31 @@ describe("readTldFromDir / writeTldFile", () => {
   it("handles removing the default TLD file when it does not exist", () => {
     writeTldFile(tmpDir, DEFAULT_TLD);
     expect(readTldFromDir(tmpDir)).toBe(DEFAULT_TLD);
+  });
+});
+
+describe("getRiskyTldReason", () => {
+  it("matches exact risky TLDs", () => {
+    expect(getRiskyTldReason("dev")).toMatch(/HSTS/);
+    expect(getRiskyTldReason("app")).toMatch(/HSTS/);
+    expect(getRiskyTldReason("com")).toMatch(/public TLD/);
+  });
+
+  it("matches multi-segment TLDs under tree-wide risky suffixes", () => {
+    expect(getRiskyTldReason("example.dev")).toMatch(/HSTS/);
+    expect(getRiskyTldReason("myapp.app")).toMatch(/HSTS/);
+    expect(getRiskyTldReason("foo.local")).toMatch(/mDNS/);
+  });
+
+  it("does not suffix-match ownership-class TLDs", () => {
+    expect(getRiskyTldReason("dev.example.com")).toBeUndefined();
+    expect(getRiskyTldReason("internal.example.org")).toBeUndefined();
+  });
+
+  it("returns undefined for safe TLDs", () => {
+    expect(getRiskyTldReason("test")).toBeUndefined();
+    expect(getRiskyTldReason("dev.internal")).toBeUndefined();
+    expect(getRiskyTldReason("devx")).toBeUndefined();
   });
 });
 
@@ -1249,14 +1341,42 @@ describe("validateTld", () => {
     expect(validateTld("")).toMatch(/cannot be empty/);
   });
 
-  it("rejects suffixes with invalid labels", () => {
-    expect(validateTld(".test")).toMatch(/must not start or end with a dot/);
-    expect(validateTld("test.")).toMatch(/must not start or end with a dot/);
-    expect(validateTld("my..tld")).toMatch(/consecutive dots/);
+  it("rejects TLDs with invalid characters", () => {
     expect(validateTld("MY_TLD")).toMatch(/must contain only/);
     expect(validateTld("tld!")).toMatch(/must contain only/);
-    expect(validateTld("-test")).toMatch(/start and end/);
-    expect(validateTld("test-")).toMatch(/start and end/);
+    expect(validateTld("my tld")).toMatch(/must contain only/);
+  });
+
+  it("accepts multi-segment TLDs", () => {
+    expect(validateTld("dev.example.com")).toBeNull();
+    expect(validateTld("local.example.dev")).toBeNull();
+    expect(validateTld("a.b.c.d.e")).toBeNull();
+  });
+
+  it("accepts hyphens inside labels", () => {
+    expect(validateTld("my-tld")).toBeNull();
+    expect(validateTld("dev.my-network.com")).toBeNull();
+  });
+
+  it("rejects empty labels", () => {
+    expect(validateTld(".example.com")).toMatch(/labels cannot be empty/);
+    expect(validateTld("example.com.")).toMatch(/labels cannot be empty/);
+    expect(validateTld("example..com")).toMatch(/labels cannot be empty/);
+  });
+
+  it("rejects hyphens at label edges", () => {
+    expect(validateTld("-bad.example.com")).toMatch(/must contain only/);
+    expect(validateTld("bad-.example.com")).toMatch(/must contain only/);
+  });
+
+  it("rejects labels over 63 characters", () => {
+    expect(validateTld(`${"a".repeat(64)}.example.com`)).toMatch(/63-character/);
+  });
+
+  it("rejects TLDs over 253 characters", () => {
+    const label = "a".repeat(63);
+    const long = [label, label, label, label, "example"].join(".");
+    expect(validateTld(long)).toMatch(/253-character/);
   });
 
   it("allows public TLDs (they produce warnings elsewhere)", () => {

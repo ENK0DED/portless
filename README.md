@@ -44,6 +44,8 @@ portless run my-server --port {PORT} --host {HOST} --url {PORTLESS_URL}
 
 When auto-starting, portless reuses the configuration (port, TLS, suffix) from the most recent proxy run, so a restart or reboot does not silently revert to defaults. Explicit env vars (`PORTLESS_PORT`, `PORTLESS_HTTPS`, etc.) always take priority.
 
+Portless stores per-user state in `~/.portless`. When the proxy runs under sudo, it resolves this path from the invoking user's home so the proxy and unprivileged app processes share the same route registrations.
+
 In non-interactive environments (no TTY, or `CI=1`), portless exits with a descriptive error instead of prompting, so task runners like turborepo and CI scripts fail early with a clear message.
 
 ## Configuration
@@ -246,7 +248,7 @@ portless myapp next dev
 
 `PORTLESS_SUFFIX` is read before the legacy `PORTLESS_TLD` variable. If both are set, `PORTLESS_SUFFIX` wins. `PORTLESS_TLD` and `--tld` remain supported so existing upstream-style environments and scripts keep working.
 
-Suffix values are lowercased and validated as DNS labels: each label may contain lowercase letters, digits, and hyphens, must start and end with a letter or digit, and must be 63 characters or less. Leading dots, trailing dots, and consecutive dots are rejected.
+Suffix values are lowercased and validated as DNS names: each label may contain lowercase letters, digits, and hyphens, must start and end with a letter or digit, and must be 63 characters or less. The full suffix and generated hostname must be 253 characters or less. Leading dots, trailing dots, and consecutive dots are rejected.
 
 Auto-elevated proxy starts pass the resolved `PORTLESS_STATE_DIR` and proxy flags such as `--skip-trust` through `sudo`, so a root-owned proxy uses the same per-user state, suffix settings, and trust choice as the command that started it. Set `PORTLESS_STATE_DIR` explicitly before running portless if you want a separate proxy state directory.
 
@@ -729,7 +731,7 @@ To remove portless data from your machine (proxy state under `~/.portless` and t
 portless clean
 ```
 
-macOS/Linux may prompt for `sudo`. Custom certificate paths passed with `--cert` and `--key` are not deleted. After `portless clean` or manual certificate deletion, the next HTTPS proxy start generates a new local CA.
+macOS/Linux may prompt for `sudo`. Custom certificate paths passed with `--cert` and `--key` are not deleted. If trust-store removal fails, portless retains its CA certificate and key so a later `portless clean` can safely retry. After successful cleanup or manual certificate deletion, the next HTTPS proxy start generates a new local CA.
 
 ## Safari / DNS
 

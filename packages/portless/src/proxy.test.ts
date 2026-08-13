@@ -471,14 +471,17 @@ describe("createProxyServer", () => {
       expect(res.body).toBe("wildcard path");
     });
 
-    it("proxies to a backend listening on IPv6 loopback only", async () => {
-      const backend = trackServer(
-        http.createServer((_req, res) => {
-          res.writeHead(200, { "Content-Type": "text/plain" });
-          res.end("hello from ipv6 backend");
-        })
-      );
-      await new Promise<void>((resolve) => backend.listen(0, "::1", () => resolve()));
+    it("proxies to a backend listening on IPv6 loopback only (issue #320)", async (ctx) => {
+      const backend = http.createServer((_req, res) => {
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end("hello from ipv6 backend");
+      });
+      const ipv6Available = await new Promise<boolean>((resolve) => {
+        backend.once("error", () => resolve(false));
+        backend.listen(0, "::1", () => resolve(true));
+      });
+      if (!ipv6Available) return ctx.skip();
+      trackServer(backend);
       const backendAddr = backend.address();
       if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
 
