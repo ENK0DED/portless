@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.15.6000
+
+### Fork Sync
+
+- **Upstream v0.15 sync**: Merges upstream v0.15.0 through v0.15.5 at `326e893`, including `portless doctor`, multi-TLD proxy support, loopback-only binding, sudo state and Windows/WSL CA trust, Tailscale hostname routing, IPv6 loopback dialing, worktree prefixes, RFC 8441 WebSocket proxying, multi-segment custom TLD validation, package-manager script flag injection, and the Windows service timeout fix
+- **Fork release mapping**: Tracks upstream `0.15.5` as `0.15.6000` for `@enk0ded/portless` and reserves `0.15.6001` for the feature batch that follows this merge
+- **Fork package identity**: Keeps the npm package under `@enk0ded/portless` while preserving the `portless` CLI command
+- **Bun workspace policy**: Keeps Bun as the repository package manager and preserves the fork's package, documentation, and workflow invariants
+
 ## 0.15.5
 
 ### Bug Fixes

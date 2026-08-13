@@ -102,6 +102,8 @@ Current fork-owned commits and what they protect:
 | `f22e276` | Merged the signed `prepare-v0.14.1002` release branch into `main` while preserving the upstream PR coverage and release preparation history.                                                       |
 | `fa79183` | Updated the fork-only ledger for the signed `prepare-v0.14.1002` release merge commit.                                                                                                             |
 | `16d85ed` | Prepared fork release `0.14.1003` with HMR subprotocol forwarding, privileged `--skip-trust` propagation, CA reuse documentation, and release metadata.                                            |
+| `b729e1f` | Updated the fork-only ledger with the release merge and the `0.14.1003` preparation commit.                                                                                                        |
+| `e3c746e` | Merged upstream v0.15.5 at `326e893` while preserving fork identity, version mapping, Bun, suffix behavior, docs, tests, release workflow, Windows debugging, and the fork sync skill.             |
 
 ## Fork-Owned Invariants
 
@@ -139,7 +141,7 @@ Examples:
 
 This avoids prerelease semantics and keeps room for local-only releases between upstream syncs.
 
-The current fork release `0.14.1003` tracks upstream `0.14.0` plus local fork fixes and maintenance updates. If upstream publishes `0.14.1`, the first synced fork release should be `0.14.2000`. If the fork ships another local-only change before the next upstream patch, use `0.14.1004`.
+The current fork release `0.15.6000` tracks upstream `0.15.5`. Release `0.15.6001` is reserved for the feature batch that follows this sync. If upstream publishes `0.15.6`, the first synced fork release should be `0.15.7000`. If the fork ships another local-only change before the next upstream patch, use `0.15.6002`.
 
 ### Package Manager
 
