@@ -28,6 +28,7 @@ import {
   getProxyBindTargets,
   getRiskyTldReason,
   hasConfiguredTldEnv,
+  injectPackageScriptFrameworkFlags,
   isHttpsEnvDisabled,
   injectFrameworkFlags,
   isPortListening,
@@ -41,6 +42,7 @@ import {
   readTldsFromDir,
   readWildcardMarker,
   replacePlaceholders,
+  resolveFrameworkBasename,
   resolveWindowsCommandInvocation,
   resolveWindowsExecutable,
   resolveStateDir,
@@ -1044,6 +1046,320 @@ describe("injectFrameworkFlags", () => {
     const args = ["php", "artisan", "serve"];
     injectFrameworkFlags(args, 4567);
     expect(args).toEqual(["php", "artisan", "serve", "--port", "4567", "--host", "127.0.0.1"]);
+  });
+
+  it("does not inject server flags into a Vite build", () => {
+    const args = ["vite", "build"];
+    injectFrameworkFlags(args, 4567);
+    expect(args).toEqual(["vite", "build"]);
+  });
+
+  it("recognizes an existing --port=value option and still adds a missing host", () => {
+    const args = ["vite", "dev", "--port=5000"];
+    injectFrameworkFlags(args, 4567);
+    expect(args).toEqual(["vite", "dev", "--port=5000", "--host", "127.0.0.1"]);
+  });
+});
+
+describe("injectPackageScriptFrameworkFlags", () => {
+  let packageDir: string;
+
+  beforeEach(() => {
+    packageDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-script-injection-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(packageDir, { recursive: true, force: true });
+  });
+
+  function writeScript(script: string): void {
+    writeScripts({ dev: script });
+  }
+
+  function writeScripts(scripts: Record<string, string>): void {
+    fs.writeFileSync(
+      path.join(packageDir, "package.json"),
+      JSON.stringify({ name: "test-app", scripts })
+    );
+  }
+
+  it.each(["bun", "npm", "pnpm", "yarn"])("forwards Vite flags through %s run dev", (pm) => {
+    writeScript("vite dev");
+    const args = [pm, "run", "dev"];
+
+    injectPackageScriptFrameworkFlags(args, 4567, packageDir);
+
+    expect(args).toEqual([
+      pm,
+      "run",
+      "dev",
+      ...(pm === "npm" ? ["--"] : []),
+      "--port",
+      "4567",
+      "--strictPort",
+      "--host",
+      "127.0.0.1",
+    ]);
+  });
+
+  it.each([
+    ["vitepress", "vitepress dev"],
+    ["rsbuild", "rsbuild dev"],
+    ["laravel", "php artisan serve"],
+    ["wrangler", "wrangler dev"],
+  ])("forwards flags for the fork's %s injector", (_name, script) => {
+    writeScript(script);
+    const args = ["bun", "run", "dev"];
+
+    injectPackageScriptFrameworkFlags(args, 4567, packageDir);
+
+    expect(args.slice(3)).toEqual(
+      script.startsWith("vitepress")
+        ? ["--port", "4567", "--strictPort", "--host", "127.0.0.1"]
+        : script.startsWith("wrangler")
+          ? ["--port", "4567", "--ip", "127.0.0.1"]
+          : ["--port", "4567", "--host", "127.0.0.1"]
+    );
+  });
+
+  it("does not append into a compound script or a non-server command", () => {
+    writeScript("vite dev && vite build");
+    const compoundArgs = ["bun", "run", "dev"];
+    injectPackageScriptFrameworkFlags(compoundArgs, 4567, packageDir);
+    expect(compoundArgs).toEqual(["bun", "run", "dev"]);
+
+    writeScript("vite build");
+    const buildArgs = ["bun", "run", "dev"];
+    injectPackageScriptFrameworkFlags(buildArgs, 4567, packageDir);
+    expect(buildArgs).toEqual(["bun", "run", "dev"]);
+  });
+
+  it("resolves framework identity through a package script independently of append safety", () => {
+    writeScript("expo start --port 4567 # already configured");
+    expect(resolveFrameworkBasename(["bun", "run", "dev"], packageDir)).toBe("expo");
+  });
+
+  it("forwards only the missing host when the script supplies a port", () => {
+    writeScript("expo start --port 4567");
+    const args = ["bun", "run", "dev"];
+    injectPackageScriptFrameworkFlags(args, 4567, packageDir);
+    expect(args).toEqual(["bun", "run", "dev", "--host", "localhost"]);
+  });
+
+  it.each(["--localhost", "--lan", "--tunnel"])(
+    "preserves Expo connection mode %s through a package script",
+    (mode) => {
+      writeScript(`expo start ${mode}`);
+      const args = ["pnpm", "run", "dev"];
+      injectPackageScriptFrameworkFlags(args, 4567, packageDir);
+      expect(args).toEqual(["pnpm", "run", "dev", "--port", "4567"]);
+    }
+  );
+
+  it("forwards only the missing port when the script supplies a host", () => {
+    writeScript("vite dev --host 127.0.0.1");
+    const args = ["bun", "run", "dev", "--", "--host", "0.0.0.0"];
+    injectPackageScriptFrameworkFlags(args, 4567, packageDir);
+    expect(args).toEqual([
+      "bun",
+      "run",
+      "dev",
+      "--",
+      "--host",
+      "0.0.0.0",
+      "--port",
+      "4567",
+      "--strictPort",
+    ]);
+  });
+
+  it("does not duplicate a port supplied by script or user trailing args", () => {
+    writeScript("vite dev --host 127.0.0.1");
+    const userArgs = ["npm", "run", "dev", "--", "--port", "3000"];
+    injectPackageScriptFrameworkFlags(userArgs, 4567, packageDir);
+    expect(userArgs).toEqual(["npm", "run", "dev", "--", "--port", "3000"]);
+
+    writeScript("vite dev --port=5000 --host=127.0.0.1");
+    const scriptArgs = ["bun", "run", "dev"];
+    injectPackageScriptFrameworkFlags(scriptArgs, 4567, packageDir);
+    expect(scriptArgs).toEqual(["bun", "run", "dev"]);
+
+    writeScript("vite dev --host=127.0.0.1");
+    const equalsArgs = ["bun", "run", "dev", "--port=3000"];
+    injectPackageScriptFrameworkFlags(equalsArgs, 4567, packageDir);
+    expect(equalsArgs).toEqual(["bun", "run", "dev", "--port=3000"]);
+  });
+
+  it.each([
+    "vite dev && node second.js",
+    "vite dev&&node second.js",
+    "vite dev\nnode second.js",
+    "vite dev | tee log.txt",
+    "vite dev # keep this note",
+    "vite dev --open  # opens a browser",
+    "vite dev \\\n# note",
+  ])("does not append flags to unsafe shell script %s", (script) => {
+    writeScript(script);
+    const args = ["bun", "run", "dev"];
+    injectPackageScriptFrameworkFlags(args, 4567, packageDir);
+    expect(args).toEqual(["bun", "run", "dev"]);
+  });
+
+  it("preserves quoted metacharacters and redirections in a single script", () => {
+    for (const script of ["vite dev --open '/foo&bar'", "vite dev >vite.log 2>&1"]) {
+      writeScript(script);
+      const args = ["bun", "run", "dev"];
+      injectPackageScriptFrameworkFlags(args, 4567, packageDir);
+      expect(args).toEqual([
+        "bun",
+        "run",
+        "dev",
+        "--port",
+        "4567",
+        "--strictPort",
+        "--host",
+        "127.0.0.1",
+      ]);
+    }
+  });
+
+  it("does not append past a script's own option terminator", () => {
+    writeScript("vite dev -- --extra");
+    const args = ["bun", "run", "dev"];
+    injectPackageScriptFrameworkFlags(args, 4567, packageDir);
+    expect(args).toEqual(["bun", "run", "dev"]);
+  });
+
+  it("handles server and non-server framework subcommands", () => {
+    writeScripts({
+      preview: "vite preview",
+      build: "vite build",
+      optimize: "vite optimize",
+      test: "vp test",
+      export: "expo export",
+      check: "astro check",
+    });
+
+    const previewArgs = ["bun", "run", "preview"];
+    injectPackageScriptFrameworkFlags(previewArgs, 4567, packageDir);
+    expect(previewArgs).toEqual([
+      "bun",
+      "run",
+      "preview",
+      "--port",
+      "4567",
+      "--strictPort",
+      "--host",
+      "127.0.0.1",
+    ]);
+
+    for (const script of ["build", "optimize", "test", "export", "check"]) {
+      const args = ["bun", "run", script];
+      injectPackageScriptFrameworkFlags(args, 4567, packageDir);
+      expect(args).toEqual(["bun", "run", script]);
+    }
+  });
+
+  it("handles runner-wrapped and flag-prefixed build scripts conservatively", () => {
+    writeScripts({
+      build: "bunx vite build",
+      mode: "vite --mode production build",
+      dev: "bunx vite dev --host 127.0.0.1",
+    });
+
+    const buildArgs = ["bun", "run", "build"];
+    injectPackageScriptFrameworkFlags(buildArgs, 4567, packageDir);
+    expect(buildArgs).toEqual(["bun", "run", "build"]);
+
+    const modeArgs = ["bun", "run", "mode"];
+    injectPackageScriptFrameworkFlags(modeArgs, 4567, packageDir);
+    expect(modeArgs).toEqual(["bun", "run", "mode"]);
+
+    const runnerArgs = ["bun", "run", "dev"];
+    injectPackageScriptFrameworkFlags(runnerArgs, 4567, packageDir);
+    expect(runnerArgs).toEqual(["bun", "run", "dev", "--port", "4567", "--strictPort"]);
+  });
+
+  it("ignores missing scripts and commands outside package-manager run", () => {
+    writeScripts({ start: "vite dev" });
+    for (const args of [
+      ["vite", "dev"],
+      ["bun", "dev"],
+      ["bun", "run", "--bun"],
+      ["bunx", "vite", "dev"],
+      ["cargo", "run", "dev"],
+      ["bun", "run", "dev"],
+    ]) {
+      const before = [...args];
+      injectPackageScriptFrameworkFlags(args, 4567, packageDir);
+      expect(args).toEqual(before);
+    }
+  });
+
+  it("resolves an absolute package-manager path and runner inside the script", () => {
+    writeScript("bunx vite dev --host 127.0.0.1");
+    const args = ["/usr/local/bin/bun", "run", "dev"];
+    injectPackageScriptFrameworkFlags(args, 4567, packageDir);
+    expect(args).toEqual(["/usr/local/bin/bun", "run", "dev", "--port", "4567", "--strictPort"]);
+  });
+
+  it("keeps comments, escaped spaces, and substitutions classified correctly", () => {
+    writeScript("vite dev --tag v1#2");
+    const wordArgs = ["bun", "run", "dev"];
+    injectPackageScriptFrameworkFlags(wordArgs, 4567, packageDir);
+    expect(wordArgs).toContain("--port");
+
+    writeScript("vite dev --open /foo\\ #bar");
+    const escapedArgs = ["bun", "run", "dev"];
+    injectPackageScriptFrameworkFlags(escapedArgs, 4567, packageDir);
+    expect(escapedArgs).toContain("--port");
+
+    writeScript("vite dev --define SHA=$(git rev-parse HEAD)");
+    const substitutionArgs = ["bun", "run", "dev"];
+    injectPackageScriptFrameworkFlags(substitutionArgs, 4567, packageDir);
+    expect(substitutionArgs).toContain("--port");
+  });
+});
+
+describe("resolveFrameworkBasename", () => {
+  let packageDir: string;
+
+  beforeEach(() => {
+    packageDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-framework-resolution-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(packageDir, { recursive: true, force: true });
+  });
+
+  it("resolves direct and package-runner invocations", () => {
+    expect(resolveFrameworkBasename(["vite", "dev"], packageDir)).toBe("vite");
+    expect(resolveFrameworkBasename(["bunx", "--bun", "vite", "dev"], packageDir)).toBe("vite");
+  });
+
+  it("resolves framework identity through a package script", () => {
+    fs.writeFileSync(
+      path.join(packageDir, "package.json"),
+      JSON.stringify({ scripts: { dev: "expo start" } })
+    );
+    expect(resolveFrameworkBasename(["bun", "run", "dev"], packageDir)).toBe("expo");
+  });
+
+  it("keeps identity resolution independent from append safety", () => {
+    fs.writeFileSync(
+      path.join(packageDir, "package.json"),
+      JSON.stringify({ scripts: { dev: "expo start --port 4567 # note" } })
+    );
+    expect(resolveFrameworkBasename(["bun", "run", "dev"], packageDir)).toBe("expo");
+  });
+
+  it("returns null when no known framework is reached", () => {
+    fs.writeFileSync(
+      path.join(packageDir, "package.json"),
+      JSON.stringify({ scripts: { dev: "node server.js" } })
+    );
+    expect(resolveFrameworkBasename(["bun", "run", "dev"], packageDir)).toBeNull();
+    expect(resolveFrameworkBasename(["node", "server.js"], packageDir)).toBeNull();
   });
 });
 

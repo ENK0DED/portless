@@ -366,7 +366,7 @@ Auto-elevated proxy starts pass the resolved `PORTLESS_STATE_DIR` and proxy flag
 
 ## Port assignment
 
-Apps get a random port in the 4000 to 4999 range that is free on `127.0.0.1`. Portless skips browser-blocked ports during auto-assignment and rejects them for fixed app ports. Portless sets `PORT` and usually `HOST` before running your command. Most frameworks respect `PORT` automatically. For frameworks that ignore it (Vite, VitePress, Astro, React Router, Angular, Laravel, Expo, React Native, Wrangler), portless auto-injects the right `--port` flag and, when needed, a matching `--host` flag or Wrangler's `--ip` flag.
+Apps get a random port in the 4000 to 4999 range that is free on `127.0.0.1`. Portless skips browser-blocked ports during auto-assignment and rejects them for fixed app ports. Portless sets `PORT` and usually `HOST` before running your command. Most frameworks respect `PORT` automatically. For frameworks that ignore it (Vite, VitePress, Astro, React Router, Angular, Laravel, Expo, React Native, Wrangler), portless auto-injects the right `--port` flag and, when needed, a matching `--host` flag or Wrangler's `--ip` flag. Injection also reaches through a safe `bun run`, `npm run`, `pnpm run`, or `yarn run` script when its command resolves directly to a recognized framework or package runner. Only server commands receive flags; builds, checks, comments, compound commands, scripts with their own `--` terminator, environment-prefixed or delegated commands, and runner flags before the script name are left unchanged. Set the port in those scripts yourself.
 
 If a tool needs custom argument names, use exact command placeholders:
 

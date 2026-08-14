@@ -3022,6 +3022,163 @@ describe("CLI", () => {
       }
     });
 
+    async function captureScriptDelegation(options: {
+      pm: string;
+      script: string;
+      cliArgs: string[];
+      lan?: boolean;
+    }): Promise<{
+      status: number | null;
+      proxyPort: number;
+      capture: { args: string[]; env: Record<string, string | undefined> };
+    }> {
+      const server = http.createServer((_req, res) => {
+        res.setHeader("X-Portless", "1");
+        res.end("ok");
+      });
+      const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-pm-script-shim-"));
+      const capturePath = path.join(shimDir, "capture.json");
+
+      try {
+        const proxyPort = await new Promise<number>((resolve) => {
+          server.listen(0, "127.0.0.1", () => {
+            const addr = server.address();
+            if (addr && typeof addr !== "string") resolve(addr.port);
+          });
+        });
+
+        fs.writeFileSync(path.join(tmpDir, "proxy.port"), proxyPort.toString());
+        if (options.lan) fs.writeFileSync(path.join(tmpDir, "proxy.lan"), "192.168.1.42");
+        fs.writeFileSync(
+          path.join(tmpDir, "package.json"),
+          JSON.stringify({
+            name: "test-app",
+            packageManager: `${options.pm}@1.0.0`,
+            portless: { appPort: 4567 },
+            scripts: { dev: options.script },
+          })
+        );
+
+        const captureScriptPath = path.join(shimDir, "capture-pm.cjs");
+        fs.writeFileSync(
+          captureScriptPath,
+          [
+            'const fs = require("node:fs");',
+            "const capturePath = process.env.PORTLESS_TEST_CAPTURE_FILE;",
+            "fs.writeFileSync(capturePath, JSON.stringify({",
+            "  args: process.argv.slice(2),",
+            "  env: {",
+            "    PORT: process.env.PORT,",
+            "    HOST: process.env.HOST,",
+            "    PORTLESS_URL: process.env.PORTLESS_URL,",
+            "    PORTLESS_LAN: process.env.PORTLESS_LAN,",
+            "  },",
+            "}));",
+          ].join("\n") + "\n"
+        );
+
+        const localBinDir = path.join(tmpDir, "node_modules", ".bin");
+        fs.mkdirSync(localBinDir, { recursive: true });
+        if (process.platform === "win32") {
+          fs.writeFileSync(
+            path.join(localBinDir, `${options.pm}.cmd`),
+            `@echo off\r\n"${process.execPath}" "${captureScriptPath}" %*\r\n`
+          );
+        } else {
+          const shimPath = path.join(localBinDir, options.pm);
+          fs.writeFileSync(
+            shimPath,
+            `#!/bin/sh\n"${process.execPath}" "${captureScriptPath}" "$@"\n`
+          );
+          fs.chmodSync(shimPath, 0o755);
+        }
+
+        const { status, stdout, stderr } = run(options.cliArgs, {
+          cwd: tmpDir,
+          env: {
+            PATH: process.platform === "win32" ? process.env.PATH : "/usr/bin:/bin",
+            PORTLESS_STATE_DIR: tmpDir,
+            PORTLESS_TEST_CAPTURE_FILE: capturePath,
+            PORTLESS_HTTPS: "0",
+          },
+        });
+
+        if (!fs.existsSync(capturePath)) {
+          throw new Error(
+            [
+              `package-manager shim never ran (${options.pm})`,
+              `platform: ${process.platform}`,
+              `exit: ${status}`,
+              `stdout: ${stdout.trim() || "(empty)"}`,
+              `stderr: ${stderr.trim() || "(empty)"}`,
+            ].join("\n")
+          );
+        }
+
+        const capture = JSON.parse(fs.readFileSync(capturePath, "utf-8")) as {
+          args: string[];
+          env: Record<string, string | undefined>;
+        };
+        return { status, proxyPort, capture };
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        fs.rmSync(shimDir, { recursive: true, force: true });
+      }
+    }
+
+    it.each(["bun", "npm", "pnpm", "yarn"])(
+      "forwards Vite flags through the %s package script",
+      async (pm) => {
+        const { status, proxyPort, capture } = await captureScriptDelegation({
+          pm,
+          script: "vite dev --host 127.0.0.1",
+          cliArgs: [],
+        });
+
+        expect(status).toBe(0);
+        expect(capture.args).toEqual([
+          "run",
+          "dev",
+          ...(pm === "npm" ? ["--"] : []),
+          "--port",
+          "4567",
+          "--strictPort",
+        ]);
+        expect(capture.env).toMatchObject({
+          PORT: "4567",
+          HOST: "127.0.0.1",
+          PORTLESS_URL: `http://test-app.localhost:${proxyPort}`,
+        });
+      }
+    );
+
+    it("resolves Expo through a Bun package script before binding child HOST", async () => {
+      const { status, capture } = await captureScriptDelegation({
+        pm: "bun",
+        script: "expo start",
+        cliArgs: [],
+        lan: true,
+      });
+
+      expect(status).toBe(0);
+      expect(capture.env.PORTLESS_LAN).toBe("1");
+      expect(capture.env.HOST).toBeUndefined();
+      expect(capture.args).toEqual(["run", "dev", "--port", "4567"]);
+    });
+
+    it("keeps a declined Expo script's environment carve-out", async () => {
+      const { status, capture } = await captureScriptDelegation({
+        pm: "bun",
+        script: "expo start --port 4567 # configured",
+        cliArgs: [],
+        lan: true,
+      });
+
+      expect(status).toBe(0);
+      expect(capture.env.HOST).toBeUndefined();
+      expect(capture.args).toEqual(["run", "dev"]);
+    });
+
     it("portless (no args) forwards Vite port flags through bun run dev", async () => {
       const server = http.createServer((_req, res) => {
         res.setHeader("X-Portless", "1");

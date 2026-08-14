@@ -75,6 +75,7 @@ import {
   getProxyBindTargets,
   hasConfiguredTldEnv,
   hasPlaceholders,
+  injectPackageScriptFrameworkFlags,
   injectFrameworkFlags,
   isHttpsEnvDisabled,
   isPortListening,
@@ -93,6 +94,7 @@ import {
   resolveWindowsExecutable,
   resolveStateDir,
   replacePlaceholders,
+  resolveFrameworkBasename,
   spawnCommand,
   augmentedPath,
   parseTldList,
@@ -118,7 +120,6 @@ import {
 import {
   loadConfig,
   resolveAppConfig,
-  resolveScript,
   resolveScriptCommand,
   hasScript,
   isServerCommand,
@@ -2054,9 +2055,12 @@ async function runApp(
   // conflicts with its internal networking, causing HMR WebSocket degradation.
   // Exception: bun --bun — Bun's native runtime uses HOST for WebSocket origin
   // validation, which breaks Next.js fast refresh behind the proxy hostname.
-  const basename = path.basename(commandArgs[0]);
-  const isExpo = basename === "expo";
-  const isExpoLan = isExpo && (lanMode || isLanEnvEnabled());
+  const framework = resolveFrameworkBasename(
+    commandArgs,
+    scriptContext?.packageDir ?? process.cwd()
+  );
+  const isExpoLan = framework === "expo" && (lanMode || isLanEnvEnabled());
+  const basename = path.basename(commandArgs[0] ?? "");
   const isBunNativeRuntime = basename === "bun" && commandArgs.includes("--bun");
   const hostBind = isExpoLan || isBunNativeRuntime ? undefined : "127.0.0.1";
 
@@ -2076,7 +2080,7 @@ async function runApp(
 
   if (!usedPlaceholders) {
     // Inject --port for frameworks that ignore the PORT env var (e.g. Vite)
-    injectPackageScriptFrameworkFlags(commandArgs, port, scriptContext);
+    injectPackageScriptFrameworkFlags(commandArgs, port, scriptContext?.packageDir);
     injectFrameworkFlags(commandArgs, port);
   }
 
@@ -2160,30 +2164,6 @@ async function runApp(
       }
     },
   });
-}
-
-function injectPackageScriptFrameworkFlags(
-  commandArgs: string[],
-  port: number,
-  scriptContext?: { scriptName: string; packageDir: string }
-): void {
-  if (!scriptContext) return;
-
-  const [runner, runSubcommand, scriptName] = commandArgs;
-  if (runSubcommand !== "run" || scriptName !== scriptContext.scriptName) return;
-
-  const rawScript = resolveScript(scriptContext.scriptName, scriptContext.packageDir);
-  if (!rawScript) return;
-
-  const scriptWithInjectedFlags = [...rawScript];
-  injectFrameworkFlags(scriptWithInjectedFlags, port);
-  const forwardedFlags = scriptWithInjectedFlags.slice(rawScript.length);
-  if (forwardedFlags.length === 0) return;
-
-  if (runner === "npm" && !commandArgs.includes("--")) {
-    commandArgs.push("--");
-  }
-  commandArgs.push(...forwardedFlags);
 }
 
 // ---------------------------------------------------------------------------
@@ -3263,9 +3243,10 @@ ${colors.bold("How it works:")}
      (apps get a random port in the 4000 to 4999 range that is free on 127.0.0.1 via PORT)
   3. Access via https://<name>.localhost
   4. .localhost domains auto-resolve to 127.0.0.1
-  5. Frameworks that ignore PORT (Vite, VitePlus, VitePress, Astro,
+  5. Frameworks that ignore PORT (Vite, VitePlus, VitePress, Rsbuild, Astro,
      React Router, Angular, Laravel, Expo, React Native, Wrangler) get --port and, when needed,
-     --host or --ip flags injected automatically
+     --host or --ip flags injected automatically; safe bun run, npm run, pnpm run, or yarn run
+     scripts resolving directly to those server commands receive the same injection
   6. The proxy listens only on 127.0.0.1 and ::1 unless LAN mode is enabled
 
 ${colors.bold("Background apps:")}
@@ -5110,6 +5091,7 @@ async function spawnProxiedApp(
   let store: RouteStore | null = null;
   let hostnames: string[] | null = null;
   let routePathPrefix: string | null = null;
+  let assignedAppPort: number | undefined;
   let displayUrl: string;
 
   if (usesPortless) {
@@ -5121,6 +5103,7 @@ async function spawnProxiedApp(
     });
 
     const appPort = app.appPort ?? (await findFreePort());
+    assignedAppPort = appPort;
     routePathPrefix = normalizePathPrefix(pathPrefixFromEnv());
     hostnames = buildHostnames(app.name, tlds);
     const url = formatUrl(hostnames[0]!, proxyPort, tls, routePathPrefix);
@@ -5149,6 +5132,11 @@ async function spawnProxiedApp(
         env.NODE_EXTRA_CA_CERTS = caPath;
       }
     }
+  }
+
+  if (assignedAppPort !== undefined) {
+    injectPackageScriptFrameworkFlags(app.commandArgs, assignedAppPort, app.pkg.dir);
+    injectFrameworkFlags(app.commandArgs, assignedAppPort);
   }
 
   const child = spawnChildProcess(app.commandArgs, env, app.pkg.dir);

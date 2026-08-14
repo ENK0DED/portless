@@ -199,6 +199,8 @@ Outside LAN mode, the proxy and its HTTP redirect listener bind only to the IPv4
 
 Most frameworks (Next.js, Express, Nuxt, etc.) respect the `PORT` env var automatically. Portless skips browser-blocked ports during auto-assignment and rejects them for fixed app ports. For frameworks that ignore `PORT` (Vite, VitePlus, VitePress, Astro, React Router, Angular, Laravel, Expo, React Native, Wrangler), portless auto-injects the correct `--port` flag and, when needed, a matching `--host` CLI flag or Wrangler's `--ip` flag.
 
+The same injection applies when a safe `bun run`, `npm run`, `pnpm run`, or `yarn run` script resolves directly to a recognized framework or package runner. Only server commands receive flags. Builds, checks, comments, compound commands, scripts with their own `--` terminator, environment-prefixed or delegated commands, and runner flags before the script name are left unchanged. Exact `{PORT}`, `{HOST}`, and `{PORTLESS_URL}` placeholders still take precedence and disable automatic framework flag injection.
+
 For other tools, command args can use exact placeholders:
 
 ```bash
@@ -596,7 +598,7 @@ portless proxy start -p 8080
 
 ### Framework not respecting PORT
 
-Portless auto-injects the right `--port` flag and, when needed, a matching `--host` flag for frameworks that ignore the `PORT` env var: **Vite**, **VitePlus** (`vp`), **VitePress**, **Astro**, **React Router**, **Angular**, **Laravel**, **Expo**, **React Native**, and **Wrangler**. Wrangler gets `--ip` because its `--host` flag means route hostname. SvelteKit uses Vite internally and is handled automatically.
+Portless auto-injects the right `--port` flag and, when needed, a matching `--host` flag for frameworks that ignore the `PORT` env var: **Vite**, **VitePlus** (`vp`), **VitePress**, **Rsbuild**, **Astro**, **React Router**, **Angular**, **Laravel**, **Expo**, **React Native**, and **Wrangler**. Wrangler gets `--ip` because its `--host` flag means route hostname. SvelteKit uses Vite internally and is handled automatically. The injection also works through a safe `bun run`, `npm run`, `pnpm run`, or `yarn run` script that resolves directly to a recognized server command. Exact whole-argument placeholders remain the escape hatch for custom flag shapes.
 
 If a tool needs a custom flag shape, use exact command placeholders instead:
 

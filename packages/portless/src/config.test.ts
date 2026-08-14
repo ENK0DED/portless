@@ -6,6 +6,7 @@ import {
   loadConfig,
   resolveAppConfig,
   resolveScript,
+  resolveScriptRaw,
   resolveScriptCommand,
   detectPackageManager,
   hasScript,
@@ -483,6 +484,27 @@ describe("resolveScript", () => {
     );
     const result = resolveScript("dev", tmpDir);
     expect(result).toEqual(["NODE_ENV=development", "next", "dev", "--turbo"]);
+  });
+});
+
+describe("resolveScriptRaw", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = createTmpDir();
+  });
+
+  afterEach(() => {
+    cleanupDir(tmpDir);
+  });
+
+  it("preserves shell syntax and whitespace from a package script", () => {
+    fs.writeFileSync(
+      path.join(tmpDir, "package.json"),
+      JSON.stringify({ scripts: { dev: "vite dev\nnode server.js" } })
+    );
+
+    expect(resolveScriptRaw("dev", tmpDir)).toBe("vite dev\nnode server.js");
   });
 });
 

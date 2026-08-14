@@ -6,6 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
 import { execSync, spawn } from "node:child_process";
+import { resolveScript, resolveScriptRaw } from "./config.js";
 import { LOOPBACK_DIAL_OPTIONS, PORTLESS_HEADER, PORTLESS_LISTENER_PORT_HEADER } from "./proxy.js";
 import { resolveUserHome } from "./utils.js";
 
@@ -1229,45 +1230,146 @@ export function spawnCommand(
 // ---------------------------------------------------------------------------
 
 /**
- * Frameworks that ignore the `PORT` env var. Maps command basename to the
- * flags needed. `strictPort` indicates whether `--strictPort` is supported
- * (prevents the framework from silently picking a different port). `hostFlag`
- * overrides the bind-address flag when a framework uses another name.
- *
- * SvelteKit is not listed because its dev server is Vite under the hood,
- * so the `vite` entry already covers it.
+ * Frameworks that ignore the `PORT` env var. `serverSubcommands` lists the
+ * subcommands that accept the injected flags, while `defaultIsServer` marks a
+ * bare invocation that starts a server. Unknown commands are left untouched
+ * because framework CLIs commonly reject server flags on build and inspection
+ * commands.
  */
-const FRAMEWORKS_NEEDING_PORT: Record<string, { strictPort: boolean; hostFlag?: string }> = {
-  vite: { strictPort: true },
-  vp: { strictPort: true },
-  vitepress: { strictPort: true },
-  "react-router": { strictPort: true },
-  rsbuild: { strictPort: false },
-  astro: { strictPort: false },
-  ng: { strictPort: false },
-  "laravel-artisan": { strictPort: false },
-  "react-native": { strictPort: false },
-  expo: { strictPort: false },
-  wrangler: { strictPort: false, hostFlag: "--ip" },
+type FrameworkSpec = {
+  strictPort: boolean;
+  hostFlag?: string;
+  serverSubcommands: string[];
+  nonServerSubcommands?: string[];
+  defaultIsServer: boolean;
+  positionalRootIsServer?: boolean;
+  valueFlags?: string[];
+};
+
+const FRAMEWORKS_NEEDING_PORT: Record<string, FrameworkSpec> = {
+  vite: {
+    strictPort: true,
+    serverSubcommands: ["dev", "serve", "preview"],
+    nonServerSubcommands: ["build", "optimize"],
+    defaultIsServer: true,
+    positionalRootIsServer: true,
+    valueFlags: [
+      "--assetsDir",
+      "--assetsInlineLimit",
+      "--base",
+      "--configLoader",
+      "--host",
+      "--manifest",
+      "--minify",
+      "--open",
+      "--outDir",
+      "--port",
+      "--sourcemap",
+      "--ssr",
+      "--ssrManifest",
+      "--target",
+      "-c",
+      "--config",
+      "-d",
+      "--debug",
+      "-f",
+      "--filter",
+      "-l",
+      "--logLevel",
+      "-m",
+      "--mode",
+    ],
+  },
+  vp: { strictPort: true, serverSubcommands: ["dev"], defaultIsServer: false },
+  vitepress: {
+    strictPort: true,
+    serverSubcommands: ["dev", "preview"],
+    defaultIsServer: false,
+  },
+  "react-router": { strictPort: true, serverSubcommands: ["dev"], defaultIsServer: false },
+  rsbuild: {
+    strictPort: false,
+    serverSubcommands: ["dev", "preview"],
+    defaultIsServer: true,
+    valueFlags: [
+      "--base",
+      "--config-loader",
+      "--dist-path",
+      "--env-dir",
+      "--env-mode",
+      "--environment",
+      "--host",
+      "--log-level",
+      "--output",
+      "--port",
+      "-c",
+      "--config",
+      "-m",
+      "--mode",
+      "-o",
+      "--open",
+      "-r",
+      "--root",
+    ],
+  },
+  astro: { strictPort: false, serverSubcommands: ["dev", "preview"], defaultIsServer: false },
+  ng: {
+    strictPort: false,
+    serverSubcommands: ["serve", "dev", "s"],
+    defaultIsServer: false,
+  },
+  "laravel-artisan": {
+    strictPort: false,
+    serverSubcommands: [],
+    defaultIsServer: true,
+  },
+  "react-native": { strictPort: false, serverSubcommands: ["start"], defaultIsServer: false },
+  expo: {
+    strictPort: false,
+    serverSubcommands: ["start", "serve"],
+    defaultIsServer: true,
+  },
+  wrangler: {
+    strictPort: false,
+    hostFlag: "--ip",
+    serverSubcommands: ["dev"],
+    defaultIsServer: false,
+  },
+};
+
+type PackageRunnerSpec = {
+  subcommands: string[];
+  valueFlags?: string[];
 };
 
 /** Known package runners. Values list subcommands that run a package. */
-const PACKAGE_RUNNERS: Record<string, string[]> = {
-  npm: ["exec"],
-  npx: [],
-  bunx: [],
+const PACKAGE_RUNNERS: Record<string, PackageRunnerSpec> = {
+  npm: { subcommands: ["exec"], valueFlags: ["-p", "--package"] },
+  npx: {
+    subcommands: [],
+    valueFlags: ["-c", "--call", "-p", "--package", "-w", "--workspace", "--allow-scripts"],
+  },
+  bunx: { subcommands: [] },
   // `bun <bin>` and `bun run <bin>` can both execute framework CLIs.
-  bun: ["run"],
-  pnpx: [],
-  yarn: ["dlx", "exec"],
-  pnpm: ["dlx", "exec"],
+  bun: { subcommands: ["run"] },
+  pnpx: { subcommands: [], valueFlags: ["-p", "--package"] },
+  yarn: { subcommands: ["dlx", "exec"] },
+  pnpm: { subcommands: ["dlx", "exec"] },
+};
+
+type FrameworkInvocation = {
+  basename: string;
+  framework: FrameworkSpec;
+  frameworkIndex: number;
+  frameworkArgs: string[];
+  insertionIndex: number;
 };
 
 /**
- * Find the basename of the framework command inside `commandArgs`, looking
- * past known package runners (npx, bunx, yarn dlx, …) and their flags.
+ * Find the framework command inside `commandArgs`, looking past known package
+ * runners and preserving the insertion point before a framework `--` marker.
  */
-function findFrameworkBasename(commandArgs: string[]): string | null {
+function parseFrameworkInvocation(commandArgs: string[]): FrameworkInvocation | null {
   if (commandArgs.length === 0) return null;
 
   const first = path.basename(commandArgs[0]);
@@ -1276,34 +1378,107 @@ function findFrameworkBasename(commandArgs: string[]): string | null {
     path.basename(commandArgs[1] ?? "") === "artisan" &&
     commandArgs[2] === "serve"
   ) {
-    return "laravel-artisan";
+    const framework = FRAMEWORKS_NEEDING_PORT["laravel-artisan"]!;
+    const frameworkIndex = 2;
+    const optionEnd = commandArgs.indexOf("--", frameworkIndex + 1);
+    const insertionIndex = optionEnd === -1 ? commandArgs.length : optionEnd;
+    return {
+      basename: "laravel-artisan",
+      framework,
+      frameworkIndex,
+      frameworkArgs: commandArgs.slice(frameworkIndex + 1, insertionIndex),
+      insertionIndex,
+    };
   }
 
-  if (FRAMEWORKS_NEEDING_PORT[first]) return first;
+  let frameworkIndex: number | null = FRAMEWORKS_NEEDING_PORT[first] ? 0 : null;
 
-  const subcommands = PACKAGE_RUNNERS[first];
-  if (!subcommands) return null;
+  if (frameworkIndex === null) {
+    const runner = PACKAGE_RUNNERS[first];
+    if (!runner) return null;
 
-  let i = 1;
+    let i = 1;
+    const skipRunnerOptions = () => {
+      while (i < commandArgs.length && commandArgs[i]!.startsWith("-")) {
+        const option = commandArgs[i]!;
+        i++;
+        if (option === "--") break;
+        if (!option.includes("=") && runner.valueFlags?.includes(option)) i++;
+      }
+    };
 
-  if (subcommands.length > 0) {
-    // Skip flags before the subcommand
-    while (i < commandArgs.length && commandArgs[i].startsWith("-")) i++;
-    if (i >= commandArgs.length) return null;
-    if (!subcommands.includes(commandArgs[i])) {
-      // Not a recognized subcommand — might be an implicit bin (e.g. `yarn vite`)
-      const name = path.basename(commandArgs[i]);
-      return FRAMEWORKS_NEEDING_PORT[name] ? name : null;
+    if (runner.subcommands.length > 0) {
+      skipRunnerOptions();
+      if (i >= commandArgs.length) return null;
+      if (!runner.subcommands.includes(commandArgs[i]!)) {
+        const name = path.basename(commandArgs[i]!);
+        frameworkIndex = FRAMEWORKS_NEEDING_PORT[name] ? i : null;
+      } else {
+        i++;
+      }
     }
-    i++;
+
+    if (frameworkIndex === null) {
+      skipRunnerOptions();
+      if (i >= commandArgs.length) return null;
+      const name = path.basename(commandArgs[i]!);
+      frameworkIndex = FRAMEWORKS_NEEDING_PORT[name] ? i : null;
+    }
   }
 
-  // Skip runner flags (e.g. `--bun`, `--yes`)
-  while (i < commandArgs.length && commandArgs[i].startsWith("-")) i++;
+  if (frameworkIndex === null) return null;
+  const basename = path.basename(commandArgs[frameworkIndex]!);
+  const framework = FRAMEWORKS_NEEDING_PORT[basename];
+  if (!framework) return null;
+  const optionEnd = commandArgs.indexOf("--", frameworkIndex + 1);
+  const insertionIndex = optionEnd === -1 ? commandArgs.length : optionEnd;
+  return {
+    basename,
+    framework,
+    frameworkIndex,
+    frameworkArgs: commandArgs.slice(frameworkIndex + 1, insertionIndex),
+    insertionIndex,
+  };
+}
 
-  if (i >= commandArgs.length) return null;
-  const name = path.basename(commandArgs[i]);
-  return FRAMEWORKS_NEEDING_PORT[name] ? name : null;
+function findFrameworkBasename(commandArgs: string[]): string | null {
+  return parseFrameworkInvocation(commandArgs)?.basename ?? null;
+}
+
+/**
+ * Return framework positionals while consuming known flag values. This keeps
+ * a value such as `production` from being mistaken for a build subcommand.
+ */
+function frameworkPositionals(args: string[], framework: FrameworkSpec): string[] | null {
+  const positionals: string[] = [];
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === "--") break;
+    if (!arg.startsWith("-")) {
+      positionals.push(arg);
+      continue;
+    }
+    if (arg.includes("=")) continue;
+    if (framework.valueFlags?.includes(arg)) {
+      i++;
+      continue;
+    }
+    if (!framework.valueFlags && positionals.length === 0) return null;
+  }
+
+  return positionals;
+}
+
+function invokesFrameworkServer(frameworkArgs: string[], framework: FrameworkSpec): boolean {
+  const positionals = frameworkPositionals(frameworkArgs, framework);
+  if (positionals === null) return false;
+
+  const [subcommand] = positionals;
+  if (subcommand === undefined) return framework.defaultIsServer;
+  if (framework.serverSubcommands.includes(subcommand)) return true;
+  if (framework.nonServerSubcommands?.includes(subcommand)) return false;
+  return framework.positionalRootIsServer === true;
 }
 
 const PLACEHOLDERS = ["{PORT}", "{HOST}", "{PORTLESS_URL}"] as const;
@@ -1350,28 +1525,153 @@ export function replacePlaceholders(commandArgs: string[], vars: PlaceholderVars
  * HMR WebSocket to degrade. Outside LAN mode, `--host localhost` keeps the
  * server local.
  */
-export function injectFrameworkFlags(commandArgs: string[], port: number): void {
-  const basename = findFrameworkBasename(commandArgs);
-  if (!basename) return;
+export function injectFrameworkFlags(commandArgs: string[], port: number): string[] {
+  const invocation = parseFrameworkInvocation(commandArgs);
+  if (!invocation) return [];
+  const { basename, framework, frameworkArgs, insertionIndex } = invocation;
 
-  const framework = FRAMEWORKS_NEEDING_PORT[basename];
+  if (!invokesFrameworkServer(frameworkArgs, framework)) return [];
 
-  if (!commandArgs.includes("--port")) {
-    commandArgs.push("--port", port.toString());
-    if (framework.strictPort) {
-      commandArgs.push("--strictPort");
-    }
+  const flags: string[] = [];
+  if (!hasCliOption(frameworkArgs, "--port")) {
+    flags.push("--port", port.toString());
+    if (framework.strictPort) flags.push("--strictPort");
   }
 
   const hostFlag = framework.hostFlag ?? "--host";
-  if (!commandArgs.includes(hostFlag)) {
-    // In LAN mode, let Expo use its default (LAN) — injecting --host alongside
-    // HOST=127.0.0.1 causes Metro's HMR WebSocket to break after a few reloads.
+  const hasHostChoice =
+    hasCliOption(frameworkArgs, hostFlag) ||
+    (basename === "expo" &&
+      ["--localhost", "--lan", "--tunnel"].some((option) => hasCliOption(frameworkArgs, option)));
+  if (!hasHostChoice) {
     const isExpoLan = basename === "expo" && isLanEnvEnabled();
-    if (isExpoLan) return;
-    const hostValue = basename === "expo" ? "localhost" : "127.0.0.1";
-    commandArgs.push(hostFlag, hostValue);
+    if (!isExpoLan) {
+      flags.push(hostFlag, basename === "expo" ? "localhost" : "127.0.0.1");
+    }
   }
+
+  commandArgs.splice(insertionIndex, 0, ...flags);
+  return flags;
+}
+
+/** Package managers whose `run` command delegates to package.json scripts. */
+const PACKAGE_SCRIPT_MANAGERS = new Set(["bun", "npm", "pnpm", "yarn"]);
+
+/**
+ * Return true when shell syntax means flags appended to the raw script would
+ * be sent to a different command or discarded by the shell.
+ */
+function isUnsafeToAppendArgs(command: string): boolean {
+  let inSingle = false;
+  let inDouble = false;
+  let escaped = false;
+  let atWordStart = true;
+  const chars = Array.from(command);
+
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i]!;
+    if (escaped) {
+      escaped = false;
+      if (ch === "\n" || ch === "\r") continue;
+      atWordStart = false;
+      continue;
+    }
+    if (ch === "\\" && !inSingle) {
+      escaped = true;
+      continue;
+    }
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      atWordStart = false;
+      continue;
+    }
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      atWordStart = false;
+      continue;
+    }
+    if (inSingle || inDouble) continue;
+
+    if (ch === ";" || ch === "\n" || ch === "\r" || ch === "|") return true;
+    if (ch === "#" && atWordStart) return true;
+    if (ch === "&") {
+      const prev = chars[i - 1];
+      const next = chars[i + 1];
+      if (prev === ">" && next !== undefined && /[0-9-]/.test(next)) continue;
+      return true;
+    }
+    atWordStart = ch === " " || ch === "\t";
+  }
+  return false;
+}
+
+function hasCliOption(args: string[], option: string): boolean {
+  return args.some((arg) => arg === option || arg.startsWith(`${option}=`));
+}
+
+function resolvePackageScriptTokens(commandArgs: string[], packageDir: string): string[] | null {
+  if (commandArgs.length < 3) return null;
+
+  const runner = path.basename(commandArgs[0]!);
+  if (!PACKAGE_SCRIPT_MANAGERS.has(runner)) return null;
+
+  const [, runSubcommand, scriptName] = commandArgs;
+  if (runSubcommand !== "run" || !scriptName || scriptName.startsWith("-")) return null;
+
+  return resolveScript(scriptName, packageDir);
+}
+
+function isSafeToInjectIntoScript(
+  scriptName: string,
+  rawScript: string[],
+  packageDir: string
+): boolean {
+  const rawScriptText = resolveScriptRaw(scriptName, packageDir);
+  if (rawScriptText && isUnsafeToAppendArgs(rawScriptText)) return false;
+  if (rawScript.includes("--")) return false;
+  return true;
+}
+
+/**
+ * Resolve the framework reached by a direct command, package runner, or one
+ * package-manager script indirection. This identity is intentionally separate
+ * from append safety so Expo's LAN environment carve-out still works when a
+ * script is deliberately left untouched.
+ */
+export function resolveFrameworkBasename(
+  commandArgs: string[],
+  packageDir: string = process.cwd()
+): string | null {
+  const direct = findFrameworkBasename(commandArgs);
+  if (direct) return direct;
+  const scriptTokens = resolvePackageScriptTokens(commandArgs, packageDir);
+  return scriptTokens ? findFrameworkBasename(scriptTokens) : null;
+}
+
+/**
+ * Forward framework flags through `<pm> run <script>` without changing the
+ * package manager's Windows spawn path. npm needs `--` before script args;
+ * Bun, pnpm, and yarn forward the appended args directly.
+ */
+export function injectPackageScriptFrameworkFlags(
+  commandArgs: string[],
+  port: number,
+  packageDir: string = process.cwd()
+): void {
+  const rawScript = resolvePackageScriptTokens(commandArgs, packageDir);
+  if (!rawScript) return;
+  const [, , scriptName] = commandArgs;
+  if (!scriptName || !isSafeToInjectIntoScript(scriptName, rawScript, packageDir)) return;
+
+  const userExtras = commandArgs.slice(3).filter((arg) => arg !== "--");
+  const probe = [...rawScript, ...userExtras];
+  const forwardedFlags = injectFrameworkFlags(probe, port);
+  if (forwardedFlags.length === 0) return;
+
+  if (path.basename(commandArgs[0]!) === "npm" && !commandArgs.includes("--")) {
+    commandArgs.push("--");
+  }
+  commandArgs.push(...forwardedFlags);
 }
 
 /**
