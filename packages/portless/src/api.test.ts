@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { execFileSync } from "node:child_process";
 import { getUrl } from "./api.js";
 import { getUrl as getUrlFromIndex } from "./index.js";
+import { applyWorktreePrefix } from "./auto.js";
 
 function writeStateMarkers(
   dir: string,
@@ -34,10 +35,12 @@ describe("getUrl", () => {
       PORTLESS_STATE_DIR: process.env.PORTLESS_STATE_DIR,
       PORTLESS_SUFFIX: process.env.PORTLESS_SUFFIX,
       PORTLESS_TLD: process.env.PORTLESS_TLD,
+      PORTLESS_WORKTREE_FLAT: process.env.PORTLESS_WORKTREE_FLAT,
     };
     process.env.PORTLESS_STATE_DIR = stateDir;
     delete process.env.PORTLESS_SUFFIX;
     delete process.env.PORTLESS_TLD;
+    delete process.env.PORTLESS_WORKTREE_FLAT;
   });
 
   afterEach(() => {
@@ -213,5 +216,65 @@ describe("getUrl worktree behavior", { timeout: 15_000 }, () => {
     const result = await getUrl("myapp", { cwd: wtDir, worktree: false });
 
     expect(result.url).toBe("https://myapp.localhost");
+  });
+
+  it.skipIf(!gitAvailable())("matches the shared flat worktree helper", async () => {
+    const repo = path.join(tmpDir, "repo");
+    initRepoWithCommit(repo);
+    runGit(repo, ["branch", "feature-x"]);
+    const wtDir = path.join(tmpDir, "wt-feature-x");
+    runGit(repo, ["worktree", "add", wtDir, "feature-x"]);
+
+    const result = await getUrl("web", { cwd: wtDir, worktreeFlat: true });
+    const expectedName = applyWorktreePrefix(
+      "web",
+      { prefix: "feature-x", source: "git branch" },
+      true
+    );
+
+    expect(result.hostname).toBe(`${expectedName}.localhost`);
+    expect(result.url).toBe(`https://${expectedName}.localhost`);
+  });
+
+  it.skipIf(!gitAvailable())(
+    "uses portless.json flat mode while allowing the environment to override it",
+    async () => {
+      const repo = path.join(tmpDir, "repo");
+      initRepoWithCommit(repo);
+      runGit(repo, ["branch", "feature-x"]);
+      const wtDir = path.join(tmpDir, "wt-feature-x");
+      runGit(repo, ["worktree", "add", wtDir, "feature-x"]);
+      fs.writeFileSync(path.join(wtDir, "portless.json"), JSON.stringify({ worktreeFlat: true }));
+
+      const flat = await getUrl("web", { cwd: wtDir });
+      const expectedFlatName = applyWorktreePrefix(
+        "web",
+        { prefix: "feature-x", source: "git branch" },
+        true
+      );
+      expect(flat.hostname).toBe(`${expectedFlatName}.localhost`);
+
+      process.env.PORTLESS_WORKTREE_FLAT = "0";
+      const nested = await getUrl("web", { cwd: wtDir });
+      expect(nested.hostname).toBe("feature-x.web.localhost");
+    }
+  );
+
+  it.skipIf(!gitAvailable())("lets an explicit API option override the environment", async () => {
+    const repo = path.join(tmpDir, "repo");
+    initRepoWithCommit(repo);
+    runGit(repo, ["branch", "feature-x"]);
+    const wtDir = path.join(tmpDir, "wt-feature-x");
+    runGit(repo, ["worktree", "add", wtDir, "feature-x"]);
+
+    process.env.PORTLESS_WORKTREE_FLAT = "0";
+    const result = await getUrl("web", { cwd: wtDir, worktreeFlat: true });
+    const expectedName = applyWorktreePrefix(
+      "web",
+      { prefix: "feature-x", source: "git branch" },
+      true
+    );
+
+    expect(result.hostname).toBe(`${expectedName}.localhost`);
   });
 });

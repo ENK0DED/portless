@@ -96,14 +96,15 @@ In linked git worktrees, workspace URLs also get the branch prefix. For example,
 
 ### Config fields
 
-| Field     | Type    | Default  | Description                                                           |
-| --------- | ------- | -------- | --------------------------------------------------------------------- |
-| `name`    | string  | inferred | Base app name. Worktree prefix still applies.                         |
-| `script`  | string  | `"dev"`  | Name of a `package.json` script to run.                               |
-| `appPort` | number  | auto     | Fixed port for the child process. Browser-blocked ports are rejected. |
-| `proxy`   | boolean | auto     | Whether to route through the proxy. Auto-detected.                    |
-| `apps`    | object  |          | Overrides for workspace packages, keyed by relative path.             |
-| `turbo`   | boolean | `true`   | Set `false` to use direct spawning instead of turborepo.              |
+| Field          | Type    | Default  | Description                                                           |
+| -------------- | ------- | -------- | --------------------------------------------------------------------- |
+| `name`         | string  | inferred | Base app name. Worktree prefix still applies.                         |
+| `script`       | string  | `"dev"`  | Name of a `package.json` script to run.                               |
+| `appPort`      | number  | auto     | Fixed port for the child process. Browser-blocked ports are rejected. |
+| `proxy`        | boolean | auto     | Whether to route through the proxy. Auto-detected.                    |
+| `worktreeFlat` | boolean | `false`  | Join worktree and app labels into one DNS label.                      |
+| `apps`         | object  |          | Overrides for workspace packages, keyed by relative path.             |
+| `turbo`        | boolean | `true`   | Set `false` to use direct spawning instead of turborepo.              |
 
 ### package.json "portless" key
 
@@ -116,7 +117,7 @@ Instead of a separate config file, you can add a `"portless"` key to your `packa
 }
 ```
 
-An object supports all per-app fields (`name`, `script`, `appPort`, `proxy`):
+An object supports all per-app fields (`name`, `script`, `appPort`, `proxy`, `worktreeFlat`):
 
 ```json
 {
@@ -219,6 +220,19 @@ portless run --name myapp next dev   # -> https://fix-ui.myapp.localhost
 Put `portless run` in your `package.json` once and it works everywhere. The main checkout uses the plain name, each worktree gets a unique subdomain. No collisions, no `--force`.
 
 Monorepo workspace apps use the same prefixing rule, including names set through the root `apps` map.
+
+When a single-level wildcard certificate is required, set `worktreeFlat` in the project config. This joins the worktree and app labels into one DNS label and adds a short hash when the source labels could otherwise collide:
+
+```json
+{ "worktreeFlat": true }
+```
+
+```bash
+PORTLESS_WORKTREE_FLAT=1 portless run next dev
+# -> https://fix-ui-myapp.localhost
+```
+
+`PORTLESS_WORKTREE_FLAT=0` disables flat mode for a shell even when the project config enables it. The environment setting overrides `worktreeFlat` for both the CLI and `getUrl()`.
 
 ## Custom Suffixes
 
@@ -692,6 +706,7 @@ PORTLESS_WILDCARD=1              Allow unregistered subdomains to fall back to p
 PORTLESS_ROUTES_CLEANUP_INTERVAL=<s>
                                  Sweep dead routes every <s> seconds (default 300, `0` disables)
 PORTLESS_SYNC_HOSTS=0            Disable auto-sync of /etc/hosts (on by default)
+PORTLESS_WORKTREE_FLAT=1         Join worktree and app names into one DNS label
 PORTLESS_TAILSCALE=1             Share apps on your Tailscale network (same as --tailscale)
 PORTLESS_TAILSCALE_SERVICE=1     Share apps as Tailscale Services
 PORTLESS_TAILSCALE_SERVICE_NAME=<name>
@@ -757,6 +772,8 @@ const stable = await getUrl("cms", { worktree: false });
 ```
 
 `getUrl()` uses the same hostname and worktree logic as `portless get`, reading port, TLS, and suffix from the active proxy's persisted state. The returned object JSON-serializes to `{ url, hostname, port, tls, tld }`.
+
+Pass `{ worktreeFlat: true }` to select flat worktree hostnames for one lookup. When omitted, `getUrl()` reads `worktreeFlat` from the project config and honors the `PORTLESS_WORKTREE_FLAT` environment override.
 
 ## Uninstall / reset
 

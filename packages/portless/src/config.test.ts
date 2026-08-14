@@ -325,6 +325,20 @@ describe("loadConfig validation", () => {
     expect(result?.config.turbo).toBe(false);
   });
 
+  it("accepts worktreeFlat as a boolean", () => {
+    fs.writeFileSync(
+      path.join(tmpDir, "portless.json"),
+      JSON.stringify({ name: "test", worktreeFlat: true })
+    );
+    const result = loadConfig(tmpDir);
+    expect(result?.config.worktreeFlat).toBe(true);
+  });
+
+  it("throws when worktreeFlat is not a boolean", () => {
+    fs.writeFileSync(path.join(tmpDir, "portless.json"), JSON.stringify({ worktreeFlat: "yes" }));
+    expect(() => loadConfig(tmpDir)).toThrow(ConfigValidationError);
+  });
+
   it("throws when turbo is not a boolean", () => {
     fs.writeFileSync(path.join(tmpDir, "portless.json"), JSON.stringify({ turbo: "yes" }));
     expect(() => loadConfig(tmpDir)).toThrow(ConfigValidationError);

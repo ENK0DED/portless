@@ -378,6 +378,8 @@ describe("CLI", () => {
       expect(stdout).toContain("PORTLESS_PATH");
       expect(stdout).toContain("--routes-cleanup-interval");
       expect(stdout).toContain("PORTLESS_ROUTES_CLEANUP_INTERVAL");
+      expect(stdout).toContain("PORTLESS_WORKTREE_FLAT");
+      expect(stdout).toContain('"worktreeFlat": true');
     });
 
     it("prints help and exits 0 with -h", () => {
@@ -1704,6 +1706,7 @@ describe("CLI", () => {
       expect(stdout).toContain("--force");
       expect(stdout).toContain("--app-port");
       expect(stdout).toContain("--path");
+      expect(stdout).toContain("PORTLESS_WORKTREE_FLAT=1");
     });
 
     it("prints run-specific help for run -h", () => {

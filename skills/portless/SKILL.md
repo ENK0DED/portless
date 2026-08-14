@@ -151,6 +151,19 @@ No config changes needed. Put `portless run` in `package.json` once and it works
 
 Monorepo workspace apps use the same prefixing rule, including names set through the root `apps` map.
 
+Set `worktreeFlat` to `true` in `portless.json` when a single-level wildcard certificate is required. Flat mode joins the worktree and app labels into one DNS label and adds a short hash when the source labels could otherwise collide:
+
+```json
+{ "worktreeFlat": true }
+```
+
+```bash
+PORTLESS_WORKTREE_FLAT=1 portless run next dev
+# -> https://fix-ui-myapp.localhost
+```
+
+Use `PORTLESS_WORKTREE_FLAT=0` to override the project setting for a shell. The environment setting applies to both the CLI and `getUrl()`.
+
 ### Multiplexed hostnames
 
 Use `--multiplex` when several apps should share one stable hostname instead of getting unique URLs — for example multiple worktrees of the same app, all reachable at `https://myapp.localhost`:
@@ -246,6 +259,7 @@ The proxy periodically removes route records whose owning process is dead. The s
 | `PORTLESS_TLD`                    | Compatibility alias for `PORTLESS_SUFFIX`                                   |
 | `PORTLESS_WILDCARD`               | Set to `1` to allow unregistered subdomains to fall back to parent          |
 | `PORTLESS_SYNC_HOSTS`             | Set to `0` to disable auto-sync of /etc/hosts (on by default)               |
+| `PORTLESS_WORKTREE_FLAT`          | Set to `1` to join worktree and app names into one DNS label                |
 | `PORTLESS_TAILSCALE`              | Set to `1` to share apps on your Tailscale network (same as `--tailscale`)  |
 | `PORTLESS_TAILSCALE_SERVICE`      | Set to `1` to share apps as stable Tailscale Services                       |
 | `PORTLESS_TAILSCALE_SERVICE_NAME` | Use an explicit Tailscale Service name                                      |
@@ -546,18 +560,21 @@ const stable = await getUrl("cms", { worktree: false });
 
 `getUrl()` uses the same hostname and worktree logic as `portless get`, reading port, TLS, and suffix from the active proxy's persisted state. The returned object JSON-serializes to `{ url, hostname, port, tls, tld }`.
 
+Pass `{ worktreeFlat: true }` for a one-lookup override. When omitted, `getUrl()` reads `worktreeFlat` from the project config and honors the `PORTLESS_WORKTREE_FLAT` environment override.
+
 ## portless config
 
 Optional config file. Portless looks for `portless.json` in the current directory, then `.config/portless.json`.
 
-| Field     | Type    | Default                    | Description                                              |
-| --------- | ------- | -------------------------- | -------------------------------------------------------- |
-| `name`    | string  | inferred from package.json | Base app name (worktree prefix still applies)            |
-| `script`  | string  | `"dev"`                    | Name of a package.json script to run                     |
-| `appPort` | number  | auto-assigned              | Fixed app port; browser-blocked ports are rejected       |
-| `proxy`   | boolean | auto-detected              | Whether to route through the proxy (`false` for tasks)   |
-| `apps`    | object  |                            | Overrides for workspace packages, keyed by relative path |
-| `turbo`   | boolean | `true`                     | Set `false` to use direct spawning instead of turborepo  |
+| Field          | Type    | Default                    | Description                                              |
+| -------------- | ------- | -------------------------- | -------------------------------------------------------- |
+| `name`         | string  | inferred from package.json | Base app name (worktree prefix still applies)            |
+| `script`       | string  | `"dev"`                    | Name of a package.json script to run                     |
+| `appPort`      | number  | auto-assigned              | Fixed app port; browser-blocked ports are rejected       |
+| `proxy`        | boolean | auto-detected              | Whether to route through the proxy (`false` for tasks)   |
+| `worktreeFlat` | boolean | `false`                    | Join worktree and app labels into one DNS label          |
+| `apps`         | object  |                            | Overrides for workspace packages, keyed by relative path |
+| `turbo`        | boolean | `true`                     | Set `false` to use direct spawning instead of turborepo  |
 
 Each `apps` entry has the same shape (`name`, `script`, `appPort`, `proxy`). When `apps` is present, top-level fields apply only in single-app mode.
 
@@ -569,7 +586,7 @@ Instead of a separate config file, you can add a `"portless"` key to your `packa
 { "portless": "myapp" }
 ```
 
-An object supports all per-app fields (`name`, `script`, `appPort`, `proxy`):
+An object supports all per-app fields (`name`, `script`, `appPort`, `proxy`, `worktreeFlat`):
 
 ```json
 { "portless": { "name": "myapp", "script": "dev:app" } }

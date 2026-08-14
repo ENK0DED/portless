@@ -13,6 +13,7 @@ export interface AppConfig {
   script?: string;
   appPort?: number;
   proxy?: boolean;
+  worktreeFlat?: boolean;
 }
 
 export interface PortlessConfig extends AppConfig {
@@ -137,7 +138,13 @@ export function resolveAppConfig(
     }
     return {};
   }
-  return { name: config.name, script: config.script, appPort: config.appPort, proxy: config.proxy };
+  return {
+    name: config.name,
+    script: config.script,
+    appPort: config.appPort,
+    proxy: config.proxy,
+    ...(config.worktreeFlat !== undefined ? { worktreeFlat: config.worktreeFlat } : {}),
+  };
 }
 
 /**
@@ -323,8 +330,16 @@ function isErrnoException(err: unknown): err is NodeJS.ErrnoException {
   return err instanceof Error && "code" in err;
 }
 
-const KNOWN_TOP_KEYS = new Set(["name", "script", "appPort", "proxy", "apps", "turbo"]);
-const KNOWN_APP_KEYS = new Set(["name", "script", "appPort", "proxy"]);
+const KNOWN_TOP_KEYS = new Set([
+  "name",
+  "script",
+  "appPort",
+  "proxy",
+  "worktreeFlat",
+  "apps",
+  "turbo",
+]);
+const KNOWN_APP_KEYS = new Set(["name", "script", "appPort", "proxy", "worktreeFlat"]);
 
 function validateConfig(config: unknown, configPath: string): asserts config is PortlessConfig {
   if (typeof config !== "object" || config === null || Array.isArray(config)) {
@@ -361,6 +376,12 @@ function validateConfig(config: unknown, configPath: string): asserts config is 
   if (obj.proxy !== undefined) {
     if (typeof obj.proxy !== "boolean") {
       throw new ConfigValidationError(`"proxy" in ${configPath} must be a boolean.`);
+    }
+  }
+
+  if (obj.worktreeFlat !== undefined) {
+    if (typeof obj.worktreeFlat !== "boolean") {
+      throw new ConfigValidationError(`"worktreeFlat" in ${configPath} must be a boolean.`);
     }
   }
 
@@ -415,6 +436,14 @@ function validateAppConfig(obj: Record<string, unknown>, prefix: string, configP
   if (obj.proxy !== undefined) {
     if (typeof obj.proxy !== "boolean") {
       throw new ConfigValidationError(`"${prefix}.proxy" in ${configPath} must be a boolean.`);
+    }
+  }
+
+  if (obj.worktreeFlat !== undefined) {
+    if (typeof obj.worktreeFlat !== "boolean") {
+      throw new ConfigValidationError(
+        `"${prefix}.worktreeFlat" in ${configPath} must be a boolean.`
+      );
     }
   }
 
