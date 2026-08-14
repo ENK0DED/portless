@@ -152,6 +152,8 @@ Current fork-owned commits and what they protect:
 | `f95d7de` | Added strict path-prefix registration, raw-match verbatim-forward routing with the arbitrated absolute-form handling, per-app path config, multi-app path splitting, and simple routes.json migration. |
 | `674074e` | Merged the ticket 28 worktree branch bringing strict multi-app path routing into the sync branch.                                                                                                      |
 | `1c66ed3` | Recorded the ticket 24 integration rows in the fork-only ledger.                                                                                                                                       |
+| `80a0fc0` | Recorded the ticket 28 integration in the fork-only ledger.                                                                                                                                            |
+| `cf009cf` | Rewrote the standing upstream-intake procedure in FORK.md and narrowed the fork-sync skill to canonical-procedure routing and agent hints.                                                             |
 
 ## Fork-Owned Invariants
 
