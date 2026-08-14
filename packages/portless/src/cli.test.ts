@@ -535,12 +535,19 @@ describe("CLI", () => {
       expect(stdout).toContain("portless doctor");
     });
 
-    it("diagnoses an empty custom state directory without modifying it", () => {
+    it("diagnoses an empty custom state directory without modifying it", async () => {
       const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-doctor-cli-"));
       try {
         const before = fs.readdirSync(stateDir);
+        // Pin a free port: the default port 80 is occupied by http.sys on
+        // Windows CI hosts, which doctor correctly reports as a failure.
+        const doctorPort = await getFreePort();
         const { status, stdout, stderr } = run(["doctor"], {
-          env: { PORTLESS_STATE_DIR: stateDir, PORTLESS_HTTPS: "0" },
+          env: {
+            PORTLESS_STATE_DIR: stateDir,
+            PORTLESS_HTTPS: "0",
+            PORTLESS_PORT: doctorPort.toString(),
+          },
         });
 
         expect(status).toBe(0);
@@ -3979,7 +3986,12 @@ describe("CLI", () => {
             },
           });
 
-          expect(stderr).toBe("");
+          // Multi-label *.custom.localhost names resolve on Linux resolvers
+          // but not on Windows CI, where the new registration warning fires.
+          const stderrNoise = stderr
+            .split("\n")
+            .filter((line) => line.trim() !== "" && !line.includes("will not resolve"));
+          expect(stderrNoise).toEqual([]);
           expect(status).toBe(0);
           expect(stdout).toContain(`http://feature-auth.api.custom.localhost:${proxyPort}`);
           expect(stdout).toContain(`http://feature-auth.web.custom.localhost:${proxyPort}`);
