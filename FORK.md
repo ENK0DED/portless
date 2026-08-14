@@ -162,6 +162,8 @@ Current fork-owned commits and what they protect:
 | `db651e5` | Prepared fork release `0.15.6002` with the nine upstream-PR backport entries, including the Windows cmd.exe security fix and routes.json migration warning.                                            |
 | `4160929` | Canonicalized the watched routes directory to stop a Windows libuv fs-event abort and scoped POSIX-only doctor and mDNS tests with a hardened certificate-probe timeout.                               |
 | `7630012` | Recorded the 0.15.6002 release ledger finalization rows.                                                                                                                                               |
+| `6bf9c3e` | Stabilized the doctor empty-state and worktree URL tests on Windows CI with a pinned free port and resolution-warning tolerance.                                                                       |
+| `6c27bb0` | Recorded the Windows CI watcher fix rows in the fork-only ledger.                                                                                                                                      |
 
 ## Fork-Owned Invariants
 
