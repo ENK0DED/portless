@@ -26,6 +26,7 @@ import {
   deduplicateHostnames,
 } from "./hosts.js";
 import { FILE_MODE, RouteConflictError, RouteStore } from "./routes.js";
+import type { RouteMapping } from "./routes.js";
 import { TunnelAliasStore, normalizeTunnelHostname } from "./tunnel-aliases.js";
 import {
   ensureTunnelProviderAvailable,
@@ -153,6 +154,7 @@ import {
   hasTurboConfig,
 } from "./turbo.js";
 import type { ManifestEntry } from "./turbo.js";
+import { formatViteAllowedHosts } from "./vite.js";
 import { buildServiceUninstallSudoArgs, handleService, tryUninstallService } from "./service.js";
 import { handleBg, pruneBgEntriesForState, stopBgEntriesForState } from "./bg.js";
 import { cleanupRouteSharing } from "./route-cleanup.js";
@@ -569,8 +571,20 @@ function buildHostnames(name: string, tlds: readonly string[]): string[] {
   return parseHostnames(name, normalizeTlds(tlds));
 }
 
-function formatViteAllowedHosts(tlds: readonly string[]): string {
-  return tlds.map((configuredTld) => `.${configuredTld}`).join(",");
+function loadViteRouteMetadata(
+  store: RouteStore,
+  hostnames: readonly string[],
+  pathPrefix: string
+): RouteMapping[] {
+  const hostnameSet = new Set(hostnames);
+  return store
+    .loadRoutes()
+    .filter(
+      (route) =>
+        route.pid === process.pid &&
+        hostnameSet.has(route.hostname) &&
+        normalizePathPrefix(route.pathPrefix) === pathPrefix
+    );
 }
 
 function formatBindEndpoint(host: string, port: number): string {
@@ -2181,6 +2195,8 @@ async function runApp(
     }
   }
 
+  const viteRouteMetadata = loadViteRouteMetadata(store, hostnames, routePathPrefix);
+
   // Run the command
   const caFragment = caEnv.NODE_EXTRA_CA_CERTS
     ? ` NODE_EXTRA_CA_CERTS="${caEnv.NODE_EXTRA_CA_CERTS}"`
@@ -2198,7 +2214,7 @@ async function runApp(
       PORT: port.toString(),
       ...(hostBind ? { HOST: hostBind } : {}),
       PORTLESS_URL: finalUrl,
-      __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: formatViteAllowedHosts(tlds),
+      __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: formatViteAllowedHosts(tlds, viteRouteMetadata),
       // Note: EXPO_PACKAGER_PROXY_URL is not used — expo-dev-client removed
       // baked-in pinging, making this env var ineffective. Expo handles its
       // own LAN discovery natively.
@@ -5333,13 +5349,14 @@ async function spawnProxiedApp(
       label: multiplexLabelFromEnv(),
     });
     await reportHostsSyncHere(hostnames, lanMode);
+    const viteRouteMetadata = loadViteRouteMetadata(store, hostnames, routePathPrefix);
 
     env = {
       ...pkgEnv,
       PORT: String(appPort),
       HOST: "127.0.0.1",
       PORTLESS_URL: url,
-      __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: formatViteAllowedHosts(tlds),
+      __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: formatViteAllowedHosts(tlds, viteRouteMetadata),
     };
 
     if (tls) {
@@ -5617,13 +5634,14 @@ async function runWithTurbo(
       label: multiplexLabelFromEnv(),
     });
     await reportHostsSyncHere(hostnames, lanMode);
+    const viteRouteMetadata = loadViteRouteMetadata(store, hostnames, routePathPrefix);
     routes.push({ hostnames, pathPrefix: routePathPrefix });
 
     const entry: ManifestEntry = {
       PORT: String(appPort),
       HOST: "127.0.0.1",
       PORTLESS_URL: url,
-      __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: formatViteAllowedHosts(tlds),
+      __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: formatViteAllowedHosts(tlds, viteRouteMetadata),
     };
     if (tls) {
       const caPath = path.join(stateDir, "ca.pem");
