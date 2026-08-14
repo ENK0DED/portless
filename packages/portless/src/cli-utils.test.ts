@@ -9,6 +9,8 @@ import {
   buildSudoEnvArgs,
   buildProxyStartConfig,
   BLOCKED_PORTS,
+  cmdEscape,
+  cmdEscapeCommand,
   DEFAULT_TLD,
   FALLBACK_PROXY_PORT,
   hasPlaceholders,
@@ -1529,6 +1531,94 @@ describe("parseTldList", () => {
   });
 });
 
+describe("cmdEscape", () => {
+  it("leaves safe arguments bare (cmd built-ins print added quotes literally)", () => {
+    expect(cmdEscape("dev")).toBe("dev");
+    expect(cmdEscape("--force")).toBe("--force");
+    expect(cmdEscape("--port=3000")).toBe("--port=3000");
+    expect(cmdEscape("C:\\tools\\script.js")).toBe("C:\\tools\\script.js");
+  });
+
+  it("preserves paths with spaces as a single argument", () => {
+    expect(cmdEscape("C:\\Program Files\\nodejs\\node.exe")).toBe(
+      '^"C:\\Program^ Files\\nodejs\\node.exe^"'
+    );
+  });
+
+  it("caret-escapes cmd metacharacters", () => {
+    expect(cmdEscape("console.log(1)")).toBe('^"console.log^(1^)^"');
+    expect(cmdEscape("a&&b")).toBe('^"a^&^&b^"');
+    expect(cmdEscape("%PATH%")).toBe('^"^%PATH^%^"');
+  });
+
+  it("escapes embedded double quotes", () => {
+    expect(cmdEscape('say "hi"')).toBe('^"say^ \\^"hi\\^"^"');
+  });
+
+  it("escapes quote-toggle injection payloads", () => {
+    expect(cmdEscape('a" & echo PORTLESS_INJECTED & "b')).toBe(
+      '^"a\\^"^ ^&^ echo^ PORTLESS_INJECTED^ ^&^ \\^"b^"'
+    );
+  });
+
+  it("caret-escapes percent expansion payloads", () => {
+    expect(cmdEscape("%PATH%")).toBe('^"^%PATH^%^"');
+  });
+
+  it("doubles backslashes before quotes and before the added closing quote", () => {
+    expect(cmdEscape('dir\\"x')).toBe('^"dir\\\\\\^"x^"');
+    expect(cmdEscape("trailing \\")).toBe('^"trailing^ \\\\^"');
+  });
+
+  it("leaves a bare trailing backslash alone (no quote added, so no doubling)", () => {
+    expect(cmdEscape("trailing\\")).toBe("trailing\\");
+  });
+
+  it("handles the empty argument", () => {
+    expect(cmdEscape("")).toBe('^"^"');
+  });
+
+  it("escapes long backslash runs in linear time (regex form is quadratic)", () => {
+    const arg = "a " + "\\".repeat(64 * 1024);
+    const start = performance.now();
+    const escaped = cmdEscape(arg);
+    // The old /(\\\\*)"/g implementation takes >10s here; allow generous CI jitter.
+    expect(performance.now() - start).toBeLessThan(1000);
+    expect(escaped).toBe('^"a^ ' + "\\".repeat(128 * 1024) + '^"');
+  });
+});
+
+describe("cmdEscapeCommand", () => {
+  it("leaves bare PATH-resolved names untouched (quoting breaks %~dp0 in .cmd shims)", () => {
+    expect(cmdEscapeCommand("npm")).toBe("npm");
+    expect(cmdEscapeCommand("pnpm")).toBe("pnpm");
+    expect(cmdEscapeCommand("node")).toBe("node");
+    expect(cmdEscapeCommand("C:\\tools\\node.exe")).toBe("C:\\tools\\node.exe");
+  });
+
+  it("plain-quotes (no carets) paths with spaces", () => {
+    expect(cmdEscapeCommand("C:\\Program Files\\nodejs\\node.exe")).toBe(
+      '"C:\\Program Files\\nodejs\\node.exe"'
+    );
+  });
+
+  it("plain-quotes names containing cmd metacharacters", () => {
+    expect(cmdEscapeCommand("foo&bar")).toBe('"foo&bar"');
+    expect(cmdEscapeCommand("a(b)c")).toBe('"a(b)c"');
+  });
+
+  it("caret-escapes % in bare names (quotes cannot suppress %VAR% expansion)", () => {
+    expect(cmdEscapeCommand("probe%PATH%.cmd")).toBe("probe^%PATH^%.cmd");
+    expect(cmdEscapeCommand("100%.exe")).toBe("100^%.exe");
+  });
+
+  it("caret-escapes % in a resolved path with spaces", () => {
+    expect(cmdEscapeCommand("C:\\Program Files\\probe%PATH%.cmd")).toBe(
+      '"C:\\Program Files\\probe^%PATH^%.cmd"'
+    );
+  });
+});
+
 describe("buildProxyStartConfig", () => {
   it("preserves an explicit suffix list in LAN mode and appends local", () => {
     expect(
@@ -2114,7 +2204,7 @@ describe("resolveWindowsCommandInvocation", () => {
     }
   });
 
-  it("wraps cmd shims through cmd.exe with one quoted command line", () => {
+  it("wraps cmd shims through cmd.exe with /s-safe quoting", () => {
     process.env.PATHEXT = ".COM;.EXE;.BAT;.CMD";
     const binDir = path.join(tmpDir, "bin dir");
     fs.mkdirSync(binDir);
@@ -2123,7 +2213,7 @@ describe("resolveWindowsCommandInvocation", () => {
 
     expect(resolveWindowsCommandInvocation("cloudflared", ["version"], binDir)).toEqual({
       command: "cmd.exe",
-      args: ["/d", "/s", "/c", `"${shim}" version`],
+      args: ["/d", "/v:off", "/s", "/c", `""${shim}" version"`],
       windowsVerbatimArguments: true,
     });
   });

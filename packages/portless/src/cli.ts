@@ -90,7 +90,8 @@ import {
   readTldsFromDir,
   readTlsMarker,
   readWildcardMarker,
-  quoteWindowsCmdArg,
+  cmdEscape,
+  cmdEscapeCommand,
   resolveWindowsExecutable,
   resolveStateDir,
   replacePlaceholders,
@@ -5017,8 +5018,11 @@ function spawnChildProcess(
     if (resolved) {
       const ext = path.extname(resolved).toLowerCase();
       if (ext === ".cmd" || ext === ".bat") {
-        const cmdline = [resolved, ...commandArgs.slice(1)].map(quoteWindowsCmdArg).join(" ");
-        return spawn("cmd.exe", ["/d", "/s", "/c", cmdline], {
+        const cmdline =
+          '"' +
+          [cmdEscapeCommand(resolved), ...commandArgs.slice(1).map(cmdEscape)].join(" ") +
+          '"';
+        return spawn("cmd.exe", ["/d", "/v:off", "/s", "/c", cmdline], {
           stdio: ["ignore", "pipe", "pipe"],
           env,
           cwd,

@@ -1075,9 +1075,66 @@ export function resolveWindowsExecutable(cmd: string, pathStr: string): string |
   return null;
 }
 
-export function quoteWindowsCmdArg(arg: string): string {
-  if (!/[\s"&|<>^()%!]/.test(arg)) return arg;
-  return `"${arg.replace(/"/g, '\\"')}"`;
+/** cmd.exe metacharacters that require caret-escaping. */
+const CMD_META_CHARS = /([()\][%!^"\x60<>&|;, *?])/g;
+
+/**
+ * Arguments matching this need no escaping for cmd.exe: non-empty, no
+ * whitespace, no quotes, and no cmd metacharacters. `=` is deliberately
+ * allowed, because cmd only treats it specially in the command token, not in
+ * arguments.
+ */
+const CMD_SAFE_ARG = /^[^\s()\][%!^"\x60<>&|;,*?]+$/;
+
+/**
+ * Quote a string per Windows argv rules in a single linear scan. A quote
+ * preceded by N backslashes becomes 2N+1 backslashes plus an escaped quote,
+ * and N trailing backslashes, which precede the closing quote we append,
+ * become 2N. A regex implementation can backtrack quadratically on long
+ * backslash runs, so the scan stays deliberately linear.
+ */
+function windowsArgvQuote(arg: string): string {
+  let out = "";
+  let backslashes = 0;
+  for (const ch of arg) {
+    if (ch === "\\") {
+      backslashes++;
+      continue;
+    }
+    if (ch === '"') {
+      out += "\\".repeat(2 * backslashes + 1) + '"';
+    } else {
+      out += "\\".repeat(backslashes) + ch;
+    }
+    backslashes = 0;
+  }
+  return '"' + out + "\\".repeat(2 * backslashes) + '"';
+}
+
+/**
+ * Escape a string so cmd.exe passes it to the child as a single literal
+ * argument. Safe arguments stay bare because cmd built-ins print added quotes
+ * literally. Other arguments use Windows argv quoting followed by caret
+ * escaping of cmd.exe metacharacters, including the quote characters.
+ */
+export function cmdEscape(arg: string): string {
+  if (CMD_SAFE_ARG.test(arg)) return arg;
+  return windowsArgvQuote(arg).replace(CMD_META_CHARS, "^$1");
+}
+
+/**
+ * Escape the command token of a cmd.exe command line. Bare PATH-resolved
+ * names stay unquoted so %~dp0 continues to resolve correctly in package
+ * manager shims. Resolved paths containing whitespace or other command-token
+ * metacharacters use plain quotes. Caret-escaping percent signs is required
+ * in both forms because quotes do not suppress %VAR% expansion.
+ */
+export function cmdEscapeCommand(command: string): string {
+  const escapedPercent = command.replace(/%/g, "^%");
+  if (/[\s()\][!^"\x60<>&|;,=*?]/.test(command)) {
+    return '"' + escapedPercent + '"';
+  }
+  return escapedPercent;
 }
 
 export interface WindowsCommandInvocation {
@@ -1098,7 +1155,13 @@ export function resolveWindowsCommandInvocation(
   if (ext === ".cmd" || ext === ".bat") {
     return {
       command: "cmd.exe",
-      args: ["/d", "/s", "/c", [resolved, ...args].map(quoteWindowsCmdArg).join(" ")],
+      args: [
+        "/d",
+        "/v:off",
+        "/s",
+        "/c",
+        '"' + [cmdEscapeCommand(resolved), ...args.map(cmdEscape)].join(" ") + '"',
+      ],
       windowsVerbatimArguments: true,
     };
   }
@@ -1158,8 +1221,9 @@ export function spawnCommand(
 
     const ext = path.extname(resolved).toLowerCase();
     if (ext === ".cmd" || ext === ".bat") {
-      const cmdline = [resolved, ...commandArgs.slice(1)].map(quoteWindowsCmdArg).join(" ");
-      child = spawn("cmd.exe", ["/d", "/s", "/c", cmdline], {
+      const cmdline =
+        '"' + [cmdEscapeCommand(resolved), ...commandArgs.slice(1).map(cmdEscape)].join(" ") + '"';
+      child = spawn("cmd.exe", ["/d", "/v:off", "/s", "/c", cmdline], {
         stdio: "inherit",
         env,
         windowsVerbatimArguments: true,
