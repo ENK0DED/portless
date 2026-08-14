@@ -117,6 +117,9 @@ Current fork-owned commits and what they protect:
 | `e2b89f2` | Recorded the complete fork-only ledger after resolving Tailscale hostname routing ticket 14.                                                                                                       |
 | `2959046` | Recorded final ledger verification after ticket 14.                                                                                                                                                |
 | `8fd6bfb` | Injected framework flags through safe Bun, npm, pnpm, and yarn package scripts while preserving fork framework and Windows-spawn behavior.                                                         |
+| `e2b237b` | Recorded the package-script flag injection ticket resolution and ledger rows for the 0.15 sync feature batch.                                                                                      |
+| `11c28fe` | Proxied cleartext HTTP/1.1 WebSocket upgrades on the TLS port through strict route selection and answered 502 on malformed backend WebSocket handshakes.                                           |
+| `df47943` | Merged the ticket 17 worktree branch bringing residual #363 WebSocket behaviors into the sync branch.                                                                                              |
 
 ## Fork-Owned Invariants
 
