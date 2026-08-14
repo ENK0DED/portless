@@ -33,6 +33,8 @@ jobs:
 
       - run: bun run test:fork-ledger
 
+      - run: bun run test:upstream-drift
+
       - run: bun run check:fork-ledger
 
       - run: bun run format:check
