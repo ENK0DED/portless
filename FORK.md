@@ -166,6 +166,8 @@ Current fork-owned commits and what they protect:
 | `6c27bb0` | Recorded the Windows CI watcher fix rows in the fork-only ledger.                                                                                                                                      |
 | `7b0ff29` | Watched the canonical temp path in the atomic-write route watcher tests to stop the Windows vitest worker abort.                                                                                       |
 | `ea9dc6a` | Recorded the Windows test stabilization rows in the fork-only ledger.                                                                                                                                  |
+| `7ecd54c` | Scoped the routes file-mode assertion to POSIX platforms where 0o644 is representable.                                                                                                                 |
+| `40163d6` | Recorded the routes watcher canonicalization rows in the fork-only ledger.                                                                                                                             |
 
 ## Fork-Owned Invariants
 
