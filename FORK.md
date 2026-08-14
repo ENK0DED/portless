@@ -154,6 +154,8 @@ Current fork-owned commits and what they protect:
 | `1c66ed3` | Recorded the ticket 24 integration rows in the fork-only ledger.                                                                                                                                       |
 | `80a0fc0` | Recorded the ticket 28 integration in the fork-only ledger.                                                                                                                                            |
 | `cf009cf` | Rewrote the standing upstream-intake procedure in FORK.md and narrowed the fork-sync skill to canonical-procedure routing and agent hints.                                                             |
+| `a29e83b` | Resolved ticket 31 and recorded the standing-procedure and ticket 28 ledger commits.                                                                                                                   |
+| `2850ba7` | Added a tested upstream-drift checker for the recorded base, live open-PR set, and optional triage head stamps, with manual CLI and CI test wiring.                                                    |
 
 ## Fork-Owned Invariants
 
