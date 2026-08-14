@@ -160,6 +160,8 @@ Current fork-owned commits and what they protect:
 | `b5151e1` | Resolved ticket 29 and recorded the final open-PR triage ledger before provenance stamps were backfilled.                                                                                              |
 | `589bb36` | Backfilled 2026-08-14 triage dates and upstream head SHAs for every open-PR ledger row.                                                                                                                |
 | `db651e5` | Prepared fork release `0.15.6002` with the nine upstream-PR backport entries, including the Windows cmd.exe security fix and routes.json migration warning.                                            |
+| `4160929` | Canonicalized the watched routes directory to stop a Windows libuv fs-event abort and scoped POSIX-only doctor and mDNS tests with a hardened certificate-probe timeout.                               |
+| `7630012` | Recorded the 0.15.6002 release ledger finalization rows.                                                                                                                                               |
 
 ## Fork-Owned Invariants
 
