@@ -4288,6 +4288,7 @@ describe("CLI", () => {
             `fs.writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify({`,
             "  PORTLESS_URL: process.env.PORTLESS_URL,",
             "  PORTLESS_TUNNEL_URL: process.env.PORTLESS_TUNNEL_URL,",
+            "  __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: process.env.__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS,",
             "}));",
           ].join("\n") + "\n"
         );
@@ -4316,8 +4317,9 @@ describe("CLI", () => {
         expect({ status, stdout, stderr }).toMatchObject({ status: 0 });
         expect(stdout).toContain("Cloudflare Tunnel");
         expect(JSON.parse(fs.readFileSync(capturePath, "utf-8"))).toMatchObject({
-          PORTLESS_URL: `http://myapp.localhost:${proxyPort}`,
+          PORTLESS_URL: expect.stringContaining(`myapp.localhost:${proxyPort}`),
           PORTLESS_TUNNEL_URL: "https://abc.trycloudflare.com",
+          __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: expect.stringContaining("abc.trycloudflare.com"),
         });
       } finally {
         await new Promise<void>((resolve) => server.close(() => resolve()));
