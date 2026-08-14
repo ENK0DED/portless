@@ -143,6 +143,9 @@ Current fork-owned commits and what they protect:
 | `cb33fc7` | Warned on unresolvable registered hostnames with a daemon warn latch, fixed marker-based LAN inference, and deduplicated exact hosts blocks without adding a mutation endpoint.                    |
 | `5b057c8` | Merged the ticket 22 worktree branch bringing the hostname resolution warning into the sync branch.                                                                                                |
 | `777ef1d` | Recorded the doctor shim test alignment and backport batch rows in the fork-only ledger.                                                                                                           |
+| `1d5ddd2` | Pooled HTTP/1.1 backend connections with a capped loopback keep-alive agent, idempotent-only replay, and shutdown cleanup while keeping upgrade paths unpooled.                                    |
+| `accac85` | Merged the ticket 23 worktree branch bringing keep-alive backend pooling into the sync branch.                                                                                                     |
+| `3580990` | Recorded the ticket 22 integration rows in the fork-only ledger.                                                                                                                                   |
 
 ## Fork-Owned Invariants
 
