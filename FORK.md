@@ -336,7 +336,7 @@ The fork sync skill is part of the repository on purpose. Do not remove it durin
 
 ## Upstream Open PR Triage
 
-This fork periodically audits every open upstream PR in `vercel-labs/portless`. The current ledger uses only these final states:
+This fork audits every open upstream PR in `vercel-labs/portless`. The current ledger uses only these final states:
 
 - `implemented`: the fork contains materially equivalent behavior.
 - `implemented differently`: the fork contains the behavior but changed design, names, safety defaults, or integration shape.
@@ -470,17 +470,78 @@ Rechecked against upstream on 2026-06-18: GitHub reported 48 open PRs, and every
 
 ## Sync Checklist
 
-1. Start from a clean worktree and create a backup branch at the current fork tip.
-2. Fetch `origin` and `upstream` with a working SSH agent.
-3. Merge `upstream/main` into local `main`.
-4. Resolve conflicts by keeping fork code in regions covered by an invariant unless upstream is demonstrably better on the merits; take upstream where the fork has no implementation.
-5. Remove upstream pnpm workspace files if they return.
-6. Run the package-name search above and fix every hit outside intentional upstream PR references or compatibility tests.
-7. Run `bun install` to refresh `bun.lock`.
-8. Compare the live upstream open PR set with "Full Open Upstream PR State" and update that table when upstream opens or closes PRs.
-9. Review `git log --oneline upstream/main..HEAD` and update this ledger when the fork adds or removes behavior-protecting fork-only commits. The ledger-maintenance commit itself can be picked up by the next sweep.
-10. Run focused tests for any fork invariant touched by the merge.
-11. Run full verification before pushing.
+`FORK.md` is the canonical standing procedure for upstream intake. Read it before resolving conflicts. The fork-sync skill routes agents to this document and keeps only skill-shaped guidance beside the pointer.
+
+A pass starts only when the maintainer explicitly starts it. Nothing in this repository starts a pass automatically. Automation inside a running pass is welcome, but it does not choose when intake begins.
+
+### Choose an entry point
+
+Upstream intake has two entry points because PR triage becomes stale continuously while merging and releasing are batch operations. Keeping them separate makes a cheap triage pass possible without pretending that a merge is needed.
+
+- **Sweep** is triage only. Diff the live open-PR set and each PR's triage stamp against the ledger. A stamp records the date of triage and the upstream PR head SHA at that point. A sweep produces ledger updates or a list of PRs that need the maintainer's decision. It does not merge upstream code or cut a release.
+- **Sync** is merge plus release and always includes a sweep first. It carries the sweep's ledger reconciliation into the merge, verification, and release steps below.
+
+### Start every pass
+
+1. Run `bun run check:upstream-drift` first. This is a manual command for the start of a pass, never a CI drift gate. The checker is added by the next ticket, ticket 32; if this checkout does not have the command yet, record it as pending and do not restore the retired inline shell pipeline.
+2. Run `git status --short --branch` and start from a clean worktree at the current fork tip. Create a backup branch before changing it.
+3. Fetch `origin` and `upstream`. If the default SSH agent cannot authenticate, find a reachable agent socket and retry the fetch with that socket. If no reachable credentials exist, stop for the maintainer under the capability rule below and hand over the exact fetch command and missing access.
+   ```bash
+   find /tmp -type s \( -name 'agent.*' -o -name '*ssh*' \) 2>/dev/null
+   SSH_AUTH_SOCK=/tmp/path/to/agent ssh-add -l
+   SSH_AUTH_SOCK=/tmp/path/to/agent git fetch --all --prune
+   ```
+4. Choose **sweep** or **sync**. A sync performs the sweep before merging anything.
+
+### Sweep path
+
+1. Reconcile the live open-PR set and the triage stamps with the matching table in this file. The drift checker reports both set drift and PR-head drift.
+2. Have research subagents read upstream PRs and report evidence for any row that needs a decision. Keep the final state vocabulary to `implemented`, `implemented differently`, or `won't implement`.
+3. Update rows whose state is already settled, or stop for the maintainer before changing a final state. Preserve the triage date, upstream head SHA, decision rationale, and fork commit evidence.
+4. Run the relevant ledger checks. A sweep never charts a wayfinder map, even when it produces a list of decisions for a later sync.
+
+### Sync path
+
+After the sweep has handed back all required judgment decisions, continue in this order:
+
+1. Compare `git log --oneline --decorate upstream/main..HEAD` and `git log --oneline --decorate HEAD..upstream/main` before merging.
+2. Merge `upstream/main` with `git merge upstream/main --no-edit` into the sync branch.
+3. Resolve conflicts by keeping fork code in regions covered by a `FORK.md` invariant unless upstream is demonstrably better on the merits. Take upstream where the fork has no implementation.
+4. Remove upstream pnpm workspace files if they return. Run `bun install` to refresh `bun.lock`.
+5. Run the package-identity search in the Package Identity invariant and fix every hit outside intentional upstream PR references or compatibility tests. Also run the package-manager command search and conflict-marker search:
+   ```bash
+   rg '[p]npm install|[p]npm build|[p]npm test|[p]npm lint|[p]npm type-check|[p]npm format|[p]npm dev|[p]npm run dev:app'
+   rg -n '^[<]{7}|^[=]{7}|^[>]{7}'
+   ```
+6. Apply only mechanical backports and the decisions already made in the sweep. Stop for the maintainer when a conflict touches an invariant or when scope must be ruled in or out.
+7. Review `git log --oneline upstream/main..HEAD` and update the fork-only ledger for behavior-protecting fork commits. The ledger-maintenance commit itself may be picked up by the next sweep.
+8. Run focused tests for every fork invariant touched by the merge, then run the full verification gate below.
+9. Prepare the sync branch and its release notes. Do not push `main` directly. If a sync PR is opened, merging that PR to `main` remains a maintainer action under the consequence rule. When a branch push is authorized but SSH remains unavailable, use `git push https://github.com/ENK0DED/portless.git <branch>`.
+10. End every sync with a fork release. Apply the Version Mapping formula, `fork patch = ((upstream patch + 1) * 1000) + fork iteration`, to select the next version and update the matching release material. Preparing the release is AFK; dispatching `release.yml` for the real `@enk0ded/portless` publish is HITL by consequence, so the agent stops before publishing.
+
+### AFK and HITL boundaries
+
+Use wayfinder's criterion: **HITL** is human in the loop, worked with a human who speaks for themselves; **AFK** is driven by the agent alone. A HITL step resolves through that live exchange, and the agent never stands in for the human's side of it.
+
+Stop for the maintainer for exactly these reasons:
+
+- **Judgment:** assigning a final triage state to any PR whose state would change, resolving a conflict in a region covered by a `FORK.md` invariant, or ruling anything out of scope.
+- **Capability:** the agent cannot reach the required credential, the maintainer's machine, or an account. This is a rule rather than a hardcoded list because reachability varies by pass. Hand over a precise checklist of the remaining actions.
+- **Consequence:** the agent is capable but not authorized to perform an outward or irreversible action. Dispatching `release.yml` for a real `@enk0ded/portless` publish and merging the sync PR to `main` are HITL by consequence, even when working credentials are available.
+
+Fetching, drift diffing, ledger-set reconciliation, mechanical backports, the verification gate, release mechanics short of publishing, and reading upstream PRs as research are AFK. The agent may perform them alone when the judgment, capability, and consequence boundaries are clear.
+
+### Map threshold and fresh-clone rule
+
+A sweep never charts a wayfinder map. A sync charts one only when the pass surfaces genuine decisions, such as contested conflicts or backports worth arguing about. A clean merge runs the checklist without a map.
+
+The procedure must run from the repository alone. It never requires a past wayfinder map or any `.scratch/` artifact. Those artifacts are disposable; durable invariants, state-choice rules, decision rationales, and this standing procedure belong in tracked repository documents.
+
+### Conflict hotspots and completion gate
+
+Expect recurring conflicts in `package.json`, `packages/portless/package.json`, `bun.lock`, `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `README.md`, `skills/portless/SKILL.md`, `packages/portless/src/cli.ts`, `packages/portless/src/cli.test.ts`, `packages/portless/src/cli-utils.test.ts`, `CHANGELOG.md`, and `apps/docs/src/app/changelog/page.mdx`. When behavior changes commands, flags, config, or human-facing usage, update the corresponding user and agent surfaces together.
+
+Before finishing a sync, confirm the fork package identity, the Version Mapping formula, the absence of unscoped upstream install commands, the absence of conflict markers, the live open-PR set, the verification outcomes, and the maintainer handoffs still outstanding.
 
 ## Verification Commands
 
@@ -493,7 +554,11 @@ bun run lint
 bun run type-check
 bun run build
 bun run test
+bun run test:fork-ledger
+bun run check:fork-ledger
 ```
+
+The next ticket, ticket 32, adds `bun run test:upstream-drift`; when it lands, run that command in CI to test the repository's drift-checker implementation. This is a test of the local checker, not a live upstream drift gate. Until ticket 32 adds the script, keep this reference marked as pending and do not add a workflow or CI check that fails because upstream moved.
 
 Run `bun run test:e2e` when source changes affect proxy lifecycle, framework flag injection, multi-app orchestration, sharing, or route cleanup.
 
