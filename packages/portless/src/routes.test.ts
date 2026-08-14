@@ -1,10 +1,15 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 import { FILE_MODE, RouteStore, RouteConflictError, isRetryableLockError } from "./routes.js";
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return { ...actual, renameSync: vi.fn(actual.renameSync) };
+});
 
 describe("RouteStore", () => {
   let tmpDir: string;
@@ -42,6 +47,30 @@ describe("RouteStore", () => {
       store.ensureDir();
       fs.writeFileSync(store.getRoutesPath(), "not json");
       expect(store.loadRoutes()).toEqual([]);
+    });
+
+    it("aborts a route mutation on corrupt JSON without changing the file", () => {
+      store.ensureDir();
+      const raw = "{ not json";
+      fs.writeFileSync(store.getRoutesPath(), raw);
+
+      expect(() => store.addRoute("new.localhost", 4001, process.pid)).toThrow(
+        `Refusing to modify a corrupt routes file: ${store.getRoutesPath()}`
+      );
+      expect(fs.readFileSync(store.getRoutesPath(), "utf-8")).toBe(raw);
+    });
+
+    it("does not persist migration changes during an unlocked read", () => {
+      store.ensureDir();
+      const raw = JSON.stringify([
+        { hostname: "api.localhost", port: 4001, pid: process.pid, pathPrefix: "/api/" },
+      ]);
+      fs.writeFileSync(store.getRoutesPath(), raw);
+
+      expect(store.loadRoutesRaw()).toEqual([
+        { hostname: "api.localhost", port: 4001, pid: process.pid, pathPrefix: "/api" },
+      ]);
+      expect(fs.readFileSync(store.getRoutesPath(), "utf-8")).toBe(raw);
     });
 
     it("calls onWarning for invalid JSON", () => {
@@ -93,6 +122,7 @@ describe("RouteStore", () => {
         ])
       );
 
+      store.updateRoute("missing.localhost", {});
       expect(store.loadRoutes()).toEqual([
         { hostname: "api.localhost", port: 4001, pid: process.pid, pathPrefix: "/api" },
         { hostname: "web.localhost", port: 4002, pid: process.pid },
@@ -122,6 +152,7 @@ describe("RouteStore", () => {
         ])
       );
 
+      warnStore.updateRoute("missing.localhost", {});
       expect(warnStore.loadRoutes()).toEqual([
         { hostname: "valid.localhost", port: 4002, pid: process.pid, pathPrefix: "/api" },
       ]);
@@ -225,7 +256,9 @@ describe("RouteStore", () => {
 
     it("cleans the temp file when the atomic rename fails", async () => {
       store.ensureDir();
-      fs.mkdirSync(store.getRoutesPath());
+      vi.mocked(fs.renameSync).mockImplementationOnce(() => {
+        throw new Error("simulated rename failure");
+      });
       const events: string[] = [];
       // Watch the canonical spelling: Windows 8.3 short temp paths make
       // libuv's fs-event assert and abort the vitest worker.
@@ -233,13 +266,15 @@ describe("RouteStore", () => {
         if (filename) events.push(filename.toString());
       });
       try {
-        expect(() => store.addRoute("new.localhost", 4002, process.pid)).toThrow();
+        expect(() => store.addRoute("new.localhost", 4002, process.pid)).toThrow(
+          "simulated rename failure"
+        );
         for (let attempt = 0; attempt < 20; attempt++) {
           if (events.some((entry) => entry.startsWith("routes.json.tmp-"))) break;
           await new Promise((resolve) => setTimeout(resolve, 25));
         }
         expect(events.some((entry) => entry.startsWith("routes.json.tmp-"))).toBe(true);
-        expect(fs.statSync(store.getRoutesPath()).isDirectory()).toBe(true);
+        expect(fs.existsSync(store.getRoutesPath())).toBe(false);
         expect(
           fs.readdirSync(tmpDir).filter((entry) => entry.startsWith("routes.json.tmp-"))
         ).toEqual([]);

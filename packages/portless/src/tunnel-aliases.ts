@@ -181,18 +181,35 @@ export class TunnelAliasStore {
   }
 
   loadAliases(): TunnelAlias[] {
+    return this.readAliases(false);
+  }
+
+  private loadAliasesStrict(): TunnelAlias[] {
+    return this.readAliases(true);
+  }
+
+  private readAliases(strict: boolean): TunnelAlias[] {
     if (!fs.existsSync(this.aliasesPath)) return [];
+    const strictError = new Error(
+      `Refusing to modify a corrupt tunnel aliases file: ${this.aliasesPath}. ` +
+        `Move or delete the file to reset alias state.`
+    );
+    const emptyOnCorruption = (): TunnelAlias[] => {
+      if (strict) throw strictError;
+      return [];
+    };
     try {
       const parsed = JSON.parse(fs.readFileSync(this.aliasesPath, "utf-8")) as unknown;
       if (!Array.isArray(parsed)) {
         this.onWarning?.(`Corrupted tunnel aliases file (expected array): ${this.aliasesPath}`);
-        return [];
+        return emptyOnCorruption();
       }
       return parsed.filter(isValidAlias).map(normalizeAlias);
     } catch (err: unknown) {
       if (isErrnoException(err) && err.code === "ENOENT") return [];
+      if (err === strictError) throw err;
       this.onWarning?.(`Corrupted tunnel aliases file (invalid JSON): ${this.aliasesPath}`);
-      return [];
+      return emptyOnCorruption();
     }
   }
 
@@ -203,7 +220,7 @@ export class TunnelAliasStore {
       throw new Error("Failed to acquire tunnel alias lock");
     }
     try {
-      const aliases = this.loadAliases().filter(
+      const aliases = this.loadAliasesStrict().filter(
         (entry) => entry.externalHostname !== normalized.externalHostname
       );
       aliases.push(normalized);
@@ -220,7 +237,7 @@ export class TunnelAliasStore {
       throw new Error("Failed to acquire tunnel alias lock");
     }
     try {
-      const aliases = this.loadAliases();
+      const aliases = this.loadAliasesStrict();
       const filtered = aliases.filter((entry) => entry.externalHostname !== normalizedExternal);
       if (filtered.length === aliases.length) return false;
       this.saveAliases(filtered);
@@ -237,7 +254,7 @@ export class TunnelAliasStore {
       throw new Error("Failed to acquire tunnel alias lock");
     }
     try {
-      const aliases = this.loadAliases();
+      const aliases = this.loadAliasesStrict();
       const filtered = aliases.filter(
         (entry) =>
           entry.externalHostname !== normalizedExternal ||
@@ -258,7 +275,7 @@ export class TunnelAliasStore {
       throw new Error("Failed to acquire tunnel alias lock");
     }
     try {
-      const aliases = this.loadAliases();
+      const aliases = this.loadAliasesStrict();
       const alive: TunnelAlias[] = [];
       const stale: TunnelAlias[] = [];
       for (const alias of aliases) {

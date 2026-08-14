@@ -129,4 +129,50 @@ describe("BgStore", () => {
 
     expect(store.loadEntries()).toHaveLength(10);
   });
+
+  describe("corrupt registry", () => {
+    it("aborts a mutation on corrupt JSON without changing the file", () => {
+      store.ensureDirs();
+      const raw = "{ not json";
+      fs.writeFileSync(store.getPaths().registryPath, raw);
+
+      expect(() => store.upsertEntry(sampleEntry())).toThrow(
+        `Refusing to modify a corrupt background registry: ${store.getPaths().registryPath}`
+      );
+      expect(fs.readFileSync(store.getPaths().registryPath, "utf-8")).toBe(raw);
+    });
+
+    it("aborts a mutation on a non-array JSON document without changing the file", () => {
+      store.ensureDirs();
+      const raw = '{"a":1}';
+      fs.writeFileSync(store.getPaths().registryPath, raw);
+
+      expect(() => store.updateEntry("bg_01", { state: "ready" })).toThrow(
+        `Refusing to modify a corrupt background registry: ${store.getPaths().registryPath}`
+      );
+      expect(fs.readFileSync(store.getPaths().registryPath, "utf-8")).toBe(raw);
+    });
+
+    it("treats a missing registry file as a normal first run", () => {
+      store.upsertEntry(sampleEntry());
+
+      expect(store.loadEntries()).toEqual([sampleEntry()]);
+    });
+
+    it("keeps read paths fail-open for corrupt JSON", () => {
+      store.ensureDirs();
+      fs.writeFileSync(store.getPaths().registryPath, "{ not json");
+
+      expect(() => store.loadEntries()).not.toThrow();
+      expect(store.loadEntries()).toEqual([]);
+    });
+
+    it("leaves no temporary files after an atomic write", () => {
+      store.upsertEntry(sampleEntry());
+
+      expect(
+        fs.readdirSync(store.getPaths().rootDir).filter((file) => file.includes(".tmp-"))
+      ).toEqual([]);
+    });
+  });
 });

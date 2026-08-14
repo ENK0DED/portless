@@ -195,6 +195,7 @@ export class RouteStore {
   readonly pidPath: string;
   readonly portFilePath: string;
   private readonly onWarning: ((message: string) => void) | undefined;
+  private lockDepth = 0;
 
   constructor(dir: string, options?: { onWarning?: (message: string) => void }) {
     this.dir = dir;
@@ -280,10 +281,18 @@ export class RouteStore {
     }
   }
 
-  private loadAndMigrateRoutes(): RouteMapping[] {
+  private loadAndMigrateRoutes(strict = false): RouteMapping[] {
     if (!fs.existsSync(this.routesPath)) {
       return [];
     }
+    const strictError = new Error(
+      `Refusing to modify a corrupt routes file: ${this.routesPath}. ` +
+        `Move or delete the file to reset routing state.`
+    );
+    const emptyOnCorruption = (): RouteMapping[] => {
+      if (strict) throw strictError;
+      return [];
+    };
     try {
       const raw = fs.readFileSync(this.routesPath, "utf-8");
       let parsed: unknown;
@@ -291,11 +300,11 @@ export class RouteStore {
         parsed = JSON.parse(raw);
       } catch {
         this.onWarning?.(`Corrupted routes file (invalid JSON): ${this.routesPath}`);
-        return [];
+        return emptyOnCorruption();
       }
       if (!Array.isArray(parsed)) {
         this.onWarning?.(`Corrupted routes file (expected array): ${this.routesPath}`);
-        return [];
+        return emptyOnCorruption();
       }
       let migrationChanged = false;
       const routes: RouteMapping[] = [];
@@ -346,9 +355,7 @@ export class RouteStore {
         }
         routes.push(route);
       }
-      if (migrationChanged) {
-        // Migration writes happen on the first load through either public
-        // reader so legacy entries cannot remain silently unusable.
+      if (migrationChanged && this.lockDepth > 0) {
         try {
           this.saveRoutes(routes);
         } catch {
@@ -356,8 +363,9 @@ export class RouteStore {
         }
       }
       return routes;
-    } catch {
-      return [];
+    } catch (err: unknown) {
+      if (err === strictError) throw err;
+      return emptyOnCorruption();
     }
   }
 
@@ -367,8 +375,8 @@ export class RouteStore {
    * already holds the lock (i.e. inside addRoute/removeRoute) to avoid
    * unprotected concurrent writes.
    */
-  loadRoutes(persistCleanup = false): RouteMapping[] {
-    const routes = this.loadAndMigrateRoutes();
+  loadRoutes(persistCleanup = false, strict = false): RouteMapping[] {
+    const routes = this.loadAndMigrateRoutes(strict);
     const alive = routes.filter((r) => r.pid === 0 || this.isProcessAlive(r.pid));
     if (persistCleanup && alive.length !== routes.length) {
       try {
@@ -479,9 +487,10 @@ export class RouteStore {
     if (!this.acquireLock()) {
       throw new Error("Failed to acquire route lock");
     }
+    this.lockDepth++;
     let killedPid: number | undefined;
     try {
-      const routes = this.loadRoutes(true);
+      const routes = this.loadRoutes(true, true);
       const pathPrefix = normalizePathPrefix(options.pathPrefix);
       const label = normalizeLabel(options.label);
 
@@ -550,6 +559,7 @@ export class RouteStore {
         this.saveRoutes(filtered);
       }
     } finally {
+      this.lockDepth--;
       this.releaseLock();
     }
     return killedPid;
@@ -573,6 +583,7 @@ export class RouteStore {
     if (!this.acquireLock()) {
       throw new Error("Failed to acquire route lock");
     }
+    this.lockDepth++;
     try {
       const all = this.loadRoutesRaw();
       const alive: RouteMapping[] = [];
@@ -589,6 +600,7 @@ export class RouteStore {
       }
       return stale;
     } finally {
+      this.lockDepth--;
       this.releaseLock();
     }
   }
@@ -602,8 +614,9 @@ export class RouteStore {
     if (!this.acquireLock()) {
       throw new Error("Failed to acquire route lock");
     }
+    this.lockDepth++;
     try {
-      const routes = this.loadRoutes(true);
+      const routes = this.loadRoutes(true, true);
       const pathPrefix = normalizePathPrefix(options.pathPrefix);
       const label = normalizeLabel(options.label);
       const route = routes.find(
@@ -675,6 +688,7 @@ export class RouteStore {
       }
       this.saveRoutes(routes);
     } finally {
+      this.lockDepth--;
       this.releaseLock();
     }
   }
@@ -690,10 +704,11 @@ export class RouteStore {
     if (!this.acquireLock()) {
       throw new Error("Failed to acquire route lock");
     }
+    this.lockDepth++;
     try {
       const pathPrefix = normalizePathPrefix(options.pathPrefix);
       const label = normalizeLabel(options.label);
-      const routes = this.loadRoutes(true).filter((r) => {
+      const routes = this.loadRoutes(true, true).filter((r) => {
         if (!routeMatchesKey(r, hostname, pathPrefix)) return true;
         if (ownerPid !== undefined && r.pid !== ownerPid) return true;
         if (label !== undefined && r.label !== label) return true;
@@ -701,6 +716,7 @@ export class RouteStore {
       });
       this.saveRoutes(routes);
     } finally {
+      this.lockDepth--;
       this.releaseLock();
     }
   }

@@ -21,6 +21,20 @@ describe("TunnelAliasStore", () => {
     expect(store.loadAliases()).toEqual([]);
   });
 
+  it("aborts an alias mutation on corrupt JSON without changing the file", () => {
+    store.ensureDir();
+    const raw = "{ not json";
+    fs.writeFileSync(store.getAliasesPath(), raw);
+
+    expect(() =>
+      store.setAlias({
+        externalHostname: "public.example.com",
+        targetHostname: "myapp.localhost",
+      })
+    ).toThrow(`Refusing to modify a corrupt tunnel aliases file: ${store.getAliasesPath()}`);
+    expect(fs.readFileSync(store.getAliasesPath(), "utf-8")).toBe(raw);
+  });
+
   it("persists and updates exact tunnel aliases", () => {
     store.setAlias({
       externalHostname: "Public.Example.com",
