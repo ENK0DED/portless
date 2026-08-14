@@ -13,7 +13,7 @@ On `upstream-sync-v015`, re-derive upstream #352 (`4209ca8`) inside the fork's t
 Commits:
 
 - `c405ea9` adds exact persisted Tailscale Serve, Funnel, and Service hostname routing, path-aware selection, authority normalization, tests, and user-facing documentation.
-- The resolution commit updates the fork-only ledger and records this ticket as resolved.
+- `624fd7c` updates the fork-only ledger and records this ticket as resolved. `e2b89f2` records the remaining ledger entries found by the checker.
 
 Decisions:
 
@@ -30,4 +30,5 @@ Verification:
 
 - `bun install` passed with no dependency changes.
 - `bun run lint`, `bun run type-check`, `bun run build`, `bun run test`, and `bun run test:e2e` passed. Unit tests: 1,041 passed and 2 skipped. E2e tests: 15 passed and 2 skipped.
-- `bun run check:fork-ledger` is run after this ledger commit.
+- `bun run check:fork-ledger` passed with 99 fork commits checked.
+- The full gate passed from a clean detached worktree: `bun run format:check`, `bun run lint`, `bun run type-check`, `bun run build`, and `bun run test`.
