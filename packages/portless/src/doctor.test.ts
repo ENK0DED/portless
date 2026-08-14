@@ -410,7 +410,7 @@ describe("doctor probes", () => {
 
     expect(resolveDoctorCommandInvocation("ngrok", ["version"], "win32", binDir)).toEqual({
       command: "cmd.exe",
-      args: ["/d", "/s", "/c", `${path.join(binDir, "ngrok.cmd")} version`],
+      args: ["/d", "/v:off", "/s", "/c", `"${path.join(binDir, "ngrok.cmd")} version"`],
       windowsVerbatimArguments: true,
     });
   });
