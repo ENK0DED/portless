@@ -122,6 +122,8 @@ Current fork-owned commits and what they protect:
 | `df47943` | Merged the ticket 17 worktree branch bringing residual #363 WebSocket behaviors into the sync branch.                                                                                              |
 | `199c5ef` | Excluded the untracked `.scratch` agent tracker directory from the repository Prettier gate.                                                                                                       |
 | `e8fab11` | Updated the fork-only ledger for the ticket 15 resolution and the ticket 17 integration merge.                                                                                                     |
+| `4b68d8d` | Recorded the `.scratch` Prettier exclusion and integrated ticket-resolution commits in the fork-only ledger.                                                                                       |
+| `a455c86` | Added read-only, fork-aware `portless doctor` diagnostics across suffix, bind, state, certificate, routing, background, and sharing surfaces.                                                      |
 
 ## Fork-Owned Invariants
 
