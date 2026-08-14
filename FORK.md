@@ -109,6 +109,8 @@ Current fork-owned commits and what they protect:
 | `dcb43fd` | Added ordered `PORTLESS_SUFFIX` lists, repeatable suffix flags, explicit LAN list preservation, exact `.local` mDNS publishing, and multi-suffix route, TLS, service, and state handling.          |
 | `e261c65` | Recorded the release-ledger and ordered suffix-list implementation commits in the fork-only ledger.                                                                                                |
 | `d3c3f57` | Resolved Wayfinder ticket 12 with implementation decisions, coverage, and verification evidence.                                                                                                   |
+| `92370cb` | Finalized the suffix-list ledger before the loopback-bind implementation.                                                                                                                          |
+| `a8fc980` | Added loopback-by-default proxy and redirect binds with per-target TLS wrappers, LAN-mode widening, and socket-level bind coverage.                                                                |
 
 ## Fork-Owned Invariants
 
