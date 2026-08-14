@@ -105,6 +105,8 @@ Current fork-owned commits and what they protect:
 | `b729e1f` | Updated the fork-only ledger with the release merge and the `0.14.1003` preparation commit.                                                                                                        |
 | `e3c746e` | Merged upstream v0.15.5 at `326e893` while preserving fork identity, version mapping, Bun, suffix behavior, docs, tests, release workflow, Windows debugging, and the fork sync skill.             |
 | `05b2c69` | Prepared fork release `0.15.6000` for the post-merge feature batch.                                                                                                                                |
+| `207b3ff` | Updated the fork-only ledger for the `0.15.6000` release preparation commit.                                                                                                                       |
+| `dcb43fd` | Added ordered `PORTLESS_SUFFIX` lists, repeatable suffix flags, explicit LAN list preservation, exact `.local` mDNS publishing, and multi-suffix route, TLS, service, and state handling.          |
 
 ## Fork-Owned Invariants
 
