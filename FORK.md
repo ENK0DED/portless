@@ -124,6 +124,8 @@ Current fork-owned commits and what they protect:
 | `e8fab11` | Updated the fork-only ledger for the ticket 15 resolution and the ticket 17 integration merge.                                                                                                     |
 | `4b68d8d` | Recorded the `.scratch` Prettier exclusion and integrated ticket-resolution commits in the fork-only ledger.                                                                                       |
 | `a455c86` | Added read-only, fork-aware `portless doctor` diagnostics across suffix, bind, state, certificate, routing, background, and sharing surfaces.                                                      |
+| `8b25491` | Finalized the `portless doctor` ticket resolution and recorded its implementation in the fork-only ledger.                                                                                         |
+| `4dd7f00` | Prepared fork release `0.15.6001` with the six-feature batch changelogs and the `0.15.6002` upstream-PR backport reservation.                                                                      |
 
 ## Fork-Owned Invariants
 
