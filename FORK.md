@@ -158,6 +158,8 @@ Current fork-owned commits and what they protect:
 | `2850ba7` | Added a tested upstream-drift checker for the recorded base, live open-PR set, and optional triage head stamps, with manual CLI and CI test wiring.                                                    |
 | `2000772` | Resolved ticket 32 and recorded the upstream-drift checker in the fork-only ledger.                                                                                                                    |
 | `b5151e1` | Resolved ticket 29 and recorded the final open-PR triage ledger before provenance stamps were backfilled.                                                                                              |
+| `589bb36` | Backfilled 2026-08-14 triage dates and upstream head SHAs for every open-PR ledger row.                                                                                                                |
+| `db651e5` | Prepared fork release `0.15.6002` with the nine upstream-PR backport entries, including the Windows cmd.exe security fix and routes.json migration warning.                                            |
 
 ## Fork-Owned Invariants
 
