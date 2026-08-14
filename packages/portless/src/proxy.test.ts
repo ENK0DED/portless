@@ -792,6 +792,243 @@ describe("createProxyServer", () => {
     });
   });
 
+  describe("upstream connections", () => {
+    it("caps concurrent upstream connections at 64", async () => {
+      const connections = new Set<net.Socket>();
+      const responses: http.ServerResponse[] = [];
+      let requestCount = 0;
+      let releaseResponses = false;
+      let resolve64: (() => void) | undefined;
+      const reached64 = new Promise<void>((resolve) => {
+        resolve64 = resolve;
+      });
+      const backend = trackServer(
+        http.createServer((_req, res) => {
+          responses.push(res);
+          requestCount++;
+          if (requestCount === 64) resolve64?.();
+          if (releaseResponses) res.end("ok");
+        })
+      );
+      backend.on("connection", (socket) => connections.add(socket));
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const routes: RouteInfo[] = [{ hostname: "myapp.localhost", port: backendAddr.port }];
+      const server = trackServer(
+        createProxyServer({ getRoutes: () => routes, proxyPort: TEST_PROXY_PORT })
+      );
+      await listen(server);
+
+      const requests = Array.from({ length: 65 }, () =>
+        request(server, { host: "myapp.localhost" })
+      );
+      try {
+        await Promise.race([
+          reached64,
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error("backend did not receive 64 requests")), 1000)
+          ),
+        ]);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        expect(connections.size).toBeLessThanOrEqual(64);
+      } finally {
+        releaseResponses = true;
+        for (const res of responses) {
+          res.end("ok");
+        }
+        await Promise.allSettled(requests);
+      }
+      const results = await Promise.all(requests);
+      expect(results.every((res) => res.status === 200 && res.body === "ok")).toBe(true);
+    });
+
+    it("reuses one upstream connection across ordinary requests", async () => {
+      const connections = new Set<net.Socket>();
+      const backend = trackServer(http.createServer((_req, res) => res.end("ok")));
+      backend.on("connection", (socket) => connections.add(socket));
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const routes: RouteInfo[] = [{ hostname: "myapp.localhost", port: backendAddr.port }];
+      const server = trackServer(
+        createProxyServer({ getRoutes: () => routes, proxyPort: TEST_PROXY_PORT })
+      );
+      await listen(server);
+
+      for (let i = 0; i < 5; i++) {
+        const res = await request(server, { host: "myapp.localhost" });
+        expect(res.status).toBe(200);
+        expect(res.body).toBe("ok");
+      }
+
+      expect(connections.size).toBe(1);
+    });
+
+    it("strips connection-token headers before ordinary forwarding", async () => {
+      let receivedHeaders: http.IncomingHttpHeaders = {};
+      const backend = trackServer(
+        http.createServer((req, res) => {
+          receivedHeaders = req.headers;
+          res.end("ok");
+        })
+      );
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const routes: RouteInfo[] = [{ hostname: "myapp.localhost", port: backendAddr.port }];
+      const server = trackServer(
+        createProxyServer({ getRoutes: () => routes, proxyPort: TEST_PROXY_PORT })
+      );
+      await listen(server);
+
+      const res = await request(server, {
+        host: "myapp.localhost",
+        headers: {
+          connection: "keep-alive, X-Forwarded-Unit",
+          "x-forwarded-unit": "secret",
+          "x-forwarded-value": "preserve",
+        },
+      });
+
+      expect(res.status).toBe(200);
+      expect(receivedHeaders.connection).toBe("keep-alive");
+      expect(receivedHeaders["x-forwarded-unit"]).toBeUndefined();
+      expect(receivedHeaders["x-forwarded-value"]).toBe("preserve");
+    });
+
+    it("replays a bodyless idempotent request when a reused socket resets", async () => {
+      const handled = new WeakMap<net.Socket, number>();
+      let resets = 0;
+      const backend = trackServer(
+        http.createServer((req, res) => {
+          const count = (handled.get(req.socket) ?? 0) + 1;
+          handled.set(req.socket, count);
+          if (count === 1) return res.end("ok");
+          resets++;
+          req.socket.resetAndDestroy();
+        })
+      );
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const errors: string[] = [];
+      const routes: RouteInfo[] = [{ hostname: "myapp.localhost", port: backendAddr.port }];
+      const server = trackServer(
+        createProxyServer({
+          getRoutes: () => routes,
+          proxyPort: TEST_PROXY_PORT,
+          onError: (message) => errors.push(message),
+        })
+      );
+      await listen(server);
+
+      for (let i = 0; i < 4; i++) {
+        const res = await request(server, { host: "myapp.localhost", accept: null });
+        expect(res.status).toBe(200);
+        expect(res.body).toBe("ok");
+      }
+
+      expect(resets).toBeGreaterThan(0);
+      expect(errors).toEqual([]);
+    });
+
+    it("destroys pooled upstream sockets when a plain server closes", async () => {
+      let upstreamSocket: net.Socket | undefined;
+      let resolveClosed: (() => void) | undefined;
+      const upstreamClosed = new Promise<void>((resolve) => {
+        resolveClosed = resolve;
+      });
+      const backend = trackServer(http.createServer((_req, res) => res.end("ok")));
+      backend.on("connection", (socket) => {
+        upstreamSocket = socket;
+        socket.once("close", () => resolveClosed?.());
+      });
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const routes: RouteInfo[] = [{ hostname: "myapp.localhost", port: backendAddr.port }];
+      const server = trackServer(
+        createProxyServer({ getRoutes: () => routes, proxyPort: TEST_PROXY_PORT })
+      );
+      await listen(server);
+      await request(server, { host: "myapp.localhost" });
+
+      try {
+        await new Promise<void>((resolve, reject) => {
+          server.close((error) => (error ? reject(error) : resolve()));
+        });
+        await Promise.race([
+          upstreamClosed,
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error("upstream socket stayed open")), 500)
+          ),
+        ]);
+      } finally {
+        upstreamSocket?.destroy();
+      }
+    });
+
+    it("does not replay non-idempotent or body-bearing requests", async () => {
+      const handled = new WeakMap<net.Socket, number>();
+      let resets = 0;
+      let requests = 0;
+      const backend = trackServer(
+        http.createServer((req, res) => {
+          requests++;
+          const count = (handled.get(req.socket) ?? 0) + 1;
+          handled.set(req.socket, count);
+          if (count === 1) return res.end("ok");
+          resets++;
+          req.socket.resetAndDestroy();
+        })
+      );
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const errors: string[] = [];
+      const routes: RouteInfo[] = [{ hostname: "myapp.localhost", port: backendAddr.port }];
+      const server = trackServer(
+        createProxyServer({
+          getRoutes: () => routes,
+          proxyPort: TEST_PROXY_PORT,
+          onError: (message) => errors.push(message),
+        })
+      );
+      await listen(server);
+
+      expect((await request(server, { host: "myapp.localhost", accept: null })).status).toBe(200);
+
+      const post = await request(server, {
+        host: "myapp.localhost",
+        method: "POST",
+        accept: null,
+        body: "payload",
+      });
+      expect(post.status).toBe(502);
+
+      expect((await request(server, { host: "myapp.localhost", accept: null })).status).toBe(200);
+
+      const getWithBody = await request(server, {
+        host: "myapp.localhost",
+        method: "GET",
+        accept: null,
+        body: "payload",
+      });
+      expect(getWithBody.status).toBe(502);
+      expect(requests).toBe(4);
+      expect(resets).toBe(2);
+      expect(errors).toHaveLength(2);
+    });
+  });
+
   describe("missing Host header", () => {
     it("returns 400 when Host header is missing", async () => {
       const routes: RouteInfo[] = [];
@@ -1858,6 +2095,45 @@ describe("createProxyServer with TLS (HTTP/2)", () => {
     const res = await httpsRequest(server, { host: "myapp.localhost" });
     expect(res.status).toBe(200);
     expect(res.body).toBe("hello from backend via h2");
+  });
+
+  it("destroys pooled upstream sockets when the TLS wrapper closes", async () => {
+    let upstreamSocket: net.Socket | undefined;
+    let resolveClosed: (() => void) | undefined;
+    const upstreamClosed = new Promise<void>((resolve) => {
+      resolveClosed = resolve;
+    });
+    const backend = trackServer(http.createServer((_req, res) => res.end("ok")));
+    backend.on("connection", (socket) => {
+      upstreamSocket = socket;
+      socket.once("close", () => resolveClosed?.());
+    });
+    await listen(backend);
+    const backendAddr = backend.address();
+    if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+    const routes: RouteInfo[] = [{ hostname: "myapp.localhost", port: backendAddr.port }];
+    const server = trackServer(
+      createProxyServer({
+        getRoutes: () => routes,
+        proxyPort: TEST_PROXY_PORT,
+        tls: { cert: tlsCert, key: tlsKey },
+      })
+    );
+    await listen(server);
+    await httpsRequest(server, { host: "myapp.localhost" });
+
+    try {
+      server.close();
+      await Promise.race([
+        upstreamClosed,
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("TLS upstream socket stayed open")), 500)
+        ),
+      ]);
+    } finally {
+      upstreamSocket?.destroy();
+    }
   });
 
   it("supports HTTP/2 connections", async () => {

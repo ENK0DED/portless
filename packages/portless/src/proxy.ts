@@ -164,6 +164,41 @@ const HOP_BY_HOP_HEADERS = new Set([
   "upgrade",
 ]);
 
+/** Cap ordinary upstream connections so multiplexed clients cannot overload a backend. */
+const MAX_UPSTREAM_SOCKETS = 64;
+const REPLAYABLE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+/** Remove Connection and every header named by its comma-separated token list. */
+function stripConnectionHeaders(headers: http.OutgoingHttpHeaders): void {
+  const connectionTokens = new Set<string>();
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() !== "connection") continue;
+    const values = Array.isArray(value) ? value : [value];
+    for (const item of values) {
+      if (typeof item !== "string") continue;
+      for (const token of item.split(",")) {
+        const normalized = token.trim().toLowerCase();
+        if (normalized) connectionTokens.add(normalized);
+      }
+    }
+  }
+
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() === "connection" || connectionTokens.has(key.toLowerCase())) {
+      delete headers[key];
+    }
+  }
+}
+
+/** A request can be replayed only when its headers prove it has no body. */
+function isBodylessRequest(req: http.IncomingMessage): boolean {
+  if (req.headers["transfer-encoding"] !== undefined) return false;
+  const contentLength = req.headers["content-length"];
+  if (contentLength === undefined) return true;
+  const values = Array.isArray(contentLength) ? contentLength : [contentLength];
+  return values.every((value) => value.trim() === "0");
+}
+
 /**
  * Get the effective host value from a request.
  * HTTP/2 uses the :authority pseudo-header; HTTP/1.1 uses Host.
@@ -541,6 +576,15 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     return matched?.slice(1) ?? primaryTld;
   };
   const caFingerprint = tls?.ca ? formatFingerprint(tls.ca) : undefined;
+  const upstreamAgent = new http.Agent({
+    keepAlive: true,
+    maxSockets: MAX_UPSTREAM_SOCKETS,
+  });
+  upstreamAgent.createConnection = (options) =>
+    net.connect({
+      ...LOOPBACK_DIAL_OPTIONS,
+      port: options.port as number,
+    });
 
   const hostPort = (reqTls: boolean): string =>
     proxyPort === (reqTls ? 443 : 80) ? "" : `:${proxyPort}`;
@@ -866,7 +910,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     stream.on("aborted", cleanup);
   };
 
-  const handleRequest = (req: http.IncomingMessage, res: http.ServerResponse) => {
+  const handleRequest = (req: http.IncomingMessage, res: http.ServerResponse, isReplay = false) => {
     const reqTls = isEncrypted(req);
     res.setHeader(PORTLESS_HEADER, "1");
     res.setHeader(PORTLESS_LISTENER_PORT_HEADER, getListenerPort(req, proxyPort));
@@ -991,6 +1035,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       proxyReqHeaders[key] = value;
     }
     proxyReqHeaders[PORTLESS_HOPS_HEADER] = String(hops + 1);
+    stripConnectionHeaders(proxyReqHeaders);
     // Remove HTTP/2 pseudo-headers before forwarding to HTTP/1.1 backend
     for (const key of Object.keys(proxyReqHeaders)) {
       if (key.startsWith(":")) {
@@ -1006,7 +1051,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
 
     const proxyReq = http.request(
       {
-        ...LOOPBACK_DIAL_OPTIONS,
+        agent: upstreamAgent,
         port: route.port,
         path: req.url,
         method: req.method,
@@ -1036,9 +1081,21 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     );
 
     proxyReq.on("error", (err) => {
+      const errWithCode = err as NodeJS.ErrnoException;
+      if (
+        !isReplay &&
+        proxyReq.reusedSocket &&
+        errWithCode.code === "ECONNRESET" &&
+        !res.headersSent &&
+        REPLAYABLE_METHODS.has(req.method || "") &&
+        isBodylessRequest(req)
+      ) {
+        req.unpipe(proxyReq);
+        handleRequest(req, res, true);
+        return;
+      }
       onError(`Proxy error for ${getRequestHost(req)}: ${dialErrorMessage(err)}`);
       if (!res.headersSent) {
-        const errWithCode = err as NodeJS.ErrnoException;
         const detail =
           errWithCode.code === "ECONNREFUSED"
             ? "The target app is not responding. It may have crashed."
@@ -1078,7 +1135,11 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       }
     });
 
-    req.pipe(proxyReq);
+    if (isReplay) {
+      proxyReq.end();
+    } else {
+      req.pipe(proxyReq);
+    }
   };
 
   const handleUpgrade = (req: http.IncomingMessage, socket: net.Socket, head: Buffer) => {
@@ -1150,6 +1211,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     }
 
     const proxyReq = http.request({
+      agent: false,
       ...LOOPBACK_DIAL_OPTIONS,
       port: route.port,
       path: req.url,
@@ -1334,6 +1396,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     const origClose = wrapper.close.bind(wrapper);
     wrapper.close = function (cb?: (err?: Error) => void) {
       closeH2cSessions(h2cSessions);
+      upstreamAgent.destroy();
       h2Server.close();
       plainServer.close();
       return origClose(cb);
@@ -1344,7 +1407,10 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
 
   const httpServer = http.createServer(handleRequest);
   httpServer.on("upgrade", handleUpgrade);
-  httpServer.on("close", () => closeH2cSessions(h2cSessions));
+  httpServer.on("close", () => {
+    closeH2cSessions(h2cSessions);
+    upstreamAgent.destroy();
+  });
 
   return httpServer;
 }
