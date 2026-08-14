@@ -128,6 +128,8 @@ describe("renderCertPage", () => {
     expect(html).toContain("Linux");
     expect(html).toContain("Windows");
     expect(html).toContain("Firefox");
+    expect(html).toContain("security.pki.certificateFiles");
+    expect(html).toContain("sudo nixos-rebuild switch");
     // <wbr> break hints are inserted at colons for balanced wrapping.
     expect(html.replaceAll("<wbr>", "")).toContain("AB:CD");
   });

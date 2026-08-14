@@ -15,6 +15,11 @@ import {
   untrustCALinux,
 } from "./certs.js";
 
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return { ...actual, readFileSync: vi.fn(actual.readFileSync) };
+});
+
 /**
  * Return the signature algorithm string for a PEM cert file using openssl.
  * X509Certificate.signatureAlgorithm was only added in Node.js 24.9.0 and
@@ -411,6 +416,73 @@ describe("isCATrusted", () => {
   it("returns false for an empty directory", () => {
     expect(isCATrusted(path.join(tmpDir, "nonexistent"))).toBe(false);
   });
+
+  it.skipIf(process.platform !== "linux")(
+    "accepts the Windows CurrentUser Root store when WSL Linux trust is absent",
+    () => {
+      const { caPath } = ensureCerts(tmpDir);
+      const fingerprint = new crypto.X509Certificate(fs.readFileSync(caPath)).fingerprint.replace(
+        /:/g,
+        ""
+      );
+      const fakeBinDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-wsl-ca-bin-"));
+      const certutilPath = path.join(fakeBinDir, "certutil");
+      const wslpathPath = path.join(fakeBinDir, "wslpath");
+      const originalPath = process.env.PATH;
+      const originalWslDistroName = process.env.WSL_DISTRO_NAME;
+      const readFileSyncMock = vi.mocked(fs.readFileSync);
+      const originalReadFileSync = readFileSyncMock.getMockImplementation()!;
+      readFileSyncMock.mockImplementation(
+        (filePath: Parameters<typeof fs.readFileSync>[0], options) => {
+          if (String(filePath) === "/etc/os-release") {
+            return "NAME=NixOS\nID=nixos\n";
+          }
+          return originalReadFileSync(filePath, options as Parameters<typeof fs.readFileSync>[1]);
+        }
+      );
+
+      fs.writeFileSync(
+        wslpathPath,
+        [
+          "#!/bin/sh",
+          'if [ "$1" = "-u" ]; then',
+          `  printf '%s\\n' ${JSON.stringify(certutilPath)}`,
+          "  exit 0",
+          "fi",
+          'if [ "$1" = "-w" ]; then',
+          "  printf '%s\\n' 'C:\\\\Users\\\\portless\\\\ca.pem'",
+          "  exit 0",
+          "fi",
+          "exit 1",
+        ].join("\n") + "\n"
+      );
+      fs.writeFileSync(
+        certutilPath,
+        [
+          "#!/bin/sh",
+          'if [ "$1" = "-store" ]; then',
+          `  printf '%s\\n' ${JSON.stringify(`Cert Hash(sha1): ${fingerprint}`)}`,
+          "fi",
+        ].join("\n") + "\n"
+      );
+      fs.chmodSync(wslpathPath, 0o755);
+      fs.chmodSync(certutilPath, 0o755);
+
+      try {
+        process.env.PATH = fakeBinDir;
+        process.env.WSL_DISTRO_NAME = "NixOS";
+
+        expect(isCATrusted(tmpDir)).toBe(true);
+      } finally {
+        readFileSyncMock.mockImplementation(originalReadFileSync);
+        if (originalPath === undefined) delete process.env.PATH;
+        else process.env.PATH = originalPath;
+        if (originalWslDistroName === undefined) delete process.env.WSL_DISTRO_NAME;
+        else process.env.WSL_DISTRO_NAME = originalWslDistroName;
+        fs.rmSync(fakeBinDir, { recursive: true, force: true });
+      }
+    }
+  );
 });
 
 describe("trustCA", () => {
@@ -461,6 +533,68 @@ describe("trustCA", () => {
       } finally {
         process.env.PATH = origPath;
         fs.rmSync(fakeBinDir, { recursive: true, force: true });
+      }
+    }
+  );
+
+  it.skipIf(process.platform !== "linux")(
+    "returns manual setup guidance on NixOS-style Linux distros (#336)",
+    () => {
+      const originalReadFileSync = vi.mocked(fs.readFileSync).getMockImplementation()!;
+
+      // Generate real certs so trustCA reaches the trust-store branch.
+      ensureCerts(tmpDir);
+
+      const readFileSyncMock = vi.mocked(fs.readFileSync);
+      readFileSyncMock.mockImplementation(
+        (filePath: Parameters<typeof fs.readFileSync>[0], options) => {
+          if (String(filePath) === "/etc/os-release") {
+            return "NAME=NixOS\nID=nixos\n";
+          }
+          return originalReadFileSync(filePath, options as Parameters<typeof fs.readFileSync>[1]);
+        }
+      );
+
+      try {
+        const result = trustCA(tmpDir);
+
+        expect(result.trusted).toBe(false);
+        expect(result.error).toContain("NixOS");
+        expect(result.error).toContain("security.pki.certificateFiles");
+        expect(result.error).toContain("sudo nixos-rebuild switch");
+      } finally {
+        readFileSyncMock.mockImplementation(originalReadFileSync);
+      }
+    }
+  );
+
+  it.skipIf(process.platform !== "linux")(
+    "returns generic manual setup guidance when Linux distro detection fails",
+    () => {
+      const originalPath = process.env.PATH;
+      const readFileSyncMock = vi.mocked(fs.readFileSync);
+      const originalReadFileSync = readFileSyncMock.getMockImplementation()!;
+      readFileSyncMock.mockImplementation(
+        (filePath: Parameters<typeof fs.readFileSync>[0], options) => {
+          if (String(filePath) === "/etc/os-release") {
+            return "NAME=Unrecognized Linux\nID=unrecognized\n";
+          }
+          return originalReadFileSync(filePath, options as Parameters<typeof fs.readFileSync>[1]);
+        }
+      );
+
+      // Ensure command probing cannot find a known trust updater.
+      ensureCerts(tmpDir);
+      try {
+        process.env.PATH = tmpDir;
+        const result = trustCA(tmpDir);
+
+        expect(result.trusted).toBe(false);
+        expect(result.error).toContain("does not have automatic CA trust wiring");
+      } finally {
+        readFileSyncMock.mockImplementation(originalReadFileSync);
+        if (originalPath === undefined) delete process.env.PATH;
+        else process.env.PATH = originalPath;
       }
     }
   );
@@ -533,5 +667,24 @@ describe("untrustCA", () => {
       })
     ).toEqual({ removed: true });
     expect(runUpdate).not.toHaveBeenCalled();
+  });
+
+  it("skips Linux trust configurations without certificate directories", () => {
+    const { caPath } = ensureCerts(tmpDir);
+    const trustDir = path.join(tmpDir, "linux-trust");
+    const installedCA = path.join(trustDir, "portless-ca.crt");
+    const config = { certDir: trustDir, updateCommand: "refresh-linux-trust" };
+    const runUpdate = vi.fn<(command: string) => void>();
+    fs.mkdirSync(trustDir);
+    fs.copyFileSync(caPath, installedCA);
+
+    expect(
+      untrustCALinux(tmpDir, {
+        configs: [{ manualSetupMessage: "manual setup" }, config],
+        activeConfig: config,
+        runUpdate,
+      })
+    ).toEqual({ removed: true });
+    expect(runUpdate).toHaveBeenCalledWith("refresh-linux-trust");
   });
 });

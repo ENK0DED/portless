@@ -355,6 +355,7 @@ export function renderCertPage(data: CertPageData): string {
     "<strong>Download</strong> the certificate above.",
     'Copy it into your trust anchors, e.g. <span class="inline-code">sudo cp portless-ca.pem /usr/local/share/ca-certificates/portless-ca.crt</span>.',
     'Run <span class="inline-code">sudo update-ca-certificates</span> (Debian/Ubuntu) or <span class="inline-code">sudo update-ca-trust</span> (Fedora/Arch/openSUSE).',
+    'NixOS users: add the generated file to your system configuration, e.g. <span class="inline-code">security.pki.certificateFiles = ["/path/to/portless-ca.pem"];</span>, then run <span class="inline-code">sudo nixos-rebuild switch</span>.',
     "Firefox keeps its own store — import it under <strong>Settings → Privacy &amp; Security → Certificates → Authorities</strong>.",
   ];
   const winSteps = [
