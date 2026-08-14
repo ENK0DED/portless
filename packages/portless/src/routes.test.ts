@@ -4,7 +4,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
-import { RouteStore, RouteConflictError, isRetryableLockError } from "./routes.js";
+import { FILE_MODE, RouteStore, RouteConflictError, isRetryableLockError } from "./routes.js";
 
 describe("RouteStore", () => {
   let tmpDir: string;
@@ -122,7 +122,7 @@ describe("RouteStore", () => {
       expect(raw).toHaveLength(2);
     });
 
-    it("persists cleaned-up routes when persistCleanup is true", () => {
+    it("persists cleaned-up routes through an atomic temp file", async () => {
       const deadPid = 999999;
       const routes = [
         { hostname: "alive.localhost", port: 4001, pid: process.pid },
@@ -130,7 +130,20 @@ describe("RouteStore", () => {
       ];
       store.ensureDir();
       fs.writeFileSync(store.getRoutesPath(), JSON.stringify(routes));
-      store.loadRoutes(true);
+      const events: string[] = [];
+      const watcher = fs.watch(tmpDir, (_eventType, filename) => {
+        if (filename) events.push(filename.toString());
+      });
+      try {
+        store.loadRoutes(true);
+        for (let attempt = 0; attempt < 20; attempt++) {
+          if (events.some((entry) => entry.startsWith("routes.json.tmp-"))) break;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        expect(events.some((entry) => entry.startsWith("routes.json.tmp-"))).toBe(true);
+      } finally {
+        watcher.close();
+      }
 
       // Re-read the file directly to verify it was cleaned up
       const raw = JSON.parse(fs.readFileSync(store.getRoutesPath(), "utf-8"));
@@ -154,6 +167,34 @@ describe("RouteStore", () => {
       const s = new RouteStore(nested);
       s.addRoute("test.localhost", 4001, process.pid);
       expect(fs.existsSync(s.getRoutesPath())).toBe(true);
+    });
+
+    it("cleans the temp file when the atomic rename fails", async () => {
+      store.ensureDir();
+      fs.mkdirSync(store.getRoutesPath());
+      const events: string[] = [];
+      const watcher = fs.watch(tmpDir, (_eventType, filename) => {
+        if (filename) events.push(filename.toString());
+      });
+      try {
+        expect(() => store.addRoute("new.localhost", 4002, process.pid)).toThrow();
+        for (let attempt = 0; attempt < 20; attempt++) {
+          if (events.some((entry) => entry.startsWith("routes.json.tmp-"))) break;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        expect(events.some((entry) => entry.startsWith("routes.json.tmp-"))).toBe(true);
+        expect(fs.statSync(store.getRoutesPath()).isDirectory()).toBe(true);
+        expect(
+          fs.readdirSync(tmpDir).filter((entry) => entry.startsWith("routes.json.tmp-"))
+        ).toEqual([]);
+      } finally {
+        watcher.close();
+      }
+    });
+
+    it("writes route files with the configured file mode", () => {
+      store.addRoute("mode.localhost", 4003, process.pid);
+      expect(fs.statSync(store.getRoutesPath()).mode & 0o777).toBe(FILE_MODE);
     });
   });
 

@@ -226,6 +226,8 @@ PORTLESS_SUFFIX=test,server01.acme.com portless proxy start
 
 Each suffix may be a single label such as `test` or a dotted suffix such as `server01.acme.com`. Values are trimmed, lowercased, deduplicated in order, and validated as DNS names. Each label is limited to 63 characters, and every full suffix and generated hostname is limited to 253 characters. `PORTLESS_SUFFIX` is preferred over the legacy `PORTLESS_TLD` variable, and repeatable `--tld <tld>` remains accepted as a compatibility alias. In LAN mode, explicit suffixes are preserved and `local` is appended; plain LAN mode uses only `local`, and mDNS publishes only those `.local` routes.
 
+The proxy periodically removes route records whose owning process is dead. The sweep runs every 300 seconds by default, can be tuned with `--routes-cleanup-interval <seconds>` or `PORTLESS_ROUTES_CLEANUP_INTERVAL=<seconds>`, and is disabled by setting either value to `0`. It removes stale route and sharing metadata without terminating the app process behind the route's port.
+
 ### Environment variables
 
 | Variable                          | Description                                                                 |
@@ -257,6 +259,8 @@ Each suffix may be a single label such as `test` or a dotted suffix such as `ser
 | `PORTLESS_NETBIRD_GROUPS`         | Restrict the NetBird public URL to comma-separated user groups              |
 | `PORTLESS_STATE_DIR`              | Override the state directory                                                |
 | `PORTLESS=0`                      | Bypass the proxy, run the command directly                                  |
+
+`PORTLESS_ROUTES_CLEANUP_INTERVAL` sets the dead-route sweep interval in seconds. The default is 300; `0` disables the sweep.
 
 ### HTTP/2 + HTTPS
 

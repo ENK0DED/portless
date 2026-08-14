@@ -1616,6 +1616,26 @@ describe("buildProxyStartConfig", () => {
       args: ["--https", "--suffix", "localhost", "--suffix", "test"],
     });
   });
+
+  it("forwards the routes cleanup interval, including zero", () => {
+    expect(
+      buildProxyStartConfig({
+        useHttps: false,
+        lanMode: false,
+        tld: "localhost",
+        routesCleanupIntervalSeconds: 60,
+      }).args
+    ).toEqual(["--no-tls", "--routes-cleanup-interval", "60"]);
+
+    expect(
+      buildProxyStartConfig({
+        useHttps: false,
+        lanMode: false,
+        tld: "localhost",
+        routesCleanupIntervalSeconds: 0,
+      }).args
+    ).toEqual(["--no-tls", "--routes-cleanup-interval", "0"]);
+  });
 });
 
 describe("buildSudoEnvArgs", () => {
