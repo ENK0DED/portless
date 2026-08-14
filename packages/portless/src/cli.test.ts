@@ -1238,6 +1238,132 @@ describe("CLI", () => {
         expect(parsed.logs.stderr).toContain(".stderr.log");
       });
 
+      it("omits the NetBird password from JSON status", () => {
+        const entry = makeBgEntry({
+          id: "json-password",
+          label: "json-password",
+          pid: 2_147_483_647,
+        });
+        writeBgRegistry(tmpDir, [
+          {
+            ...entry,
+            intent: {
+              ...entry.intent,
+              sharing: {
+                ...entry.intent.sharing,
+                netbird: true,
+                netbirdPassword: "placeholder-password",
+              },
+            },
+          },
+        ]);
+
+        const { status, stdout } = run(["bg", "status", "json-password", "--json"], {
+          env: bgEnv(),
+        });
+
+        expect(status).toBe(0);
+        expect(stdout).not.toContain("placeholder-password");
+      });
+
+      it("omits the NetBird PIN from JSON status", () => {
+        const entry = makeBgEntry({ id: "json-pin", label: "json-pin", pid: 2_147_483_647 });
+        writeBgRegistry(tmpDir, [
+          {
+            ...entry,
+            intent: {
+              ...entry.intent,
+              sharing: {
+                ...entry.intent.sharing,
+                netbird: true,
+                netbirdPin: "0000",
+              },
+            },
+          },
+        ]);
+
+        const { status, stdout } = run(["bg", "status", "json-pin", "--json"], {
+          env: bgEnv(),
+        });
+
+        expect(status).toBe(0);
+        expect(stdout).not.toContain("0000");
+      });
+
+      it("reports whether NetBird credentials are set in JSON list output", () => {
+        const withCredentials = makeBgEntry({
+          id: "with-credentials",
+          label: "with-credentials",
+          pid: 2_147_483_647,
+        });
+        const withoutCredentials = makeBgEntry({
+          id: "without-credentials",
+          label: "without-credentials",
+          pid: 2_147_483_647,
+        });
+        writeBgRegistry(tmpDir, [
+          {
+            ...withCredentials,
+            intent: {
+              ...withCredentials.intent,
+              sharing: {
+                ...withCredentials.intent.sharing,
+                netbird: true,
+                netbirdPassword: "placeholder-password",
+                netbirdPin: "0000",
+              },
+            },
+          },
+          withoutCredentials,
+        ]);
+
+        const { status, stdout } = run(["bg", "list", "--json"], { env: bgEnv() });
+        const entries = JSON.parse(stdout) as Array<{
+          id: string;
+          intent: {
+            sharing: {
+              netbirdPasswordSet: boolean;
+              netbirdPinSet: boolean;
+            };
+          };
+        }>;
+
+        expect(status).toBe(0);
+        expect(stdout).not.toContain("placeholder-password");
+        expect(stdout).not.toContain("0000");
+        expect(
+          entries.find((entry) => entry.id === "with-credentials")?.intent.sharing
+        ).toMatchObject({
+          netbirdPasswordSet: true,
+          netbirdPinSet: true,
+        });
+        expect(
+          entries.find((entry) => entry.id === "without-credentials")?.intent.sharing
+        ).toMatchObject({
+          netbirdPasswordSet: false,
+          netbirdPinSet: false,
+        });
+      });
+
+      it("preserves representative entry fields when JSON status has no NetBird credentials", () => {
+        const entry = makeBgEntry({
+          id: "json-fields",
+          label: "json-fields",
+          pid: 2_147_483_647,
+        });
+        writeBgRegistry(tmpDir, [entry]);
+
+        const { status, stdout } = run(["bg", "status", "json-fields", "--json"], {
+          env: bgEnv(),
+        });
+        const parsed = JSON.parse(stdout) as TestBgEntry & { logs: Record<string, string> };
+
+        expect(status).toBe(0);
+        expect(parsed.id).toBe("json-fields");
+        expect(parsed.label).toBe("json-fields");
+        expect(parsed.logs).toEqual(getBgLogPaths(tmpDir, "json-fields"));
+      });
+
       it("lists all background entries sorted by label", async () => {
         const alphaPort = await getFreePort();
         const zetaPort = await getFreePort();

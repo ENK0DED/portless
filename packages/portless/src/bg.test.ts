@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { parseBgStartArgs } from "./bg.js";
+import { parseBgStartArgs, runArgsFromIntent } from "./bg.js";
+import type { BgStartIntent } from "./bg-store.js";
 
 describe("bg start parser", () => {
   it("parses bg start with every current run flag", () => {
@@ -24,9 +25,9 @@ describe("bg start parser", () => {
       "--ngrok",
       "--netbird",
       "--netbird-password",
-      "secret",
+      "placeholder-password",
       "--netbird-pin",
-      "123456",
+      "0000",
       "--netbird-groups",
       "admins,devs",
       "--wait",
@@ -64,9 +65,9 @@ describe("bg start parser", () => {
       "--ngrok",
       "--netbird",
       "--netbird-password",
-      "secret",
+      "placeholder-password",
       "--netbird-pin",
-      "123456",
+      "0000",
       "--netbird-groups",
       "admins,devs",
       "--",
@@ -106,5 +107,31 @@ describe("bg start parser", () => {
     expect(parsed.waitSeconds).toBe(30);
     expect(parsed.keep).toBe(false);
     expect(parsed.runArgs).toEqual(["vite", "--no-wait", "--keep"]);
+  });
+
+  it("builds restart arguments without NetBird credentials", () => {
+    const intent: BgStartIntent = {
+      cwd: "/tmp/app",
+      commandArgs: ["bun", "run", "dev"],
+      explicitCommand: true,
+      force: false,
+      pathPrefix: "/",
+      sharing: {
+        tailscale: false,
+        tailscaleService: false,
+        funnel: false,
+        ngrok: false,
+        netbird: true,
+        netbirdPassword: "placeholder-password",
+        netbirdPin: "0000",
+      },
+    };
+
+    const args = runArgsFromIntent(intent, false);
+
+    expect(args).not.toContain("--netbird-password");
+    expect(args).not.toContain("--netbird-pin");
+    expect(args).not.toContain("placeholder-password");
+    expect(args).not.toContain("0000");
   });
 });

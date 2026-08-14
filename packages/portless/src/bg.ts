@@ -65,9 +65,15 @@ export interface BgStopEntryOperations {
   waitForProcessExit?: (pid: number, timeoutMs: number) => Promise<boolean>;
 }
 
-interface EntryView extends BgProcessEntry {
+type EntryView = Omit<BgProcessEntry, "intent"> & {
+  intent: Omit<BgStartIntent, "sharing"> & {
+    sharing: Omit<BgStartIntent["sharing"], "netbirdPassword" | "netbirdPin"> & {
+      netbirdPasswordSet: boolean;
+      netbirdPinSet: boolean;
+    };
+  };
   logs: BgLogPaths;
-}
+};
 
 const RUN_VALUE_FLAGS = new Set([
   "--name",
@@ -137,8 +143,8 @@ ${colors.bold("Run options forwarded to portless run:")}
   --funnel                      Share publicly via Tailscale Funnel
   --ngrok                       Share publicly via ngrok
   --netbird                     Share publicly via NetBird Peer Expose
-  --netbird-password <string>   Require a password for the NetBird public URL
-  --netbird-pin <code>          Require a PIN for the NetBird public URL
+  --netbird-password <string>   Require a password; PORTLESS_NETBIRD_PASSWORD keeps it out of process listings
+  --netbird-pin <code>          Require a PIN; PORTLESS_NETBIRD_PIN keeps it out of process listings
   --netbird-groups <csv>        Restrict the NetBird URL to user groups
 
 ${colors.bold("Background options:")}
@@ -582,7 +588,7 @@ export async function stopEntry(
   return { stopped: true, alreadyStopped: !alive };
 }
 
-function runArgsFromIntent(intent: BgStartIntent, force: boolean): string[] {
+export function runArgsFromIntent(intent: BgStartIntent, force: boolean): string[] {
   const args: string[] = [];
   if (intent.name) args.push("--name", intent.name);
   if (force || intent.force) args.push("--force");
@@ -601,9 +607,6 @@ function runArgsFromIntent(intent: BgStartIntent, force: boolean): string[] {
   if (intent.sharing.funnel) args.push("--funnel");
   if (intent.sharing.ngrok) args.push("--ngrok");
   if (intent.sharing.netbird) args.push("--netbird");
-  if (intent.sharing.netbirdPassword)
-    args.push("--netbird-password", intent.sharing.netbirdPassword);
-  if (intent.sharing.netbirdPin) args.push("--netbird-pin", intent.sharing.netbirdPin);
   if (intent.sharing.netbirdGroups) args.push("--netbird-groups", intent.sharing.netbirdGroups);
   return args;
 }
@@ -630,8 +633,17 @@ export function buildRestartStartArgs(
 }
 
 function withLogs(stateDir: string, entry: BgProcessEntry): EntryView {
+  const { netbirdPassword, netbirdPin, ...sharing } = entry.intent.sharing;
   return {
     ...entry,
+    intent: {
+      ...entry.intent,
+      sharing: {
+        ...sharing,
+        netbirdPasswordSet: netbirdPassword !== undefined && netbirdPassword !== "",
+        netbirdPinSet: netbirdPin !== undefined && netbirdPin !== "",
+      },
+    },
     logs: getBgLogPaths(stateDir, entry.id),
   };
 }
@@ -998,7 +1010,11 @@ async function handleBgRestart(args: string[], options: { entryScript: string })
       process.exit(1);
     }
     const startArgs = buildRestartStartArgs(entry.intent, parsed);
-    await handleBgStart(startArgs, options, { cwd: entry.cwd });
+    await handleBgStart(startArgs, options, {
+      cwd: entry.cwd,
+      netbirdPassword: entry.intent.sharing.netbirdPassword,
+      netbirdPin: entry.intent.sharing.netbirdPin,
+    });
   } catch (err) {
     console.error(colors.red(`Error: ${(err as Error).message}`));
     process.exit(1);
@@ -1107,7 +1123,7 @@ export async function pruneBgEntriesForState(stateDir: string): Promise<{ remove
 async function handleBgStart(
   startArgs: string[],
   options: { entryScript: string },
-  startOptions: { cwd?: string } = {}
+  startOptions: { cwd?: string; netbirdPassword?: string; netbirdPin?: string } = {}
 ): Promise<void> {
   let parsed: ParsedBgStartArgs;
   try {
@@ -1126,7 +1142,16 @@ async function handleBgStart(
   const readyPath = getBgReadyPath(state.dir, id);
   const logs = getBgLogPaths(state.dir, id);
   const cwd = startOptions.cwd ?? process.cwd();
-  const { intent, label } = parseRunIntent(parsed.runArgs, cwd);
+  const parsedIntent = parseRunIntent(parsed.runArgs, cwd);
+  const label = parsedIntent.label;
+  const intent: BgStartIntent = {
+    ...parsedIntent.intent,
+    sharing: {
+      ...parsedIntent.intent.sharing,
+      ...(startOptions.netbirdPassword ? { netbirdPassword: startOptions.netbirdPassword } : {}),
+      ...(startOptions.netbirdPin ? { netbirdPin: startOptions.netbirdPin } : {}),
+    },
+  };
   const startedAt = new Date().toISOString();
   let entry: BgProcessEntry = {
     version: 1,
@@ -1149,15 +1174,30 @@ async function handleBgStart(
       ...process.env,
       [PORTLESS_BG_ID_ENV]: id,
       [PORTLESS_BG_READY_PATH_ENV]: readyPath,
+      ...(intent.sharing.netbirdPassword
+        ? { PORTLESS_NETBIRD_PASSWORD: intent.sharing.netbirdPassword }
+        : {}),
+      ...(intent.sharing.netbirdPin ? { PORTLESS_NETBIRD_PIN: intent.sharing.netbirdPin } : {}),
     };
     delete childEnv.PORTLESS;
-    child = spawn(process.execPath, [options.entryScript, "run", ...parsed.runArgs], {
-      cwd,
-      detached: true,
-      env: childEnv,
-      stdio: ["ignore", stdoutFd, stderrFd],
-      windowsHide: true,
-    });
+    child = spawn(
+      process.execPath,
+      [
+        options.entryScript,
+        "run",
+        ...runArgsFromIntent(intent, false),
+        // runArgsFromIntent no longer appends the command tail, so restore the
+        // separator here; everything after it is the user's command.
+        ...(intent.explicitCommand ? ["--", ...intent.commandArgs] : []),
+      ],
+      {
+        cwd,
+        detached: true,
+        env: childEnv,
+        stdio: ["ignore", stdoutFd, stderrFd],
+        windowsHide: true,
+      }
+    );
   } catch (err) {
     closeLogFd(stdoutFd);
     closeLogFd(stderrFd);
