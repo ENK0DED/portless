@@ -120,6 +120,8 @@ Current fork-owned commits and what they protect:
 | `e2b237b` | Recorded the package-script flag injection ticket resolution and ledger rows for the 0.15 sync feature batch.                                                                                      |
 | `11c28fe` | Proxied cleartext HTTP/1.1 WebSocket upgrades on the TLS port through strict route selection and answered 502 on malformed backend WebSocket handshakes.                                           |
 | `df47943` | Merged the ticket 17 worktree branch bringing residual #363 WebSocket behaviors into the sync branch.                                                                                              |
+| `199c5ef` | Excluded the untracked `.scratch` agent tracker directory from the repository Prettier gate.                                                                                                       |
+| `e8fab11` | Updated the fork-only ledger for the ticket 15 resolution and the ticket 17 integration merge.                                                                                                     |
 
 ## Fork-Owned Invariants
 
