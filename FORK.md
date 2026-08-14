@@ -111,7 +111,9 @@ Current fork-owned commits and what they protect:
 | `d3c3f57` | Resolved Wayfinder ticket 12 with implementation decisions, coverage, and verification evidence.                                                                                                   |
 | `92370cb` | Finalized the suffix-list ledger before the loopback-bind implementation.                                                                                                                          |
 | `a8fc980` | Added loopback-by-default proxy and redirect binds with per-target TLS wrappers, LAN-mode widening, and socket-level bind coverage.                                                                |
+| `6d93382` | Recorded the loopback-bind implementation in the fork-only ledger.                                                                                                                                 |
 | `c405ea9` | Added exact persisted Tailscale Serve, Funnel, and Service hostname routing while preserving exact tunnel aliases and rejecting unrelated public hosts.                                            |
+| `624fd7c` | Resolved Wayfinder ticket 14 with Tailscale hostname routing decisions, coverage, and verification evidence.                                                                                       |
 
 ## Fork-Owned Invariants
 
