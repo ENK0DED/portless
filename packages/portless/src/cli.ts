@@ -72,6 +72,7 @@ import {
   getConfiguredTldEnv,
   getDefaultPort,
   getDefaultTlds,
+  getProxyBindTargets,
   hasConfiguredTldEnv,
   hasPlaceholders,
   injectFrameworkFlags,
@@ -82,6 +83,7 @@ import {
   isProxyRunning,
   isWindows,
   killTree,
+  listenOnProxyInterface,
   readLanMarker,
   readPersistedProxyState,
   readTldsFromDir,
@@ -545,6 +547,14 @@ function formatViteAllowedHosts(tlds: readonly string[]): string {
   return tlds.map((configuredTld) => `.${configuredTld}`).join(",");
 }
 
+function formatBindEndpoint(host: string, port: number): string {
+  return host.includes(":") ? `[${host}]:${port}` : `${host}:${port}`;
+}
+
+function isUnavailableIpv6Bind(err: NodeJS.ErrnoException, host: string): boolean {
+  return host.includes(":") && (err.code === "EAFNOSUPPORT" || err.code === "EADDRNOTAVAIL");
+}
+
 type RouteRegistrationOptions = {
   protocol?: RouteProtocol;
   pathPrefix?: string;
@@ -644,13 +654,16 @@ function startProxyServer(
   tlds: string[],
   tlsOptions?: { cert: Buffer; key: Buffer },
   lanIp?: string | null,
-  strict?: boolean
+  strict?: boolean,
+  lanMode = false
 ): void {
   store.ensureDir();
 
   const isTls = !!tlsOptions;
   const mdnsSupport = isMdnsSupported();
   let activeLanIp = lanIp && mdnsSupport.supported ? lanIp : null;
+  const bindTargets = getProxyBindTargets(lanMode);
+  const primaryBindTarget = bindTargets[0]!;
   const lanIpPinned = !!process.env.PORTLESS_LAN_IP;
   let lanMonitor: ReturnType<typeof startLanIpMonitor> | null = null;
   if (lanIp && !mdnsSupport.supported) {
@@ -776,18 +789,32 @@ function startProxyServer(
     return value;
   };
 
-  const server = createProxyServer({
-    getRoutes: () => cachedRoutes,
-    getTunnelAliases: () => new TunnelAliasStore(store.dir).loadAliases(),
-    proxyPort,
-    tld,
-    tlds,
-    strict,
-    onError: (msg) => console.error(colors.red(msg)),
-    tls: tlsOptions,
-    internalPages: process.env.PORTLESS_DASHBOARD !== "0",
-    getCaTrusted,
-  });
+  const createServer = () =>
+    createProxyServer({
+      getRoutes: () => cachedRoutes,
+      getTunnelAliases: () => new TunnelAliasStore(store.dir).loadAliases(),
+      proxyPort,
+      tld,
+      tlds,
+      strict,
+      onError: (msg) => console.error(colors.red(msg)),
+      tls: tlsOptions,
+      internalPages: process.env.PORTLESS_DASHBOARD !== "0",
+      getCaTrusted,
+    });
+  const server = createServer();
+  const additionalServers = new Set<ReturnType<typeof createProxyServer>>();
+  const redirectServers = new Set<ReturnType<typeof createHttpRedirectServer>>();
+
+  const closeAuxiliaryServers = () => {
+    for (const auxiliaryServer of [...additionalServers, ...redirectServers]) {
+      try {
+        auxiliaryServer.close();
+      } catch {
+        // The listener may have failed before it started; nothing to close.
+      }
+    }
+  };
 
   server.on("error", (err: NodeJS.ErrnoException) => {
     if (err.code === "EADDRINUSE") {
@@ -807,23 +834,58 @@ function startProxyServer(
     } else {
       console.error(colors.red(`Proxy error: ${err.message}`));
     }
-    if (redirectServer) redirectServer.close();
+    closeAuxiliaryServers();
     process.exit(1);
   });
+
+  const proto = isTls ? "HTTPS/2" : "HTTP";
+  const tldLabel =
+    tlds.length > 1 || tld !== DEFAULT_TLD ? ` (suffixes: ${formatTldList(tlds)})` : "";
+  const modeLabel = strict === false ? " (wildcard)" : "";
+
+  for (const bindTarget of bindTargets.slice(1)) {
+    const additionalServer = createServer();
+    additionalServers.add(additionalServer);
+    additionalServer.on("error", (err: NodeJS.ErrnoException) => {
+      additionalServers.delete(additionalServer);
+      if (!isUnavailableIpv6Bind(err, bindTarget.host)) {
+        console.warn(
+          colors.yellow(
+            `Could not listen on ${formatBindEndpoint(bindTarget.host, proxyPort)}: ${err.message}`
+          )
+        );
+      }
+    });
+    listenOnProxyInterface(additionalServer, proxyPort, bindTarget, () => {
+      console.log(
+        colors.green(
+          `${proto} proxy listening on ${formatBindEndpoint(bindTarget.host, proxyPort)}${tldLabel}${modeLabel}`
+        )
+      );
+    });
+  }
 
   // When TLS is enabled, start a plain HTTP server on port 80 that redirects
   // to HTTPS. Best-effort: if port 80 is unavailable, skip silently (the main
   // proxy on 443 still works; users just won't get automatic redirects).
-  let redirectServer: ReturnType<typeof createHttpRedirectServer> | null = null;
   if (isTls && proxyPort !== 80) {
-    redirectServer = createHttpRedirectServer(proxyPort);
-    redirectServer.on("error", () => {
-      redirectServer = null;
-    });
-    redirectServer.listen(80);
+    for (const bindTarget of bindTargets) {
+      const redirectServer = createHttpRedirectServer(proxyPort);
+      redirectServers.add(redirectServer);
+      redirectServer.on("error", () => {
+        redirectServers.delete(redirectServer);
+      });
+      listenOnProxyInterface(redirectServer, 80, bindTarget, () => {
+        console.log(
+          colors.green(
+            `HTTP-to-HTTPS redirect listening on ${formatBindEndpoint(bindTarget.host, 80)}`
+          )
+        );
+      });
+    }
   }
 
-  server.listen(proxyPort, () => {
+  listenOnProxyInterface(server, proxyPort, primaryBindTarget, () => {
     // Save PID and port once the server is actually listening
     fs.writeFileSync(store.pidPath, process.pid.toString(), { mode: FILE_MODE });
     fs.writeFileSync(store.portFilePath, proxyPort.toString(), { mode: FILE_MODE });
@@ -832,12 +894,10 @@ function startProxyServer(
     writeLanMarker(store.dir, activeLanIp);
     writeWildcardMarker(store.dir, strict === false);
     fixOwnership(store.dir, store.pidPath, store.portFilePath);
-    const proto = isTls ? "HTTPS/2" : "HTTP";
-    const tldLabel =
-      tlds.length > 1 || tld !== DEFAULT_TLD ? ` (suffixes: ${formatTldList(tlds)})` : "";
-    const modeLabel = strict === false ? " (wildcard)" : "";
     console.log(
-      colors.green(`${proto} proxy listening on port ${proxyPort}${tldLabel}${modeLabel}`)
+      colors.green(
+        `${proto} proxy listening on ${formatBindEndpoint(primaryBindTarget.host, proxyPort)}${tldLabel}${modeLabel}`
+      )
     );
     if (activeLanIp) {
       console.log(chalk.green(`LAN mode: ${activeLanIp}`));
@@ -857,9 +917,6 @@ function startProxyServer(
         });
       }
     }
-    if (redirectServer) {
-      console.log(colors.green("HTTP-to-HTTPS redirect listening on port 80"));
-    }
   });
 
   // Cleanup on exit
@@ -874,9 +931,7 @@ function startProxyServer(
       watcher.close();
     }
     if (activeLanIp) cleanupMdns();
-    if (redirectServer) {
-      redirectServer.close();
-    }
+    closeAuxiliaryServers();
     try {
       fs.unlinkSync(store.pidPath);
     } catch {
@@ -3211,6 +3266,7 @@ ${colors.bold("How it works:")}
   5. Frameworks that ignore PORT (Vite, VitePlus, VitePress, Astro,
      React Router, Angular, Laravel, Expo, React Native, Wrangler) get --port and, when needed,
      --host or --ip flags injected automatically
+  6. The proxy listens only on 127.0.0.1 and ::1 unless LAN mode is enabled
 
 ${colors.bold("Background apps:")}
   Use portless bg start for long-lived local servers that should keep running
@@ -3243,6 +3299,8 @@ ${colors.bold("HTTP/2 + HTTPS (default):")}
 ${colors.bold("LAN mode:")}
   Use --lan to make services accessible from other devices (phones,
   tablets) on the same WiFi network via mDNS (.local domains).
+  Normal mode binds only to 127.0.0.1 and ::1.
+  LAN mode binds to 0.0.0.0 and ::.
   Useful for testing React Native / Expo apps on real devices.
   Expo keeps Metro's default LAN host behavior in this mode.
   Auto-detected LAN IPs follow network changes automatically.
@@ -4308,6 +4366,8 @@ ${colors.bold("Usage:")}
   ${colors.cyan("portless proxy stop")}                 Stop the proxy
 
 ${colors.bold("LAN mode (--lan):")}
+  Without LAN mode, the proxy listens only on 127.0.0.1 and ::1.
+  LAN mode explicitly binds the proxy to 0.0.0.0 and ::.
   Makes services accessible from other devices on the same WiFi network
   via mDNS (.local domains). Useful for testing on real mobile devices.
   Auto-detects your LAN IP and follows changes automatically, or use
@@ -4748,7 +4808,8 @@ ${colors.bold("LAN mode (--lan):")}
       tlds,
       tlsOptions,
       lanIp,
-      desiredWildcard ? false : undefined
+      desiredWildcard ? false : undefined,
+      lanMode
     );
     return;
   }

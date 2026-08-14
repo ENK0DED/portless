@@ -92,6 +92,40 @@ export const SIGNAL_CODES: Record<string, number> = {
   SIGTERM: 15,
 };
 
+/** Listener address used when the proxy is only accessible from this machine. */
+export const IPV4_LOOPBACK_PROXY_HOST = "127.0.0.1";
+
+/** IPv6 listener address used when the proxy is only accessible from this machine. */
+export const IPV6_LOOPBACK_PROXY_HOST = "::1";
+
+/** IPv4 listener address used when LAN mode explicitly exposes the proxy. */
+export const IPV4_LAN_PROXY_HOST = "0.0.0.0";
+
+/** IPv6 listener address used when LAN mode explicitly exposes the proxy. */
+export const IPV6_LAN_PROXY_HOST = "::";
+
+export type ProxyBindTarget = {
+  host: string;
+  ipv6Only?: boolean;
+};
+
+/** Return explicit IPv4 and IPv6 listener targets for the effective proxy mode. */
+export function getProxyBindTargets(lanMode: boolean): ProxyBindTarget[] {
+  return lanMode
+    ? [{ host: IPV4_LAN_PROXY_HOST }, { host: IPV6_LAN_PROXY_HOST, ipv6Only: true }]
+    : [{ host: IPV4_LOOPBACK_PROXY_HOST }, { host: IPV6_LOOPBACK_PROXY_HOST, ipv6Only: true }];
+}
+
+/** Start a proxy listener on the selected interface and port. */
+export function listenOnProxyInterface(
+  server: net.Server,
+  port: number,
+  target: ProxyBindTarget,
+  listener?: () => void
+): void {
+  server.listen({ port, host: target.host, ipv6Only: target.ipv6Only }, listener);
+}
+
 /**
  * Kill a child process and its entire process tree. On Unix, when the child
  * was spawned with `detached: true`, it leads its own process group and

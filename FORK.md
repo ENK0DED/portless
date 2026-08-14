@@ -331,6 +331,7 @@ Rechecked against upstream on 2026-06-18: GitHub reported 48 open PRs. Every ope
 ### Security Decisions To Preserve
 
 - Public exposure stays explicit. NetBird, ngrok, Cloudflare Tunnel, Tailscale Funnel, and Tailscale Service never widen child app binds or imply another public exposure mode.
+- The proxy binds only to 127.0.0.1 and ::1 by default; widening it is explicit through LAN mode alone.
 - Apps remain loopback-bound by default. Do not add an implicit all-interfaces bind for sharing features without a separate reviewed opt-in.
 - Managed public exposure records enough PID or alias metadata for crash cleanup and stale-route cleanup.
 - WSL trust integration targets the Windows CurrentUser Root store for Windows browsers and removes certificates by SHA-1 fingerprint, not by common name.

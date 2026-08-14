@@ -301,6 +301,39 @@ async function getFreePort(): Promise<number> {
   }
 }
 
+async function waitForHttpHeader(
+  port: number,
+  headerName: string,
+  expectedValue: string,
+  hostname = "127.0.0.1"
+): Promise<void> {
+  for (let i = 0; i < 50; i++) {
+    const matched = await new Promise<boolean>((resolve) => {
+      const req = http.request(
+        {
+          hostname,
+          port,
+          method: "HEAD",
+          timeout: 200,
+        },
+        (res) => {
+          res.resume();
+          resolve(res.headers[headerName.toLowerCase()] === expectedValue);
+        }
+      );
+      req.on("error", () => resolve(false));
+      req.on("timeout", () => {
+        req.destroy();
+        resolve(false);
+      });
+      req.end();
+    });
+    if (matched) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`Timed out waiting for ${headerName} on ${hostname}:${port}`);
+}
+
 describe("CLI", () => {
   beforeAll(() => {
     if (!fs.existsSync(CLI_PATH)) {
@@ -2689,6 +2722,33 @@ describe("CLI", () => {
       const stop = run(["proxy", "stop"], { env: proxyEnv() });
       expect(stop.status).toBe(0);
       expect(stop.stdout).toContain("Proxy stopped");
+    });
+
+    it("accepts connections on IPv6 loopback when available", async (ctx) => {
+      const ipv6Probe = http.createServer();
+      const ipv6Available = await new Promise<boolean>((resolve, reject) => {
+        ipv6Probe.once("error", (err: NodeJS.ErrnoException) => {
+          if (err.code === "EAFNOSUPPORT" || err.code === "EADDRNOTAVAIL") {
+            resolve(false);
+          } else {
+            reject(err);
+          }
+        });
+        ipv6Probe.listen(0, "::1", () => resolve(true));
+      });
+      if (!ipv6Available) return ctx.skip();
+      await new Promise<void>((resolve) => ipv6Probe.close(() => resolve()));
+
+      const start = run(["proxy", "start"], { env: proxyEnv() });
+      expect(start.status, start.stdout + start.stderr).toBe(0);
+      const logPath = path.join(tmpDir, "proxy.log");
+      await expect(
+        waitForFileIncludes(logPath, `HTTP proxy listening on 127.0.0.1:${testPort}`)
+      ).resolves.toBe(true);
+      await waitForHttpHeader(testPort, "X-Portless", "1", "::1");
+      expect(fs.readFileSync(logPath, "utf-8")).toContain(
+        `HTTP proxy listening on [::1]:${testPort}`
+      );
     });
 
     it("reports not running when stopped twice", () => {

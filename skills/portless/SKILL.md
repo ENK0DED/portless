@@ -193,6 +193,8 @@ Background mode is not a public sharing feature. It keeps the same loopback-firs
 2. `portless <name> <cmd>` assigns a random port in the 4000 to 4999 range that is free on `127.0.0.1` via the `PORT` env var and registers the app with the proxy
 3. The browser hits `https://<name>.localhost`; the proxy forwards to the app's assigned port
 
+Outside LAN mode, the proxy and its HTTP redirect listener bind only to the IPv4 and IPv6 loopback addresses, `127.0.0.1` and `::1`. They do not accept connections through LAN, VPN, or other network interfaces.
+
 `.localhost` domains resolve to `127.0.0.1` natively in Chrome, Firefox, and Edge. Safari relies on the system DNS resolver, which may not handle `.localhost` subdomains on all configurations. Run `portless hosts sync` to add entries to `/etc/hosts` if needed.
 
 Most frameworks (Next.js, Express, Nuxt, etc.) respect the `PORT` env var automatically. Portless skips browser-blocked ports during auto-assignment and rejects them for fixed app ports. For frameworks that ignore `PORT` (Vite, VitePlus, VitePress, Astro, React Router, Angular, Laravel, Expo, React Native, Wrangler), portless auto-injects the correct `--port` flag and, when needed, a matching `--host` CLI flag or Wrangler's `--ip` flag.
@@ -308,7 +310,7 @@ portless proxy start --lan --https
 portless proxy start --lan --ip 192.168.1.42
 ```
 
-`--lan` advertises `<name>.local` hostnames over mDNS so any device on the same Wi-Fi can reach your apps. Portless auto-detects your LAN IP and follows network changes automatically, but you can pin a specific address with `--ip <address>` or the `PORTLESS_LAN_IP` environment variable. Set `PORTLESS_LAN=1` to default to LAN mode every time the proxy starts.
+`--lan` explicitly binds the proxy to the IPv4 and IPv6 unspecified addresses, `0.0.0.0` and `::`, and advertises `<name>.local` hostnames over mDNS so devices on the same Wi-Fi can reach your apps. Portless auto-detects your LAN IP and follows network changes automatically, but you can pin a specific address with `--ip <address>` or the `PORTLESS_LAN_IP` environment variable. Set `PORTLESS_LAN=1` to default to LAN mode every time the proxy starts.
 
 Portless remembers LAN mode via `proxy.lan`, so if you stop a LAN proxy and start again, it stays in LAN mode. All proxy settings (port, TLS, suffix, LAN) are persisted and reused on auto-start unless overridden by explicit flags or env vars. Use `PORTLESS_LAN=0` for one start to switch back to `.localhost` mode. If a proxy is already running with different explicit LAN/TLS/suffix settings, portless warns and asks you to stop it first.
 
