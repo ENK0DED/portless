@@ -364,6 +364,114 @@ describe("createProxyServer", () => {
       ).toBe(404);
     });
 
+    it.each([
+      ["Serve", "https://my-device.tail1234.ts.net", undefined],
+      ["Funnel", "https://my-device.tail1234.ts.net:8443", true],
+    ])("routes a request addressed to a Tailscale %s hostname", async (_mode, url, funnel) => {
+      const backend = trackServer(http.createServer((_req, res) => res.end("tailscale app")));
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const routes: RouteInfo[] = [
+        {
+          hostname: "myapp.localhost",
+          port: backendAddr.port,
+          tailscaleUrl: url,
+          tailscaleFunnel: funnel,
+        },
+      ];
+      const server = trackServer(
+        createProxyServer({ getRoutes: () => routes, proxyPort: TEST_PROXY_PORT })
+      );
+      await listen(server);
+
+      const res = await request(server, { host: new URL(url).host });
+      expect(res.status).toBe(200);
+      expect(res.body).toBe("tailscale app");
+    });
+
+    it("routes a request addressed to a Tailscale Service hostname", async () => {
+      const backend = trackServer(http.createServer((_req, res) => res.end("service app")));
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const serviceUrl = "https://api.tail1234.ts.net";
+      const routes: RouteInfo[] = [
+        {
+          hostname: "api.localhost",
+          port: backendAddr.port,
+          tailscaleServiceUrl: serviceUrl,
+        },
+      ];
+      const server = trackServer(
+        createProxyServer({ getRoutes: () => routes, proxyPort: TEST_PROXY_PORT })
+      );
+      await listen(server);
+
+      const res = await request(server, { host: new URL(serviceUrl).hostname });
+      expect(res.status).toBe(200);
+      expect(res.body).toBe("service app");
+    });
+
+    it("uses the longest path prefix for a Tailscale hostname", async () => {
+      const rootBackend = trackServer(http.createServer((_req, res) => res.end("tailscale root")));
+      const apiBackend = trackServer(http.createServer((_req, res) => res.end("tailscale api")));
+      await listen(rootBackend);
+      await listen(apiBackend);
+      const rootAddr = rootBackend.address();
+      const apiAddr = apiBackend.address();
+      if (!rootAddr || typeof rootAddr === "string" || !apiAddr || typeof apiAddr === "string") {
+        throw new Error("no addr");
+      }
+
+      const tailscaleUrl = "https://my-device.tail1234.ts.net";
+      const routes: RouteInfo[] = [
+        { hostname: "myapp.localhost", port: rootAddr.port, tailscaleUrl },
+        {
+          hostname: "myapp.localhost",
+          port: apiAddr.port,
+          pathPrefix: "/api",
+          tailscaleUrl,
+        },
+      ];
+      const server = trackServer(
+        createProxyServer({ getRoutes: () => routes, proxyPort: TEST_PROXY_PORT })
+      );
+      await listen(server);
+
+      const res = await request(server, {
+        host: "my-device.tail1234.ts.net",
+        path: "/api/users",
+      });
+      expect(res.status).toBe(200);
+      expect(res.body).toBe("tailscale api");
+    });
+
+    it("rejects an unrelated .ts.net host", async () => {
+      const backend = trackServer(http.createServer((_req, res) => res.end("private app")));
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const routes: RouteInfo[] = [
+        {
+          hostname: "myapp.localhost",
+          port: backendAddr.port,
+          tailscaleUrl: "https://my-device.tail1234.ts.net",
+        },
+      ];
+      const server = trackServer(
+        createProxyServer({ getRoutes: () => routes, proxyPort: TEST_PROXY_PORT, strict: false })
+      );
+      await listen(server);
+
+      const res = await request(server, { host: "other-device.tail1234.ts.net" });
+      expect(res.status).toBe(404);
+      expect(res.body).not.toBe("private app");
+    });
+
     it("uses the longest matching path prefix for the same hostname", async () => {
       const rootBackend = trackServer(http.createServer((_req, res) => res.end("root")));
       const apiBackend = trackServer(http.createServer((_req, res) => res.end("api")));

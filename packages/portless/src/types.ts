@@ -18,9 +18,9 @@ export interface RouteInfo {
    */
   label?: string;
   /**
-   * Public-exposure URLs, surfaced for display only (the dashboard and the
-   * `list` command). These are populated on the live route objects the proxy
-   * reads; the proxy itself never routes by them.
+   * Public-exposure URLs, surfaced in the dashboard and `list` output. The
+   * proxy also accepts each persisted URL's exact hostname as a route
+   * authority for Tailscale Serve, Funnel, and Service traffic.
    */
   tailscaleUrl?: string;
   tailscaleServiceUrl?: string;

@@ -366,14 +366,41 @@ const PORTLESS_HOPS_HEADER = "x-portless-hops";
  */
 const MAX_PROXY_HOPS = 5;
 
-/**
- * Find the route matching a given host. Matches exact hostname first, then
- * falls back to wildcard subdomain matching (e.g. tenant.myapp.localhost
- * matches a route registered for myapp.localhost).
- *
- * When `strict` is true, only exact matches are returned; unregistered
- * subdomain prefixes will not fall back to the base service.
- */
+/** Normalize an authority for case-insensitive matching and default HTTPS port handling. */
+function normalizeAuthority(authority: string): string {
+  const lower = authority.toLowerCase();
+  return lower.endsWith(":443") ? lower.slice(0, -4) : lower;
+}
+
+/** Extract the hostname portion from a normalized request authority. */
+function authorityHostname(authority: string): string {
+  if (authority.startsWith("[")) {
+    const closingBracket = authority.indexOf("]");
+    return closingBracket === -1 ? authority : authority.slice(0, closingBracket + 1);
+  }
+
+  const lastColon = authority.lastIndexOf(":");
+  const port = authority.slice(lastColon + 1);
+  return lastColon > -1 && /^\d+$/.test(port) ? authority.slice(0, lastColon) : authority;
+}
+
+/** Return the normalized authority stored in a Tailscale URL, or undefined if invalid. */
+function tailscaleAuthority(url: string | undefined): string | undefined {
+  if (!url) return undefined;
+  try {
+    return normalizeAuthority(new URL(url).host);
+  } catch {
+    return undefined;
+  }
+}
+
+function routeTailscaleAuthorities(route: RouteInfo): string[] {
+  return [route.tailscaleUrl, route.tailscaleServiceUrl]
+    .map(tailscaleAuthority)
+    .filter((authority): authority is string => authority !== undefined);
+}
+
+/** Pick the route with the longest matching path prefix. */
 function pickLongestPathRoute(routes: RouteInfo[], requestPath: string): RouteInfo | undefined {
   let best: RouteInfo | undefined;
   let bestLength = -1;
@@ -388,6 +415,12 @@ function pickLongestPathRoute(routes: RouteInfo[], requestPath: string): RouteIn
   return best;
 }
 
+/**
+ * Find the route matching a request authority. Exact local routes win first,
+ * followed by exact tunnel aliases, exact Tailscale authorities, and then
+ * Tailscale hostnames when the request port differs. The final non-strict
+ * fallback is the existing local subdomain match.
+ */
 function findRoute(
   routes: RouteInfo[],
   tunnelAliases: TunnelAlias[],
@@ -395,13 +428,15 @@ function findRoute(
   requestPath: string,
   strict?: boolean
 ): RouteInfo | undefined {
+  const authority = normalizeAuthority(host);
+  const hostname = authorityHostname(authority);
   const exact = pickLongestPathRoute(
-    routes.filter((r) => r.hostname === host),
+    routes.filter((r) => r.hostname === hostname),
     requestPath
   );
   if (exact) return exact;
 
-  const alias = tunnelAliases.find((entry) => entry.externalHostname === host);
+  const alias = tunnelAliases.find((entry) => entry.externalHostname === hostname);
   if (alias) {
     const targetPathPrefix = normalizePathPrefix(alias.targetPathPrefix);
     if (matchesPathPrefix(requestPath, targetPathPrefix)) {
@@ -413,9 +448,25 @@ function findRoute(
     }
   }
 
+  const tailscaleAuthorityRoute = pickLongestPathRoute(
+    routes.filter((route) => routeTailscaleAuthorities(route).includes(authority)),
+    requestPath
+  );
+  if (tailscaleAuthorityRoute) return tailscaleAuthorityRoute;
+
+  const tailscaleHostnameRoute = pickLongestPathRoute(
+    routes.filter((route) =>
+      routeTailscaleAuthorities(route).some(
+        (routeAuthority) => authorityHostname(routeAuthority) === hostname
+      )
+    ),
+    requestPath
+  );
+  if (tailscaleHostnameRoute) return tailscaleHostnameRoute;
+
   if (strict) return undefined;
   return pickLongestPathRoute(
-    routes.filter((r) => host.endsWith("." + r.hostname)),
+    routes.filter((r) => hostname.endsWith("." + r.hostname)),
     requestPath
   );
 }
@@ -691,7 +742,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
         (selected ? members.find((member) => member.label === selected) : undefined) ??
         defaultMember(members);
     } else {
-      route = findRoute(routes, tunnelAliases, host, path, strict);
+      route = findRoute(routes, tunnelAliases, authority, path, strict);
     }
 
     if (!route) return { ...base, rejectReason: "missing-route" };
@@ -822,7 +873,8 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
 
     const routes = getRoutes();
     const tunnelAliases = getTunnelAliases();
-    const host = getRequestHost(req).split(":")[0];
+    const rawHost = getRequestHost(req);
+    const host = rawHost.split(":")[0];
 
     if (!host) {
       res.writeHead(400, { "Content-Type": "text/plain" });
@@ -876,7 +928,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       route = resolveMultiplex(req, res, members, host, requestPath, reqTls);
       if (!route) return; // a picker page or selection redirect was served
     } else {
-      route = findRoute(routes, tunnelAliases, host, requestPath, strict);
+      route = findRoute(routes, tunnelAliases, rawHost, requestPath, strict);
     }
 
     if (!route) {
@@ -1051,7 +1103,8 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
 
     const routes = getRoutes();
     const tunnelAliases = getTunnelAliases();
-    const host = getRequestHost(req).split(":")[0];
+    const rawHost = getRequestHost(req);
+    const host = rawHost.split(":")[0];
 
     // Reserved internal hosts have no WebSocket surface.
     if (internalPages && isInternalHost(host)) {
@@ -1069,7 +1122,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
         (selected ? members.find((m) => m.label === selected) : undefined) ??
         defaultMember(members);
     } else {
-      route = findRoute(routes, tunnelAliases, host, requestPath, strict);
+      route = findRoute(routes, tunnelAliases, rawHost, requestPath, strict);
     }
 
     if (!route) {

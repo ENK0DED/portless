@@ -352,6 +352,8 @@ MagicDNS and Tailscale HTTPS certificates must be enabled before `--tailscale`, 
 
 Each `--tailscale` app is root-mounted on its own Tailscale HTTPS port (443, then 8443, 8444, etc.) so no framework `basePath` configuration is needed. Set `PORTLESS_TAILSCALE=1` to share every app by default. `portless list` shows both local and tailnet URLs. Tailscale serve registrations are cleaned up when the app exits. Requires `tailscale` CLI installed and connected, with MagicDNS and Tailscale HTTPS certificates enabled on the active tailnet.
 
+The proxy routes requests with a route's persisted Serve, Funnel, or Service hostname to that route. Matching is exact. Unrelated public Host values and wildcard `.ts.net` hostnames are rejected.
+
 `--tailscale-service` is tailnet-scoped and does not imply public Funnel exposure. Tailscale Services require tagged device identity and may need admin approval before MagicDNS resolves. Portless records pending approval in `portless list`.
 
 ### ngrok sharing

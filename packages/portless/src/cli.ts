@@ -3318,6 +3318,8 @@ ${colors.bold("Tailscale sharing:")}
   Use --tailscale to share your dev server with teammates on your tailnet.
   Each app is root-mounted on its own Tailscale HTTPS port (443, then 8443,
   8444, etc.) so no basePath configuration is needed.
+  Requests for a route's persisted Serve, Funnel, or Service hostname resolve
+  to that route. Matching is exact; unrelated public Host values are rejected.
   Use --tailscale-service for a stable Tailscale Service MagicDNS name.
   Tailscale Services require tagged device identity and may need admin approval
   before the service name resolves.

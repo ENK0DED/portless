@@ -401,6 +401,8 @@ portless myapp --tailscale next dev
 
 Each `--tailscale` app is root-mounted on its own Tailscale HTTPS port, so no framework `basePath` configuration is needed. The first app gets port 443, subsequent apps get 8443, 8444, etc.
 
+Requests arriving with a route's persisted Tailscale Serve or Funnel hostname are routed to that app. Tailscale Service hostnames work the same way. Matching is exact, so an unrelated `.ts.net` hostname is rejected.
+
 ```bash
 portless myapp --tailscale next dev     # -> https://devbox.ts.net
 portless api --tailscale bun start     # -> https://devbox.ts.net:8443
@@ -428,6 +430,8 @@ portless myapp --funnel next dev
 Tailscale HTTPS certificates must be enabled before `--tailscale`, `--tailscale-service`, or `--funnel` can register HTTPS URLs. Funnel must also be enabled for the tailnet and node before `--funnel` can register the public URL. If either setting is missing, portless exits before starting the child process.
 
 Set `PORTLESS_TAILSCALE=1` in your shell profile or `.env` to share every app by default. `portless list` shows both local and tailnet URLs. Tailscale serve registrations are cleaned up automatically when the app exits.
+
+The proxy routes exact requests for each persisted Serve, Funnel, or Service hostname to its registered app. It does not accept unrelated public Host values or wildcard-match other `.ts.net` names.
 
 Requires the Tailscale CLI to be installed and connected (`tailscale up`), with MagicDNS and Tailscale HTTPS certificates enabled on the active tailnet.
 
