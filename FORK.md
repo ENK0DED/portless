@@ -107,6 +107,8 @@ Current fork-owned commits and what they protect:
 | `05b2c69` | Prepared fork release `0.15.6000` for the post-merge feature batch.                                                                                                                                |
 | `207b3ff` | Updated the fork-only ledger for the `0.15.6000` release preparation commit.                                                                                                                       |
 | `dcb43fd` | Added ordered `PORTLESS_SUFFIX` lists, repeatable suffix flags, explicit LAN list preservation, exact `.local` mDNS publishing, and multi-suffix route, TLS, service, and state handling.          |
+| `e261c65` | Recorded the release-ledger and ordered suffix-list implementation commits in the fork-only ledger.                                                                                                |
+| `d3c3f57` | Resolved Wayfinder ticket 12 with implementation decisions, coverage, and verification evidence.                                                                                                   |
 
 ## Fork-Owned Invariants
 
