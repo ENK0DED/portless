@@ -37,6 +37,9 @@ jobs:
 
       - run: bun run check:fork-ledger
 
+      - name: Check changelog release markers
+        run: bash .github/scripts/check-release-markers.sh
+
       - run: bun run format:check
 
       - run: bun run lint
