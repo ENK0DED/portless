@@ -138,6 +138,8 @@ Current fork-owned commits and what they protect:
 | `903f79f` | Merged the ticket 26 worktree branch bringing Windows cmd escaping hardening into the sync branch.                                                                                                 |
 | `066f906` | Merged the ticket 27 worktree branch bringing flat worktree hostnames into the sync branch.                                                                                                        |
 | `91de9c0` | Merged the ticket 20 worktree branch bringing hosts and mDNS deduplication into the sync branch.                                                                                                   |
+| `925d875` | Aligned the doctor Windows shim test with the hardened cmd escaping invocation shape.                                                                                                              |
+| `d161f0a` | Recorded the 0.15.6002 backport batch integration in the fork-only ledger.                                                                                                                         |
 
 ## Fork-Owned Invariants
 
