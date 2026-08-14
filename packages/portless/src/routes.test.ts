@@ -248,10 +248,15 @@ describe("RouteStore", () => {
       }
     });
 
-    it("writes route files with the configured file mode", () => {
-      store.addRoute("mode.localhost", 4003, process.pid);
-      expect(fs.statSync(store.getRoutesPath()).mode & 0o777).toBe(FILE_MODE);
-    });
+    // POSIX-only: Windows stat models just the write bit, so a 0o644
+    // request reads back as 0o666 there.
+    it.skipIf(process.platform === "win32")(
+      "writes route files with the configured file mode",
+      () => {
+        store.addRoute("mode.localhost", 4003, process.pid);
+        expect(fs.statSync(store.getRoutesPath()).mode & 0o777).toBe(FILE_MODE);
+      }
+    );
   });
 
   describe("addRoute", () => {
