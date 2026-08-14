@@ -115,6 +115,8 @@ Current fork-owned commits and what they protect:
 | `c405ea9` | Added exact persisted Tailscale Serve, Funnel, and Service hostname routing while preserving exact tunnel aliases and rejecting unrelated public hosts.                                            |
 | `624fd7c` | Resolved Wayfinder ticket 14 with Tailscale hostname routing decisions, coverage, and verification evidence.                                                                                       |
 | `e2b89f2` | Recorded the complete fork-only ledger after resolving Tailscale hostname routing ticket 14.                                                                                                       |
+| `2959046` | Recorded final ledger verification after ticket 14.                                                                                                                                                |
+| `8fd6bfb` | Injected framework flags through safe Bun, npm, pnpm, and yarn package scripts while preserving fork framework and Windows-spawn behavior.                                                         |
 
 ## Fork-Owned Invariants
 
