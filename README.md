@@ -77,8 +77,8 @@ One portless config file at the repo root covers all workspace packages. Portles
 ```json
 {
   "apps": {
-    "apps/web": { "name": "myapp" },
-    "apps/api": { "name": "api.myapp" }
+    "apps/web": { "name": "myapp", "path": "/" },
+    "apps/api": { "name": "myapp", "path": "/api" }
   }
 }
 ```
@@ -88,7 +88,7 @@ portless        # from repo root: starts all workspace packages with a "dev" scr
 cd apps/web && portless   # start just one package
 ```
 
-The `apps` map is optional and only needed for name overrides. Packages not listed still auto-discover with names inferred from their `package.json`. Paths in `apps` are always relative to the repo root, even if the config file lives in `.config/`.
+The `apps` map is optional. Packages not listed still auto-discover with names inferred from their `package.json`. Apps may share a `name` when each uses a distinct `path`, which places several workspace apps under one hostname. Paths used as `apps` keys are always relative to the repo root, even if the config file lives in `.config/`.
 
 Without an `apps` map, hostnames follow the `<package>.<project>.localhost` convention. The project name comes from the most common npm scope across workspace packages (e.g. `@myorg/web` and `@myorg/api` produce `myorg`), falling back to the workspace root directory name. If a package's short name matches the project name, it gets the bare `<project>.localhost` without duplication.
 
@@ -101,6 +101,7 @@ In linked git worktrees, workspace URLs also get the branch prefix. For example,
 | `name`         | string  | inferred | Base app name. Worktree prefix still applies.                         |
 | `script`       | string  | `"dev"`  | Name of a `package.json` script to run.                               |
 | `appPort`      | number  | auto     | Fixed port for the child process. Browser-blocked ports are rejected. |
+| `path`         | string  | `"/"`    | Route path prefix.                                                    |
 | `proxy`        | boolean | auto     | Whether to route through the proxy. Auto-detected.                    |
 | `worktreeFlat` | boolean | `false`  | Join worktree and app labels into one DNS label.                      |
 | `apps`         | object  |          | Overrides for workspace packages, keyed by relative path.             |
@@ -117,7 +118,7 @@ Instead of a separate config file, you can add a `"portless"` key to your `packa
 }
 ```
 
-An object supports all per-app fields (`name`, `script`, `appPort`, `proxy`, `worktreeFlat`):
+An object supports all per-app fields (`name`, `script`, `appPort`, `path`, `proxy`, `worktreeFlat`):
 
 ```json
 {
@@ -132,7 +133,7 @@ Lookup order is:
 2. `.config/portless.json`
 3. `package.json` `"portless"` key
 
-For workspace package overrides, the package's own `package.json` `"portless"` key takes precedence over the root config's `apps` entry but is overridden by CLI flags.
+For workspace package settings, a package's own `package.json` `"portless"` key takes precedence over the root config's `apps` entry. Route path precedence is `--path`, then `PORTLESS_PATH`, then per-app config. A set `PORTLESS_PATH` applies to every workspace app; unset it to use distinct configured paths.
 
 ### --script flag
 
@@ -361,6 +362,8 @@ PORTLESS_PATH=/api portless run bun run api
 ```
 
 Path routing is explicit and boundary-aware. `/api` matches `/api` and `/api/users`, but not `/api-v2`. Portless forwards the full request path unchanged, so the upstream app still receives `/api/users`.
+
+Configured prefixes must begin with `/` and use RFC 3986 path characters. Portless rejects spaces, backslashes, empty or dot-only segments, malformed percent escapes, and percent-encoded slashes or dots. Trailing slashes are normalized away. Printed local and sharing URLs include the configured prefix.
 
 ## Start at OS startup
 

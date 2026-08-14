@@ -322,6 +322,8 @@ PORTLESS_PATH=/api portless run bun run api
 
 Path matching is boundary-aware: `/api` matches `/api` and `/api/users`, not `/api-v2`. Portless forwards the full path unchanged to the upstream app. Do not strip the prefix unless the upstream app is configured to do that itself.
 
+Authoring is strict: prefixes must begin with `/` and use RFC 3986 path characters. Reject spaces, backslashes, empty or dot-only segments, malformed percent escapes, and percent-encoded slashes or dots. Trailing slashes normalize away. Incoming request paths are matched and forwarded by their raw spelling; do not decode or resolve dot segments in an agent workflow.
+
 ### LAN mode
 
 ```bash
@@ -571,12 +573,13 @@ Optional config file. Portless looks for `portless.json` in the current director
 | `name`         | string  | inferred from package.json | Base app name (worktree prefix still applies)            |
 | `script`       | string  | `"dev"`                    | Name of a package.json script to run                     |
 | `appPort`      | number  | auto-assigned              | Fixed app port; browser-blocked ports are rejected       |
+| `path`         | string  | `"/"`                      | Route path prefix                                        |
 | `proxy`        | boolean | auto-detected              | Whether to route through the proxy (`false` for tasks)   |
 | `worktreeFlat` | boolean | `false`                    | Join worktree and app labels into one DNS label          |
 | `apps`         | object  |                            | Overrides for workspace packages, keyed by relative path |
 | `turbo`        | boolean | `true`                     | Set `false` to use direct spawning instead of turborepo  |
 
-Each `apps` entry has the same shape (`name`, `script`, `appPort`, `proxy`). When `apps` is present, top-level fields apply only in single-app mode.
+Each `apps` entry has the same shape (`name`, `script`, `appPort`, `path`, `proxy`, `worktreeFlat`). Apps can share a `name` when they use distinct `path` values. When `apps` is present, top-level fields apply only in single-app mode.
 
 ### package.json "portless" key
 
@@ -586,7 +589,7 @@ Instead of a separate config file, you can add a `"portless"` key to your `packa
 { "portless": "myapp" }
 ```
 
-An object supports all per-app fields (`name`, `script`, `appPort`, `proxy`, `worktreeFlat`):
+An object supports all per-app fields (`name`, `script`, `appPort`, `path`, `proxy`, `worktreeFlat`):
 
 ```json
 { "portless": { "name": "myapp", "script": "dev:app" } }
@@ -598,7 +601,7 @@ Lookup order:
 2. `.config/portless.json`
 3. `package.json` `"portless"` key
 
-For workspace package overrides, precedence is: CLI flags > package `package.json` `"portless"` key > root config `apps` entry > defaults.
+For workspace package overrides, package `package.json` `"portless"` values take precedence over the root config `apps` entry. Path precedence is `--path` > `PORTLESS_PATH` > per-app config > `/`. A set `PORTLESS_PATH` applies to every workspace app; unset it to use distinct configured paths.
 
 ## Troubleshooting
 

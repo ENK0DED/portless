@@ -116,6 +116,20 @@ function isValidRoute(value: unknown): value is RouteMapping {
   return true;
 }
 
+function invalidPersistedRouteWarning(route: {
+  hostname: string;
+  port: number;
+  pid: number;
+  pathPrefix: unknown;
+  reason: string;
+}): string {
+  const displayedPrefix = typeof route.pathPrefix === "string" ? route.pathPrefix : "<invalid>";
+  return (
+    `Removed invalid route "${route.hostname}${displayedPrefix}" (PID ${route.pid}) from routes.json: ${route.reason}. ` +
+    `Re-register with: portless alias ${route.hostname} ${route.port} --path <valid-prefix>`
+  );
+}
+
 function routePathPrefix(route: Pick<RouteMapping, "pathPrefix">): string {
   return normalizePathPrefix(route.pathPrefix);
 }
@@ -266,13 +280,7 @@ export class RouteStore {
     }
   }
 
-  /**
-   * Load routes from disk, filtering out stale entries whose owning process
-   * is no longer alive. Stale-route cleanup is only persisted when the caller
-   * already holds the lock (i.e. inside addRoute/removeRoute) to avoid
-   * unprotected concurrent writes.
-   */
-  loadRoutes(persistCleanup = false): RouteMapping[] {
+  private loadAndMigrateRoutes(): RouteMapping[] {
     if (!fs.existsSync(this.routesPath)) {
       return [];
     }
@@ -289,22 +297,87 @@ export class RouteStore {
         this.onWarning?.(`Corrupted routes file (expected array): ${this.routesPath}`);
         return [];
       }
-      const routes: RouteMapping[] = parsed.filter(isValidRoute);
-      // Filter out stale routes whose owning process is no longer alive
-      const alive = routes.filter((r) => r.pid === 0 || this.isProcessAlive(r.pid));
-      if (persistCleanup && alive.length !== routes.length) {
-        // Persist the cleaned-up list so stale entries don't accumulate.
-        // Only safe when caller holds the lock.
+      let migrationChanged = false;
+      const routes: RouteMapping[] = [];
+      for (const value of parsed) {
+        if (
+          typeof value === "object" &&
+          value !== null &&
+          typeof (value as RouteMapping).hostname === "string" &&
+          typeof (value as RouteMapping).port === "number" &&
+          typeof (value as RouteMapping).pid === "number" &&
+          (value as RouteMapping).pathPrefix !== undefined
+        ) {
+          try {
+            if (typeof (value as RouteMapping).pathPrefix !== "string") {
+              throw new Error("path prefix must be a string");
+            }
+            normalizePathPrefix((value as RouteMapping).pathPrefix);
+          } catch (err) {
+            this.onWarning?.(
+              invalidPersistedRouteWarning({
+                hostname: (value as RouteMapping).hostname,
+                port: (value as RouteMapping).port,
+                pid: (value as RouteMapping).pid,
+                pathPrefix: (value as RouteMapping).pathPrefix,
+                reason: err instanceof Error ? err.message : "invalid path prefix",
+              })
+            );
+            migrationChanged = true;
+            continue;
+          }
+        }
+
+        if (!isValidRoute(value)) {
+          migrationChanged = true;
+          continue;
+        }
+
+        const route = { ...value };
+        const normalizedPathPrefix = normalizePathPrefix(route.pathPrefix);
+        if (normalizedPathPrefix === "/") {
+          if (route.pathPrefix !== undefined) {
+            delete route.pathPrefix;
+            migrationChanged = true;
+          }
+        } else if (route.pathPrefix !== normalizedPathPrefix) {
+          route.pathPrefix = normalizedPathPrefix;
+          migrationChanged = true;
+        }
+        routes.push(route);
+      }
+      if (migrationChanged) {
+        // Migration writes happen on the first load through either public
+        // reader so legacy entries cannot remain silently unusable.
         try {
-          this.saveRoutes(alive);
+          this.saveRoutes(routes);
         } catch {
           // Write may fail (permissions); non-fatal
         }
       }
-      return alive;
+      return routes;
     } catch {
       return [];
     }
+  }
+
+  /**
+   * Load routes from disk, filtering out stale entries whose owning process
+   * is no longer alive. Stale-route cleanup is only persisted when the caller
+   * already holds the lock (i.e. inside addRoute/removeRoute) to avoid
+   * unprotected concurrent writes.
+   */
+  loadRoutes(persistCleanup = false): RouteMapping[] {
+    const routes = this.loadAndMigrateRoutes();
+    const alive = routes.filter((r) => r.pid === 0 || this.isProcessAlive(r.pid));
+    if (persistCleanup && alive.length !== routes.length) {
+      try {
+        this.saveRoutes(alive);
+      } catch {
+        // Write may fail (permissions); non-fatal
+      }
+    }
+    return alive;
   }
 
   private saveRoutes(routes: RouteMapping[]): void {
@@ -488,24 +561,7 @@ export class RouteStore {
    * but whose dev server may still be holding a port.
    */
   loadRoutesRaw(): RouteMapping[] {
-    if (!fs.existsSync(this.routesPath)) {
-      return [];
-    }
-    try {
-      const raw = fs.readFileSync(this.routesPath, "utf-8");
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(raw);
-      } catch {
-        return [];
-      }
-      if (!Array.isArray(parsed)) {
-        return [];
-      }
-      return parsed.filter(isValidRoute);
-    } catch {
-      return [];
-    }
+    return this.loadAndMigrateRoutes();
   }
 
   /**

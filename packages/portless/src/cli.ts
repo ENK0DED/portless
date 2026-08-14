@@ -25,7 +25,7 @@ import {
   shouldAutoSyncHosts,
   deduplicateHostnames,
 } from "./hosts.js";
-import { FILE_MODE, RouteConflictError, RouteStore } from "./routes.js";
+import { FILE_MODE, RouteConflictError, RouteStore, type RouteMapping } from "./routes.js";
 import { TunnelAliasStore, normalizeTunnelHostname } from "./tunnel-aliases.js";
 import {
   ensureTunnelProviderAvailable,
@@ -1181,6 +1181,15 @@ function tunnelAliasLabel(alias: Pick<TunnelAlias, "targetHostname" | "targetPat
     : `${alias.targetHostname}${targetPathPrefix}`;
 }
 
+function formatRouteLabel(route: Pick<RouteMapping, "hostname" | "pathPrefix">): string {
+  const pathPrefix = normalizePathPrefix(route.pathPrefix);
+  return pathPrefix === "/" ? route.hostname : `${route.hostname}${pathPrefix}`;
+}
+
+function formatSharedUrl(url: string, pathPrefix: string): string {
+  return pathPrefix === "/" ? url : `${url}${pathPrefix}`;
+}
+
 function aliasesForRoute(
   aliases: TunnelAlias[],
   hostname: string,
@@ -1214,24 +1223,26 @@ function listRoutes(
         upstream_protocol: route.protocol ?? "http1",
         pid: route.pid,
         kind: route.pid === 0 ? "alias" : "app",
-        ...(route.tailscaleUrl ? { tailscale_url: route.tailscaleUrl } : {}),
+        ...(route.tailscaleUrl
+          ? { tailscale_url: formatSharedUrl(route.tailscaleUrl, pathPrefix) }
+          : {}),
         ...(route.tailscaleServiceUrl
           ? {
-              tailscale_service_url: route.tailscaleServiceUrl,
+              tailscale_service_url: formatSharedUrl(route.tailscaleServiceUrl, pathPrefix),
               tailscale_service_name: route.tailscaleServiceName,
               tailscale_service_pending: !!route.tailscaleServicePending,
             }
           : {}),
-        ...(route.ngrokUrl ? { ngrok_url: route.ngrokUrl } : {}),
+        ...(route.ngrokUrl ? { ngrok_url: formatSharedUrl(route.ngrokUrl, pathPrefix) } : {}),
         ...(route.tunnelUrl
           ? {
-              tunnel_url: route.tunnelUrl,
+              tunnel_url: formatSharedUrl(route.tunnelUrl, pathPrefix),
               tunnel_provider: route.tunnelProvider,
               tunnel_external_hostname: route.tunnelExternalHostname,
             }
           : {}),
         ...(routeAliases.length > 0 ? { tunnel_aliases: routeAliases } : {}),
-        ...(route.netbirdUrl ? { netbird_url: route.netbirdUrl } : {}),
+        ...(route.netbirdUrl ? { netbird_url: formatSharedUrl(route.netbirdUrl, pathPrefix) } : {}),
       };
     });
     process.stdout.write(JSON.stringify(payload, null, 2) + "\n");
@@ -1257,24 +1268,30 @@ function listRoutes(
     );
     if (route.tailscaleUrl) {
       const tsLabel = route.tailscaleFunnel ? "funnel" : "tailscale";
-      console.log(`    ${colors.gray(tsLabel + ":")} ${colors.green(route.tailscaleUrl)}`);
+      console.log(
+        `    ${colors.gray(tsLabel + ":")} ${colors.green(formatSharedUrl(route.tailscaleUrl, pathPrefix))}`
+      );
     }
     if (route.tailscaleServiceUrl) {
       const pending = route.tailscaleServicePending ? " (pending admin approval)" : "";
       console.log(
-        `    ${colors.gray("tailscale service:")} ${colors.green(route.tailscaleServiceUrl)}${colors.yellow(pending)}`
+        `    ${colors.gray("tailscale service:")} ${colors.green(formatSharedUrl(route.tailscaleServiceUrl, pathPrefix))}${colors.yellow(pending)}`
       );
     }
     if (route.ngrokUrl) {
-      console.log(`    ${colors.gray("ngrok:")} ${colors.green(route.ngrokUrl)}`);
+      console.log(
+        `    ${colors.gray("ngrok:")} ${colors.green(formatSharedUrl(route.ngrokUrl, pathPrefix))}`
+      );
     }
     if (route.tunnelUrl) {
       console.log(
-        `    ${colors.gray(`${route.tunnelProvider ?? "tunnel"}:`)} ${colors.green(route.tunnelUrl)}`
+        `    ${colors.gray(`${route.tunnelProvider ?? "tunnel"}:`)} ${colors.green(formatSharedUrl(route.tunnelUrl, pathPrefix))}`
       );
     }
     if (route.netbirdUrl) {
-      console.log(`    ${colors.gray("netbird:")} ${colors.green(route.netbirdUrl)}`);
+      console.log(
+        `    ${colors.gray("netbird:")} ${colors.green(formatSharedUrl(route.netbirdUrl, pathPrefix))}`
+      );
     }
   }
   if (aliases.length > 0) {
@@ -1608,7 +1625,8 @@ async function runApp(
   // (e.g. --lan changes tld from "localhost" to "local")
   const hostnames = buildHostnames(name, tlds);
   const hostname = hostnames[0]!;
-  const routePathPrefix = normalizePathPrefix(pathPrefix ?? pathPrefixFromEnv());
+  const routePathPrefix = normalizePathPrefix(pathPrefix);
+  const routeDisplayLabel = formatRouteLabel({ hostname, pathPrefix: routePathPrefix });
 
   const configuredTldEnv = getConfiguredTldEnv();
   if (
@@ -1716,7 +1734,7 @@ async function runApp(
     netbirdUrl = undefined;
     console.warn(
       colors.yellow(
-        `Warning: NetBird expose for ${hostname} stopped${formatProcessExitSuffix(
+        `Warning: NetBird expose for ${routeDisplayLabel} stopped${formatProcessExitSuffix(
           code,
           signal
         )}. Removing its public URL from the route list.`
@@ -1746,7 +1764,7 @@ async function runApp(
     ngrokUrl = undefined;
     console.warn(
       colors.yellow(
-        `Warning: ngrok tunnel for ${hostname} stopped${formatProcessExitSuffix(
+        `Warning: ngrok tunnel for ${routeDisplayLabel} stopped${formatProcessExitSuffix(
           code,
           signal
         )}. Removing its public URL from the route list.`
@@ -1776,7 +1794,7 @@ async function runApp(
     tunnelUrl = undefined;
     console.warn(
       colors.yellow(
-        `Warning: tunnel for ${hostname} stopped${formatProcessExitSuffix(
+        `Warning: tunnel for ${routeDisplayLabel} stopped${formatProcessExitSuffix(
           code,
           signal
         )}. Removing its public URL from the route list.`
@@ -1826,7 +1844,11 @@ async function runApp(
     }
 
     const pending = tailscaleServicePending ? " (pending admin approval)" : "";
-    console.log(chalk.green(`  Tailscale Service -> ${tailscaleServiceUrl}${pending}`));
+    console.log(
+      chalk.green(
+        `  Tailscale Service -> ${formatSharedUrl(tailscaleServiceUrl, routePathPrefix)}${pending}`
+      )
+    );
     console.log(chalk.gray("  (accessible from your tailnet after service approval)\n"));
 
     try {
@@ -1867,7 +1889,7 @@ async function runApp(
     // a successful register or exits the process on final failure.
     tailscaleUrl = formatTailscaleUrl(tsBaseUrl, tailscaleHttpsPort!);
     const label = wantsFunnel ? "Funnel (public)" : "Tailscale";
-    console.log(chalk.green(`  ${label} -> ${tailscaleUrl}`));
+    console.log(chalk.green(`  ${label} -> ${formatSharedUrl(tailscaleUrl, routePathPrefix)}`));
     if (wantsFunnel) {
       console.log(chalk.gray("  (accessible from the public internet via Tailscale Funnel)\n"));
     } else {
@@ -1911,7 +1933,7 @@ async function runApp(
         onExit: handleNetbirdExit,
       });
       netbirdUrl = netbirdProcess.info.url;
-      console.log(chalk.green(`  NetBird -> ${netbirdUrl}`));
+      console.log(chalk.green(`  NetBird -> ${formatSharedUrl(netbirdUrl, routePathPrefix)}`));
       console.log(chalk.gray("  (accessible from the public internet via NetBird)\n"));
 
       try {
@@ -1967,7 +1989,7 @@ async function runApp(
         onExit: handleNgrokExit,
       });
       ngrokUrl = ngrokProcess.url;
-      console.log(chalk.green(`  ngrok -> ${ngrokUrl}`));
+      console.log(chalk.green(`  ngrok -> ${formatSharedUrl(ngrokUrl, routePathPrefix)}`));
       console.log(chalk.gray("  (accessible from the public internet via ngrok)\n"));
 
       try {
@@ -2037,7 +2059,7 @@ async function runApp(
         routeOwnerPid: process.pid,
       });
       const label = managedTunnel.provider === "cloudflare" ? "Cloudflare Tunnel" : "ngrok tunnel";
-      console.log(chalk.green(`  ${label} -> ${tunnelUrl}`));
+      console.log(chalk.green(`  ${label} -> ${formatSharedUrl(tunnelUrl, routePathPrefix)}`));
       console.log(
         chalk.gray("  (accessible from the public internet through an exact tunnel alias)\n")
       );
@@ -2356,7 +2378,7 @@ function parsePathPrefix(value: string | undefined, source: string): string {
   try {
     return normalizePathPrefix(value);
   } catch (err) {
-    console.error(colors.red(`Error: ${(err as Error).message}`));
+    console.error(colors.red(`Error: ${source}: ${(err as Error).message}`));
     process.exit(1);
   }
 }
@@ -3313,8 +3335,11 @@ ${colors.bold("Configuration (portless.json or .config/portless.json):")}
 
   Override name:   { "name": "myapp" }
   Override script: { "name": "myapp", "script": "start" }
+  Route path:      { "name": "myapp", "path": "/api" }
   Flat worktree:   { "worktreeFlat": true }
-  Monorepo:        { "apps": { "apps/web": { "name": "myapp" } } }
+  Monorepo split:  { "apps": { "apps/web": { "name": "myapp", "path": "/" },
+                                "apps/api": { "name": "myapp", "path": "/api" } } }
+  Path precedence: --path, then PORTLESS_PATH, then config
 
 ${colors.bold("In package.json:")}
   {
@@ -3830,28 +3855,29 @@ ${colors.bold("Options:")}
   }
 
   for (const route of stale) {
+    const routeLabel = formatRouteLabel(route);
     if (route.tailscaleHttpsPort || route.tailscaleServiceName) {
       try {
         unregisterTailscale(route);
         const label = route.tailscaleServiceName
           ? `service ${route.tailscaleServiceName}`
           : `serve on port ${route.tailscaleHttpsPort}`;
-        console.log(colors.gray(`  ${route.hostname} - removed tailscale ${label}`));
+        console.log(colors.gray(`  ${routeLabel} - removed tailscale ${label}`));
       } catch {
         // Tailscale CLI may not be installed; non-fatal during prune
       }
     }
     if (route.ngrokPid) {
       stopNgrok(route);
-      console.log(colors.gray(`  ${route.hostname} - stopped ngrok tunnel`));
+      console.log(colors.gray(`  ${routeLabel} - stopped ngrok tunnel`));
     }
     if (route.tunnelPid) {
       stopTunnelPid(route.tunnelPid);
-      console.log(colors.gray(`  ${route.hostname} - stopped managed tunnel`));
+      console.log(colors.gray(`  ${routeLabel} - stopped managed tunnel`));
     }
     if (route.netbirdPid) {
       stopNetbird(route);
-      console.log(colors.gray(`  ${route.hostname} - stopped NetBird expose`));
+      console.log(colors.gray(`  ${routeLabel} - stopped NetBird expose`));
     }
   }
   for (const alias of staleAliases) {
@@ -3863,10 +3889,11 @@ ${colors.bold("Options:")}
 
   let killed = 0;
   for (const route of stale) {
+    const routeLabel = formatRouteLabel(route);
     const pids = findPidsOnPort(route.port);
     if (pids.length === 0) {
       console.log(
-        colors.gray(`  ${route.hostname} :${route.port} - route removed (port already free)`)
+        colors.gray(`  ${routeLabel} :${route.port} - route removed (port already free)`)
       );
       continue;
     }
@@ -3875,11 +3902,9 @@ ${colors.bold("Options:")}
       try {
         process.kill(pid, signal);
         killed++;
-        console.log(
-          colors.gray(`  ${route.hostname} :${route.port} - killed PID ${pid} (${signal})`)
-        );
+        console.log(colors.gray(`  ${routeLabel} :${route.port} - killed PID ${pid} (${signal})`));
       } catch {
-        console.log(colors.gray(`  ${route.hostname} :${route.port} - PID ${pid} already exited`));
+        console.log(colors.gray(`  ${routeLabel} :${route.port} - PID ${pid} already exited`));
       }
     }
   }
@@ -5199,7 +5224,10 @@ async function handleDefaultSingle(
     appConfig?.config.appPort,
     lanMode,
     lanIp,
-    { scriptName, packageDir: cwd }
+    { scriptName, packageDir: cwd },
+    {},
+    undefined,
+    pathPrefixFromEnv() ?? appConfig?.config.path
   );
 }
 
@@ -5215,6 +5243,7 @@ interface MultiAppEntry {
   label: string;
   commandArgs: string[];
   appPort?: number;
+  path?: string;
   proxied: boolean;
 }
 
@@ -5319,7 +5348,7 @@ async function spawnProxiedApp(
 
     const appPort = app.appPort ?? (await findFreePort());
     assignedAppPort = appPort;
-    routePathPrefix = normalizePathPrefix(pathPrefixFromEnv());
+    routePathPrefix = normalizePathPrefix(pathPrefixFromEnv() ?? app.path);
     hostnames = buildHostnames(app.name, tlds);
     const url = formatUrl(hostnames[0]!, proxyPort, tls, routePathPrefix);
     displayUrl = url;
@@ -5514,7 +5543,15 @@ async function handleDefaultMulti(
       label = pkg.scope ? `@${pkg.scope}/${pkg.name}` : (pkg.name ?? rel);
     }
 
-    apps.push({ pkg, name, label, commandArgs, appPort: appOverride.appPort, proxied });
+    apps.push({
+      pkg,
+      name,
+      label,
+      commandArgs,
+      appPort: appOverride.appPort,
+      path: appOverride.path,
+      proxied,
+    });
   }
 
   if (apps.length === 0) {
@@ -5603,7 +5640,7 @@ async function runWithTurbo(
     }
 
     const appPort = app.appPort ?? (await findFreePort());
-    const routePathPrefix = normalizePathPrefix(pathPrefixFromEnv());
+    const routePathPrefix = normalizePathPrefix(pathPrefixFromEnv() ?? app.path);
     const hostnames = buildHostnames(app.name, tlds);
     const url = formatUrl(hostnames[0]!, proxyPort, tls, routePathPrefix);
     appUrls.push({ label: app.label, url });
@@ -5845,6 +5882,7 @@ async function handleRunMode(args: string[], globalScript?: string): Promise<voi
   if (!parsed.appPort && appConfig?.config.appPort) {
     parsed.appPort = appConfig.config.appPort;
   }
+  parsed.pathPrefix ??= appConfig?.config.path;
 
   const worktree = detectWorktreePrefix();
   const effectiveName = applyWorktreePrefix(
@@ -5890,12 +5928,11 @@ async function handleNamedMode(args: string[]): Promise<void> {
     process.exit(1);
   }
 
-  if (!parsed.appPort) {
-    const appConfig = loadAppConfig();
-    if (appConfig?.config.appPort) {
-      parsed.appPort = appConfig.config.appPort;
-    }
+  const appConfig = loadAppConfig();
+  if (!parsed.appPort && appConfig?.config.appPort) {
+    parsed.appPort = appConfig.config.appPort;
   }
+  parsed.pathPrefix ??= appConfig?.config.path;
 
   // Truncate individual labels that exceed the DNS limit, same as handleRunMode.
   const safeName = parsed.name

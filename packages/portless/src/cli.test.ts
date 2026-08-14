@@ -73,7 +73,9 @@ function run(args: string[], options?: { env?: Record<string, string | undefined
     encoding: "utf-8",
     timeout: 10_000,
     env,
-    cwd: options?.cwd,
+    // Default to a non-repository directory so parallel worktrees created by
+    // other test or agent processes cannot change an unrelated test's name.
+    cwd: options?.cwd ?? os.tmpdir(),
   });
   return {
     status: result.status,
@@ -704,6 +706,72 @@ describe("CLI", () => {
           path_prefix: "/v1",
         },
       ]);
+    });
+
+    it("appends path prefixes to every sharing URL in text and JSON output", () => {
+      fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
+      fs.writeFileSync(
+        path.join(tmpDir, "routes.json"),
+        JSON.stringify([
+          {
+            hostname: "api.localhost",
+            port: 4100,
+            pid: process.pid,
+            pathPrefix: "/v1",
+            tailscaleUrl: "https://device.example.ts.net",
+            tailscaleServiceUrl: "https://svc.example.ts.net",
+            ngrokUrl: "https://api.ngrok.app",
+            tunnelUrl: "https://api.trycloudflare.com",
+            tunnelProvider: "cloudflare",
+            netbirdUrl: "https://api.netbird.cloud",
+          },
+        ])
+      );
+
+      const textResult = run(["list"], { env: { PORTLESS_STATE_DIR: tmpDir } });
+      expect(textResult.status).toBe(0);
+      for (const url of [
+        "https://device.example.ts.net/v1",
+        "https://svc.example.ts.net/v1",
+        "https://api.ngrok.app/v1",
+        "https://api.trycloudflare.com/v1",
+        "https://api.netbird.cloud/v1",
+      ]) {
+        expect(textResult.stdout).toContain(url);
+      }
+
+      const jsonResult = run(["list", "--json"], {
+        env: { PORTLESS_STATE_DIR: tmpDir },
+      });
+      expect(jsonResult.status).toBe(0);
+      expect(JSON.parse(jsonResult.stdout)[0]).toMatchObject({
+        tailscale_url: "https://device.example.ts.net/v1",
+        tailscale_service_url: "https://svc.example.ts.net/v1",
+        ngrok_url: "https://api.ngrok.app/v1",
+        tunnel_url: "https://api.trycloudflare.com/v1",
+        netbird_url: "https://api.netbird.cloud/v1",
+      });
+    });
+
+    it("prints path-qualified labels while pruning stale routes", () => {
+      fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
+      fs.writeFileSync(
+        path.join(tmpDir, "routes.json"),
+        JSON.stringify([
+          {
+            hostname: "api.localhost",
+            port: 65534,
+            pid: 999999,
+            pathPrefix: "/v1",
+          },
+        ])
+      );
+
+      const { status, stdout } = run(["prune"], {
+        env: { PORTLESS_STATE_DIR: tmpDir },
+      });
+      expect(status).toBe(0);
+      expect(stdout).toContain("api.localhost/v1 :65534");
     });
 
     it("prints list help with --json documented", () => {
@@ -3378,6 +3446,8 @@ describe("CLI", () => {
       script: string;
       cliArgs: string[];
       lan?: boolean;
+      path?: string;
+      env?: Record<string, string | undefined>;
     }): Promise<{
       status: number | null;
       proxyPort: number;
@@ -3405,7 +3475,7 @@ describe("CLI", () => {
           JSON.stringify({
             name: "test-app",
             packageManager: `${options.pm}@1.0.0`,
-            portless: { appPort: 4567 },
+            portless: { appPort: 4567, ...(options.path ? { path: options.path } : {}) },
             scripts: { dev: options.script },
           })
         );
@@ -3451,6 +3521,7 @@ describe("CLI", () => {
             PORTLESS_STATE_DIR: tmpDir,
             PORTLESS_TEST_CAPTURE_FILE: capturePath,
             PORTLESS_HTTPS: "0",
+            ...options.env,
           },
         });
 
@@ -3502,6 +3573,40 @@ describe("CLI", () => {
         });
       }
     );
+
+    it.each([
+      {
+        name: "config",
+        cliArgs: [],
+        env: {},
+        expectedPath: "/config",
+      },
+      {
+        name: "environment over config",
+        cliArgs: [],
+        env: { PORTLESS_PATH: "/env" },
+        expectedPath: "/env",
+      },
+      {
+        name: "flag over environment and config",
+        cliArgs: ["--path", "/flag"],
+        env: { PORTLESS_PATH: "/env" },
+        expectedPath: "/flag",
+      },
+    ])("uses the path from $name", async ({ cliArgs, env, expectedPath }) => {
+      const { status, proxyPort, capture } = await captureScriptDelegation({
+        pm: "bun",
+        script: "vite dev",
+        cliArgs,
+        path: "/config",
+        env,
+      });
+
+      expect(status).toBe(0);
+      expect(capture.env.PORTLESS_URL).toBe(
+        `http://test-app.localhost:${proxyPort}${expectedPath}`
+      );
+    });
 
     it("resolves Expo through a Bun package script before binding child HOST", async () => {
       const { status, capture } = await captureScriptDelegation({
@@ -4302,6 +4407,8 @@ describe("CLI", () => {
             "myapp",
             "--app-port",
             "4567",
+            "--path",
+            "/api",
             "--tunnel",
             "cloudflare",
             process.execPath,
@@ -4317,9 +4424,11 @@ describe("CLI", () => {
         );
 
         expect({ status, stdout, stderr }).toMatchObject({ status: 0 });
-        expect(stdout).toContain("Cloudflare Tunnel");
+        expect(stdout).toContain("Cloudflare Tunnel -> https://abc.trycloudflare.com/api");
         expect(JSON.parse(fs.readFileSync(capturePath, "utf-8"))).toMatchObject({
-          PORTLESS_URL: `http://myapp.localhost:${proxyPort}`,
+          PORTLESS_URL: expect.stringMatching(
+            new RegExp(`^http://(?:[^.]+\\.)?myapp\\.localhost:${proxyPort}/api$`)
+          ),
           PORTLESS_TUNNEL_URL: "https://abc.trycloudflare.com",
         });
       } finally {
@@ -4395,7 +4504,7 @@ describe("CLI", () => {
     // logic under test here, which is platform-agnostic and covered
     // cross-platform by the detectWorktreePrefix unit tests. Runs on macOS/Linux.
     it.skipIf(process.platform === "win32")(
-      "prefixes every app hostname with the worktree branch",
+      "splits one worktree hostname across per-app path prefixes",
       async () => {
         const root = fs.mkdtempSync(path.join(os.tmpdir(), "portless-multi-wt-"));
         const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-multi-state-"));
@@ -4418,6 +4527,16 @@ describe("CLI", () => {
               private: true,
               packageManager: "npm@10.0.0",
               workspaces: ["packages/*"],
+            })
+          );
+          fs.writeFileSync(
+            path.join(root, "portless.json"),
+            JSON.stringify({
+              turbo: false,
+              apps: {
+                "packages/web": { name: "shared", path: "/" },
+                "packages/api": { name: "shared", path: "/api" },
+              },
             })
           );
 
@@ -4484,10 +4603,109 @@ describe("CLI", () => {
               `capture incomplete (web=${JSON.stringify(webUrl)}, api=${JSON.stringify(apiUrl)}). CLI output:\n${output}`
             );
           }
-          // Routed URL must carry the worktree prefix, in the full multi-app
-          // form <branch>.<pkg>.<project>.<tld>.
-          expect(webUrl).toContain("feature-x.web.myrepo.localhost");
-          expect(apiUrl).toContain("feature-x.api.myrepo.localhost");
+          expect(webUrl).toBe(`http://feature-x.shared.localhost:${proxyPort}`);
+          expect(apiUrl).toBe(`http://feature-x.shared.localhost:${proxyPort}/api`);
+        } finally {
+          if (cli) await stopChild(cli);
+          run(["proxy", "stop"], {
+            env: { PORTLESS_STATE_DIR: stateDir, PORTLESS_HTTPS: "0" },
+          });
+          fs.rmSync(root, { recursive: true, force: true });
+          fs.rmSync(stateDir, { recursive: true, force: true });
+        }
+      },
+      60_000
+    );
+
+    it.skipIf(process.platform === "win32")(
+      "applies PORTLESS_PATH over every per-app configured path",
+      async () => {
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), "portless-multi-path-env-"));
+        const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-multi-path-state-"));
+        const proxyPort = await getFreePort();
+        const capFile = (name: string) => path.join(stateDir, `url-${name}.txt`);
+        const readCap = (name: string) => {
+          try {
+            return fs.readFileSync(capFile(name), "utf-8");
+          } catch {
+            return "";
+          }
+        };
+        let cli: ReturnType<typeof spawn> | undefined;
+
+        try {
+          fs.writeFileSync(
+            path.join(root, "package.json"),
+            JSON.stringify({
+              name: "myrepo",
+              private: true,
+              packageManager: "npm@10.0.0",
+              workspaces: ["packages/*"],
+            })
+          );
+          fs.writeFileSync(
+            path.join(root, "portless.json"),
+            JSON.stringify({
+              turbo: false,
+              apps: {
+                "packages/web": { name: "web", path: "/web-config" },
+                "packages/api": { name: "api", path: "/api-config" },
+              },
+            })
+          );
+
+          for (const name of ["web", "api"]) {
+            const dir = path.join(root, "packages", name);
+            fs.mkdirSync(dir, { recursive: true });
+            fs.writeFileSync(
+              path.join(dir, "capture.cjs"),
+              `require("node:fs").writeFileSync(${JSON.stringify(capFile(name))}, process.env.PORTLESS_URL || "");\n`
+            );
+            fs.writeFileSync(
+              path.join(dir, "package.json"),
+              JSON.stringify({
+                name,
+                version: "0.0.0",
+                scripts: { dev: "node capture.cjs" },
+                portless: { proxy: true },
+              })
+            );
+          }
+
+          const childEnv: Record<string, string | undefined> = { ...process.env };
+          for (const key of Object.keys(childEnv)) {
+            if (key.startsWith("npm_") || key.startsWith("PNPM_")) delete childEnv[key];
+            if (key.startsWith("PORTLESS")) delete childEnv[key];
+          }
+          childEnv.PORTLESS_STATE_DIR = stateDir;
+          childEnv.PORTLESS_PORT = proxyPort.toString();
+          childEnv.PORTLESS_HTTPS = "0";
+          childEnv.PORTLESS_PATH = "/global";
+          childEnv.NO_COLOR = "1";
+
+          let output = "";
+          cli = spawn(process.execPath, [CLI_PATH], {
+            cwd: root,
+            env: childEnv,
+            stdio: ["ignore", "pipe", "pipe"],
+          });
+          cli.stdout?.on("data", (chunk) => (output += chunk.toString()));
+          cli.stderr?.on("data", (chunk) => (output += chunk.toString()));
+
+          for (let i = 0; i < 60; i++) {
+            if (readCap("web") && readCap("api")) break;
+            await new Promise((resolve) => setTimeout(resolve, 500));
+          }
+
+          const webUrl = readCap("web");
+          const apiUrl = readCap("api");
+          if (!webUrl || !apiUrl) {
+            throw new Error(
+              `capture incomplete (web=${JSON.stringify(webUrl)}, api=${JSON.stringify(apiUrl)}). CLI output:\n${output}`
+            );
+          }
+          expect(webUrl).toBe(`http://web.localhost:${proxyPort}/global`);
+          expect(apiUrl).toBe(`http://api.localhost:${proxyPort}/global`);
         } finally {
           if (cli) await stopChild(cli);
           run(["proxy", "stop"], {
