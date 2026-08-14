@@ -161,7 +161,7 @@ Examples:
 
 This avoids prerelease semantics and keeps room for local-only releases between upstream syncs.
 
-The current fork release `0.15.6000` tracks upstream `0.15.5`. Release `0.15.6001` is reserved for the feature batch that follows this sync. If upstream publishes `0.15.6`, the first synced fork release should be `0.15.7000`. If the fork ships another local-only change before the next upstream patch, use `0.15.6002`.
+The current fork release `0.15.6001` tracks upstream `0.15.5` plus the feature batch of ordered suffix lists with explicit LAN suffix behavior, loopback-by-default binding, exact Tailscale hostname routing, package-script framework flag injection, residual #363 WebSocket handling, and fork-aware `portless doctor`. Release `0.15.6002` is reserved for the upstream-PR backport batch from tickets 20–28; those changes are not included in this release. If upstream publishes `0.15.6`, the first synced fork release should be `0.15.7000`. If the fork ships another local-only change after the reserved backport release and before the next upstream patch, use `0.15.6003`.
 
 ### Package Manager
 

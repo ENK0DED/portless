@@ -1,8 +1,25 @@
 # Changelog
 
-## 0.15.6000
+## 0.15.6001
 
 <!-- release:start -->
+
+### Feature Batch
+
+- **Ordered suffix lists and LAN behavior**: `PORTLESS_SUFFIX` now supports ordered suffix lists with repeatable suffix flags, preserves explicit LAN suffix configuration, and publishes mDNS only for `.local` entries while routes, TLS, service, and state handling use the complete list.
+- **Loopback-by-default binding**: Proxy and redirect listeners bind only to `127.0.0.1` and `::1` by default. LAN reachability now requires explicit `--lan`, which widens the listeners to all interfaces.
+- **Tailscale hostname routing**: Exact persisted Tailscale Serve, Funnel, and Service hostnames now route to their matching apps while tunnel aliases remain strict.
+- **Framework flag injection through package scripts**: Framework flags now pass safely through Bun, npm, pnpm, and yarn package scripts while preserving fork injectors, placeholders, and the Windows spawn design.
+- **Residual WebSocket behaviors**: Cleartext HTTP/1.1 WebSocket upgrades on the TLS port now use strict route handling, and malformed backend handshakes return 502 instead of silently destroying the socket.
+- **Fork-aware `portless doctor`**: The read-only diagnostics command now covers fork state including suffixes, bind scope, sudo handoff, CA trust, hosts and mDNS, background apps, and tunnel, Tailscale, and NetBird readiness.
+
+### Contributors
+
+- @enk0ded
+
+<!-- release:end -->
+
+## 0.15.6000
 
 ### Fork Sync
 
@@ -14,8 +31,6 @@
 ### Contributors
 
 - @enk0ded
-
-<!-- release:end -->
 
 ## 0.15.5
 

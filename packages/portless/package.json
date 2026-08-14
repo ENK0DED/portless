@@ -1,6 +1,6 @@
 {
   "name": "@enk0ded/portless",
-  "version": "0.15.6000",
+  "version": "0.15.6001",
   "description": "Replace port numbers with stable, named .localhost URLs. For humans and agents.",
   "type": "module",
   "main": "./dist/index.js",
