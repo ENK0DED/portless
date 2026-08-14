@@ -109,18 +109,18 @@ Use `--name` to override the inferred base name while keeping the worktree prefi
 portless run --name myapp next dev   # -> https://fix-ui.myapp.localhost
 ```
 
-## Custom Suffix
+## Custom Suffixes
 
-By default, portless uses `.localhost` which auto-resolves to `127.0.0.1` in most browsers. If you prefer a different suffix, use `--suffix`.
-It accepts either a single label such as `test` or a full dotted suffix such as `acme.com`. Each label is limited to 63 characters, and the full suffix and generated hostname are limited to 253 characters. `--tld` still works as a compatibility alias:
+By default, portless uses `.localhost` which auto-resolves to `127.0.0.1` in most browsers. Repeat `--suffix` to serve the same apps under multiple suffixes.
+Each value may be a single label such as `test` or a full dotted suffix such as `acme.com`. Each label is limited to 63 characters, and every full suffix and generated hostname is limited to 253 characters. `PORTLESS_SUFFIX` accepts comma-separated values, and repeatable `--tld` remains a compatibility alias:
 
 ```bash
-portless proxy start --suffix test
+portless proxy start --suffix test --suffix local.example.com
 portless myapp next dev
-# -> https://myapp.test
+# -> https://myapp.test and https://myapp.local.example.com
 ```
 
-The proxy auto-syncs `/etc/hosts` for route hostnames, so `.test`, `.acme.com`, and other dev hostnames resolve on your machine.
+The proxy auto-syncs `/etc/hosts` for route hostnames, so `.test`, `.acme.com`, and other dev hostnames resolve on your machine. Explicit lists are preserved in LAN mode with `.local` appended; mDNS publishes only the `.local` routes.
 
 Recommended: `.test` (IANA-reserved, no collision risk). Avoid `.local` (conflicts with mDNS/Bonjour) and `.dev` (Google-owned, forces HTTPS via HSTS).
 

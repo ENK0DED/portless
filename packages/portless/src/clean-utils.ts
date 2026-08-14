@@ -13,6 +13,7 @@ const PORTLESS_STATE_FILES = [
   "proxy.log",
   "proxy.tls",
   "proxy.tld",
+  "proxy.tlds",
   "proxy.lan",
   "proxy.wildcard",
   "ca.trusted",

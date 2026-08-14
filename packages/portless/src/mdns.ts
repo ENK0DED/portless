@@ -131,6 +131,15 @@ function serviceName(hostname: string): string {
 }
 
 /**
+ * Return an mDNS-publishable FQDN, or null outside the exact .local namespace.
+ * LAN mode may route the same app under explicit custom suffixes and .local;
+ * custom routes must not acquire a second, synthetic .local suffix.
+ */
+export function mdnsFqdn(hostname: string): string | null {
+  return hostname.endsWith(".local") ? hostname : null;
+}
+
+/**
  * Publish an mDNS record for a hostname.
  *
  * On macOS: spawns `dns-sd -P` which publishes both a DNS-SD service record
@@ -150,7 +159,8 @@ export function publish(
   // Don't double-publish
   if (activePublishers.has(hostname)) return;
 
-  const fqdn = hostname.endsWith(".local") ? hostname : `${hostname}.local`;
+  const fqdn = mdnsFqdn(hostname);
+  if (!fqdn) return;
   const name = serviceName(fqdn);
   const publisher = getMdnsPublisher();
   if (!publisher) {

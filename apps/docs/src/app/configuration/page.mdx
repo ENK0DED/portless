@@ -199,8 +199,8 @@ const stable = await getUrl("backend", { worktree: false });
     <tr>
       <td>`PORTLESS_SUFFIX`</td>
       <td>
-        Use a custom suffix instead of `.localhost` (e.g. `test`, `acme.com`). Read before
-        `PORTLESS_TLD`, and wins when both are set; `PORTLESS_TLD` is a compatibility alias.
+        Use a comma-separated suffix list (e.g. `test,acme.com`). Read before `PORTLESS_TLD`,
+        and the complete list wins when both are set; `PORTLESS_TLD` is a compatibility alias.
       </td>
       <td>`localhost`</td>
     </tr>

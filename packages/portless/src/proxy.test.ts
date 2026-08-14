@@ -1179,6 +1179,38 @@ describe("createProxyServer", () => {
       expect(res.status).toBe(200);
       expect(res.body).toBe("custom domain hit");
     });
+
+    it("uses the longest configured suffix in 404 command suggestions", async () => {
+      const server = trackServer(
+        createProxyServer({
+          getRoutes: () => [],
+          proxyPort: TEST_PROXY_PORT,
+          tld: "example.com",
+          tlds: ["example.com", "dev.example.com"],
+        })
+      );
+      await listen(server);
+
+      const res = await request(server, { host: "missing.dev.example.com" });
+      expect(res.status).toBe(404);
+      expect(res.body).toContain("portless missing your-command");
+      expect(res.body).not.toContain("portless missing.dev your-command");
+    });
+
+    it("reserves internal pages on secondary configured suffixes", async () => {
+      const server = trackServer(
+        createProxyServer({
+          getRoutes: () => [{ hostname: "portless.test", port: 65534 }],
+          proxyPort: TEST_PROXY_PORT,
+          tlds: ["localhost", "test"],
+        })
+      );
+      await listen(server);
+
+      const res = await request(server, { host: "portless.test" });
+      expect(res.status).toBe(200);
+      expect(res.body).toContain("portless");
+    });
   });
 
   describe("XSS safety", () => {

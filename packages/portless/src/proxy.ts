@@ -464,20 +464,31 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     getTunnelAliases = () => [],
     proxyPort,
     tld = "localhost",
+    tlds = [tld],
     strict = true,
     onError = (msg: string) => console.error(msg),
     tls,
     internalPages = true,
     getCaTrusted,
   } = options;
-  const tldSuffix = `.${tld}`;
+  const configuredTlds = [...new Set(tlds.length > 0 ? tlds : [tld])];
+  const primaryTld = configuredTlds[0] ?? "localhost";
+  const tldSuffix = `.${primaryTld}`;
+  const tldSuffixes = configuredTlds
+    .map((configuredTld) => `.${configuredTld}`)
+    .sort((a, b) => b.length - a.length);
   const h2cSessions: H2cSessionCache = new Map();
 
   // Reserved internal hostnames. Intercepted before route dispatch so a user
   // app can never shadow them, and derived from the live suffix so they follow
   // a custom PORTLESS_SUFFIX (e.g. portless.test / cert.test).
-  const dashboardHost = `portless${tldSuffix}`;
-  const certHost = `cert${tldSuffix}`;
+  const dashboardHosts = new Set(configuredTlds.map((suffix) => `portless.${suffix}`));
+  const certHosts = new Set(configuredTlds.map((suffix) => `cert.${suffix}`));
+  const isInternalHost = (host: string): boolean => dashboardHosts.has(host) || certHosts.has(host);
+  const suffixForHost = (host: string): string => {
+    const matched = tldSuffixes.find((suffix) => host.endsWith(suffix));
+    return matched?.slice(1) ?? primaryTld;
+  };
   const caFingerprint = tls?.ca ? formatFingerprint(tls.ca) : undefined;
 
   const hostPort = (reqTls: boolean): string =>
@@ -494,7 +505,10 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     reqTls: boolean
   ): boolean => {
     if (!internalPages) return false;
-    if (host !== dashboardHost && host !== certHost) return false;
+    if (!isInternalHost(host)) return false;
+    const pageSuffix = suffixForHost(host);
+    const dashboardHost = `portless.${pageSuffix}`;
+    const certHost = `cert.${pageSuffix}`;
 
     const method = req.method || "GET";
     if (method !== "GET" && method !== "HEAD") {
@@ -522,7 +536,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
         return true;
       }
       const body = renderCertPage({
-        suffix: tld,
+        suffix: pageSuffix,
         downloadPath: "/portless-ca.pem",
         fingerprint: caFingerprint,
         trustedHere: getCaTrusted?.(),
@@ -551,7 +565,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       routes,
       proxyPort,
       tls: reqTls,
-      suffix: tld,
+      suffix: pageSuffix,
       caTrusted: getCaTrusted?.(),
       certHost,
       signature,
@@ -576,6 +590,8 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     reqTls: boolean
   ): RouteInfo | undefined => {
     const pathname = requestPath.split(/[?#]/, 1)[0] || "/";
+    const pageSuffix = suffixForHost(host);
+    const certHost = `cert.${pageSuffix}`;
     const base = `${reqTls ? "https" : "http"}://${host}${hostPort(reqTls)}`;
     const liveLabels = new Set(members.map((m) => m.label).filter(Boolean) as string[]);
     const selected = readSelectionCookie(req);
@@ -590,7 +606,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
         })),
         selectPath: MULTIPLEX_SELECT_PATH,
         current: selected && liveLabels.has(selected) ? selected : undefined,
-        suffix: tld,
+        suffix: pageSuffix,
         proxyPort,
         tls: reqTls,
         caTrusted: getCaTrusted?.(),
@@ -654,7 +670,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     const base = { host, authority, path, hops };
 
     if (!host) return { ...base, rejectReason: "missing-host" };
-    if (internalPages && (host === dashboardHost || host === certHost)) {
+    if (internalPages && isInternalHost(host)) {
       return { ...base, rejectReason: "internal-host" };
     }
     if (hops >= MAX_PROXY_HOPS) {
@@ -865,7 +881,11 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
 
     if (!route) {
       const safeHost = escapeHtml(host);
-      const strippedHost = host.endsWith(tldSuffix) ? host.slice(0, -tldSuffix.length) : host;
+      const matchedSuffix = tldSuffixes.find((suffix) => host.endsWith(suffix));
+      const strippedHost =
+        matchedSuffix && matchedSuffix.length < host.length
+          ? host.slice(0, -matchedSuffix.length)
+          : host;
       const safeSuggestion = escapeHtml(strippedHost);
       if (!wantsHtml(req)) {
         const lines = [`No app registered for ${textSafe(host)}.`];
@@ -1034,7 +1054,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     const host = getRequestHost(req).split(":")[0];
 
     // Reserved internal hosts have no WebSocket surface.
-    if (internalPages && (host === dashboardHost || host === certHost)) {
+    if (internalPages && isInternalHost(host)) {
       socket.destroy();
       return;
     }

@@ -2074,29 +2074,32 @@ describe("CLI", () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     });
 
-    it.skipIf(process.platform === "win32")("warns when --lan and --tld are both provided", () => {
-      // Use an empty PATH so the mDNS check fails early, causing the
-      // process to exit without needing a running proxy server (spawnSync
-      // blocks the parent event loop, preventing a fake server from responding).
-      const emptyPath = fs.mkdtempSync(path.join(os.tmpdir(), "portless-empty-path-"));
-      try {
-        const { status, stderr } = run(
-          ["proxy", "start", "--lan", "--tld", "test", "--ip", "192.168.1.42"],
-          {
-            env: {
-              PATH: emptyPath,
-              PORTLESS_STATE_DIR: tmpDir,
-              PORTLESS_PORT: "19876",
-            },
-          }
-        );
-        expect(status).toBe(1);
-        expect(stderr).toContain("--lan forces .local suffix");
-        expect(stderr).toContain("Ignoring --tld test");
-      } finally {
-        fs.rmSync(emptyPath, { recursive: true, force: true });
+    it.skipIf(process.platform === "win32")(
+      "does not discard an explicit suffix in LAN mode",
+      () => {
+        // Use an empty PATH so the mDNS check fails early, causing the
+        // process to exit without needing a running proxy server (spawnSync
+        // blocks the parent event loop, preventing a fake server from responding).
+        const emptyPath = fs.mkdtempSync(path.join(os.tmpdir(), "portless-empty-path-"));
+        try {
+          const { status, stderr } = run(
+            ["proxy", "start", "--lan", "--tld", "test", "--ip", "192.168.1.42"],
+            {
+              env: {
+                PATH: emptyPath,
+                PORTLESS_STATE_DIR: tmpDir,
+                PORTLESS_PORT: "19876",
+              },
+            }
+          );
+          expect(status).toBe(1);
+          expect(stderr).toContain("LAN mode requires mDNS publishing");
+          expect(stderr).not.toContain("Ignoring --tld test");
+        } finally {
+          fs.rmSync(emptyPath, { recursive: true, force: true });
+        }
       }
-    });
+    );
 
     it.skipIf(process.platform === "win32")(
       "fails early when the mDNS publisher binary is missing",
@@ -2768,6 +2771,27 @@ describe("CLI", () => {
       expect(fs.readFileSync(path.join(tmpDir, "proxy.tld"), "utf-8").trim()).toBe(
         "server01.acme.com"
       );
+    });
+
+    it("accepts repeated --suffix values and registers aliases for every suffix", () => {
+      const start = run(
+        ["proxy", "start", "--suffix", "test", "--suffix", "server01.acme.com", "--suffix", "test"],
+        { env: proxyEnv() }
+      );
+      expect(start.status).toBe(0);
+      expect(fs.readFileSync(path.join(tmpDir, "proxy.tld"), "utf-8").trim()).toBe("test");
+      expect(fs.readFileSync(path.join(tmpDir, "proxy.tlds"), "utf-8").trim().split("\n")).toEqual([
+        "test",
+        "server01.acme.com",
+      ]);
+
+      const alias = run(["alias", "myapp", "4567"], { env: proxyEnv() });
+      expect(alias.status).toBe(0);
+      const routes = JSON.parse(fs.readFileSync(path.join(tmpDir, "routes.json"), "utf-8"));
+      expect(routes.map((route: { hostname: string }) => route.hostname).sort()).toEqual([
+        "myapp.server01.acme.com",
+        "myapp.test",
+      ]);
     });
 
     it.skipIf(process.platform === "win32" || (process.getuid?.() ?? 0) === 0)(

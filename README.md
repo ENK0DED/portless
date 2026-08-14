@@ -222,12 +222,19 @@ Monorepo workspace apps use the same prefixing rule, including names set through
 
 By default, portless uses the `localhost` suffix, which produces URLs like `https://myapp.localhost` and auto-resolves to `127.0.0.1` in most browsers. This fork uses "suffix" terminology because the value can be more than a single top-level label.
 
-For one-off proxy starts, prefer `--suffix`:
+For one-off proxy starts, prefer repeatable `--suffix` flags:
 
 ```bash
 portless proxy start --suffix test
 portless myapp next dev
 # -> https://myapp.test
+```
+
+Repeat the flag to serve every app under multiple suffixes. Comma-separated values are also accepted:
+
+```bash
+portless proxy start --suffix test --suffix local.example.com
+# -> https://myapp.test and https://myapp.local.example.com
 ```
 
 For shell or service configuration, prefer `PORTLESS_SUFFIX`:
@@ -238,15 +245,17 @@ portless myapp next dev
 # -> https://myapp.test
 ```
 
-`PORTLESS_SUFFIX` accepts a single label such as `test` and dotted suffixes such as `server01.acme.com`:
+`PORTLESS_SUFFIX` accepts a comma-separated list. Each member may be a single label such as `test` or a dotted suffix such as `server01.acme.com`:
 
 ```bash
-PORTLESS_SUFFIX=server01.acme.com portless proxy start
+PORTLESS_SUFFIX=test,server01.acme.com portless proxy start
 portless myapp next dev
-# -> https://myapp.server01.acme.com
+# -> https://myapp.test and https://myapp.server01.acme.com
 ```
 
-`PORTLESS_SUFFIX` is read before the legacy `PORTLESS_TLD` variable. If both are set, `PORTLESS_SUFFIX` wins. `PORTLESS_TLD` and `--tld` remain supported so existing upstream-style environments and scripts keep working.
+`PORTLESS_SUFFIX` is read before the legacy `PORTLESS_TLD` variable. If both are set, the complete `PORTLESS_SUFFIX` list wins. `PORTLESS_TLD` and repeatable `--tld` remain supported so existing upstream-style environments and scripts keep working.
+
+In LAN mode, an explicit suffix list is preserved and `.local` is appended when absent. Plain `--lan` without an explicit suffix still uses only `.local`. Only `.local` names are published through mDNS.
 
 Suffix values are lowercased and validated as DNS names: each label may contain lowercase letters, digits, and hyphens, must start and end with a letter or digit, and must be 63 characters or less. The full suffix and generated hostname must be 253 characters or less. Leading dots, trailing dots, and consecutive dots are rejected.
 
@@ -348,7 +357,7 @@ portless service uninstall
 
 The service uses portless defaults unless install options or `PORTLESS_*` environment variables are provided: HTTPS on port 443 with `.localhost` names. `service install` accepts the proxy options you would use with `proxy start`, including `--port`, `--no-tls`, `--lan`, `--ip`, `--suffix`, `--tld`, `--wildcard`, `--cert`, and `--key`. Use `--state-dir <path>` or `PORTLESS_STATE_DIR=<path>` to choose where service state and logs are written.
 
-The chosen service configuration is written into launchd, systemd, or Task Scheduler and reused after reboot. Custom service suffixes are persisted as `PORTLESS_SUFFIX`; `--tld` remains accepted as a compatibility alias. `portless service status` reports the installed port, HTTPS mode, configured suffix, LAN mode, wildcard mode, and state directory. macOS and Linux install a root-owned service so port 443 can bind at boot. Windows installs a Task Scheduler startup task that runs as SYSTEM. Installation and removal may require administrator privileges. `portless clean` automatically removes the service.
+The chosen service configuration is written into launchd, systemd, or Task Scheduler and reused after reboot. Custom service suffix lists are persisted as `PORTLESS_SUFFIX`; `--suffix` and `--tld` may repeat. `portless service status` reports the installed port, HTTPS mode, configured suffixes, LAN mode, wildcard mode, and state directory. macOS and Linux install a root-owned service so port 443 can bind at boot. Windows installs a Task Scheduler startup task that runs as SYSTEM. Installation and removal may require administrator privileges. `portless clean` automatically removes the service.
 
 ## LAN mode
 
@@ -582,6 +591,7 @@ portless proxy start --no-tls    # Start without HTTPS (port 80)
 portless proxy start --lan       # Start in LAN mode (mDNS .local for devices)
 portless proxy start -p 1355     # Start on a custom port (no sudo)
 portless proxy start --suffix test  # Use .test instead of .localhost
+portless proxy start --suffix test --suffix local.example.com  # Use multiple suffixes
 portless proxy start --tld test  # Compatibility alias for --suffix
 portless proxy start --foreground  # Start in foreground for debugging
 portless proxy start --wildcard  # Allow unregistered subdomains to fall back to parent
@@ -606,7 +616,7 @@ portless service uninstall       # Remove the startup service
 --cert <path>                    Use a custom TLS certificate
 --key <path>                     Use a custom TLS private key
 --foreground                     Run proxy in foreground instead of daemon
---suffix <suffix>                Use a custom suffix instead of .localhost
+--suffix <suffix>                Add a custom suffix; repeat for multiple suffixes
 --tld <tld>                      Compatibility alias for --suffix
 --wildcard                       Allow unregistered subdomains to fall back to parent route locally
                                  Proxy-level only; restart proxy to change this mode
@@ -653,7 +663,7 @@ PORTLESS_TUNNEL_HOSTNAME=<host>  Request a provider-specific stable tunnel hostn
 PORTLESS_HTTPS=0                 Disable HTTPS (same as --no-tls)
 PORTLESS_LAN=1                   Enable LAN mode when set to 1 (auto-detects LAN IP)
 PORTLESS_LAN_IP=<address>        Pin a specific LAN IP for LAN mode
-PORTLESS_SUFFIX=<suffix>         Use a custom suffix (e.g. test, acme.com; default: localhost)
+PORTLESS_SUFFIX=<list>           Use comma-separated suffixes (e.g. test,acme.com)
 PORTLESS_TLD=<tld>               Compatibility alias for PORTLESS_SUFFIX
 PORTLESS_WILDCARD=1              Allow unregistered subdomains to fall back to parent route
 PORTLESS_SYNC_HOSTS=0            Disable auto-sync of /etc/hosts (on by default)
@@ -684,7 +694,7 @@ NODE_EXTRA_CA_CERTS              Path to the portless CA (when HTTPS is active)
 
 Command args can use exact placeholders `{PORT}`, `{HOST}`, and `{PORTLESS_URL}`. Portless replaces only whole-argument matches. For example, `{PORT}` is replaced, but `--port={PORT}` is left unchanged.
 
-Prefer `PORTLESS_SUFFIX` for new configuration. It accepts single-label suffixes such as `test` and dotted suffixes such as `acme.com` or `server01.acme.com`. `PORTLESS_TLD` is only a compatibility alias and is ignored when `PORTLESS_SUFFIX` is set.
+Prefer `PORTLESS_SUFFIX` for new configuration. It accepts comma-separated single-label and dotted suffixes, preserves order, and removes duplicates. `PORTLESS_TLD` is only a compatibility alias and is ignored when `PORTLESS_SUFFIX` is set.
 
 > **Reserved names:** `run`, `get`, `url`, `alias`, `tunnel`, `hosts`, `list`, `ls`, `status`, `trust`, `clean`, `prune`, `proxy`, `bg`, `service`, and `completion` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name from your project, or `portless --name <name> <cmd>` to force any name including reserved ones.
 

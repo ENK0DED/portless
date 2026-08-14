@@ -161,43 +161,48 @@ This fork uses Bun for repository development.
 
 Portless can still support pnpm as a child command or workspace format. Do not remove product support for pnpm just because this fork uses Bun.
 
-### Suffix Environment Variable
+### Suffix Lists
 
-This fork documents `PORTLESS_SUFFIX` as the preferred environment variable for custom suffixes. `PORTLESS_TLD` remains a compatibility alias.
+This fork documents `PORTLESS_SUFFIX` as the preferred environment variable for ordered custom suffix lists. `PORTLESS_TLD` remains a compatibility alias.
 
 Behavior to preserve:
 
-- `PORTLESS_SUFFIX` is read before `PORTLESS_TLD`
-- if both env vars are set, `PORTLESS_SUFFIX` wins
+- `PORTLESS_SUFFIX` accepts comma-separated values and is read before `PORTLESS_TLD`
+- if both env vars are set, the complete `PORTLESS_SUFFIX` list wins
 - empty values fall back to the default suffix `localhost`
-- values are trimmed and lowercased
+- list members are trimmed, lowercased, and deduplicated in order
 - single-label suffixes such as `test` are valid
 - dotted suffixes such as `acme.com` and `server01.acme.com` are valid
 - labels may contain lowercase letters, digits, and hyphens
 - labels must start and end with a letter or digit
 - labels must be 63 characters or less
+- each full suffix and generated hostname must be 253 characters or less
 - leading dots, trailing dots, and consecutive dots are invalid
-- risky suffix warnings should inspect the terminal public suffix label, so `local.example.dev` warns because the final label is `dev`
-- host parsing and proxy routing must support dotted suffixes
-- service installs should write `PORTLESS_SUFFIX`, not `PORTLESS_TLD`, into native service environment
-- `portless service install --suffix <suffix>` is the preferred service flag
-- `portless service install --tld <tld>` remains a compatibility alias
-- `portless proxy start --suffix <suffix>` is the preferred proxy flag
-- `portless proxy start --tld <tld>` remains a compatibility alias
-- the state marker file is still `proxy.tld` for compatibility with upstream and older local installs
+- risky suffix warnings match exact ownership-class entries such as bare `com`, while the tree-wide `local`, `dev`, and `app` risks also apply to dotted suffixes ending in those labels
+- warnings apply independently to every configured suffix; LAN mode suppresses only the appended `local` member
+- host parsing and proxy routing must support dotted and overlapping suffixes, matching the longest suffix first
+- invalid persisted list entries are skipped with a warning without discarding valid entries
+- service installs write the complete list to `PORTLESS_SUFFIX`, never `PORTLESS_TLD`, in native service environments
+- `portless service install --suffix <suffix>` and `portless proxy start --suffix <suffix>` are preferred and repeatable
+- repeatable `--tld <tld>` remains a compatibility alias
+- explicit suffix configuration is carried as data; it must not be reconstructed from list contents
+- explicit LAN lists are preserved in order with `local` appended when absent; plain LAN mode remains `local` only
+- LAN exposure is persisted separately from suffixes and must never be inferred from list membership
+- mDNS publishes only exact `.local` hostnames and never synthesizes `.local` for another suffix
+- `proxy.tlds` persists the complete list; `proxy.tld` remains the primary-suffix compatibility marker for upstream and older local installs
 
 Coverage:
 
-- `packages/portless/src/cli-utils.test.ts` covers `PORTLESS_SUFFIX`, `PORTLESS_TLD`, and precedence
-- `packages/portless/src/cli-utils.test.ts` covers dotted suffix validation
-- `packages/portless/src/cli.test.ts` covers the proxy `--suffix` parser
-- `packages/portless/src/utils.test.ts` covers hostname parsing with dotted suffixes
-- `packages/portless/src/proxy.test.ts` covers routing with dotted suffixes
-- `packages/portless/src/service.test.ts` covers service persistence through `PORTLESS_SUFFIX` and `--suffix`
+- `packages/portless/src/cli-utils.test.ts` covers list parsing, precedence, normalization, validation, persistence, invalid-entry recovery, and LAN explicitness
+- `packages/portless/src/cli.test.ts` covers repeated proxy `--suffix` flags, list persistence, and multi-suffix alias registration
+- `packages/portless/src/utils.test.ts` covers dotted suffix parsing and longest-suffix-first hostname parsing
+- `packages/portless/src/proxy.test.ts` covers dotted routing, overlapping suffix suggestions, and internal pages on secondary suffixes
+- `packages/portless/src/service.test.ts` covers list persistence through `PORTLESS_SUFFIX`, repeated `--suffix`, and explicit LAN list preservation
+- `packages/portless/src/mdns.test.ts` covers the exact `.local` guard for mixed LAN suffix lists
 - `packages/portless/src/cli.ts` help output documents `PORTLESS_SUFFIX` first
 - `README.md` and `skills/portless/SKILL.md` document `PORTLESS_SUFFIX` first
 
-Do not let an upstream merge restore a single-label-only validator or replace fork docs with only `PORTLESS_TLD`.
+Do not let an upstream merge restore a singleton or single-label-only model, reintroduce suffix-derived LAN exposure, or replace fork docs with only `PORTLESS_TLD`.
 
 ### Privileged Proxy State Handoff
 

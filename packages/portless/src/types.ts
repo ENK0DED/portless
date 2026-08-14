@@ -59,6 +59,8 @@ export interface ProxyServerOptions {
   proxyPort: number;
   /** Suffix used for hostnames (default: "localhost"). */
   tld?: string;
+  /** All configured suffixes. The first remains the primary compatibility value. */
+  tlds?: string[];
   /**
    * When true, only exact hostname matches are used. Unregistered subdomain
    * prefixes return 404 instead of falling back to the base service.

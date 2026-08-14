@@ -416,7 +416,7 @@ portless proxy start
     </tr>
     <tr>
       <td>`--suffix <suffix>`</td>
-      <td>Use a custom suffix instead of `.localhost` (e.g. `test`, `acme.com`). `--tld` still works as a compatibility alias. Hostnames still sync to `/etc/hosts` by default.</td>
+      <td>Add a custom suffix (e.g. `test`, `acme.com`). Repeat the flag for multiple suffixes. Repeatable `--tld` remains a compatibility alias. Hostnames still sync to `/etc/hosts` by default.</td>
     </tr>
     <tr>
       <td>`--cert <path>`</td>
@@ -452,7 +452,7 @@ portless service uninstall
 
 Installs the proxy as an OS startup service. The default is HTTPS on port 443 with `.localhost` names, but `service install` accepts proxy options including `--port`, `--no-tls`, `--lan`, `--ip`, `--suffix`, `--tld`, `--wildcard`, `--cert`, and `--key`. Use `--state-dir <path>` or `PORTLESS_STATE_DIR=<path>` to choose where service state and logs are written.
 
-The chosen service configuration is written into launchd, systemd, or Task Scheduler and reused after reboot. Custom service suffixes are persisted as `PORTLESS_SUFFIX`; `--tld` remains accepted as a compatibility alias. `portless service status` reports the installed port, HTTPS mode, configured suffix, LAN mode, wildcard mode, and state directory. macOS and Linux use a root-owned service so port 443 can bind at boot. Windows uses a Task Scheduler startup task that runs as SYSTEM. Installation and removal may require administrator privileges. `portless clean` automatically removes the service.
+The chosen service configuration is written into launchd, systemd, or Task Scheduler and reused after reboot. Custom service suffix lists are persisted as `PORTLESS_SUFFIX`; `--suffix` and `--tld` may repeat. `portless service status` reports the installed port, HTTPS mode, configured suffixes, LAN mode, wildcard mode, and state directory. macOS and Linux use a root-owned service so port 443 can bind at boot. Windows uses a Task Scheduler startup task that runs as SYSTEM. Installation and removal may require administrator privileges. `portless clean` automatically removes the service.
 
 ### LAN mode
 

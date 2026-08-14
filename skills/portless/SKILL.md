@@ -213,14 +213,14 @@ Auto-elevated proxy starts pass the resolved `PORTLESS_STATE_DIR` and proxy flag
 
 ### Custom suffixes
 
-Use `--suffix <suffix>` for one-off proxy starts and `PORTLESS_SUFFIX=<suffix>` for shell, CI, or service configuration:
+Use repeatable `--suffix <suffix>` flags for one-off proxy starts and a comma-separated `PORTLESS_SUFFIX=<list>` for shell, CI, or service configuration:
 
 ```bash
-portless proxy start --suffix test
-PORTLESS_SUFFIX=server01.acme.com portless proxy start
+portless proxy start --suffix test --suffix local.example.com
+PORTLESS_SUFFIX=test,server01.acme.com portless proxy start
 ```
 
-The suffix may be a single label such as `test` or a dotted suffix such as `server01.acme.com`. Values are trimmed, lowercased, and validated as DNS names. Each label is limited to 63 characters, and the full suffix and generated hostname are limited to 253 characters. `PORTLESS_SUFFIX` is preferred over the legacy `PORTLESS_TLD` variable, and `--tld <tld>` remains accepted as a compatibility alias.
+Each suffix may be a single label such as `test` or a dotted suffix such as `server01.acme.com`. Values are trimmed, lowercased, deduplicated in order, and validated as DNS names. Each label is limited to 63 characters, and every full suffix and generated hostname is limited to 253 characters. `PORTLESS_SUFFIX` is preferred over the legacy `PORTLESS_TLD` variable, and repeatable `--tld <tld>` remains accepted as a compatibility alias. In LAN mode, explicit suffixes are preserved and `local` is appended; plain LAN mode uses only `local`, and mDNS publishes only those `.local` routes.
 
 ### Environment variables
 
@@ -236,7 +236,7 @@ The suffix may be a single label such as `test` or a dotted suffix such as `serv
 | `PORTLESS_HTTPS`                  | HTTPS on by default; set to `0` to disable (same as `--no-tls`)             |
 | `PORTLESS_LAN`                    | Set to `1` to always enable LAN mode (auto-detects LAN IP)                  |
 | `PORTLESS_LAN_IP`                 | Pin a specific LAN IP for LAN mode                                          |
-| `PORTLESS_SUFFIX`                 | Use a custom suffix instead of localhost (e.g. test, acme.com)              |
+| `PORTLESS_SUFFIX`                 | Use comma-separated suffixes (e.g. test, acme.com)                          |
 | `PORTLESS_TLD`                    | Compatibility alias for `PORTLESS_SUFFIX`                                   |
 | `PORTLESS_WILDCARD`               | Set to `1` to allow unregistered subdomains to fall back to parent          |
 | `PORTLESS_SYNC_HOSTS`             | Set to `0` to disable auto-sync of /etc/hosts (on by default)               |
@@ -424,7 +424,7 @@ portless service uninstall
 
 The service uses portless defaults unless install options or `PORTLESS_*` environment variables are provided: HTTPS on port 443 with `.localhost` names. `service install` accepts proxy options including `--port`, `--no-tls`, `--lan`, `--ip`, `--suffix`, `--tld`, `--wildcard`, `--cert`, and `--key`. Use `--state-dir <path>` or `PORTLESS_STATE_DIR=<path>` to choose where service state and logs are written.
 
-The chosen service configuration is written into launchd, systemd, or Task Scheduler and reused after reboot. `portless service status` reports the installed port, HTTPS mode, configured suffix, LAN mode, wildcard mode, and state directory. macOS and Linux install a root-owned service so port 443 can bind at boot. Windows installs a Task Scheduler startup task that runs as SYSTEM. Installation and removal may require administrator privileges. `portless clean` automatically removes the service.
+The chosen service configuration is written into launchd, systemd, or Task Scheduler and reused after reboot. Suffix lists are persisted through `PORTLESS_SUFFIX`. `portless service status` reports the installed port, HTTPS mode, configured suffixes, LAN mode, wildcard mode, and state directory. macOS and Linux install a root-owned service so port 443 can bind at boot. Windows installs a Task Scheduler startup task that runs as SYSTEM. Installation and removal may require administrator privileges. `portless clean` automatically removes the service.
 
 ## CLI Reference
 
@@ -456,7 +456,7 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 | `portless proxy start --lan`                     | Start in LAN mode (mDNS `.local`, auto-follows LAN IP changes) |
 | `portless proxy start -p <number>`               | Start the proxy on a custom port                               |
 | `portless proxy start --skip-trust`              | Generate or reuse certs without adding the CA to trust         |
-| `portless proxy start --suffix test`             | Use .test instead of .localhost                                |
+| `portless proxy start --suffix test`             | Add .test; repeat the flag for more suffixes                   |
 | `portless proxy start --tld test`                | Compatibility alias for `--suffix`                             |
 | `portless proxy start --foreground`              | Start the proxy in foreground (for debugging)                  |
 | `portless proxy start --wildcard`                | Allow unregistered subdomains to fall back locally             |

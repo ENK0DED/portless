@@ -23,16 +23,20 @@ import {
   findFreePort,
   getDefaultPort,
   getDefaultTld,
+  getDefaultTlds,
   getProtocolPort,
   getRiskyTldReason,
+  hasConfiguredTldEnv,
   isHttpsEnvDisabled,
   injectFrameworkFlags,
   isPortListening,
   isProxyRunning,
   parsePidFromNetstat,
+  parseTldList,
   readLanMarker,
   readPersistedProxyState,
   readTldFromDir,
+  readTldsFromDir,
   readWildcardMarker,
   replacePlaceholders,
   resolveWindowsCommandInvocation,
@@ -41,6 +45,7 @@ import {
   validateTld,
   writeLanMarker,
   writeTldFile,
+  writeTldsFile,
   writeTlsMarker,
   writeWildcardMarker,
 } from "./cli-utils.js";
@@ -1076,6 +1081,11 @@ describe("getDefaultTld", () => {
     expect(getDefaultTld()).toBe("preferred.test");
   });
 
+  it("returns the first suffix from a configured list", () => {
+    process.env[SUFFIX_ENV] = "preferred.test,localhost";
+    expect(getDefaultTld()).toBe("preferred.test");
+  });
+
   it("returns DEFAULT_TLD when both env vars are empty", () => {
     process.env[SUFFIX_ENV] = "";
     process.env[LEGACY_TLD_ENV] = "";
@@ -1083,8 +1093,53 @@ describe("getDefaultTld", () => {
   });
 });
 
+describe("getDefaultTlds", () => {
+  let originalLegacyEnv: string | undefined;
+  let originalSuffixEnv: string | undefined;
+
+  beforeEach(() => {
+    originalLegacyEnv = process.env[LEGACY_TLD_ENV];
+    originalSuffixEnv = process.env[SUFFIX_ENV];
+  });
+
+  afterEach(() => {
+    if (originalLegacyEnv === undefined) delete process.env[LEGACY_TLD_ENV];
+    else process.env[LEGACY_TLD_ENV] = originalLegacyEnv;
+    if (originalSuffixEnv === undefined) delete process.env[SUFFIX_ENV];
+    else process.env[SUFFIX_ENV] = originalSuffixEnv;
+  });
+
+  it("parses, normalizes, and deduplicates PORTLESS_SUFFIX in order", () => {
+    process.env[SUFFIX_ENV] = " TEST, server01.Acme.com, test ";
+    process.env[LEGACY_TLD_ENV] = "legacy.test";
+    expect(getDefaultTlds()).toEqual(["test", "server01.acme.com"]);
+  });
+
+  it("falls back to a PORTLESS_TLD list when PORTLESS_SUFFIX is empty", () => {
+    process.env[SUFFIX_ENV] = "";
+    process.env[LEGACY_TLD_ENV] = "legacy.test,localhost";
+    expect(getDefaultTlds()).toEqual(["legacy.test", "localhost"]);
+  });
+
+  it("does not treat empty suffix variables as explicit configuration", () => {
+    process.env[SUFFIX_ENV] = "";
+    process.env[LEGACY_TLD_ENV] = "";
+    expect(hasConfiguredTldEnv()).toBe(false);
+  });
+});
+
+describe("parseTldList", () => {
+  it("parses comma-separated suffixes and removes duplicates in order", () => {
+    expect(parseTldList(" TEST, localhost, test ")).toEqual(["test", "localhost"]);
+  });
+
+  it("rejects empty comma-separated entries", () => {
+    expect(() => parseTldList("test,,localhost")).toThrow("TLD cannot be empty");
+  });
+});
+
 describe("buildProxyStartConfig", () => {
-  it("forces .local and keeps explicit --ip in LAN mode", () => {
+  it("preserves an explicit suffix list in LAN mode and appends local", () => {
     expect(
       buildProxyStartConfig({
         useHttps: true,
@@ -1092,19 +1147,28 @@ describe("buildProxyStartConfig", () => {
         lanIp: "192.168.1.42",
         lanIpExplicit: true,
         tld: "test",
+        tlds: ["test", "server01.acme.com", "test"],
+        tldsExplicit: true,
         useWildcard: true,
         foreground: true,
         includePort: true,
         proxyPort: 8080,
       })
     ).toEqual({
-      effectiveTld: "local",
+      effectiveTld: "test",
+      effectiveTlds: ["test", "server01.acme.com", "local"],
       args: [
         "--foreground",
         "--port",
         "8080",
         "--https",
         "--lan",
+        "--suffix",
+        "test",
+        "--suffix",
+        "server01.acme.com",
+        "--suffix",
+        "local",
         "--ip",
         "192.168.1.42",
         "--wildcard",
@@ -1123,6 +1187,7 @@ describe("buildProxyStartConfig", () => {
       })
     ).toEqual({
       effectiveTld: "local",
+      effectiveTlds: ["local"],
       args: ["--no-tls", "--lan", INTERNAL_LAN_IP_FLAG, "192.168.1.42"],
     });
   });
@@ -1136,7 +1201,24 @@ describe("buildProxyStartConfig", () => {
       })
     ).toEqual({
       effectiveTld: "test",
+      effectiveTlds: ["test"],
       args: ["--no-tls", "--suffix", "test"],
+    });
+  });
+
+  it("emits every suffix outside LAN mode", () => {
+    expect(
+      buildProxyStartConfig({
+        useHttps: true,
+        lanMode: false,
+        tld: "localhost",
+        tlds: ["localhost", "test"],
+        tldsExplicit: true,
+      })
+    ).toEqual({
+      effectiveTld: "localhost",
+      effectiveTlds: ["localhost", "test"],
+      args: ["--https", "--suffix", "localhost", "--suffix", "test"],
     });
   });
 });
@@ -1268,11 +1350,32 @@ describe("readTldFromDir / writeTldFile", () => {
 
   it("returns DEFAULT_TLD when file does not exist", () => {
     expect(readTldFromDir(tmpDir)).toBe(DEFAULT_TLD);
+    expect(readTldsFromDir(tmpDir)).toEqual([DEFAULT_TLD]);
   });
 
   it("writes and reads a custom TLD", () => {
     writeTldFile(tmpDir, "test");
     expect(readTldFromDir(tmpDir)).toBe("test");
+    expect(readTldsFromDir(tmpDir)).toEqual(["test"]);
+  });
+
+  it("persists a suffix list while retaining proxy.tld as the primary marker", () => {
+    writeTldsFile(tmpDir, ["server01.acme.com", "test"]);
+
+    expect(readTldsFromDir(tmpDir)).toEqual(["server01.acme.com", "test"]);
+    expect(fs.readFileSync(path.join(tmpDir, "proxy.tld"), "utf-8")).toBe("server01.acme.com");
+  });
+
+  it("skips invalid persisted list entries without discarding valid suffixes", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    fs.writeFileSync(path.join(tmpDir, "proxy.tlds"), "test\nbad_name\ninternal\n");
+
+    expect(readTldsFromDir(tmpDir)).toEqual(["test", "internal"]);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("Warning: ignoring invalid TLD entry in proxy.tlds")
+    );
+
+    warn.mockRestore();
   });
 
   it("ignores an invalid persisted TLD with a warning", () => {
@@ -1440,6 +1543,22 @@ describe("readPersistedProxyState", () => {
     expect(state!.tld).toBe("test");
   });
 
+  it("reads all suffixes from persisted state", () => {
+    fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
+    writeTldsFile(tmpDir, ["test", "local"]);
+    const state = readPersistedProxyState();
+    expect(state).not.toBeNull();
+    expect(state!.tlds).toEqual(["test", "local"]);
+  });
+
+  it("does not infer LAN mode from a local suffix without a LAN marker", () => {
+    fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
+    writeTldsFile(tmpDir, ["test", "local"]);
+    const state = readPersistedProxyState();
+    expect(state).not.toBeNull();
+    expect(state!.lanMode).toBe(false);
+  });
+
   it("reads LAN mode from persisted state", () => {
     fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
     writeLanMarker(tmpDir, "192.168.1.10");
@@ -1459,6 +1578,7 @@ describe("readPersistedProxyState", () => {
       port: 1355,
       tls: true,
       tld: "local",
+      tlds: ["local"],
       lanMode: true,
       useWildcard: true,
     });

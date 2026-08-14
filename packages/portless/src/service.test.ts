@@ -300,6 +300,50 @@ describe("buildServiceSpec", () => {
     expect(spec.unit).toContain('Environment=PORTLESS_SUFFIX="test"');
     expect(spec.stateDir).toBe("/srv/portless");
   });
+
+  it("persists a repeated suffix list through PORTLESS_SUFFIX", () => {
+    const spec = buildServiceSpec({
+      platform: "linux",
+      nodePath: "/usr/bin/node",
+      entryScript: "/usr/lib/node_modules/@enk0ded/portless/dist/cli.js",
+      userHome: "/home/alice",
+      installConfig: {
+        proxyPort: 8443,
+        tld: "test",
+        tlds: ["test", "server01.acme.com"],
+        tldsExplicit: true,
+      },
+    });
+
+    if (spec.platform !== "linux") throw new Error("Expected Linux service spec");
+    expect(spec.execStart).toContain("--suffix");
+    expect(spec.execStart.join(" ")).toContain("--suffix test --suffix server01.acme.com");
+    expect(spec.unit).toContain('Environment=PORTLESS_SUFFIX="test,server01.acme.com"');
+    expect(spec.unit).not.toContain("PORTLESS_TLD");
+  });
+
+  it("preserves an explicit LAN suffix list and appends local", () => {
+    const spec = buildServiceSpec({
+      platform: "linux",
+      nodePath: "/usr/bin/node",
+      entryScript: "/usr/lib/node_modules/@enk0ded/portless/dist/cli.js",
+      userHome: "/home/alice",
+      installConfig: {
+        proxyPort: 8443,
+        lanMode: true,
+        tld: "test",
+        tlds: ["test", "server01.acme.com"],
+        tldsExplicit: true,
+      },
+    });
+
+    if (spec.platform !== "linux") throw new Error("Expected Linux service spec");
+    expect(spec.execStart.join(" ")).toContain(
+      "--lan --suffix test --suffix server01.acme.com --suffix local"
+    );
+    expect(spec.unit).toContain('Environment=PORTLESS_SUFFIX="test,server01.acme.com,local"');
+    expect(spec.unit).toContain('Environment=PORTLESS_LAN="1"');
+  });
 });
 
 describe("buildServiceUninstallSudoArgs", () => {
@@ -764,6 +808,7 @@ describe("handleService", () => {
       port: currentPort,
       tls: true,
       tld: "localhost",
+      tlds: ["localhost"],
       lanMode: false,
       lanIp: null,
     });
@@ -911,7 +956,7 @@ describe("handleService", () => {
     const output = logSpy.mock.calls.map((c: unknown[]) => c.join(" ")).join("\n");
     expect(output).toContain("Proxy on 8443");
     expect(output).toContain("HTTPS: no");
-    expect(output).toContain("Suffix: local");
+    expect(output).toContain("Suffixes: .local");
     expect(output).toContain("LAN mode: yes");
     expect(output).toContain("LAN IP: 192.168.1.42");
     expect(output).toContain("Wildcard: yes");
