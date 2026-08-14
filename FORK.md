@@ -127,6 +127,17 @@ Current fork-owned commits and what they protect:
 | `8b25491` | Finalized the `portless doctor` ticket resolution and recorded its implementation in the fork-only ledger.                                                                                         |
 | `4dd7f00` | Prepared fork release `0.15.6001` with the six-feature batch changelogs and the `0.15.6002` upstream-PR backport reservation.                                                                      |
 | `4a6bacf` | Finalized the `0.15.6001` ledger refresh and resolved Wayfinder ticket 18.                                                                                                                         |
+| `5d89151` | Deduplicated same-hostname hosts-file lines and keyed mDNS reload detection on the hostname set to stop publisher churn.                                                                           |
+| `a0c4433` | Guided NixOS and unknown Linux distros through CA trust instead of silently assuming the Debian layout, and aligned WSL trust detection with trustCA.                                              |
+| `7fbfcf7` | Hardened Windows cmd shim argument escaping with cmdEscape helpers, outer /s quoting, and /v:off while keeping direct-exe spawning.                                                                |
+| `019eecc` | Added opt-in flat worktree hostnames on a consolidated prefix helper with getUrl parity and collision hashing.                                                                                     |
+| `c5fd9e5` | Persisted routes.json atomically with a directory watcher and added a tunable dead-PID stale-route sweep.                                                                                          |
+| `0f15a57` | Recorded the final v0.15.6001 ledger cleanup.                                                                                                                                                      |
+| `efce0d6` | Merged the ticket 21 worktree branch bringing atomic route persistence and the stale-route sweep into the sync branch.                                                                             |
+| `0581a75` | Merged the ticket 25 worktree branch bringing NixOS CA trust guidance into the sync branch.                                                                                                        |
+| `903f79f` | Merged the ticket 26 worktree branch bringing Windows cmd escaping hardening into the sync branch.                                                                                                 |
+| `066f906` | Merged the ticket 27 worktree branch bringing flat worktree hostnames into the sync branch.                                                                                                        |
+| `91de9c0` | Merged the ticket 20 worktree branch bringing hosts and mDNS deduplication into the sync branch.                                                                                                   |
 
 ## Fork-Owned Invariants
 
