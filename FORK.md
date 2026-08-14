@@ -164,6 +164,8 @@ Current fork-owned commits and what they protect:
 | `7630012` | Recorded the 0.15.6002 release ledger finalization rows.                                                                                                                                               |
 | `6bf9c3e` | Stabilized the doctor empty-state and worktree URL tests on Windows CI with a pinned free port and resolution-warning tolerance.                                                                       |
 | `6c27bb0` | Recorded the Windows CI watcher fix rows in the fork-only ledger.                                                                                                                                      |
+| `7b0ff29` | Watched the canonical temp path in the atomic-write route watcher tests to stop the Windows vitest worker abort.                                                                                       |
+| `ea9dc6a` | Recorded the Windows test stabilization rows in the fork-only ledger.                                                                                                                                  |
 
 ## Fork-Owned Invariants
 
