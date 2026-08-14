@@ -140,6 +140,9 @@ Current fork-owned commits and what they protect:
 | `91de9c0` | Merged the ticket 20 worktree branch bringing hosts and mDNS deduplication into the sync branch.                                                                                                   |
 | `925d875` | Aligned the doctor Windows shim test with the hardened cmd escaping invocation shape.                                                                                                              |
 | `d161f0a` | Recorded the 0.15.6002 backport batch integration in the fork-only ledger.                                                                                                                         |
+| `cb33fc7` | Warned on unresolvable registered hostnames with a daemon warn latch, fixed marker-based LAN inference, and deduplicated exact hosts blocks without adding a mutation endpoint.                    |
+| `5b057c8` | Merged the ticket 22 worktree branch bringing the hostname resolution warning into the sync branch.                                                                                                |
+| `777ef1d` | Recorded the doctor shim test alignment and backport batch rows in the fork-only ledger.                                                                                                           |
 
 ## Fork-Owned Invariants
 
