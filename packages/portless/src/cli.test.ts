@@ -1,14 +1,16 @@
-import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
 import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildRestartStartArgs, parseBgStartArgs } from "./bg.js";
+import { buildRestartStartArgs, parseBgStartArgs, stopEntry } from "./bg.js";
 import { getBgLogPaths } from "./bg-logs.js";
-import type { BgStartIntent } from "./bg-store.js";
+import { BgStore, type BgProcessEntry, type BgStartIntent } from "./bg-store.js";
 import { ensureCerts } from "./certs.js";
+import { RouteStore } from "./routes.js";
+import { TunnelAliasStore } from "./tunnel-aliases.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLI_PATH = path.resolve(__dirname, "../dist/cli.js");
@@ -1611,6 +1613,65 @@ describe("CLI", () => {
         expect(() =>
           parseBgStartArgs(["--name", "web", "--", "bun", "run", "dev", "--json"])
         ).toThrow("command separator");
+      });
+
+      it("force stop reports failure when SIGKILL does not end the process", async () => {
+        const entry = makeBgEntry({
+          id: "force-stop-failed",
+          label: "force-stop-failed",
+          pid: 4242,
+        }) as BgProcessEntry;
+        const store = new BgStore(tmpDir);
+        store.upsertEntry(entry);
+
+        const result = await stopEntry(
+          {
+            stateDir: tmpDir,
+            store,
+            routeStore: new RouteStore(tmpDir),
+            tunnelAliasStore: new TunnelAliasStore(tmpDir),
+          },
+          entry,
+          { force: true },
+          {
+            isProcessAlive: vi.fn(() => true),
+            signalProcessGroup: vi.fn(),
+            waitForProcessExit: vi.fn(async () => false),
+          }
+        );
+
+        expect(result).toEqual({ stopped: false, alreadyStopped: false });
+        expect(store.loadEntries()).toHaveLength(1);
+        expect(store.loadEntries()[0].state).toBe("unknown");
+      });
+
+      it("successful force stop removes the registry entry", async () => {
+        const entry = makeBgEntry({
+          id: "force-stop-success",
+          label: "force-stop-success",
+          pid: 4343,
+        }) as BgProcessEntry;
+        const store = new BgStore(tmpDir);
+        store.upsertEntry(entry);
+
+        const result = await stopEntry(
+          {
+            stateDir: tmpDir,
+            store,
+            routeStore: new RouteStore(tmpDir),
+            tunnelAliasStore: new TunnelAliasStore(tmpDir),
+          },
+          entry,
+          { force: true },
+          {
+            isProcessAlive: vi.fn(() => true),
+            signalProcessGroup: vi.fn(),
+            waitForProcessExit: vi.fn(async () => true),
+          }
+        );
+
+        expect(result).toEqual({ stopped: true, alreadyStopped: false });
+        expect(store.loadEntries()).toEqual([]);
       });
 
       it("bg clean removes dead entries and their logs", async () => {

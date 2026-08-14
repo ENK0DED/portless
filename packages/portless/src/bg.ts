@@ -52,11 +52,17 @@ interface ParsedRunIntent {
   label: string;
 }
 
-interface BgCommandContext {
+export interface BgCommandContext {
   stateDir: string;
   store: BgStore;
   routeStore: RouteStore;
   tunnelAliasStore: TunnelAliasStore;
+}
+
+export interface BgStopEntryOperations {
+  isProcessAlive?: (pid: number) => boolean;
+  signalProcessGroup?: (pid: number, signal: NodeJS.Signals) => void;
+  waitForProcessExit?: (pid: number, timeoutMs: number) => Promise<boolean>;
 }
 
 interface EntryView extends BgProcessEntry {
@@ -543,22 +549,30 @@ function removeEntryLogs(stateDir: string, entryId: string): void {
   }
 }
 
-async function stopEntry(
+export async function stopEntry(
   context: BgCommandContext,
   entry: BgProcessEntry,
-  options: { force?: boolean; removeLogs?: boolean } = {}
+  options: { force?: boolean; removeLogs?: boolean } = {},
+  operations: BgStopEntryOperations = {}
 ): Promise<{ stopped: boolean; alreadyStopped: boolean }> {
-  const alive = isProcessAlive(entry.pid);
+  const isAlive = operations.isProcessAlive ?? isProcessAlive;
+  const signal = operations.signalProcessGroup ?? signalProcessGroup;
+  const wait = operations.waitForProcessExit ?? waitForProcessExit;
+  const alive = isAlive(entry.pid);
   if (alive) {
-    signalProcessGroup(entry.pid, options.force ? "SIGKILL" : "SIGTERM");
-    const exited = await waitForProcessExit(entry.pid, options.force ? 1000 : 5000);
+    signal(entry.pid, options.force ? "SIGKILL" : "SIGTERM");
+    const exited = await wait(entry.pid, options.force ? 1000 : 5000);
     if (!exited && !options.force) {
       context.store.updateEntry(entry.id, { state: "unknown" });
       return { stopped: false, alreadyStopped: false };
     }
     if (!exited && options.force) {
-      signalProcessGroup(entry.pid, "SIGKILL");
-      await waitForProcessExit(entry.pid, 1000);
+      signal(entry.pid, "SIGKILL");
+      const killed = await wait(entry.pid, 1000);
+      if (!killed) {
+        context.store.updateEntry(entry.id, { state: "unknown" });
+        return { stopped: false, alreadyStopped: false };
+      }
     }
   }
 
