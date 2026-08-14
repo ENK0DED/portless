@@ -127,6 +127,12 @@ describe("buildBlock", () => {
     expect(lines[3]).toBe("# portless-end");
   });
 
+  it("deduplicates hostnames shared by multiple routes", () => {
+    expect(buildBlock(["myapp.localhost", "myapp.localhost"])).toBe(
+      "# portless-start\n127.0.0.1 myapp.localhost\n# portless-end"
+    );
+  });
+
   it("produces a block that extractManagedBlock can parse", () => {
     const hostnames = ["a.localhost", "b.localhost"];
     const block = buildBlock(hostnames);

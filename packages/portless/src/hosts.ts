@@ -55,9 +55,15 @@ export function removeBlock(content: string): string {
  * Build a portless-managed block for the given hostnames.
  */
 export function buildBlock(hostnames: string[]): string {
-  if (hostnames.length === 0) return "";
-  const entries = hostnames.map((h) => `127.0.0.1 ${assertSafeHostsHostname(h)}`).join("\n");
+  const uniqueHostnames = deduplicateHostnames(hostnames);
+  if (uniqueHostnames.length === 0) return "";
+  const entries = uniqueHostnames.map((h) => `127.0.0.1 ${assertSafeHostsHostname(h)}`).join("\n");
   return `${MARKER_START}\n${entries}\n${MARKER_END}`;
+}
+
+/** Return hostnames in input order without duplicate entries. */
+export function deduplicateHostnames(hostnames: readonly string[]): string[] {
+  return [...new Set(hostnames)];
 }
 
 /**
@@ -101,13 +107,14 @@ export function shouldAutoSyncHosts(syncVal: string | undefined): boolean {
  */
 export function syncHostsFile(hostnames: string[]): boolean {
   try {
+    const uniqueHostnames = deduplicateHostnames(hostnames);
     const content = readHostsFile();
     const cleaned = removeBlock(content);
 
-    if (hostnames.length === 0) {
+    if (uniqueHostnames.length === 0) {
       fs.writeFileSync(HOSTS_PATH, cleaned);
     } else {
-      const block = buildBlock(hostnames);
+      const block = buildBlock(uniqueHostnames);
       fs.writeFileSync(HOSTS_PATH, cleaned.trimEnd() + "\n\n" + block + "\n");
     }
     return true;

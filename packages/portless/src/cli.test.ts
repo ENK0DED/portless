@@ -284,6 +284,33 @@ function writeCloudflaredShim(dir: string, url = "https://abc.trycloudflare.com"
   fs.chmodSync(shimPath, 0o755);
 }
 
+function writeMdnsShim(dir: string): void {
+  const command = process.platform === "darwin" ? "dns-sd" : "avahi-publish-address";
+  const probeArg = process.platform === "darwin" ? "-h" : "--help";
+  const script = [
+    "#!/bin/sh",
+    `if [ "$1" = "${probeArg}" ]; then exit 0; fi`,
+    'printf "start\\n" >> "$PORTLESS_TEST_MDNS_LOG"',
+    'trap \'printf "stop\\n" >> "$PORTLESS_TEST_MDNS_LOG"; exit 0\' TERM INT',
+    "while :; do sleep 1; done",
+    "",
+  ].join("\n");
+  const shimPath = path.join(dir, command);
+  fs.writeFileSync(shimPath, script);
+  fs.chmodSync(shimPath, 0o755);
+}
+
+function countFileLines(filePath: string, expected: string): number {
+  try {
+    return fs
+      .readFileSync(filePath, "utf-8")
+      .split(/\r?\n/)
+      .filter((line) => line === expected).length;
+  } catch {
+    return 0;
+  }
+}
+
 async function getFreePort(): Promise<number> {
   const server = http.createServer();
   try {
@@ -633,6 +660,94 @@ describe("CLI", () => {
       expect(status).toBe(1);
       expect(stdout).toContain("proxy start");
     });
+  });
+
+  describe("mDNS route reload", () => {
+    it.skipIf(process.platform === "win32")(
+      "does not restart a publisher when same-hostname route ports change",
+      async () => {
+        const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-mdns-reload-state-"));
+        const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-mdns-reload-shim-"));
+        const mdnsLog = path.join(stateDir, "mdns.log");
+        const routesPath = path.join(stateDir, "routes.json");
+        const proxyPort = await getFreePort();
+        let proxy: ReturnType<typeof spawn> | undefined;
+
+        const routes = (firstPort: number, secondPort: number) => [
+          {
+            hostname: "shared.local",
+            port: firstPort,
+            pid: 0,
+            pathPrefix: "/api",
+          },
+          {
+            hostname: "shared.local",
+            port: secondPort,
+            pid: 0,
+            pathPrefix: "/docs",
+          },
+        ];
+
+        try {
+          writeMdnsShim(shimDir);
+          fs.writeFileSync(routesPath, JSON.stringify(routes(4101, 4102)));
+
+          const childEnv: Record<string, string | undefined> = { ...process.env };
+          for (const key of Object.keys(childEnv)) {
+            if (key.startsWith("PORTLESS")) delete childEnv[key];
+          }
+          Object.assign(childEnv, {
+            PATH: prependPath(shimDir),
+            PORTLESS_STATE_DIR: stateDir,
+            PORTLESS_SYNC_HOSTS: "0",
+            PORTLESS_HTTPS: "0",
+            PORTLESS_DASHBOARD: "0",
+            PORTLESS_TEST_MDNS_LOG: mdnsLog,
+            NO_COLOR: "1",
+          });
+
+          proxy = spawn(
+            process.execPath,
+            [
+              CLI_PATH,
+              "proxy",
+              "start",
+              "--foreground",
+              "--no-tls",
+              "--lan",
+              "--ip",
+              "192.168.1.42",
+              "--port",
+              String(proxyPort),
+            ],
+            {
+              env: childEnv,
+              stdio: ["ignore", "pipe", "pipe"],
+            }
+          );
+
+          const output: string[] = [];
+          proxy.stdout?.on("data", (chunk) => output.push(chunk.toString()));
+          proxy.stderr?.on("data", (chunk) => output.push(chunk.toString()));
+
+          const publisherStarted = await waitForFileIncludes(mdnsLog, "start");
+          if (!publisherStarted) {
+            throw new Error(`mDNS publisher did not start. CLI output:\n${output.join("")}`);
+          }
+          expect(countFileLines(mdnsLog, "start")).toBe(1);
+
+          fs.writeFileSync(routesPath, JSON.stringify(routes(4201, 4202)));
+          await new Promise((resolve) => setTimeout(resolve, 500));
+
+          expect(countFileLines(mdnsLog, "start")).toBe(1);
+        } finally {
+          if (proxy) await stopChild(proxy);
+          fs.rmSync(shimDir, { recursive: true, force: true });
+          fs.rmSync(stateDir, { recursive: true, force: true });
+        }
+      },
+      15_000
+    );
   });
 
   describe("service", () => {

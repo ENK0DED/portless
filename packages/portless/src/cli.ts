@@ -19,7 +19,12 @@ import {
   parseHostnames,
 } from "./utils.js";
 import { getUrl } from "./api.js";
-import { syncHostsFile, cleanHostsFile, shouldAutoSyncHosts } from "./hosts.js";
+import {
+  syncHostsFile,
+  cleanHostsFile,
+  shouldAutoSyncHosts,
+  deduplicateHostnames,
+} from "./hosts.js";
 import { FILE_MODE, RouteConflictError, RouteStore } from "./routes.js";
 import { TunnelAliasStore, normalizeTunnelHostname } from "./tunnel-aliases.js";
 import {
@@ -695,8 +700,8 @@ function startProxyServer(
 
   const publishCachedRoutes = () => {
     if (!activeLanIp) return;
-    for (const route of cachedRoutes) {
-      publish(route.hostname, proxyPort, activeLanIp, onMdnsError);
+    for (const hostname of deduplicateHostnames(cachedRoutes.map((route) => route.hostname))) {
+      publish(hostname, proxyPort, activeLanIp, onMdnsError);
     }
   };
 
@@ -723,25 +728,25 @@ function startProxyServer(
 
   const reloadRoutes = () => {
     try {
-      const previousRoutes = new Map(cachedRoutes.map((r) => [r.hostname, r.port]));
+      const previousHostnames = new Set(
+        deduplicateHostnames(cachedRoutes.map((route) => route.hostname))
+      );
       cachedRoutes = store.loadRoutes();
+      const currentHostnames = new Set(
+        deduplicateHostnames(cachedRoutes.map((route) => route.hostname))
+      );
       if (autoSyncHosts) {
-        syncHostsFile(cachedRoutes.map((r) => r.hostname));
+        syncHostsFile([...currentHostnames]);
       }
       // Sync mDNS records with current routes
       if (activeLanIp) {
-        const currentRoutes = new Map(cachedRoutes.map((r) => [r.hostname, r.port]));
-        for (const route of cachedRoutes) {
-          const previousPort = previousRoutes.get(route.hostname);
-          if (previousPort === undefined) {
-            publish(route.hostname, proxyPort, activeLanIp, onMdnsError);
-          } else if (previousPort !== route.port) {
-            unpublish(route.hostname);
-            publish(route.hostname, proxyPort, activeLanIp, onMdnsError);
+        for (const hostname of currentHostnames) {
+          if (!previousHostnames.has(hostname)) {
+            publish(hostname, proxyPort, activeLanIp, onMdnsError);
           }
         }
-        for (const hostname of previousRoutes.keys()) {
-          if (!currentRoutes.has(hostname)) {
+        for (const hostname of previousHostnames) {
+          if (!currentHostnames.has(hostname)) {
             unpublish(hostname);
           }
         }
@@ -763,7 +768,7 @@ function startProxyServer(
   }
 
   if (autoSyncHosts) {
-    syncHostsFile(cachedRoutes.map((r) => r.hostname));
+    syncHostsFile(deduplicateHostnames(cachedRoutes.map((route) => route.hostname)));
   }
 
   // Publish mDNS for routes that already exist at startup
@@ -4288,7 +4293,7 @@ ${colors.bold("Usage: portless hosts <command>")}
     console.log(colors.yellow("No active routes to sync."));
     return;
   }
-  const hostnames = routes.map((r) => r.hostname);
+  const hostnames = deduplicateHostnames(routes.map((route) => route.hostname));
   if (syncHostsFile(hostnames)) {
     console.log(colors.green(`Synced ${hostnames.length} hostname(s) to ${HOSTS_DISPLAY}:`));
     for (const h of hostnames) {
