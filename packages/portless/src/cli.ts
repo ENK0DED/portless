@@ -141,6 +141,7 @@ import {
 import type { ManifestEntry } from "./turbo.js";
 import { buildServiceUninstallSudoArgs, handleService, tryUninstallService } from "./service.js";
 import { handleBg, pruneBgEntriesForState, stopBgEntriesForState } from "./bg.js";
+import { cleanupRouteSharing } from "./route-cleanup.js";
 import { PORTLESS_BG_ID_ENV, PORTLESS_BG_READY_PATH_ENV, writeBgReadyFile } from "./bg-ready.js";
 
 const chalk = colors;
@@ -162,6 +163,9 @@ const DEBOUNCE_MS = 100;
 
 /** Polling interval (ms) when fs.watch is unavailable. */
 const POLL_INTERVAL_MS = 3000;
+
+/** Default interval (seconds) for the proxy's background stale-route sweep. */
+const DEFAULT_ROUTES_CLEANUP_INTERVAL_SECONDS = 300;
 
 /** Grace period (ms) for connections to drain before force-exiting the proxy. */
 const EXIT_TIMEOUT_MS = 2000;
@@ -656,7 +660,8 @@ function startProxyServer(
   tlsOptions?: { cert: Buffer; key: Buffer },
   lanIp?: string | null,
   strict?: boolean,
-  lanMode = false
+  lanMode = false,
+  routesCleanupIntervalSeconds = DEFAULT_ROUTES_CLEANUP_INTERVAL_SECONDS
 ): void {
   store.ensureDir();
 
@@ -689,6 +694,8 @@ function startProxyServer(
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;
   let watcher: fs.FSWatcher | null = null;
   let pollingInterval: ReturnType<typeof setInterval> | null = null;
+  let routesCleanupInterval: ReturnType<typeof setInterval> | null = null;
+  const tunnelAliasStore = new TunnelAliasStore(store.dir);
 
   const autoSyncHosts = shouldAutoSyncHosts(process.env.PORTLESS_SYNC_HOSTS);
 
@@ -753,7 +760,9 @@ function startProxyServer(
   };
 
   try {
-    watcher = fs.watch(routesPath, () => {
+    const routesFilename = path.basename(routesPath);
+    watcher = fs.watch(store.dir, (_eventType, filename) => {
+      if (filename && filename.toString() !== routesFilename) return;
       if (debounceTimer) clearTimeout(debounceTimer);
       debounceTimer = setTimeout(reloadRoutes, DEBOUNCE_MS);
     });
@@ -761,6 +770,32 @@ function startProxyServer(
     // fs.watch may not be supported; fall back to periodic polling
     console.warn(colors.yellow("fs.watch unavailable; falling back to polling for route changes"));
     pollingInterval = setInterval(reloadRoutes, POLL_INTERVAL_MS);
+  }
+
+  if (routesCleanupIntervalSeconds > 0) {
+    routesCleanupInterval = setInterval(() => {
+      try {
+        const staleRoutes = store.pruneStaleRoutes();
+        for (const route of staleRoutes) {
+          try {
+            cleanupRouteSharing(route, { tunnelAliasStore });
+          } catch {
+            // Sharing cleanup is best effort; the stale route is already gone.
+          }
+        }
+      } catch {
+        // Best-effort background route cleanup; non-fatal.
+      }
+
+      try {
+        const staleAliases = tunnelAliasStore.pruneManagedAliases();
+        for (const alias of staleAliases) {
+          if (alias.tunnelPid) stopTunnelPid(alias.tunnelPid);
+        }
+      } catch {
+        // Best-effort background alias cleanup; non-fatal.
+      }
+    }, routesCleanupIntervalSeconds * 1000).unref();
   }
 
   if (autoSyncHosts) {
@@ -927,6 +962,7 @@ function startProxyServer(
     exiting = true;
     if (debounceTimer) clearTimeout(debounceTimer);
     if (pollingInterval) clearInterval(pollingInterval);
+    if (routesCleanupInterval) clearInterval(routesCleanupInterval);
     if (lanMonitor) lanMonitor.stop();
     if (watcher) {
       watcher.close();
@@ -1329,6 +1365,7 @@ async function ensureProxyRunning(
     useWildcard: startConfig.useWildcard,
     includePort: startPort !== undefined,
     proxyPort: startPort,
+    routesCleanupIntervalSeconds: resolveRoutesCleanupIntervalSeconds([]),
   });
   const startArgs = [getEntryScript(), "proxy", "start", ...proxyStartConfig.args];
 
@@ -2742,6 +2779,11 @@ const GLOBAL_COMPLETION_FLAGS: CompletionFlag[] = [
   { name: "--suffix", description: "Add a custom suffix (repeatable)", value: "suffix" },
   { name: "--tld", description: "Compatibility alias for suffix", value: "suffix" },
   { name: "--wildcard", description: "Enable wildcard routing" },
+  {
+    name: "--routes-cleanup-interval",
+    description: "Sweep dead routes at this interval in seconds (0 disables)",
+    value: "seconds",
+  },
   { name: "--state-dir", description: "Use a custom state directory", value: "path" },
   { name: "--app-port", description: "Use a fixed app port", value: "port" },
   { name: "--h2c", description: "Forward to an HTTP/2 cleartext upstream" },
@@ -2826,6 +2868,7 @@ const PROXY_START_COMPLETION_FLAGS = GLOBAL_COMPLETION_FLAGS.filter((flag) =>
     "--suffix",
     "--tld",
     "--wildcard",
+    "--routes-cleanup-interval",
     "--state-dir",
   ].includes(flag.name)
 );
@@ -3370,6 +3413,7 @@ ${colors.bold("Options:")}
   --wildcard                    Allow unregistered subdomains to fall back to parent route
                                 Local proxy mode only; mDNS LAN mode cannot resolve wildcards
                                 Proxy-level only; restart proxy to change this mode
+  --routes-cleanup-interval <s> Sweep dead routes every <s> seconds (default 300, 0 disables)
   --state-dir <path>            Use a custom state directory with service install
   --app-port <number>           Use a fixed app port; browser-blocked ports are rejected
   --h2c                         Forward this route to an HTTP/2 cleartext upstream
@@ -3413,6 +3457,8 @@ ${colors.bold("Environment variables:")}
   PORTLESS_TLD=<tld>            Compatibility alias for PORTLESS_SUFFIX
   PORTLESS_WILDCARD=1           Allow unregistered subdomains to fall back to parent route
                                 Local proxy mode only; mDNS LAN mode cannot resolve wildcards
+  PORTLESS_ROUTES_CLEANUP_INTERVAL=<s>
+                                Sweep dead routes every <s> seconds (default 300, 0 disables)
   PORTLESS_SYNC_HOSTS=0         Disable auto-sync of ${HOSTS_DISPLAY} (on by default)
   PORTLESS_TAILSCALE=1          Share apps on your Tailscale network (same as --tailscale)
   PORTLESS_TAILSCALE_SERVICE=1  Share apps as Tailscale Services
@@ -4299,6 +4345,36 @@ ${colors.bold("Usage: portless hosts <command>")}
   process.exit(1);
 }
 
+function resolveRoutesCleanupIntervalSeconds(args: string[]): number {
+  const flagIndex = args.indexOf("--routes-cleanup-interval");
+  let raw: string | undefined;
+  let source: string;
+
+  if (flagIndex !== -1) {
+    raw = args[flagIndex + 1];
+    source = "--routes-cleanup-interval";
+  } else if (process.env.PORTLESS_ROUTES_CLEANUP_INTERVAL !== undefined) {
+    raw = process.env.PORTLESS_ROUTES_CLEANUP_INTERVAL;
+    source = "PORTLESS_ROUTES_CLEANUP_INTERVAL";
+  } else {
+    return DEFAULT_ROUTES_CLEANUP_INTERVAL_SECONDS;
+  }
+
+  if (!raw || raw.startsWith("--")) {
+    console.error(colors.red(`Error: ${source} requires a number of seconds.`));
+    process.exit(1);
+  }
+
+  const seconds = Number(raw);
+  if (!Number.isFinite(seconds) || !Number.isInteger(seconds) || seconds < 0) {
+    console.error(
+      colors.red(`Error: Invalid ${source}="${raw}". Must be a non-negative integer (0 disables).`)
+    );
+    process.exit(1);
+  }
+  return seconds;
+}
+
 async function handleProxy(args: string[]): Promise<void> {
   if (args[1] === "stop") {
     let explicitPort: number | undefined;
@@ -4346,6 +4422,7 @@ ${colors.bold("Usage:")}
                          Serve every app under both suffixes
   ${colors.cyan("portless proxy start --tld test")}     Compatibility alias for --suffix
   ${colors.cyan("portless proxy start --wildcard")}     Allow unregistered subdomains to fall back to parent (local only)
+  ${colors.cyan("portless proxy start --routes-cleanup-interval 60")}  Sweep dead routes every 60s (default 300, 0 disables)
   ${colors.cyan("portless proxy stop")}                 Stop the proxy
 
 ${colors.bold("LAN mode (--lan):")}
@@ -4365,6 +4442,7 @@ ${colors.bold("LAN mode (--lan):")}
 
   const isForeground = args.includes("--foreground");
   const skipTrust = args.includes("--skip-trust");
+  const routesCleanupIntervalSeconds = resolveRoutesCleanupIntervalSeconds(args);
 
   // HTTPS is on by default. Disable with --no-tls or PORTLESS_HTTPS=0.
   const hasHttpsFlag = args.includes("--https");
@@ -4639,6 +4717,7 @@ ${colors.bold("LAN mode (--lan):")}
         includePort: true,
         proxyPort,
         skipTrust,
+        routesCleanupIntervalSeconds,
       }).args,
     ];
     const fallbackCommand = formatProxyStartCommand(FALLBACK_PROXY_PORT, resolvedConfig);
@@ -4792,7 +4871,8 @@ ${colors.bold("LAN mode (--lan):")}
       tlsOptions,
       lanIp,
       desiredWildcard ? false : undefined,
-      lanMode
+      lanMode,
+      routesCleanupIntervalSeconds
     );
     return;
   }
@@ -4828,6 +4908,7 @@ ${colors.bold("LAN mode (--lan):")}
         includePort: true,
         proxyPort,
         skipTrust: true,
+        routesCleanupIntervalSeconds,
       }).args,
     ];
 

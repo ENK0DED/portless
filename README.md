@@ -265,6 +265,8 @@ Auto-elevated proxy starts pass the resolved `PORTLESS_STATE_DIR` and proxy flag
 
 The proxy auto-syncs `/etc/hosts` for route hostnames, so `.test`, `.server01.acme.com`, and other configured suffixes resolve on your machine.
 
+The proxy also sweeps `routes.json` for entries whose owning process has died. This protects against clients killed before their exit cleanup runs. The sweep runs every 300 seconds by default; use `--routes-cleanup-interval <seconds>` or `PORTLESS_ROUTES_CLEANUP_INTERVAL=<seconds>` to change it. Set either value to `0` to disable the sweep. The sweep removes stale route records and sharing metadata without killing the app process behind a route's port.
+
 Recommended: `.test` for throwaway local names because it is IANA-reserved. Use a subdomain you control, such as `local.example.com`, when OAuth providers or other external systems require a public suffix. Avoid `.local` outside LAN mode because it conflicts with mDNS/Bonjour. Avoid bare public suffixes like `.dev` unless you understand the collision and HSTS implications.
 
 ## How it works
@@ -603,6 +605,7 @@ portless proxy start --suffix test --suffix local.example.com  # Use multiple su
 portless proxy start --tld test  # Compatibility alias for --suffix
 portless proxy start --foreground  # Start in foreground for debugging
 portless proxy start --wildcard  # Allow unregistered subdomains to fall back to parent
+portless proxy start --routes-cleanup-interval 60  # Sweep dead routes every 60s (default 300, 0 disables)
 portless proxy stop              # Stop the proxy
 
 # OS startup service
@@ -628,6 +631,7 @@ portless service uninstall       # Remove the startup service
 --tld <tld>                      Compatibility alias for --suffix
 --wildcard                       Allow unregistered subdomains to fall back to parent route locally
                                  Proxy-level only; restart proxy to change this mode
+--routes-cleanup-interval <s>    Sweep dead routes every <s> seconds (default 300, `0` disables)
 --state-dir <path>               Use a custom state directory with service install
 --script <name>                  Run a specific package.json script (default: dev)
 --app-port <number>              Use a fixed app port; browser-blocked ports are rejected
@@ -674,6 +678,8 @@ PORTLESS_LAN_IP=<address>        Pin a specific LAN IP for LAN mode
 PORTLESS_SUFFIX=<list>           Use comma-separated suffixes (e.g. test,acme.com)
 PORTLESS_TLD=<tld>               Compatibility alias for PORTLESS_SUFFIX
 PORTLESS_WILDCARD=1              Allow unregistered subdomains to fall back to parent route
+PORTLESS_ROUTES_CLEANUP_INTERVAL=<s>
+                                 Sweep dead routes every <s> seconds (default 300, `0` disables)
 PORTLESS_SYNC_HOSTS=0            Disable auto-sync of /etc/hosts (on by default)
 PORTLESS_TAILSCALE=1             Share apps on your Tailscale network (same as --tailscale)
 PORTLESS_TAILSCALE_SERVICE=1     Share apps as Tailscale Services

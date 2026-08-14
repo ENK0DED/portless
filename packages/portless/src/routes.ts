@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { randomUUID } from "node:crypto";
 import type { RouteInfo, RouteProtocol, TunnelProviderName } from "./types.js";
 import { fixOwnership, isErrnoException, normalizePathPrefix } from "./utils.js";
 
@@ -295,9 +296,7 @@ export class RouteStore {
         // Persist the cleaned-up list so stale entries don't accumulate.
         // Only safe when caller holds the lock.
         try {
-          fs.writeFileSync(this.routesPath, JSON.stringify(alive, null, 2), {
-            mode: FILE_MODE,
-          });
+          this.saveRoutes(alive);
         } catch {
           // Write may fail (permissions); non-fatal
         }
@@ -309,8 +308,55 @@ export class RouteStore {
   }
 
   private saveRoutes(routes: RouteMapping[]): void {
-    fs.writeFileSync(this.routesPath, JSON.stringify(routes, null, 2), { mode: FILE_MODE });
-    fixOwnership(this.routesPath);
+    const content = JSON.stringify(routes, null, 2);
+    const tempPrefix = `${path.basename(this.routesPath)}.tmp-${process.pid}-`;
+    let tempPath: string | undefined;
+
+    try {
+      for (let attempt = 0; attempt < 10; attempt++) {
+        const candidate = path.join(this.dir, `${tempPrefix}${randomUUID()}`);
+        let fd: number | undefined;
+        try {
+          fd = fs.openSync(
+            candidate,
+            fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+            FILE_MODE
+          );
+          tempPath = candidate;
+          fs.writeFileSync(fd, content, "utf-8");
+          break;
+        } catch (err: unknown) {
+          if (isErrnoException(err) && err.code === "EEXIST" && tempPath === undefined) {
+            continue;
+          }
+          throw err;
+        } finally {
+          if (fd !== undefined) fs.closeSync(fd);
+        }
+      }
+
+      if (tempPath === undefined) {
+        throw new Error(`Failed to create a unique temporary routes file in ${this.dir}`);
+      }
+
+      try {
+        fs.chmodSync(tempPath, FILE_MODE);
+      } catch {
+        // May fail if the file is owned by another user; non-fatal
+      }
+      fixOwnership(tempPath);
+      fs.renameSync(tempPath, this.routesPath);
+      tempPath = undefined;
+      fixOwnership(this.routesPath);
+    } finally {
+      if (tempPath !== undefined) {
+        try {
+          fs.rmSync(tempPath, { force: true });
+        } catch {
+          // Best-effort cleanup; non-fatal
+        }
+      }
+    }
   }
 
   private buildEntry(

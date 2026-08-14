@@ -374,6 +374,8 @@ describe("CLI", () => {
       expect(stdout).toContain("PORTLESS_H2C");
       expect(stdout).toContain("--path");
       expect(stdout).toContain("PORTLESS_PATH");
+      expect(stdout).toContain("--routes-cleanup-interval");
+      expect(stdout).toContain("PORTLESS_ROUTES_CLEANUP_INTERVAL");
     });
 
     it("prints help and exits 0 with -h", () => {
@@ -440,6 +442,7 @@ describe("CLI", () => {
       expect(stdout).toContain("--lan");
       expect(stdout).toContain("--netbird-groups");
       expect(stdout).toContain("--ngrok");
+      expect(stdout).toContain("--routes-cleanup-interval");
     });
 
     it("prints zsh completion with current commands and flags", () => {
@@ -450,6 +453,7 @@ describe("CLI", () => {
       expect(stdout).toContain("service:Manage startup service");
       expect(stdout).toContain("--netbird-groups");
       expect(stdout).toContain("--suffix");
+      expect(stdout).toContain("--routes-cleanup-interval");
     });
 
     it("prints fish completion with current commands and flags", () => {
@@ -460,6 +464,7 @@ describe("CLI", () => {
       expect(stdout).toContain('-a "service"');
       expect(stdout).toContain("-l netbird-groups");
       expect(stdout).toContain("-l suffix");
+      expect(stdout).toContain("-l routes-cleanup-interval");
     });
 
     it("exits 1 for an unknown shell", () => {
@@ -1984,6 +1989,7 @@ describe("CLI", () => {
       expect(stdout).toContain("portless proxy");
       expect(stdout).toContain("start");
       expect(stdout).toContain("stop");
+      expect(stdout).toContain("--routes-cleanup-interval");
     });
 
     it("prints help with -h", () => {
@@ -2853,6 +2859,147 @@ describe("CLI", () => {
         "myapp.test",
       ]);
     });
+
+    it("rejects an invalid routes cleanup interval flag", () => {
+      const result = run(["proxy", "start", "--routes-cleanup-interval", "not-a-number"], {
+        env: proxyEnv(),
+      });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("Invalid --routes-cleanup-interval");
+    });
+
+    it("rejects an invalid routes cleanup interval environment value", () => {
+      const result = run(["proxy", "start"], {
+        env: { ...proxyEnv(), PORTLESS_ROUTES_CLEANUP_INTERVAL: "-1" },
+      });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("Invalid PORTLESS_ROUTES_CLEANUP_INTERVAL");
+    });
+
+    it("accepts zero to disable the routes cleanup sweep", () => {
+      const start = run(["proxy", "start", "--routes-cleanup-interval", "0"], {
+        env: proxyEnv(),
+      });
+      expect(start.status, start.stdout + start.stderr).toBe(0);
+      expect(start.stdout).toContain(`proxy started on port ${testPort}`);
+    });
+
+    it("reloads routes after consecutive atomic renames", async () => {
+      const start = run(["proxy", "start", "--routes-cleanup-interval", "0"], {
+        env: { ...proxyEnv(), PORTLESS_SYNC_HOSTS: "0" },
+      });
+      expect(start.status, start.stdout + start.stderr).toBe(0);
+
+      const backendA = http.createServer((_req, res) => res.end("A"));
+      const backendB = http.createServer((_req, res) => res.end("B"));
+      const listen = (server: http.Server): Promise<number> =>
+        new Promise((resolve) => {
+          server.listen(0, "127.0.0.1", () => {
+            const address = server.address();
+            resolve(address && typeof address !== "string" ? address.port : 0);
+          });
+        });
+      const requestStatus = (hostname: string): Promise<number> =>
+        new Promise((resolve, reject) => {
+          const request = http.request(
+            {
+              hostname: "127.0.0.1",
+              port: testPort,
+              headers: { host: hostname },
+              timeout: 500,
+            },
+            (response) => {
+              response.resume();
+              resolve(response.statusCode ?? 0);
+            }
+          );
+          request.once("error", reject);
+          request.once("timeout", () => {
+            request.destroy();
+            reject(new Error("request timed out"));
+          });
+          request.end();
+        });
+      const waitForStatus = async (hostname: string): Promise<void> => {
+        for (let attempt = 0; attempt < 60; attempt++) {
+          try {
+            if ((await requestStatus(hostname)) === 200) return;
+          } catch {
+            // The proxy or backend may still be starting.
+          }
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        throw new Error(`Timed out waiting for ${hostname}`);
+      };
+      const atomicWrite = (routes: unknown[]): void => {
+        const routesPath = path.join(tmpDir, "routes.json");
+        const tempPath = path.join(tmpDir, `routes.json.tmp-test-${Date.now()}`);
+        fs.writeFileSync(tempPath, JSON.stringify(routes));
+        fs.renameSync(tempPath, routesPath);
+      };
+
+      try {
+        const portA = await listen(backendA);
+        const portB = await listen(backendB);
+        atomicWrite([{ hostname: "a.localhost", port: portA, pid: process.pid }]);
+        await waitForStatus("a.localhost");
+
+        atomicWrite([
+          { hostname: "a.localhost", port: portA, pid: process.pid },
+          { hostname: "b.localhost", port: portB, pid: process.pid },
+        ]);
+        await waitForStatus("b.localhost");
+        expect(await requestStatus("a.localhost")).toBe(200);
+      } finally {
+        await new Promise<void>((resolve) => backendA.close(() => resolve()));
+        await new Promise<void>((resolve) => backendB.close(() => resolve()));
+      }
+    }, 10_000);
+
+    it("sweeps dead route PIDs without killing the process behind their port", async () => {
+      const backendPort = await getFreePort();
+      const backend = spawn(
+        process.execPath,
+        [
+          "-e",
+          `require("node:http").createServer((_req, res) => res.end("backend")).listen(${backendPort}, "127.0.0.1"); setInterval(() => {}, 1000);`,
+        ],
+        { stdio: "ignore" }
+      );
+      try {
+        try {
+          await waitForHttpHeader(backendPort, "x-portless", "never");
+        } catch {
+          // The helper intentionally times out because this is not a portless proxy.
+        }
+        expect(isPidAlive(backend.pid!)).toBe(true);
+
+        const start = run(["proxy", "start"], {
+          env: {
+            ...proxyEnv(),
+            PORTLESS_ROUTES_CLEANUP_INTERVAL: "1",
+            PORTLESS_SYNC_HOSTS: "0",
+          },
+        });
+        expect(start.status, start.stdout + start.stderr).toBe(0);
+        writeJson(path.join(tmpDir, "routes.json"), [
+          { hostname: "dead.localhost", port: backendPort, pid: 999999 },
+          { hostname: "alive.localhost", port: 4002, pid: process.pid },
+        ]);
+
+        const deadline = Date.now() + 4_000;
+        while (Date.now() < deadline) {
+          const routes = readRoutesFile(tmpDir);
+          if (routes.length === 1 && routes[0]?.hostname === "alive.localhost") break;
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+
+        expect(readRoutesFile(tmpDir).map((route) => route.hostname)).toEqual(["alive.localhost"]);
+        expect(isPidAlive(backend.pid!)).toBe(true);
+      } finally {
+        await stopChild(backend);
+      }
+    }, 10_000);
 
     it.skipIf(process.platform === "win32" || (process.getuid?.() ?? 0) === 0)(
       "passes --skip-trust through sudo re-exec",
