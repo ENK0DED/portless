@@ -438,44 +438,50 @@ describe("doctor probes", () => {
     });
   });
 
-  it("probes a live HTTPS certificate page without SNI or state mutation", async () => {
-    const stateDir = makeTempDir();
-    const certs = ensureCerts(stateDir);
-    let serverName: string | false | null = false;
-    const server = https.createServer(
-      {
-        key: fs.readFileSync(certs.keyPath),
-        cert: fs.readFileSync(certs.certPath),
-      },
-      (request, response) => {
-        expect(request.headers.host).toBe("cert.server01.acme.com");
-        response.writeHead(200).end("certificate page");
-      }
-    );
-    server.on("secureConnection", (socket) => {
-      serverName = socket.servername;
-    });
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    if (!address || typeof address === "string") throw new Error("Expected a TCP server address.");
-    const before = new Map(
-      fs.readdirSync(stateDir).map((name) => [name, fs.readFileSync(path.join(stateDir, name))])
-    );
-
-    try {
-      await expect(requestCertPage(address.port, true, "server01.acme.com")).resolves.toBe(true);
-    } finally {
-      await new Promise<void>((resolve, reject) =>
-        server.close((error) => (error ? reject(error) : resolve()))
+  // 30s timeout: OpenSSL certificate generation is slow on Windows CI hosts.
+  it(
+    "probes a live HTTPS certificate page without SNI or state mutation",
+    { timeout: 30_000 },
+    async () => {
+      const stateDir = makeTempDir();
+      const certs = ensureCerts(stateDir);
+      let serverName: string | false | null = false;
+      const server = https.createServer(
+        {
+          key: fs.readFileSync(certs.keyPath),
+          cert: fs.readFileSync(certs.certPath),
+        },
+        (request, response) => {
+          expect(request.headers.host).toBe("cert.server01.acme.com");
+          response.writeHead(200).end("certificate page");
+        }
       );
-    }
+      server.on("secureConnection", (socket) => {
+        serverName = socket.servername;
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const address = server.address();
+      if (!address || typeof address === "string")
+        throw new Error("Expected a TCP server address.");
+      const before = new Map(
+        fs.readdirSync(stateDir).map((name) => [name, fs.readFileSync(path.join(stateDir, name))])
+      );
 
-    const after = new Map(
-      fs.readdirSync(stateDir).map((name) => [name, fs.readFileSync(path.join(stateDir, name))])
-    );
-    expect(serverName).toBe(false);
-    expect(after).toEqual(before);
-  });
+      try {
+        await expect(requestCertPage(address.port, true, "server01.acme.com")).resolves.toBe(true);
+      } finally {
+        await new Promise<void>((resolve, reject) =>
+          server.close((error) => (error ? reject(error) : resolve()))
+        );
+      }
+
+      const after = new Map(
+        fs.readdirSync(stateDir).map((name) => [name, fs.readFileSync(path.join(stateDir, name))])
+      );
+      expect(serverName).toBe(false);
+      expect(after).toEqual(before);
+    }
+  );
 });
 
 describe("collectDoctorSnapshot", () => {
@@ -762,70 +768,76 @@ describe("collectDoctorSnapshot", () => {
     ]);
   });
 
-  it("distinguishes inbound and outbound sudo state handoff", async () => {
-    const previous = {
-      sudoUser: process.env.SUDO_USER,
-      home: process.env.HOME,
-      stateDir: process.env.PORTLESS_STATE_DIR,
-    };
-    const dependencies = {
-      isProxyRunning: async () => false,
-      isPortListening: async () => false,
-      managedHostnames: () => [],
-      mdnsSupport: () => ({ supported: false }),
-      probeTool: () => ({ status: "unavailable" as const }),
-    };
-    try {
-      process.env.SUDO_USER = "alice";
-      process.env.HOME = "/root";
-      delete process.env.PORTLESS_STATE_DIR;
-      const inbound = await collectDoctorSnapshot({
-        version: "0.15.6000",
-        state: {
-          dir: "/home/alice/.portless",
-          port: 443,
-          tls: true,
-          tld: "localhost",
-          tlds: ["localhost"],
-          lanMode: false,
-          lanIp: null,
-        },
-        dependencies,
-      });
+  // Sudo state handoff is POSIX-only: SUDO_USER cannot be set by a real
+  // Windows environment, and resolveUserHome intentionally short-circuits
+  // to USERPROFILE on win32.
+  it.skipIf(process.platform === "win32")(
+    "distinguishes inbound and outbound sudo state handoff",
+    async () => {
+      const previous = {
+        sudoUser: process.env.SUDO_USER,
+        home: process.env.HOME,
+        stateDir: process.env.PORTLESS_STATE_DIR,
+      };
+      const dependencies = {
+        isProxyRunning: async () => false,
+        isPortListening: async () => false,
+        managedHostnames: () => [],
+        mdnsSupport: () => ({ supported: false }),
+        probeTool: () => ({ status: "unavailable" as const }),
+      };
+      try {
+        process.env.SUDO_USER = "alice";
+        process.env.HOME = "/root";
+        delete process.env.PORTLESS_STATE_DIR;
+        const inbound = await collectDoctorSnapshot({
+          version: "0.15.6000",
+          state: {
+            dir: "/home/alice/.portless",
+            port: 443,
+            tls: true,
+            tld: "localhost",
+            tlds: ["localhost"],
+            lanMode: false,
+            lanIp: null,
+          },
+          dependencies,
+        });
 
-      const outboundDir = makeTempDir();
-      process.env.PORTLESS_STATE_DIR = outboundDir;
-      const outbound = await collectDoctorSnapshot({
-        version: "0.15.6000",
-        state: {
-          dir: outboundDir,
-          port: 443,
-          tls: true,
-          tld: "localhost",
-          tlds: ["localhost"],
-          lanMode: false,
-          lanIp: null,
-        },
-        dependencies,
-      });
+        const outboundDir = makeTempDir();
+        process.env.PORTLESS_STATE_DIR = outboundDir;
+        const outbound = await collectDoctorSnapshot({
+          version: "0.15.6000",
+          state: {
+            dir: outboundDir,
+            port: 443,
+            tls: true,
+            tld: "localhost",
+            tlds: ["localhost"],
+            lanMode: false,
+            lanIp: null,
+          },
+          dependencies,
+        });
 
-      expect(inbound.state).toMatchObject({
-        source: "sudo-user",
-        expectedPath: "/home/alice/.portless",
-        handoffValid: true,
-      });
-      expect(outbound.state).toMatchObject({
-        source: "sudo-environment",
-        expectedPath: outboundDir,
-        handoffValid: true,
-      });
-    } finally {
-      if (previous.sudoUser === undefined) delete process.env.SUDO_USER;
-      else process.env.SUDO_USER = previous.sudoUser;
-      if (previous.home === undefined) delete process.env.HOME;
-      else process.env.HOME = previous.home;
-      if (previous.stateDir === undefined) delete process.env.PORTLESS_STATE_DIR;
-      else process.env.PORTLESS_STATE_DIR = previous.stateDir;
+        expect(inbound.state).toMatchObject({
+          source: "sudo-user",
+          expectedPath: "/home/alice/.portless",
+          handoffValid: true,
+        });
+        expect(outbound.state).toMatchObject({
+          source: "sudo-environment",
+          expectedPath: outboundDir,
+          handoffValid: true,
+        });
+      } finally {
+        if (previous.sudoUser === undefined) delete process.env.SUDO_USER;
+        else process.env.SUDO_USER = previous.sudoUser;
+        if (previous.home === undefined) delete process.env.HOME;
+        else process.env.HOME = previous.home;
+        if (previous.stateDir === undefined) delete process.env.PORTLESS_STATE_DIR;
+        else process.env.PORTLESS_STATE_DIR = previous.stateDir;
+      }
     }
-  });
+  );
 });

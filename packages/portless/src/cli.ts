@@ -810,7 +810,16 @@ function startProxyServer(
 
   try {
     const routesFilename = path.basename(routesPath);
-    watcher = fs.watch(store.dir, (_eventType, filename) => {
+    // Canonicalize the watched directory: on Windows, watching an 8.3
+    // short-path spelling (e.g. RUNNER~1) makes libuv assert in fs-event.c
+    // when events arrive under the long name, aborting the process.
+    let watchDir = store.dir;
+    try {
+      watchDir = fs.realpathSync.native(store.dir);
+    } catch {
+      // Fall back to the configured spelling if the path cannot be resolved
+    }
+    watcher = fs.watch(watchDir, (_eventType, filename) => {
       if (filename && filename.toString() !== routesFilename) return;
       if (debounceTimer) clearTimeout(debounceTimer);
       debounceTimer = setTimeout(reloadRoutes, DEBOUNCE_MS);

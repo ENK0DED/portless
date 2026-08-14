@@ -143,11 +143,16 @@ describe("publish", () => {
     expect(getPublished()).not.toContain("myapp.test.local");
   });
 
-  it("publishes one local record for same-hostname path routes", () => {
-    publish("myapp.local", 3000, "192.168.1.10");
-    publish("myapp.local", 3000, "192.168.1.10");
+  // Positive publish requires a platform mDNS publisher (dns-sd/avahi);
+  // Windows has none, so publish() intentionally no-ops there.
+  it.skipIf(process.platform === "win32")(
+    "publishes one local record for same-hostname path routes",
+    () => {
+      publish("myapp.local", 3000, "192.168.1.10");
+      publish("myapp.local", 3000, "192.168.1.10");
 
-    expect(getPublished()).toEqual(["myapp.local"]);
-    expect(spawnMock).toHaveBeenCalledTimes(1);
-  });
+      expect(getPublished()).toEqual(["myapp.local"]);
+      expect(spawnMock).toHaveBeenCalledTimes(1);
+    }
+  );
 });
