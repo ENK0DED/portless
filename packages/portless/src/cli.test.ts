@@ -51,6 +51,9 @@ function run(args: string[], options?: { env?: Record<string, string | undefined
     }
   }
   delete env.NODE_EXTRA_CA_CERTS;
+  // CLI tests use isolated state directories and should not wait for or
+  // mutate the machine hosts file. Hosts resolution is covered by unit tests.
+  env.PORTLESS_SYNC_HOSTS = "0";
   Object.assign(env, options?.env);
   if (process.platform === "win32" && env.PATH !== undefined) {
     for (const key of Object.keys(env)) {

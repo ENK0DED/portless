@@ -7,6 +7,12 @@ import * as path from "node:path";
 import * as readline from "node:readline";
 import { execSync, spawn } from "node:child_process";
 import { LOOPBACK_DIAL_OPTIONS, PORTLESS_HEADER, PORTLESS_LISTENER_PORT_HEADER } from "./proxy.js";
+import {
+  checkHostResolution,
+  getManagedHostnames,
+  shouldAutoSyncHosts,
+  syncHostsFile,
+} from "./hosts.js";
 import { resolveUserHome } from "./utils.js";
 
 // ---------------------------------------------------------------------------
@@ -248,6 +254,15 @@ export function readLanMarker(dir: string): string | null {
   }
 }
 
+/** Return whether the LAN marker exists, regardless of whether it has an IP. */
+export function hasLanMarker(dir: string): boolean {
+  try {
+    return fs.existsSync(path.join(dir, LAN_MARKER_FILE));
+  } catch {
+    return false;
+  }
+}
+
 /** Write or remove the LAN marker in the state directory. */
 export function writeLanMarker(dir: string, ip: string | null): void {
   const markerPath = path.join(dir, LAN_MARKER_FILE);
@@ -260,6 +275,16 @@ export function writeLanMarker(dir: string, ip: string | null): void {
   } else {
     fs.writeFileSync(markerPath, ip, { mode: 0o644 });
   }
+}
+
+/** Persist LAN mode even when the current network has no usable IP. */
+export function writeLanModeMarker(dir: string, enabled: boolean, ip: string | null): void {
+  if (!enabled) {
+    writeLanMarker(dir, null);
+    return;
+  }
+
+  fs.writeFileSync(path.join(dir, LAN_MARKER_FILE), ip ?? "", { mode: 0o644 });
 }
 
 /** Name of the marker file that indicates wildcard routing is enabled. */
@@ -566,9 +591,8 @@ export function readPersistedProxyState(): {
     const tls = readTlsMarker(dir);
     const tlds = readTldsFromDir(dir);
     const tld = tlds[0] ?? DEFAULT_TLD;
-    const lanIp = readLanMarker(dir);
     const useWildcard = readWildcardMarker(dir);
-    return { port, tls, tld, tlds, lanMode: lanIp !== null, useWildcard };
+    return { port, tls, tld, tlds, lanMode: hasLanMarker(dir), useWildcard };
   }
 
   return null;
@@ -696,7 +720,7 @@ export async function discoverState(): Promise<{
       const tls = readTlsMarker(dir);
       const tlds = readTldsFromDir(dir);
       const tld = tlds[0] ?? DEFAULT_TLD;
-      return { dir, port, tls, tld, tlds, lanMode: lanIp !== null, lanIp };
+      return { dir, port, tls, tld, tlds, lanMode: hasLanMarker(dir), lanIp };
     }
 
     return {
@@ -705,7 +729,7 @@ export async function discoverState(): Promise<{
       tls: readTlsMarker(dir),
       tld: getConfiguredTldEnv() ? getDefaultTld() : readTldFromDir(dir),
       tlds: getConfiguredTldEnv() ? getDefaultTlds() : readTldsFromDir(dir),
-      lanMode: lanIp !== null,
+      lanMode: hasLanMarker(dir),
       lanIp: null,
     };
   }
@@ -727,7 +751,7 @@ export async function discoverState(): Promise<{
         tls,
         tld,
         tlds,
-        lanMode: lanIp !== null,
+        lanMode: hasLanMarker(USER_STATE_DIR),
         lanIp,
       };
     }
@@ -748,7 +772,7 @@ export async function discoverState(): Promise<{
         tls,
         tld,
         tlds,
-        lanMode: lanIp !== null,
+        lanMode: hasLanMarker(LEGACY_SYSTEM_STATE_DIR),
         lanIp,
       };
     }
@@ -769,7 +793,7 @@ export async function discoverState(): Promise<{
       const tlds = readTldsFromDir(dir);
       const tld = tlds[0] ?? DEFAULT_TLD;
       const lanIp = readLanMarker(dir);
-      return { dir, port, tls, tld, tlds, lanMode: lanIp !== null, lanIp };
+      return { dir, port, tls, tld, tlds, lanMode: hasLanMarker(dir), lanIp };
     }
   }
 
@@ -780,7 +804,7 @@ export async function discoverState(): Promise<{
     tls: readTlsMarker(dir),
     tld: readTldFromDir(dir),
     tlds: readTldsFromDir(dir),
-    lanMode: readLanMarker(dir) !== null,
+    lanMode: hasLanMarker(dir),
     lanIp: null,
   };
 }
@@ -883,6 +907,76 @@ export function isProxyRunning(port: number, tls = false): Promise<boolean> {
     });
     req.end();
   });
+}
+
+/** Display text shared by every post-registration resolution warning. */
+export function hostsUnresolvedMessage(hostnames: string[]): string {
+  return `${hostnames.join(", ")} will not resolve. Run: portless hosts sync`;
+}
+
+/** Maximum time to wait for the daemon's routes watcher to publish its block. */
+export const HOSTS_SYNC_POLL_CEILING_MS = 3500;
+const HOSTS_SYNC_POLL_INTERVAL_MS = 100;
+
+/**
+ * Wait for the daemon to publish the managed hosts block, then check each
+ * hostname once through the system resolver. Polling the block avoids repeated
+ * resolver calls, which can preserve a negative DNS result after the block is
+ * written.
+ */
+export async function reportHostsSync(
+  hostnames: string[],
+  lanMode: boolean,
+  onWarn: (message: string) => void,
+  resolves: (hostname: string) => Promise<boolean> = checkHostResolution,
+  readManaged: () => string[] = getManagedHostnames,
+  ceilingMs = HOSTS_SYNC_POLL_CEILING_MS,
+  sleep: (delayMs: number) => Promise<void> = (delayMs) =>
+    new Promise<void>((resolve) => setTimeout(resolve, delayMs))
+): Promise<void> {
+  const uniqueHostnames = [...new Set(hostnames)];
+  const checkedHostnames = lanMode
+    ? uniqueHostnames.filter((hostname) => !hostname.endsWith(".local"))
+    : uniqueHostnames;
+  if (checkedHostnames.length === 0) return;
+
+  if (!shouldAutoSyncHosts(process.env.PORTLESS_SYNC_HOSTS)) {
+    const results = await Promise.all(checkedHostnames.map((hostname) => resolves(hostname)));
+    const unresolved = checkedHostnames.filter((_, index) => !results[index]);
+    if (unresolved.length > 0) onWarn(hostsUnresolvedMessage(unresolved));
+    return;
+  }
+
+  const deadline = Date.now() + Math.max(0, ceilingMs);
+  while (true) {
+    const managed = new Set(readManaged());
+    if (checkedHostnames.every((hostname) => managed.has(hostname))) break;
+
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await sleep(Math.min(HOSTS_SYNC_POLL_INTERVAL_MS, remaining));
+  }
+
+  const results = await Promise.all(checkedHostnames.map((hostname) => resolves(hostname)));
+  const unresolved = checkedHostnames.filter((_, index) => !results[index]);
+  if (unresolved.length > 0) onWarn(hostsUnresolvedMessage(unresolved));
+}
+
+/**
+ * Sync the daemon's hosts block and latch only non-empty failures. A successful
+ * sync re-arms the warning, while an empty route warm-up cannot spend it.
+ */
+export function syncHostsWithWarning(
+  hostnames: string[],
+  alreadyWarned: boolean,
+  onWarn: () => void,
+  sync: (hostnames: string[]) => boolean = syncHostsFile
+): boolean {
+  const uniqueHostnames = [...new Set(hostnames)];
+  if (sync(uniqueHostnames)) return false;
+  if (uniqueHostnames.length === 0) return alreadyWarned;
+  if (!alreadyWarned) onWarn();
+  return true;
 }
 
 /** Check whether any process is listening on the given port on loopback. */
