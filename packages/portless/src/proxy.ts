@@ -165,6 +165,9 @@ const HOP_BY_HOP_HEADERS = new Set([
 
 /** Cap ordinary upstream connections so multiplexed clients cannot overload a backend. */
 const MAX_UPSTREAM_SOCKETS = 64;
+
+/** Time a backend has to answer a WebSocket handshake before the proxy gives up. */
+const WEBSOCKET_HANDSHAKE_TIMEOUT_MS = 30_000;
 const REPLAYABLE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
 /** Remove Connection and every header named by its comma-separated token list. */
@@ -1369,8 +1372,26 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     // be reported as an HTTP response.
     let handshakeRelayed = false;
 
+    // Until the backend's 101 has been relayed, the client socket closing means
+    // nobody is waiting for this handshake any more. The post-upgrade cleanup
+    // below only covers the period after the answer arrives.
+    const abortPendingHandshake = () => {
+      if (!handshakeRelayed && !proxyReq.destroyed) proxyReq.destroy();
+    };
+    socket.on("close", abortPendingHandshake);
+    socket.on("end", abortPendingHandshake);
+
+    const handshakeTimer = setTimeout(() => {
+      if (handshakeRelayed) return;
+      onError(`WebSocket handshake timed out for ${getRequestHost(req)}`);
+      if (!proxyReq.destroyed) proxyReq.destroy();
+      socket.destroy();
+    }, WEBSOCKET_HANDSHAKE_TIMEOUT_MS);
+    handshakeTimer.unref?.();
+
     proxyReq.on("upgrade", (proxyRes, proxySocket, proxyHead) => {
       handshakeRelayed = true;
+      clearTimeout(handshakeTimer);
       // Forward the backend's actual 101 response including Sec-WebSocket-Accept,
       // subprotocol negotiation, and extension headers.
       let response = `HTTP/1.1 101 Switching Protocols\r\n`;
@@ -1401,6 +1422,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     });
 
     proxyReq.on("error", (err) => {
+      clearTimeout(handshakeTimer);
       onError(`WebSocket proxy error for ${getRequestHost(req)}: ${dialErrorMessage(err)}`);
       if (!handshakeRelayed && socket.writable) {
         socket.end(
@@ -1417,6 +1439,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
 
     proxyReq.on("response", (res) => {
       handshakeRelayed = true;
+      clearTimeout(handshakeTimer);
       // The backend responded with a normal HTTP response instead of upgrading.
       // Forward the rejection to the client.
       if (!socket.destroyed) {

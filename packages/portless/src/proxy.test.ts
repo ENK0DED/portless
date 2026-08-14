@@ -6,6 +6,7 @@ import * as https from "node:https";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { Duplex } from "node:stream";
 import { createProxyServer, PORTLESS_HEADER, PORTLESS_LISTENER_PORT_HEADER } from "./proxy.js";
 import type { ProxyServer } from "./proxy.js";
 import type { RouteInfo, TunnelAlias } from "./types.js";
@@ -81,6 +82,7 @@ describe("createProxyServer", () => {
   }
 
   afterEach(async () => {
+    vi.useRealTimers();
     for (const s of servers) {
       await new Promise<void>((resolve) => s.close(() => resolve()));
     }
@@ -1755,6 +1757,168 @@ describe("createProxyServer", () => {
   });
 
   describe("WebSocket upgrade", () => {
+    it("ends the upstream socket when the client aborts before the handshake", async () => {
+      let resolveUpstreamSocket!: (socket: Duplex) => void;
+      const upstreamSocketPromise = new Promise<Duplex>((resolve) => {
+        resolveUpstreamSocket = resolve;
+      });
+      const backend = trackServer(http.createServer());
+      backend.on("upgrade", (_req, socket) => {
+        socket.resume();
+        resolveUpstreamSocket(socket);
+      });
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const routes: RouteInfo[] = [{ hostname: "ws.localhost", port: backendAddr.port }];
+      const server = trackServer(
+        createProxyServer({
+          getRoutes: () => routes,
+          proxyPort: TEST_PROXY_PORT,
+          onError: () => {},
+        })
+      );
+      await listen(server);
+      const addr = server.address();
+      if (!addr || typeof addr === "string") throw new Error("no addr");
+
+      const clientSocket = net.connect(addr.port, "127.0.0.1");
+      await new Promise<void>((resolve, reject) => {
+        clientSocket.once("connect", resolve);
+        clientSocket.once("error", reject);
+      });
+      clientSocket.write(
+        "GET / HTTP/1.1\r\n" +
+          "Host: ws.localhost\r\n" +
+          "Connection: Upgrade\r\n" +
+          "Upgrade: websocket\r\n" +
+          "\r\n"
+      );
+
+      const upstreamSocket = await upstreamSocketPromise;
+      const upstreamEnded = new Promise<boolean>((resolve) => {
+        upstreamSocket.once("end", () => resolve(true));
+      });
+      clientSocket.resetAndDestroy();
+
+      const endedBeforeDeadline = await Promise.race([
+        upstreamEnded,
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 1_000)),
+      ]);
+      upstreamSocket.destroy();
+
+      expect(endedBeforeDeadline).toBe(true);
+    });
+
+    it("times out a stalled backend WebSocket handshake", async () => {
+      let resolveUpstreamSocket!: (socket: Duplex) => void;
+      const upstreamSocketPromise = new Promise<Duplex>((resolve) => {
+        resolveUpstreamSocket = resolve;
+      });
+      const backend = trackServer(http.createServer());
+      backend.on("upgrade", (_req, socket) => resolveUpstreamSocket(socket));
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const routes: RouteInfo[] = [{ hostname: "ws.localhost", port: backendAddr.port }];
+      const errors: string[] = [];
+      const server = trackServer(
+        createProxyServer({
+          getRoutes: () => routes,
+          proxyPort: TEST_PROXY_PORT,
+          onError: (message) => errors.push(message),
+        })
+      );
+      await listen(server);
+      const addr = server.address();
+      if (!addr || typeof addr === "string") throw new Error("no addr");
+
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const clientSocket = net.connect(addr.port, "127.0.0.1");
+      await new Promise<void>((resolve, reject) => {
+        clientSocket.once("connect", resolve);
+        clientSocket.once("error", reject);
+      });
+      clientSocket.write(
+        "GET / HTTP/1.1\r\n" +
+          "Host: ws.localhost\r\n" +
+          "Connection: Upgrade\r\n" +
+          "Upgrade: websocket\r\n" +
+          "\r\n"
+      );
+      const upstreamSocket = await upstreamSocketPromise;
+      const clientClosed = new Promise<void>((resolve) => clientSocket.once("close", resolve));
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      await clientClosed;
+
+      expect(clientSocket.destroyed).toBe(true);
+      expect(errors.some((message) => message.includes("handshake timed out"))).toBe(true);
+      upstreamSocket.destroy();
+    });
+
+    it("keeps a relayed WebSocket alive past the handshake timeout and forwards data", async () => {
+      let backendSocket: Duplex | undefined;
+      const backend = trackServer(http.createServer());
+      backend.on("upgrade", (_req, socket) => {
+        backendSocket = socket;
+        socket.write(
+          "HTTP/1.1 101 Switching Protocols\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            "\r\n"
+        );
+        socket.on("data", (chunk) => socket.write(`backend:${chunk.toString("utf8")}`));
+      });
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const routes: RouteInfo[] = [{ hostname: "ws.localhost", port: backendAddr.port }];
+      const errors: string[] = [];
+      const server = trackServer(
+        createProxyServer({
+          getRoutes: () => routes,
+          proxyPort: TEST_PROXY_PORT,
+          onError: (message) => errors.push(message),
+        })
+      );
+      await listen(server);
+      const addr = server.address();
+      if (!addr || typeof addr === "string") throw new Error("no addr");
+
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const clientSocket = await new Promise<Duplex>((resolve, reject) => {
+        const req = http.request({
+          hostname: "127.0.0.1",
+          port: addr.port,
+          path: "/",
+          headers: {
+            host: "ws.localhost",
+            connection: "Upgrade",
+            upgrade: "websocket",
+          },
+        });
+        req.once("error", reject);
+        req.once("upgrade", (_res, socket) => resolve(socket));
+        req.end();
+      });
+      const echoed = new Promise<string>((resolve) => {
+        clientSocket.once("data", (chunk) => resolve(chunk.toString("utf8")));
+      });
+      clientSocket.write("client-frame");
+
+      expect(await echoed).toBe("backend:client-frame");
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(clientSocket.destroyed).toBe(false);
+      expect(errors.some((message) => message.includes("handshake timed out"))).toBe(false);
+
+      clientSocket.destroy();
+      backendSocket?.destroy();
+    });
+
     it("proxies WebSocket upgrade to matching route", async () => {
       // Create a backend that accepts WebSocket upgrades
       const backend = trackServer(http.createServer());
