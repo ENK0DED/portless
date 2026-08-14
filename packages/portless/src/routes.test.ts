@@ -183,7 +183,9 @@ describe("RouteStore", () => {
       store.ensureDir();
       fs.writeFileSync(store.getRoutesPath(), JSON.stringify(routes));
       const events: string[] = [];
-      const watcher = fs.watch(tmpDir, (_eventType, filename) => {
+      // Watch the canonical spelling: Windows 8.3 short temp paths make
+      // libuv's fs-event assert and abort the vitest worker.
+      const watcher = fs.watch(fs.realpathSync.native(tmpDir), (_eventType, filename) => {
         if (filename) events.push(filename.toString());
       });
       try {
@@ -225,7 +227,9 @@ describe("RouteStore", () => {
       store.ensureDir();
       fs.mkdirSync(store.getRoutesPath());
       const events: string[] = [];
-      const watcher = fs.watch(tmpDir, (_eventType, filename) => {
+      // Watch the canonical spelling: Windows 8.3 short temp paths make
+      // libuv's fs-event assert and abort the vitest worker.
+      const watcher = fs.watch(fs.realpathSync.native(tmpDir), (_eventType, filename) => {
         if (filename) events.push(filename.toString());
       });
       try {
