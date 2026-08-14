@@ -16,10 +16,16 @@ import {
   isErrnoException,
   normalizePathPrefix,
   parseHostname,
+  parseHostnames,
 } from "./utils.js";
 import { getUrl } from "./api.js";
-import { syncHostsFile, cleanHostsFile, shouldAutoSyncHosts } from "./hosts.js";
-import { FILE_MODE, RouteConflictError, RouteStore } from "./routes.js";
+import {
+  syncHostsFile,
+  cleanHostsFile,
+  shouldAutoSyncHosts,
+  deduplicateHostnames,
+} from "./hosts.js";
+import { FILE_MODE, RouteConflictError, RouteStore, type RouteMapping } from "./routes.js";
 import { TunnelAliasStore, normalizeTunnelHostname } from "./tunnel-aliases.js";
 import {
   ensureTunnelProviderAvailable,
@@ -48,7 +54,9 @@ import {
 } from "./netbird.js";
 import {
   inferProjectName,
+  applyWorktreePrefix,
   detectWorktreePrefix,
+  resolveWorktreeFlat,
   truncateLabel,
   sanitizeForHostname,
 } from "./auto.js";
@@ -61,7 +69,7 @@ import {
   INTERNAL_LAN_IP_ENV,
   INTERNAL_LAN_IP_FLAG,
   PRIVILEGED_PORT_THRESHOLD,
-  RISKY_TLDS,
+  getRiskyTldReason,
   WAIT_FOR_PROXY_INTERVAL_MS,
   WAIT_FOR_PROXY_MAX_ATTEMPTS,
   discoverState,
@@ -70,9 +78,11 @@ import {
   findPidsOnPort,
   getConfiguredTldEnv,
   getDefaultPort,
-  getDefaultTld,
+  getDefaultTlds,
+  getProxyBindTargets,
   hasConfiguredTldEnv,
   hasPlaceholders,
+  injectPackageScriptFrameworkFlags,
   injectFrameworkFlags,
   isHttpsEnvDisabled,
   isPortListening,
@@ -81,25 +91,38 @@ import {
   isProxyRunning,
   isWindows,
   killTree,
+  listenOnProxyInterface,
+  hasLanMarker,
   readLanMarker,
   readPersistedProxyState,
-  readTldFromDir,
+  reportHostsSync,
+  readTldsFromDir,
   readTlsMarker,
   readWildcardMarker,
-  quoteWindowsCmdArg,
+  cmdEscape,
+  cmdEscapeCommand,
   resolveWindowsExecutable,
   resolveStateDir,
   replacePlaceholders,
+  resolveFrameworkBasename,
   spawnCommand,
   augmentedPath,
-  validateTld,
+  parseTldList,
+  syncHostsWithWarning,
   waitForProxy,
+  writeLanModeMarker,
   writeLanMarker,
-  writeTldFile,
+  writeCustomCertMarker,
+  writeInternalPagesDisabledMarker,
+  writeTldsFile,
   writeTlsMarker,
   writeWildcardMarker,
 } from "./cli-utils.js";
-import { collectStateDirsForCleanup, removePortlessStateFiles } from "./clean-utils.js";
+import {
+  attemptCATrustRemovalForCleanup,
+  collectStateDirsForCleanup,
+  removePortlessStateFiles,
+} from "./clean-utils.js";
 import {
   getLocalNetworkIp,
   isMdnsSupported,
@@ -111,7 +134,6 @@ import {
 import {
   loadConfig,
   resolveAppConfig,
-  resolveScript,
   resolveScriptCommand,
   hasScript,
   isServerCommand,
@@ -131,15 +153,24 @@ import {
   hasTurboConfig,
 } from "./turbo.js";
 import type { ManifestEntry } from "./turbo.js";
+import { formatViteAllowedHosts } from "./vite.js";
 import { buildServiceUninstallSudoArgs, handleService, tryUninstallService } from "./service.js";
 import { handleBg, pruneBgEntriesForState, stopBgEntriesForState } from "./bg.js";
+import { cleanupRouteSharing } from "./route-cleanup.js";
 import { PORTLESS_BG_ID_ENV, PORTLESS_BG_READY_PATH_ENV, writeBgReadyFile } from "./bg-ready.js";
+import {
+  collectDoctorSnapshot,
+  evaluateDoctor,
+  type DoctorFinding,
+  type DoctorStatus,
+} from "./doctor.js";
 
 const chalk = colors;
 
 type LoadedAppConfig = {
   config: AppConfig;
   sourceLabel: string;
+  worktreeFlat?: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -154,6 +185,9 @@ const DEBOUNCE_MS = 100;
 
 /** Polling interval (ms) when fs.watch is unavailable. */
 const POLL_INTERVAL_MS = 3000;
+
+/** Default interval (seconds) for the proxy's background stale-route sweep. */
+const DEFAULT_ROUTES_CLEANUP_INTERVAL_SECONDS = 300;
 
 /** Grace period (ms) for connections to drain before force-exiting the proxy. */
 const EXIT_TIMEOUT_MS = 2000;
@@ -178,10 +212,39 @@ type ProxyConfig = {
   lanIp: string | null;
   lanIpExplicit: boolean;
   tld: string;
+  tlds: string[];
+  tldsExplicit: boolean;
   useWildcard: boolean;
 };
 
-function defaultProxyConfig(tld: string, useHttps: boolean, lanMode: boolean): ProxyConfig {
+function normalizeTlds(tlds: readonly string[]): string[] {
+  return [...new Set(tlds.length > 0 ? tlds : [DEFAULT_TLD])];
+}
+
+function mergeLanTlds(tlds: readonly string[]): string[] {
+  const normalized = normalizeTlds(tlds);
+  return normalized.includes("local") ? normalized : [...normalized, "local"];
+}
+
+function primaryTld(tlds: readonly string[]): string {
+  return tlds[0] ?? DEFAULT_TLD;
+}
+
+function formatTldList(tlds: readonly string[]): string {
+  return tlds.map((tld) => `.${tld}`).join(", ");
+}
+
+function defaultProxyConfig(
+  tlds: readonly string[],
+  useHttps: boolean,
+  lanMode: boolean,
+  tldsExplicit: boolean
+): ProxyConfig {
+  const effectiveTlds = lanMode
+    ? tldsExplicit
+      ? mergeLanTlds(tlds)
+      : ["local"]
+    : normalizeTlds(tlds);
   return {
     useHttps,
     customCertPath: null,
@@ -189,7 +252,9 @@ function defaultProxyConfig(tld: string, useHttps: boolean, lanMode: boolean): P
     lanMode,
     lanIp: null,
     lanIpExplicit: false,
-    tld: lanMode ? "local" : tld,
+    tld: primaryTld(effectiveTlds),
+    tlds: effectiveTlds,
+    tldsExplicit,
     useWildcard: false,
   };
 }
@@ -198,19 +263,20 @@ function resolveProxyConfig(options: {
   persistedLanMode: boolean;
   persistedUseWildcard?: boolean;
   explicit: ProxyConfigExplicitness;
-  defaultTld: string;
+  defaultTlds: string[];
   useHttps: boolean;
   customCertPath: string | null;
   customKeyPath: string | null;
   lanMode: boolean;
   lanIp: string | null;
-  tld: string;
+  tlds: string[];
   useWildcard: boolean;
 }): ProxyConfig {
   const config = defaultProxyConfig(
-    options.defaultTld,
+    options.defaultTlds,
     options.useHttps,
-    options.explicit.lanMode ? options.lanMode : options.persistedLanMode
+    options.explicit.lanMode ? options.lanMode : options.persistedLanMode,
+    options.explicit.tld
   );
   config.useWildcard = options.explicit.useWildcard
     ? options.useWildcard
@@ -236,7 +302,9 @@ function resolveProxyConfig(options: {
       config.lanIp = null;
       config.lanIpExplicit = false;
       if (!options.explicit.tld) {
-        config.tld = options.defaultTld;
+        config.tlds = normalizeTlds(options.defaultTlds);
+        config.tld = primaryTld(config.tlds);
+        config.tldsExplicit = false;
       }
     }
   }
@@ -248,7 +316,9 @@ function resolveProxyConfig(options: {
   }
 
   if (options.explicit.tld) {
-    config.tld = options.tld;
+    config.tlds = normalizeTlds(options.tlds);
+    config.tld = primaryTld(config.tlds);
+    config.tldsExplicit = true;
   }
 
   if (!config.lanMode) {
@@ -257,7 +327,8 @@ function resolveProxyConfig(options: {
   }
 
   if (config.lanMode) {
-    config.tld = "local";
+    config.tlds = config.tldsExplicit ? mergeLanTlds(config.tlds) : ["local"];
+    config.tld = primaryTld(config.tlds);
     if (!config.lanIpExplicit) {
       config.lanIp = null;
     }
@@ -273,16 +344,19 @@ function resolveProxyConfig(options: {
 
 function readCurrentProxyConfig(dir: string): ProxyConfig {
   const lanIp = readLanMarker(dir);
-  const tld = readTldFromDir(dir);
+  const tlds = readTldsFromDir(dir);
+  const tld = primaryTld(tlds);
 
   return {
     useHttps: readTlsMarker(dir),
     customCertPath: null,
     customKeyPath: null,
-    lanMode: lanIp !== null || tld === "local",
+    lanMode: hasLanMarker(dir),
     lanIp,
     lanIpExplicit: false,
     tld,
+    tlds,
+    tldsExplicit: true,
     useWildcard: readWildcardMarker(dir),
   };
 }
@@ -316,9 +390,13 @@ function getProxyConfigMismatchMessages(
     );
   }
 
-  if (explicit.tld && desiredConfig.tld !== actualConfig.tld) {
+  if (
+    explicit.tld &&
+    (desiredConfig.tlds.length !== actualConfig.tlds.length ||
+      desiredConfig.tlds.some((tld, index) => tld !== actualConfig.tlds[index]))
+  ) {
     messages.push(
-      `requested .${desiredConfig.tld}, but the running proxy is using .${actualConfig.tld}`
+      `requested ${formatTldList(desiredConfig.tlds)}, but the running proxy is using ${formatTldList(actualConfig.tlds)}`
     );
   }
 
@@ -343,6 +421,8 @@ function formatProxyStartCommand(proxyPort: number, config: ProxyConfig): string
     lanIp: config.lanIpExplicit ? config.lanIp : null,
     lanIpExplicit: config.lanIpExplicit,
     tld: config.tld,
+    tlds: config.tlds,
+    tldsExplicit: config.tldsExplicit,
     useWildcard: config.useWildcard,
     includePort: proxyPort !== getDefaultPort(config.useHttps),
     proxyPort,
@@ -486,9 +566,97 @@ function formatProcessExitSuffix(code: number | null, signal: NodeJS.Signals | n
   return "";
 }
 
+function buildHostnames(name: string, tlds: readonly string[]): string[] {
+  return parseHostnames(name, normalizeTlds(tlds));
+}
+
+function loadViteRouteMetadata(
+  store: RouteStore,
+  hostnames: readonly string[],
+  pathPrefix: string
+): RouteMapping[] {
+  const hostnameSet = new Set(hostnames);
+  return store
+    .loadRoutes()
+    .filter(
+      (route) =>
+        route.pid === process.pid &&
+        hostnameSet.has(route.hostname) &&
+        normalizePathPrefix(route.pathPrefix) === pathPrefix
+    );
+}
+
+function formatBindEndpoint(host: string, port: number): string {
+  return host.includes(":") ? `[${host}]:${port}` : `${host}:${port}`;
+}
+
+function isUnavailableIpv6Bind(err: NodeJS.ErrnoException, host: string): boolean {
+  return host.includes(":") && (err.code === "EAFNOSUPPORT" || err.code === "EADDRNOTAVAIL");
+}
+
+type RouteRegistrationOptions = {
+  protocol?: RouteProtocol;
+  pathPrefix?: string;
+  label?: string;
+};
+
+function addRoutes(
+  store: RouteStore,
+  hostnames: readonly string[],
+  port: number,
+  pid: number,
+  force: boolean,
+  options: RouteRegistrationOptions = {}
+): number[] {
+  const registered: string[] = [];
+  const killedPids: number[] = [];
+  try {
+    for (const hostname of hostnames) {
+      const killedPid = store.addRoute(hostname, port, pid, force, options);
+      registered.push(hostname);
+      if (killedPid !== undefined) killedPids.push(killedPid);
+    }
+  } catch (err) {
+    for (const hostname of registered) {
+      try {
+        store.removeRoute(hostname, pid, {
+          pathPrefix: options.pathPrefix,
+          label: options.label,
+        });
+      } catch {
+        // Non-fatal rollback cleanup.
+      }
+    }
+    throw err;
+  }
+  return [...new Set(killedPids)];
+}
+
+function removeRoutes(
+  store: RouteStore,
+  hostnames: readonly string[],
+  ownerPid?: number,
+  options: Pick<RouteRegistrationOptions, "pathPrefix" | "label"> = {}
+): void {
+  for (const hostname of hostnames) {
+    try {
+      store.removeRoute(hostname, ownerPid, options);
+    } catch {
+      // Non-fatal cleanup.
+    }
+  }
+}
+
+/** Warn on this terminal when a registered route still has no resolution. */
+function reportHostsSyncHere(hostnames: string[], lanMode: boolean): Promise<void> {
+  return reportHostsSync(hostnames, lanMode, (message) => console.warn(colors.yellow(message)));
+}
+
 function resetProxyRuntimeMarkers(dir: string): void {
   writeTlsMarker(dir, false);
-  writeTldFile(dir, DEFAULT_TLD);
+  writeCustomCertMarker(dir, false);
+  writeInternalPagesDisabledMarker(dir, false);
+  writeTldsFile(dir, [DEFAULT_TLD]);
   writeLanMarker(dir, null);
   writeWildcardMarker(dir, false);
 }
@@ -529,15 +697,21 @@ function startProxyServer(
   store: RouteStore,
   proxyPort: number,
   tld: string,
+  tlds: string[],
   tlsOptions?: { cert: Buffer; key: Buffer },
   lanIp?: string | null,
-  strict?: boolean
+  strict?: boolean,
+  lanMode = false,
+  customCert = false,
+  routesCleanupIntervalSeconds = DEFAULT_ROUTES_CLEANUP_INTERVAL_SECONDS
 ): void {
   store.ensureDir();
 
   const isTls = !!tlsOptions;
   const mdnsSupport = isMdnsSupported();
   let activeLanIp = lanIp && mdnsSupport.supported ? lanIp : null;
+  const bindTargets = getProxyBindTargets(lanMode);
+  const primaryBindTarget = bindTargets[0]!;
   const lanIpPinned = !!process.env.PORTLESS_LAN_IP;
   let lanMonitor: ReturnType<typeof startLanIpMonitor> | null = null;
   if (lanIp && !mdnsSupport.supported) {
@@ -562,15 +736,24 @@ function startProxyServer(
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;
   let watcher: fs.FSWatcher | null = null;
   let pollingInterval: ReturnType<typeof setInterval> | null = null;
+  let routesCleanupInterval: ReturnType<typeof setInterval> | null = null;
+  const tunnelAliasStore = new TunnelAliasStore(store.dir);
 
   const autoSyncHosts = shouldAutoSyncHosts(process.env.PORTLESS_SYNC_HOSTS);
+  let hostsSyncWarned = false;
+
+  const syncHostsAndLatch = (hostnames: string[]): void => {
+    hostsSyncWarned = syncHostsWithWarning(hostnames, hostsSyncWarned, () =>
+      console.warn(colors.yellow(`Could not write ${HOSTS_DISPLAY} for route hostnames.`))
+    );
+  };
 
   const onMdnsError = (msg: string) => console.warn(chalk.yellow(msg));
 
   const publishCachedRoutes = () => {
     if (!activeLanIp) return;
-    for (const route of cachedRoutes) {
-      publish(route.hostname, proxyPort, activeLanIp, onMdnsError);
+    for (const hostname of deduplicateHostnames(cachedRoutes.map((route) => route.hostname))) {
+      publish(hostname, proxyPort, activeLanIp, onMdnsError);
     }
   };
 
@@ -582,7 +765,7 @@ function startProxyServer(
     }
 
     activeLanIp = nextIp;
-    writeLanMarker(store.dir, activeLanIp);
+    writeLanModeMarker(store.dir, lanMode, activeLanIp);
 
     if (previousIp && nextIp) {
       console.log(chalk.green(`LAN IP changed: ${previousIp} -> ${nextIp}`));
@@ -597,25 +780,25 @@ function startProxyServer(
 
   const reloadRoutes = () => {
     try {
-      const previousRoutes = new Map(cachedRoutes.map((r) => [r.hostname, r.port]));
+      const previousHostnames = new Set(
+        deduplicateHostnames(cachedRoutes.map((route) => route.hostname))
+      );
       cachedRoutes = store.loadRoutes();
+      const currentHostnames = new Set(
+        deduplicateHostnames(cachedRoutes.map((route) => route.hostname))
+      );
       if (autoSyncHosts) {
-        syncHostsFile(cachedRoutes.map((r) => r.hostname));
+        syncHostsAndLatch([...currentHostnames]);
       }
       // Sync mDNS records with current routes
       if (activeLanIp) {
-        const currentRoutes = new Map(cachedRoutes.map((r) => [r.hostname, r.port]));
-        for (const route of cachedRoutes) {
-          const previousPort = previousRoutes.get(route.hostname);
-          if (previousPort === undefined) {
-            publish(route.hostname, proxyPort, activeLanIp, onMdnsError);
-          } else if (previousPort !== route.port) {
-            unpublish(route.hostname);
-            publish(route.hostname, proxyPort, activeLanIp, onMdnsError);
+        for (const hostname of currentHostnames) {
+          if (!previousHostnames.has(hostname)) {
+            publish(hostname, proxyPort, activeLanIp, onMdnsError);
           }
         }
-        for (const hostname of previousRoutes.keys()) {
-          if (!currentRoutes.has(hostname)) {
+        for (const hostname of previousHostnames) {
+          if (!currentHostnames.has(hostname)) {
             unpublish(hostname);
           }
         }
@@ -626,7 +809,18 @@ function startProxyServer(
   };
 
   try {
-    watcher = fs.watch(routesPath, () => {
+    const routesFilename = path.basename(routesPath);
+    // Canonicalize the watched directory: on Windows, watching an 8.3
+    // short-path spelling (e.g. RUNNER~1) makes libuv assert in fs-event.c
+    // when events arrive under the long name, aborting the process.
+    let watchDir = store.dir;
+    try {
+      watchDir = fs.realpathSync.native(store.dir);
+    } catch {
+      // Fall back to the configured spelling if the path cannot be resolved
+    }
+    watcher = fs.watch(watchDir, (_eventType, filename) => {
+      if (filename && filename.toString() !== routesFilename) return;
       if (debounceTimer) clearTimeout(debounceTimer);
       debounceTimer = setTimeout(reloadRoutes, DEBOUNCE_MS);
     });
@@ -636,8 +830,34 @@ function startProxyServer(
     pollingInterval = setInterval(reloadRoutes, POLL_INTERVAL_MS);
   }
 
+  if (routesCleanupIntervalSeconds > 0) {
+    routesCleanupInterval = setInterval(() => {
+      try {
+        const staleRoutes = store.pruneStaleRoutes();
+        for (const route of staleRoutes) {
+          try {
+            cleanupRouteSharing(route, { tunnelAliasStore });
+          } catch {
+            // Sharing cleanup is best effort; the stale route is already gone.
+          }
+        }
+      } catch {
+        // Best-effort background route cleanup; non-fatal.
+      }
+
+      try {
+        const staleAliases = tunnelAliasStore.pruneManagedAliases();
+        for (const alias of staleAliases) {
+          if (alias.tunnelPid) stopTunnelPid(alias.tunnelPid);
+        }
+      } catch {
+        // Best-effort background alias cleanup; non-fatal.
+      }
+    }, routesCleanupIntervalSeconds * 1000).unref();
+  }
+
   if (autoSyncHosts) {
-    syncHostsFile(cachedRoutes.map((r) => r.hostname));
+    syncHostsAndLatch(deduplicateHostnames(cachedRoutes.map((route) => route.hostname)));
   }
 
   // Publish mDNS for routes that already exist at startup
@@ -663,17 +883,32 @@ function startProxyServer(
     return value;
   };
 
-  const server = createProxyServer({
-    getRoutes: () => cachedRoutes,
-    getTunnelAliases: () => new TunnelAliasStore(store.dir).loadAliases(),
-    proxyPort,
-    tld,
-    strict,
-    onError: (msg) => console.error(colors.red(msg)),
-    tls: tlsOptions,
-    internalPages: process.env.PORTLESS_DASHBOARD !== "0",
-    getCaTrusted,
-  });
+  const createServer = () =>
+    createProxyServer({
+      getRoutes: () => cachedRoutes,
+      getTunnelAliases: () => new TunnelAliasStore(store.dir).loadAliases(),
+      proxyPort,
+      tld,
+      tlds,
+      strict,
+      onError: (msg) => console.error(colors.red(msg)),
+      tls: tlsOptions,
+      internalPages: process.env.PORTLESS_DASHBOARD !== "0",
+      getCaTrusted,
+    });
+  const server = createServer();
+  const additionalServers = new Set<ReturnType<typeof createProxyServer>>();
+  const redirectServers = new Set<ReturnType<typeof createHttpRedirectServer>>();
+
+  const closeAuxiliaryServers = () => {
+    for (const auxiliaryServer of [...additionalServers, ...redirectServers]) {
+      try {
+        auxiliaryServer.close();
+      } catch {
+        // The listener may have failed before it started; nothing to close.
+      }
+    }
+  };
 
   server.on("error", (err: NodeJS.ErrnoException) => {
     if (err.code === "EADDRINUSE") {
@@ -693,41 +928,77 @@ function startProxyServer(
     } else {
       console.error(colors.red(`Proxy error: ${err.message}`));
     }
-    if (redirectServer) redirectServer.close();
+    closeAuxiliaryServers();
     process.exit(1);
   });
+
+  const proto = isTls ? "HTTPS/2" : "HTTP";
+  const tldLabel =
+    tlds.length > 1 || tld !== DEFAULT_TLD ? ` (suffixes: ${formatTldList(tlds)})` : "";
+  const modeLabel = strict === false ? " (wildcard)" : "";
+
+  for (const bindTarget of bindTargets.slice(1)) {
+    const additionalServer = createServer();
+    additionalServers.add(additionalServer);
+    additionalServer.on("error", (err: NodeJS.ErrnoException) => {
+      additionalServers.delete(additionalServer);
+      if (!isUnavailableIpv6Bind(err, bindTarget.host)) {
+        console.warn(
+          colors.yellow(
+            `Could not listen on ${formatBindEndpoint(bindTarget.host, proxyPort)}: ${err.message}`
+          )
+        );
+      }
+    });
+    listenOnProxyInterface(additionalServer, proxyPort, bindTarget, () => {
+      console.log(
+        colors.green(
+          `${proto} proxy listening on ${formatBindEndpoint(bindTarget.host, proxyPort)}${tldLabel}${modeLabel}`
+        )
+      );
+    });
+  }
 
   // When TLS is enabled, start a plain HTTP server on port 80 that redirects
   // to HTTPS. Best-effort: if port 80 is unavailable, skip silently (the main
   // proxy on 443 still works; users just won't get automatic redirects).
-  let redirectServer: ReturnType<typeof createHttpRedirectServer> | null = null;
   if (isTls && proxyPort !== 80) {
-    redirectServer = createHttpRedirectServer(proxyPort);
-    redirectServer.on("error", () => {
-      redirectServer = null;
-    });
-    redirectServer.listen(80);
+    for (const bindTarget of bindTargets) {
+      const redirectServer = createHttpRedirectServer(proxyPort);
+      redirectServers.add(redirectServer);
+      redirectServer.on("error", () => {
+        redirectServers.delete(redirectServer);
+      });
+      listenOnProxyInterface(redirectServer, 80, bindTarget, () => {
+        console.log(
+          colors.green(
+            `HTTP-to-HTTPS redirect listening on ${formatBindEndpoint(bindTarget.host, 80)}`
+          )
+        );
+      });
+    }
   }
 
-  server.listen(proxyPort, () => {
+  listenOnProxyInterface(server, proxyPort, primaryBindTarget, () => {
     // Save PID and port once the server is actually listening
     fs.writeFileSync(store.pidPath, process.pid.toString(), { mode: FILE_MODE });
     fs.writeFileSync(store.portFilePath, proxyPort.toString(), { mode: FILE_MODE });
     writeTlsMarker(store.dir, isTls);
-    writeTldFile(store.dir, tld);
-    writeLanMarker(store.dir, activeLanIp);
+    writeCustomCertMarker(store.dir, isTls && customCert);
+    writeInternalPagesDisabledMarker(store.dir, process.env.PORTLESS_DASHBOARD === "0");
+    writeTldsFile(store.dir, tlds);
+    writeLanModeMarker(store.dir, lanMode, activeLanIp);
     writeWildcardMarker(store.dir, strict === false);
     fixOwnership(store.dir, store.pidPath, store.portFilePath);
-    const proto = isTls ? "HTTPS/2" : "HTTP";
-    const tldLabel = tld !== DEFAULT_TLD ? ` (suffix: .${tld})` : "";
-    const modeLabel = strict === false ? " (wildcard)" : "";
     console.log(
-      colors.green(`${proto} proxy listening on port ${proxyPort}${tldLabel}${modeLabel}`)
+      colors.green(
+        `${proto} proxy listening on ${formatBindEndpoint(primaryBindTarget.host, proxyPort)}${tldLabel}${modeLabel}`
+      )
     );
     if (activeLanIp) {
       console.log(chalk.green(`LAN mode: ${activeLanIp}`));
       console.log(chalk.gray("Services are discoverable as <name>.local on your network"));
-      if (isTls) {
+      if (isTls && !customCert) {
         console.log(chalk.yellow("For HTTPS on devices, install the CA certificate:"));
         console.log(chalk.gray(`  ${path.join(store.dir, "ca.pem")}`));
       }
@@ -742,9 +1013,6 @@ function startProxyServer(
         });
       }
     }
-    if (redirectServer) {
-      console.log(colors.green("HTTP-to-HTTPS redirect listening on port 80"));
-    }
   });
 
   // Cleanup on exit
@@ -754,14 +1022,13 @@ function startProxyServer(
     exiting = true;
     if (debounceTimer) clearTimeout(debounceTimer);
     if (pollingInterval) clearInterval(pollingInterval);
+    if (routesCleanupInterval) clearInterval(routesCleanupInterval);
     if (lanMonitor) lanMonitor.stop();
     if (watcher) {
       watcher.close();
     }
     if (activeLanIp) cleanupMdns();
-    if (redirectServer) {
-      redirectServer.close();
-    }
+    closeAuxiliaryServers();
     try {
       fs.unlinkSync(store.pidPath);
     } catch {
@@ -936,6 +1203,15 @@ function tunnelAliasLabel(alias: Pick<TunnelAlias, "targetHostname" | "targetPat
     : `${alias.targetHostname}${targetPathPrefix}`;
 }
 
+function formatRouteLabel(route: Pick<RouteMapping, "hostname" | "pathPrefix">): string {
+  const pathPrefix = normalizePathPrefix(route.pathPrefix);
+  return pathPrefix === "/" ? route.hostname : `${route.hostname}${pathPrefix}`;
+}
+
+function formatSharedUrl(url: string, pathPrefix: string): string {
+  return pathPrefix === "/" ? url : `${url}${pathPrefix}`;
+}
+
 function aliasesForRoute(
   aliases: TunnelAlias[],
   hostname: string,
@@ -969,24 +1245,26 @@ function listRoutes(
         upstream_protocol: route.protocol ?? "http1",
         pid: route.pid,
         kind: route.pid === 0 ? "alias" : "app",
-        ...(route.tailscaleUrl ? { tailscale_url: route.tailscaleUrl } : {}),
+        ...(route.tailscaleUrl
+          ? { tailscale_url: formatSharedUrl(route.tailscaleUrl, pathPrefix) }
+          : {}),
         ...(route.tailscaleServiceUrl
           ? {
-              tailscale_service_url: route.tailscaleServiceUrl,
+              tailscale_service_url: formatSharedUrl(route.tailscaleServiceUrl, pathPrefix),
               tailscale_service_name: route.tailscaleServiceName,
               tailscale_service_pending: !!route.tailscaleServicePending,
             }
           : {}),
-        ...(route.ngrokUrl ? { ngrok_url: route.ngrokUrl } : {}),
+        ...(route.ngrokUrl ? { ngrok_url: formatSharedUrl(route.ngrokUrl, pathPrefix) } : {}),
         ...(route.tunnelUrl
           ? {
-              tunnel_url: route.tunnelUrl,
+              tunnel_url: formatSharedUrl(route.tunnelUrl, pathPrefix),
               tunnel_provider: route.tunnelProvider,
               tunnel_external_hostname: route.tunnelExternalHostname,
             }
           : {}),
         ...(routeAliases.length > 0 ? { tunnel_aliases: routeAliases } : {}),
-        ...(route.netbirdUrl ? { netbird_url: route.netbirdUrl } : {}),
+        ...(route.netbirdUrl ? { netbird_url: formatSharedUrl(route.netbirdUrl, pathPrefix) } : {}),
       };
     });
     process.stdout.write(JSON.stringify(payload, null, 2) + "\n");
@@ -1012,24 +1290,30 @@ function listRoutes(
     );
     if (route.tailscaleUrl) {
       const tsLabel = route.tailscaleFunnel ? "funnel" : "tailscale";
-      console.log(`    ${colors.gray(tsLabel + ":")} ${colors.green(route.tailscaleUrl)}`);
+      console.log(
+        `    ${colors.gray(tsLabel + ":")} ${colors.green(formatSharedUrl(route.tailscaleUrl, pathPrefix))}`
+      );
     }
     if (route.tailscaleServiceUrl) {
       const pending = route.tailscaleServicePending ? " (pending admin approval)" : "";
       console.log(
-        `    ${colors.gray("tailscale service:")} ${colors.green(route.tailscaleServiceUrl)}${colors.yellow(pending)}`
+        `    ${colors.gray("tailscale service:")} ${colors.green(formatSharedUrl(route.tailscaleServiceUrl, pathPrefix))}${colors.yellow(pending)}`
       );
     }
     if (route.ngrokUrl) {
-      console.log(`    ${colors.gray("ngrok:")} ${colors.green(route.ngrokUrl)}`);
+      console.log(
+        `    ${colors.gray("ngrok:")} ${colors.green(formatSharedUrl(route.ngrokUrl, pathPrefix))}`
+      );
     }
     if (route.tunnelUrl) {
       console.log(
-        `    ${colors.gray(`${route.tunnelProvider ?? "tunnel"}:`)} ${colors.green(route.tunnelUrl)}`
+        `    ${colors.gray(`${route.tunnelProvider ?? "tunnel"}:`)} ${colors.green(formatSharedUrl(route.tunnelUrl, pathPrefix))}`
       );
     }
     if (route.netbirdUrl) {
-      console.log(`    ${colors.gray("netbird:")} ${colors.green(route.netbirdUrl)}`);
+      console.log(
+        `    ${colors.gray("netbird:")} ${colors.green(formatSharedUrl(route.netbirdUrl, pathPrefix))}`
+      );
     }
   }
   if (aliases.length > 0) {
@@ -1051,11 +1335,11 @@ type EnsureProxyResult =
 interface ProxyDesiredState {
   explicit: ProxyConfigExplicitness;
   desiredConfig: ReturnType<typeof resolveProxyConfig>;
-  envTld: string;
+  envTlds: string[];
 }
 
 function resolveProxyDesiredState(lanMode: boolean): ProxyDesiredState {
-  const envTld = getDefaultTld();
+  const envTlds = getDefaultTlds();
   const explicit: ProxyConfigExplicitness = {
     useHttps: process.env.PORTLESS_HTTPS !== undefined,
     customCert: false,
@@ -1067,16 +1351,16 @@ function resolveProxyDesiredState(lanMode: boolean): ProxyDesiredState {
   const desiredConfig = resolveProxyConfig({
     persistedLanMode: lanMode,
     explicit,
-    defaultTld: envTld,
+    defaultTlds: envTlds,
     useHttps: !isHttpsEnvDisabled(),
     customCertPath: null,
     customKeyPath: null,
     lanMode: isLanEnvEnabled(),
     lanIp: process.env.PORTLESS_LAN_IP || null,
-    tld: envTld,
+    tlds: envTlds,
     useWildcard: isWildcardEnvEnabled(),
   });
-  return { explicit, desiredConfig, envTld };
+  return { explicit, desiredConfig, envTlds };
 }
 
 /**
@@ -1107,8 +1391,10 @@ async function ensureProxyRunning(
     if (!explicit.useHttps && persisted.tls !== desiredConfig.useHttps) {
       startConfig.useHttps = persisted.tls;
     }
-    if (!explicit.tld && persisted.tld !== desiredConfig.tld) {
-      startConfig.tld = persisted.tld;
+    if (!explicit.tld) {
+      startConfig.tlds = persisted.tlds;
+      startConfig.tld = primaryTld(persisted.tlds);
+      startConfig.tldsExplicit = true;
     }
     if (!explicit.lanMode && persisted.lanMode !== desiredConfig.lanMode) {
       startConfig.lanMode = persisted.lanMode;
@@ -1151,9 +1437,12 @@ async function ensureProxyRunning(
     lanIp: startConfig.lanIpExplicit ? startConfig.lanIp : null,
     lanIpExplicit: startConfig.lanIpExplicit,
     tld: startConfig.tld,
+    tlds: startConfig.tlds,
+    tldsExplicit: startConfig.tldsExplicit,
     useWildcard: startConfig.useWildcard,
     includePort: startPort !== undefined,
     proxyPort: startPort,
+    routesCleanupIntervalSeconds: resolveRoutesCleanupIntervalSeconds([]),
   });
   const startArgs = [getEntryScript(), "proxy", "start", ...proxyStartConfig.args];
 
@@ -1197,7 +1486,7 @@ async function runApp(
   name: string,
   commandArgs: string[],
   tls: boolean,
-  tld: string,
+  tlds: string[],
   force: boolean,
   autoInfo?: { nameSource: string; prefix?: string; prefixSource?: string },
   desiredPort?: number,
@@ -1316,14 +1605,14 @@ async function runApp(
   }
 
   // Validate the hostname before we try to auto-start the proxy.
-  parseHostname(name, tld);
+  buildHostnames(name, tlds);
 
   const ensureResult = await ensureProxyRunning(proxyPort, tls, desired);
 
   if (ensureResult.started) {
     proxyPort = ensureResult.state.port;
     stateDir = ensureResult.state.dir;
-    tld = ensureResult.state.tld;
+    tlds = ensureResult.state.tlds;
     tls = ensureResult.state.tls;
     lanMode = ensureResult.state.lanMode;
     lanIp = ensureResult.state.lanIp;
@@ -1346,6 +1635,7 @@ async function runApp(
     }
     lanMode = runningConfig.lanMode;
     lanIp = runningConfig.lanIp;
+    tlds = runningConfig.tlds;
     console.log(chalk.gray("-- Proxy is running"));
   }
 
@@ -1355,22 +1645,29 @@ async function runApp(
 
   // Compute hostname after auto-start so tld reflects the running proxy
   // (e.g. --lan changes tld from "localhost" to "local")
-  const hostname = parseHostname(name, tld);
-  const routePathPrefix = normalizePathPrefix(pathPrefix ?? pathPrefixFromEnv());
+  const hostnames = buildHostnames(name, tlds);
+  const hostname = hostnames[0]!;
+  const routePathPrefix = normalizePathPrefix(pathPrefix);
+  const routeDisplayLabel = formatRouteLabel({ hostname, pathPrefix: routePathPrefix });
 
   const configuredTldEnv = getConfiguredTldEnv();
-  if (configuredTldEnv && desired.envTld !== DEFAULT_TLD && desired.envTld !== tld) {
+  if (
+    configuredTldEnv &&
+    desired.explicit.tld &&
+    (desired.envTlds.length !== tlds.length ||
+      desired.envTlds.some((configuredTld, index) => configuredTld !== tlds[index]))
+  ) {
     console.warn(
       chalk.yellow(
-        `Warning: ${configuredTldEnv.source}=${desired.envTld} but the running proxy uses .${tld}. Using .${tld}.`
+        `Warning: ${configuredTldEnv.source}=${desired.envTlds.join(",")} but the running proxy uses ${formatTldList(tlds)}.`
       )
     );
   }
 
   if (lanIp) {
-    console.log(chalk.gray(`-- ${hostname} (LAN: ${lanIp})`));
+    console.log(chalk.gray(`-- ${hostnames.join(", ")} (LAN: ${lanIp})`));
   } else {
-    console.log(chalk.gray(`-- ${hostname} (auto-resolves to 127.0.0.1)`));
+    console.log(chalk.gray(`-- ${hostnames.join(", ")} (auto-resolves to 127.0.0.1)`));
   }
   if (autoInfo) {
     const baseName = autoInfo.prefix ? name.slice(autoInfo.prefix.length + 1) : name;
@@ -1388,10 +1685,12 @@ async function runApp(
   }
 
   // Register route (--force kills the existing owner if any)
-  assertNotReservedHostname(hostname, tld);
-  let killedPid: number | undefined;
+  for (const [index, configuredHostname] of hostnames.entries()) {
+    assertNotReservedHostname(configuredHostname, tlds[index]!);
+  }
+  let killedPids: number[];
   try {
-    killedPid = store.addRoute(hostname, port, process.pid, force, {
+    killedPids = addRoutes(store, hostnames, port, process.pid, force, {
       protocol,
       pathPrefix: routePathPrefix,
       label: multiplexLabelFromEnv(),
@@ -1403,12 +1702,18 @@ async function runApp(
     }
     throw err;
   }
-  if (killedPid !== undefined) {
+  await reportHostsSyncHere(hostnames, lanMode);
+  for (const killedPid of killedPids) {
     console.log(colors.yellow(`Killed existing process (PID ${killedPid})`));
   }
 
   const finalUrl = formatUrl(hostname, proxyPort, tls, routePathPrefix);
   console.log(chalk.cyan.bold(`\n  -> ${finalUrl}\n`));
+  for (const secondaryHostname of hostnames.slice(1)) {
+    console.log(
+      chalk.cyan(`  -> ${formatUrl(secondaryHostname, proxyPort, tls, routePathPrefix)}`)
+    );
+  }
   if (lanIp) {
     console.log(chalk.green(`  LAN -> ${finalUrl}`));
     console.log(chalk.gray("  (accessible from other devices on the same WiFi network)\n"));
@@ -1451,7 +1756,7 @@ async function runApp(
     netbirdUrl = undefined;
     console.warn(
       colors.yellow(
-        `Warning: NetBird expose for ${hostname} stopped${formatProcessExitSuffix(
+        `Warning: NetBird expose for ${routeDisplayLabel} stopped${formatProcessExitSuffix(
           code,
           signal
         )}. Removing its public URL from the route list.`
@@ -1481,7 +1786,7 @@ async function runApp(
     ngrokUrl = undefined;
     console.warn(
       colors.yellow(
-        `Warning: ngrok tunnel for ${hostname} stopped${formatProcessExitSuffix(
+        `Warning: ngrok tunnel for ${routeDisplayLabel} stopped${formatProcessExitSuffix(
           code,
           signal
         )}. Removing its public URL from the route list.`
@@ -1511,7 +1816,7 @@ async function runApp(
     tunnelUrl = undefined;
     console.warn(
       colors.yellow(
-        `Warning: tunnel for ${hostname} stopped${formatProcessExitSuffix(
+        `Warning: tunnel for ${routeDisplayLabel} stopped${formatProcessExitSuffix(
           code,
           signal
         )}. Removing its public URL from the route list.`
@@ -1553,7 +1858,7 @@ async function runApp(
       const message = err instanceof Error ? err.message : String(err);
       console.error(colors.red(`Error: ${message}`));
       try {
-        store.removeRoute(hostname, process.pid, { pathPrefix: routePathPrefix });
+        removeRoutes(store, hostnames, process.pid, { pathPrefix: routePathPrefix });
       } catch {
         // Best-effort cleanup; non-fatal
       }
@@ -1561,7 +1866,11 @@ async function runApp(
     }
 
     const pending = tailscaleServicePending ? " (pending admin approval)" : "";
-    console.log(chalk.green(`  Tailscale Service -> ${tailscaleServiceUrl}${pending}`));
+    console.log(
+      chalk.green(
+        `  Tailscale Service -> ${formatSharedUrl(tailscaleServiceUrl, routePathPrefix)}${pending}`
+      )
+    );
     console.log(chalk.gray("  (accessible from your tailnet after service approval)\n"));
 
     try {
@@ -1602,7 +1911,7 @@ async function runApp(
     // a successful register or exits the process on final failure.
     tailscaleUrl = formatTailscaleUrl(tsBaseUrl, tailscaleHttpsPort!);
     const label = wantsFunnel ? "Funnel (public)" : "Tailscale";
-    console.log(chalk.green(`  ${label} -> ${tailscaleUrl}`));
+    console.log(chalk.green(`  ${label} -> ${formatSharedUrl(tailscaleUrl, routePathPrefix)}`));
     if (wantsFunnel) {
       console.log(chalk.gray("  (accessible from the public internet via Tailscale Funnel)\n"));
     } else {
@@ -1646,7 +1955,7 @@ async function runApp(
         onExit: handleNetbirdExit,
       });
       netbirdUrl = netbirdProcess.info.url;
-      console.log(chalk.green(`  NetBird -> ${netbirdUrl}`));
+      console.log(chalk.green(`  NetBird -> ${formatSharedUrl(netbirdUrl, routePathPrefix)}`));
       console.log(chalk.gray("  (accessible from the public internet via NetBird)\n"));
 
       try {
@@ -1687,7 +1996,7 @@ async function runApp(
         // Best-effort cleanup; non-fatal
       }
       try {
-        store.removeRoute(hostname, process.pid, { pathPrefix: routePathPrefix });
+        removeRoutes(store, hostnames, process.pid, { pathPrefix: routePathPrefix });
       } catch {
         // Best-effort cleanup; non-fatal
       }
@@ -1702,7 +2011,7 @@ async function runApp(
         onExit: handleNgrokExit,
       });
       ngrokUrl = ngrokProcess.url;
-      console.log(chalk.green(`  ngrok -> ${ngrokUrl}`));
+      console.log(chalk.green(`  ngrok -> ${formatSharedUrl(ngrokUrl, routePathPrefix)}`));
       console.log(chalk.gray("  (accessible from the public internet via ngrok)\n"));
 
       try {
@@ -1744,7 +2053,7 @@ async function runApp(
         // Best-effort cleanup; non-fatal
       }
       try {
-        store.removeRoute(hostname, process.pid, { pathPrefix: routePathPrefix });
+        removeRoutes(store, hostnames, process.pid, { pathPrefix: routePathPrefix });
       } catch {
         // Best-effort cleanup; non-fatal
       }
@@ -1772,7 +2081,7 @@ async function runApp(
         routeOwnerPid: process.pid,
       });
       const label = managedTunnel.provider === "cloudflare" ? "Cloudflare Tunnel" : "ngrok tunnel";
-      console.log(chalk.green(`  ${label} -> ${tunnelUrl}`));
+      console.log(chalk.green(`  ${label} -> ${formatSharedUrl(tunnelUrl, routePathPrefix)}`));
       console.log(
         chalk.gray("  (accessible from the public internet through an exact tunnel alias)\n")
       );
@@ -1823,7 +2132,7 @@ async function runApp(
         // Best-effort cleanup; non-fatal
       }
       try {
-        store.removeRoute(hostname, process.pid, { pathPrefix: routePathPrefix });
+        removeRoutes(store, hostnames, process.pid, { pathPrefix: routePathPrefix });
       } catch {
         // Best-effort cleanup; non-fatal
       }
@@ -1866,9 +2175,12 @@ async function runApp(
   // conflicts with its internal networking, causing HMR WebSocket degradation.
   // Exception: bun --bun — Bun's native runtime uses HOST for WebSocket origin
   // validation, which breaks Next.js fast refresh behind the proxy hostname.
-  const basename = path.basename(commandArgs[0]);
-  const isExpo = basename === "expo";
-  const isExpoLan = isExpo && (lanMode || isLanEnvEnabled());
+  const framework = resolveFrameworkBasename(
+    commandArgs,
+    scriptContext?.packageDir ?? process.cwd()
+  );
+  const isExpoLan = framework === "expo" && (lanMode || isLanEnvEnabled());
+  const basename = path.basename(commandArgs[0] ?? "");
   const isBunNativeRuntime = basename === "bun" && commandArgs.includes("--bun");
   const hostBind = isExpoLan || isBunNativeRuntime ? undefined : "127.0.0.1";
 
@@ -1888,7 +2200,7 @@ async function runApp(
 
   if (!usedPlaceholders) {
     // Inject --port for frameworks that ignore the PORT env var (e.g. Vite)
-    injectPackageScriptFrameworkFlags(commandArgs, port, scriptContext);
+    injectPackageScriptFrameworkFlags(commandArgs, port, scriptContext?.packageDir);
     injectFrameworkFlags(commandArgs, port);
   }
 
@@ -1913,6 +2225,8 @@ async function runApp(
     }
   }
 
+  const viteRouteMetadata = loadViteRouteMetadata(store, hostnames, routePathPrefix);
+
   // Run the command
   const caFragment = caEnv.NODE_EXTRA_CA_CERTS
     ? ` NODE_EXTRA_CA_CERTS="${caEnv.NODE_EXTRA_CA_CERTS}"`
@@ -1930,7 +2244,7 @@ async function runApp(
       PORT: port.toString(),
       ...(hostBind ? { HOST: hostBind } : {}),
       PORTLESS_URL: finalUrl,
-      __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: `.${tld}`,
+      __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: formatViteAllowedHosts(tlds, viteRouteMetadata),
       // Note: EXPO_PACKAGER_PROXY_URL is not used — expo-dev-client removed
       // baked-in pinging, making this env var ineffective. Expo handles its
       // own LAN discovery natively.
@@ -1966,36 +2280,12 @@ async function runApp(
         // Best-effort cleanup; non-fatal
       }
       try {
-        store.removeRoute(hostname, process.pid, { pathPrefix: routePathPrefix });
+        removeRoutes(store, hostnames, process.pid, { pathPrefix: routePathPrefix });
       } catch {
         // Lock acquisition may fail during cleanup; non-fatal
       }
     },
   });
-}
-
-function injectPackageScriptFrameworkFlags(
-  commandArgs: string[],
-  port: number,
-  scriptContext?: { scriptName: string; packageDir: string }
-): void {
-  if (!scriptContext) return;
-
-  const [runner, runSubcommand, scriptName] = commandArgs;
-  if (runSubcommand !== "run" || scriptName !== scriptContext.scriptName) return;
-
-  const rawScript = resolveScript(scriptContext.scriptName, scriptContext.packageDir);
-  if (!rawScript) return;
-
-  const scriptWithInjectedFlags = [...rawScript];
-  injectFrameworkFlags(scriptWithInjectedFlags, port);
-  const forwardedFlags = scriptWithInjectedFlags.slice(rawScript.length);
-  if (forwardedFlags.length === 0) return;
-
-  if (runner === "npm" && !commandArgs.includes("--")) {
-    commandArgs.push("--");
-  }
-  commandArgs.push(...forwardedFlags);
 }
 
 // ---------------------------------------------------------------------------
@@ -2112,7 +2402,7 @@ function parsePathPrefix(value: string | undefined, source: string): string {
   try {
     return normalizePathPrefix(value);
   } catch (err) {
-    console.error(colors.red(`Error: ${(err as Error).message}`));
+    console.error(colors.red(`Error: ${source}: ${(err as Error).message}`));
     process.exit(1);
   }
 }
@@ -2314,6 +2604,8 @@ ${colors.bold("Name inference (in order):")}
   Use --name to override the inferred name while keeping worktree prefixes.
   In git worktrees, the branch name is prepended as a subdomain prefix
   (e.g. feature-auth.myapp.localhost).
+  Set PORTLESS_WORKTREE_FLAT=1 to join worktree and app names into one label
+  (e.g. feature-auth-myapp.localhost). Use 0 to override a project setting.
 
 ${colors.bold("Command placeholders:")}
   {PORT}                 Assigned app port
@@ -2549,6 +2841,7 @@ const TOP_LEVEL_COMPLETION_COMMANDS: CompletionCommand[] = [
   { name: "list", description: "Show active routes" },
   { name: "ls", description: "Alias for list" },
   { name: "status", description: "Alias for list" },
+  { name: "doctor", description: "Check local portless health" },
   { name: "trust", description: "Add local CA to system trust store" },
   { name: "clean", description: "Remove portless artifacts from this machine" },
   { name: "prune", description: "Kill orphaned dev servers from crashed sessions" },
@@ -2571,9 +2864,14 @@ const GLOBAL_COMPLETION_FLAGS: CompletionFlag[] = [
   { name: "--cert", description: "TLS certificate path", value: "path" },
   { name: "--key", description: "TLS private key path", value: "path" },
   { name: "--foreground", description: "Run proxy in foreground" },
-  { name: "--suffix", description: "Use a custom suffix", value: "suffix" },
+  { name: "--suffix", description: "Add a custom suffix (repeatable)", value: "suffix" },
   { name: "--tld", description: "Compatibility alias for suffix", value: "suffix" },
   { name: "--wildcard", description: "Enable wildcard routing" },
+  {
+    name: "--routes-cleanup-interval",
+    description: "Sweep dead routes at this interval in seconds (0 disables)",
+    value: "seconds",
+  },
   { name: "--state-dir", description: "Use a custom state directory", value: "path" },
   { name: "--app-port", description: "Use a fixed app port", value: "port" },
   { name: "--h2c", description: "Forward to an HTTP/2 cleartext upstream" },
@@ -2658,6 +2956,7 @@ const PROXY_START_COMPLETION_FLAGS = GLOBAL_COMPLETION_FLAGS.filter((flag) =>
     "--suffix",
     "--tld",
     "--wildcard",
+    "--routes-cleanup-interval",
     "--state-dir",
   ].includes(flag.name)
 );
@@ -2775,7 +3074,7 @@ _portless_completions() {
         COMPREPLY=( $(compgen -W "--help -h" -- "$cur") )
       fi
       ;;
-    clean)
+    doctor|clean)
       COMPREPLY=( $(compgen -W "--help -h" -- "$cur") )
       ;;
     prune)
@@ -2866,7 +3165,7 @@ _portless() {
         hosts)
           _values 'hosts command' sync clean
           ;;
-        clean)
+        doctor|clean)
           _arguments '--help[Show help]' '-h[Show help]'
           ;;
         prune)
@@ -2924,7 +3223,7 @@ ${commandLines}
 
 ${fishFlagLines(GLOBAL_COMPLETION_FLAGS)}
 ${fishFlagLines(RUN_COMPLETION_FLAGS, "__fish_seen_subcommand_from run")}
-${fishFlagLines(APP_COMPLETION_FLAGS, "not __fish_seen_subcommand_from run get url list ls status alias tunnel hosts clean prune proxy bg service completion")}
+${fishFlagLines(APP_COMPLETION_FLAGS, "not __fish_seen_subcommand_from run get url list ls status doctor alias tunnel hosts clean prune proxy bg service completion")}
 complete -c portless -n "__fish_seen_subcommand_from get url list ls status" -l json -d "Print JSON"
 complete -c portless -n "__fish_seen_subcommand_from get url" -l path -d "Scope URL to path prefix" -r
 complete -c portless -n "__fish_seen_subcommand_from alias" -l remove -d "Remove route"
@@ -2935,6 +3234,7 @@ complete -c portless -n "__fish_seen_subcommand_from tunnel; and __fish_is_nth_t
 complete -c portless -n "__fish_seen_subcommand_from tunnel" -l path -d "Scope target route to path prefix" -r
 complete -c portless -n "__fish_seen_subcommand_from tunnel" -l json -d "Print JSON"
 complete -c portless -n "__fish_seen_subcommand_from hosts; and __fish_is_nth_token 2" -a "sync clean"
+complete -c portless -n "__fish_seen_subcommand_from doctor" -l help -s h -d "Show help"
 complete -c portless -n "__fish_seen_subcommand_from clean" -l help -s h -d "Show help"
 complete -c portless -n "__fish_seen_subcommand_from prune" -l force -d "Send SIGKILL"
 complete -c portless -n "__fish_seen_subcommand_from prune" -l help -s h -d "Show help"
@@ -3018,6 +3318,7 @@ ${colors.bold("Usage:")}
   ${colors.cyan("portless list")}                    Show active routes
   ${colors.cyan("portless list --json")}             Show active routes as JSON
   ${colors.cyan("portless ls")} / ${colors.cyan("portless status")}   Aliases for portless list
+  ${colors.cyan("portless doctor")}                  Check local portless health
   ${colors.cyan("portless trust")}                   Add local CA to system trust store
   ${colors.cyan("portless clean")}                   Remove portless state, trust entry, and hosts block
   ${colors.cyan("portless prune")}                   Kill orphaned dev servers from crashed sessions
@@ -3039,6 +3340,7 @@ ${colors.bold("Examples:")}
   portless get backend                # -> https://backend.localhost
   portless get backend --json         # Service info for scripts and agents
   portless url backend                # Alias for get
+  portless doctor                     # Run read-only diagnostics
   portless myapp API_URL=1 next dev   # Pass API_URL only to the child command
   portless myapp --h2c grpc-server    # Proxy to an h2c or gRPC upstream
   portless myapp --path /api api-dev  # -> https://myapp.localhost/api
@@ -3057,7 +3359,11 @@ ${colors.bold("Configuration (portless.json or .config/portless.json):")}
 
   Override name:   { "name": "myapp" }
   Override script: { "name": "myapp", "script": "start" }
-  Monorepo:        { "apps": { "apps/web": { "name": "myapp" } } }
+  Route path:      { "name": "myapp", "path": "/api" }
+  Flat worktree:   { "worktreeFlat": true }
+  Monorepo split:  { "apps": { "apps/web": { "name": "myapp", "path": "/" },
+                                "apps/api": { "name": "myapp", "path": "/api" } } }
+  Path precedence: --path, then PORTLESS_PATH, then config
 
 ${colors.bold("In package.json:")}
   {
@@ -3075,9 +3381,11 @@ ${colors.bold("How it works:")}
      (apps get a random port in the 4000 to 4999 range that is free on 127.0.0.1 via PORT)
   3. Access via https://<name>.localhost
   4. .localhost domains auto-resolve to 127.0.0.1
-  5. Frameworks that ignore PORT (Vite, VitePlus, VitePress, Astro,
+  5. Frameworks that ignore PORT (Vite, VitePlus, VitePress, Rsbuild, Astro,
      React Router, Angular, Laravel, Expo, React Native, Wrangler) get --port and, when needed,
-     --host or --ip flags injected automatically
+     --host or --ip flags injected automatically; safe bun run, npm run, pnpm run, or yarn run
+     scripts resolving directly to those server commands receive the same injection
+  6. The proxy listens only on 127.0.0.1 and ::1 unless LAN mode is enabled
 
 ${colors.bold("Background apps:")}
   Use portless bg start for long-lived local servers that should keep running
@@ -3094,6 +3402,7 @@ ${colors.bold("Background apps:")}
   ${colors.cyan("portless bg status web")}
   ${colors.cyan("portless bg logs web --tail 100")}
   ${colors.cyan("portless bg stop web")}
+  Elevated proxy processes keep the invoking user's ~/.portless state directory.
 
 ${colors.bold("HTTP/2 + HTTPS (default):")}
   HTTPS with HTTP/2 multiplexing is enabled by default (faster page loads).
@@ -3102,13 +3411,17 @@ ${colors.bold("HTTP/2 + HTTPS (default):")}
   On first use, portless generates a local CA and adds it to your
   system trust store. Generated certs are stored in the state directory
   and reused across restarts. In WSL, the CA is also added to the Windows
-  user trust store for Windows browsers. No browser warnings.
+  user trust store for Windows browsers. On NixOS and unrecognized Linux
+  distributions, portless prints manual CA setup guidance instead of using
+  an unsupported trust-store layout. No browser warnings.
   Use --skip-trust to skip adding the CA to the trust store.
   Disable with --no-tls.
 
 ${colors.bold("LAN mode:")}
   Use --lan to make services accessible from other devices (phones,
   tablets) on the same WiFi network via mDNS (.local domains).
+  Normal mode binds only to 127.0.0.1 and ::1.
+  LAN mode binds to 0.0.0.0 and ::.
   Useful for testing React Native / Expo apps on real devices.
   Expo keeps Metro's default LAN host behavior in this mode.
   Auto-detected LAN IPs follow network changes automatically.
@@ -3126,6 +3439,8 @@ ${colors.bold("Tailscale sharing:")}
   Use --tailscale to share your dev server with teammates on your tailnet.
   Each app is root-mounted on its own Tailscale HTTPS port (443, then 8443,
   8444, etc.) so no basePath configuration is needed.
+  Requests for a route's persisted Serve, Funnel, or Service hostname resolve
+  to that route. Matching is exact; unrelated public Host values are rejected.
   Use --tailscale-service for a stable Tailscale Service MagicDNS name.
   Tailscale Services require tagged device identity and may need admin approval
   before the service name resolves.
@@ -3189,11 +3504,13 @@ ${colors.bold("Options:")}
   --cert <path>                 Use a custom TLS certificate
   --key <path>                  Use a custom TLS private key
   --foreground                  Run proxy in foreground (for debugging)
-  --suffix <suffix>             Use a custom suffix instead of .localhost (e.g. test, acme.com)
-  --tld <tld>                   Compatibility alias for --suffix
+  --suffix <suffix>             Add a custom suffix; repeat for multiple suffixes
+  --tld <tld>                   Repeatable compatibility alias for --suffix
+                                 DNS limits: 63 characters per label, 253 total
   --wildcard                    Allow unregistered subdomains to fall back to parent route
                                 Local proxy mode only; mDNS LAN mode cannot resolve wildcards
                                 Proxy-level only; restart proxy to change this mode
+  --routes-cleanup-interval <s> Sweep dead routes every <s> seconds (default 300, 0 disables)
   --state-dir <path>            Use a custom state directory with service install
   --app-port <number>           Use a fixed app port; browser-blocked ports are rejected
   --h2c                         Forward this route to an HTTP/2 cleartext upstream
@@ -3233,11 +3550,15 @@ ${colors.bold("Environment variables:")}
   PORTLESS_HTTPS=0              Disable HTTPS (same as --no-tls)
   PORTLESS_LAN=1                Enable LAN mode when set to 1 (set in .bashrc / .zshrc)
   PORTLESS_LAN_IP=<address>     Pin a specific LAN IP for LAN mode
-  PORTLESS_SUFFIX=<suffix>      Use a custom suffix (e.g. test, acme.com; default: localhost)
+  PORTLESS_SUFFIX=<list>        Use comma-separated suffixes (e.g. test,acme.com)
   PORTLESS_TLD=<tld>            Compatibility alias for PORTLESS_SUFFIX
   PORTLESS_WILDCARD=1           Allow unregistered subdomains to fall back to parent route
                                 Local proxy mode only; mDNS LAN mode cannot resolve wildcards
+  PORTLESS_ROUTES_CLEANUP_INTERVAL=<s>
+                                Sweep dead routes every <s> seconds (default 300, 0 disables)
   PORTLESS_SYNC_HOSTS=0         Disable auto-sync of ${HOSTS_DISPLAY} (on by default)
+  PORTLESS_WORKTREE_FLAT=1      Join worktree and app names into one DNS label
+                                Set to 0 to override worktreeFlat in project config
   PORTLESS_TAILSCALE=1          Share apps on your Tailscale network (same as --tailscale)
   PORTLESS_TAILSCALE_SERVICE=1  Share apps as Tailscale Services
   PORTLESS_TAILSCALE_SERVICE_NAME=<n>
@@ -3284,6 +3605,8 @@ ${colors.bold("Safari / DNS:")}
   Auto-syncs ${HOSTS_DISPLAY} for route hostnames by default (including .localhost,
   custom suffixes, and LAN .local). Set PORTLESS_SYNC_HOSTS=0 to disable. To manually sync:
     ${colors.cyan("portless hosts sync")}
+  If a route hostname will not resolve, the command that registered it warns instead
+  of failing silently and points you to the same command.
   Clean up later with:
     ${colors.cyan("portless hosts clean")}
 
@@ -3291,7 +3614,7 @@ ${colors.bold("Skip portless:")}
   PORTLESS=0 bun dev            # Runs command directly without proxy
 
 ${colors.bold("Reserved names:")}
-  run, get, url, alias, tunnel, hosts, list, ls, status, trust, clean, prune, proxy, bg, service, completion are subcommands and
+  run, get, url, alias, tunnel, hosts, list, ls, status, doctor, trust, clean, prune, proxy, bg, service, completion are subcommands and
   cannot be used as app names directly. Use "portless run" to infer the name,
   or "portless --name <name>" to force any name including reserved ones.
 `);
@@ -3363,7 +3686,8 @@ directory, and PORTLESS_STATE_DIR when set), and removes the portless block
 from ${HOSTS_DISPLAY}.
 
 Only allowlisted filenames under each state directory are deleted. Custom
-certificate paths from --cert and --key are never removed.
+certificate paths from --cert and --key are never removed. If trust removal
+fails, the CA certificate and key are retained so clean can safely retry.
 
 macOS/Linux may prompt for sudo when the proxy, trust store, or ${HOSTS_DISPLAY}
 require elevated privileges. On Windows, run as Administrator if needed.
@@ -3464,18 +3788,16 @@ ${colors.bold("Options:")}
     }
   }
 
-  for (const stateDir of stateDirs) {
-    const caPath = path.join(stateDir, "ca.pem");
-    if (!fs.existsSync(caPath)) continue;
-    const wasTrusted = isCATrusted(stateDir);
-    if (!wasTrusted) continue;
-    const untrustResult = untrustCA(stateDir);
+  const failedCAStateDirs = new Set<string>();
+  const caRemovalResults = attemptCATrustRemovalForCleanup(stateDirs, untrustCA);
+  for (const [stateDir, untrustResult] of caRemovalResults) {
     if (untrustResult.removed) {
       console.log(colors.green("Removed local CA from the system trust store."));
-    } else if (untrustResult.error) {
+    } else {
+      failedCAStateDirs.add(stateDir);
       console.warn(
         colors.yellow(
-          `Could not remove CA from trust store: ${untrustResult.error}\n` +
+          `Could not remove CA from trust store: ${untrustResult.error ?? "unknown error"}\n` +
             `Try: sudo portless clean (Linux), or delete the certificate manually.`
         )
       );
@@ -3484,9 +3806,16 @@ ${colors.bold("Options:")}
 
   for (const stateDir of stateDirs) {
     if (bgStopFailedStateDirs.has(stateDir)) continue;
-    removePortlessStateFiles(stateDir);
+    removePortlessStateFiles(stateDir, {
+      preserveCAIdentity: failedCAStateDirs.has(stateDir),
+    });
   }
   console.log(colors.green("Removed portless state files from known state directories."));
+  if (failedCAStateDirs.size > 0) {
+    console.warn(
+      colors.yellow("Retained CA identity files so trust removal can be retried safely.")
+    );
+  }
 
   if (cleanHostsFile()) {
     console.log(colors.green(`Removed portless entries from ${HOSTS_DISPLAY}.`));
@@ -3550,28 +3879,29 @@ ${colors.bold("Options:")}
   }
 
   for (const route of stale) {
+    const routeLabel = formatRouteLabel(route);
     if (route.tailscaleHttpsPort || route.tailscaleServiceName) {
       try {
         unregisterTailscale(route);
         const label = route.tailscaleServiceName
           ? `service ${route.tailscaleServiceName}`
           : `serve on port ${route.tailscaleHttpsPort}`;
-        console.log(colors.gray(`  ${route.hostname} - removed tailscale ${label}`));
+        console.log(colors.gray(`  ${routeLabel} - removed tailscale ${label}`));
       } catch {
         // Tailscale CLI may not be installed; non-fatal during prune
       }
     }
     if (route.ngrokPid) {
       stopNgrok(route);
-      console.log(colors.gray(`  ${route.hostname} - stopped ngrok tunnel`));
+      console.log(colors.gray(`  ${routeLabel} - stopped ngrok tunnel`));
     }
     if (route.tunnelPid) {
       stopTunnelPid(route.tunnelPid);
-      console.log(colors.gray(`  ${route.hostname} - stopped managed tunnel`));
+      console.log(colors.gray(`  ${routeLabel} - stopped managed tunnel`));
     }
     if (route.netbirdPid) {
       stopNetbird(route);
-      console.log(colors.gray(`  ${route.hostname} - stopped NetBird expose`));
+      console.log(colors.gray(`  ${routeLabel} - stopped NetBird expose`));
     }
   }
   for (const alias of staleAliases) {
@@ -3583,10 +3913,11 @@ ${colors.bold("Options:")}
 
   let killed = 0;
   for (const route of stale) {
+    const routeLabel = formatRouteLabel(route);
     const pids = findPidsOnPort(route.port);
     if (pids.length === 0) {
       console.log(
-        colors.gray(`  ${route.hostname} :${route.port} - route removed (port already free)`)
+        colors.gray(`  ${routeLabel} :${route.port} - route removed (port already free)`)
       );
       continue;
     }
@@ -3595,11 +3926,9 @@ ${colors.bold("Options:")}
       try {
         process.kill(pid, signal);
         killed++;
-        console.log(
-          colors.gray(`  ${route.hostname} :${route.port} - killed PID ${pid} (${signal})`)
-        );
+        console.log(colors.gray(`  ${routeLabel} :${route.port} - killed PID ${pid} (${signal})`));
       } catch {
-        console.log(colors.gray(`  ${route.hostname} :${route.port} - PID ${pid} already exited`));
+        console.log(colors.gray(`  ${routeLabel} :${route.port} - PID ${pid} already exited`));
       }
     }
   }
@@ -3612,6 +3941,74 @@ ${colors.bold("Options:")}
       `\nPruned ${stale.length} stale ${routeWord} and ${staleAliases.length} tunnel ${aliasWord}, killed ${killed} orphaned ${procWord}.`
     )
   );
+}
+
+function doctorStatusColor(status: DoctorStatus): (value: string) => string {
+  if (status === "fail") return colors.red;
+  if (status === "warn") return colors.yellow;
+  if (status === "ok") return colors.green;
+  return colors.gray;
+}
+
+function printDoctorFinding(finding: DoctorFinding): void {
+  console.log(`${doctorStatusColor(finding.status)(finding.status.padEnd(5))} ${finding.message}`);
+  if (finding.hint) console.log(colors.gray(`      ${finding.hint}`));
+}
+
+async function handleDoctor(args: string[]): Promise<void> {
+  if (args[1] === "--help" || args[1] === "-h") {
+    console.log(`
+${colors.bold("portless doctor")} - Run read-only diagnostics for the local portless installation.
+
+${colors.bold("Usage:")}
+  ${colors.cyan("portless doctor")}
+
+Checks Node.js, state and sudo handoff, ordered and dotted suffixes, proxy bind
+mode, routes, generated or custom certificates, cert.<suffix> pages, hosts sync,
+mDNS tooling, background apps, tunnel providers, Tailscale, and NetBird.
+
+Doctor never starts, stops, trusts, syncs, prunes, cleans, or modifies portless
+state.
+
+${colors.bold("Options:")}
+  --help, -h             Show this help
+`);
+    process.exit(0);
+  }
+
+  if (args.length > 1) {
+    console.error(colors.red(`Error: Unknown argument "${args[1]}".`));
+    console.error(colors.cyan("  portless doctor --help"));
+    process.exit(1);
+  }
+
+  const report = evaluateDoctor(await collectDoctorSnapshot({ version: __VERSION__ }));
+  const { snapshot } = report;
+  console.log(colors.blue.bold("\nportless doctor\n"));
+  console.log(`Version: ${snapshot.version}`);
+  console.log(`Node.js: ${snapshot.nodeVersion}`);
+  console.log(`Platform: ${snapshot.platform} ${snapshot.arch}`);
+  console.log(`State dir: ${snapshot.state.path}`);
+  console.log(
+    `Proxy: ${snapshot.proxy.tls ? "HTTPS" : "HTTP"} on port ${snapshot.proxy.port}, ${
+      snapshot.proxy.lanMode ? "LAN" : "local"
+    } mode`
+  );
+  console.log("");
+
+  for (const finding of report.findings) printDoctorFinding(finding);
+
+  const failures = report.findings.filter((finding) => finding.status === "fail").length;
+  const warnings = report.findings.filter((finding) => finding.status === "warn").length;
+  console.log("");
+  console.log(
+    (failures > 0 ? colors.red : colors.green)(
+      `Summary: ${failures} ${failures === 1 ? "failure" : "failures"}, ${warnings} ${
+        warnings === 1 ? "warning" : "warnings"
+      }.`
+    )
+  );
+  if (report.exitCode !== 0) process.exit(report.exitCode);
 }
 
 async function handleList(args: string[] = []): Promise<void> {
@@ -3785,7 +4182,7 @@ ${colors.bold("Examples:")}
     process.exit(0);
   }
 
-  const { dir, tld } = await discoverState();
+  const { dir, tlds } = await discoverState();
   const store = new TunnelAliasStore(dir, {
     onWarning: (msg) => console.warn(colors.yellow(msg)),
   });
@@ -3810,7 +4207,7 @@ ${colors.bold("Examples:")}
         process.exit(1);
       }
     }
-    const targetHostname = parseHostname(routeName, tld);
+    const targetHostname = parseHostname(routeName, primaryTld(tlds));
     const targetPathPrefix = normalizePathPrefix(pathPrefix);
     try {
       store.setAlias({
@@ -3913,7 +4310,7 @@ ${colors.bold("Examples:")}
     process.exit(0);
   }
 
-  const { dir, tld } = await discoverState();
+  const { dir, tlds, lanMode } = await discoverState();
   const store = new RouteStore(dir, {
     onWarning: (msg) => console.warn(colors.yellow(msg)),
   });
@@ -3925,7 +4322,8 @@ ${colors.bold("Examples:")}
       console.error(colors.cyan("  portless alias --remove <name>"));
       process.exit(1);
     }
-    const hostname = parseHostname(aliasName, tld);
+    const hostnames = buildHostnames(aliasName, tlds);
+    const hostname = hostnames[0]!;
     let pathPrefix = pathPrefixFromEnv();
     for (let i = 3; i < args.length; i++) {
       if (args[i] === "--path") {
@@ -3950,7 +4348,7 @@ ${colors.bold("Examples:")}
       console.error(colors.red(`Error: No alias found for "${label}".`));
       process.exit(1);
     }
-    store.removeRoute(hostname, undefined, { pathPrefix: normalizedPathPrefix });
+    removeRoutes(store, hostnames, undefined, { pathPrefix: normalizedPathPrefix });
     const label = normalizedPathPrefix === "/" ? hostname : `${hostname}${normalizedPathPrefix}`;
     console.log(colors.green(`Removed alias: ${label}`));
     return;
@@ -3968,7 +4366,8 @@ ${colors.bold("Examples:")}
     process.exit(1);
   }
 
-  const hostname = parseHostname(aliasName, tld);
+  const hostnames = buildHostnames(aliasName, tlds);
+  const hostname = hostnames[0]!;
   const port = parseInt(aliasPort, 10);
   if (isNaN(port) || port < 1 || port > 65535) {
     console.error(colors.red(`Error: Invalid port "${aliasPort}". Must be 1-65535.`));
@@ -3995,10 +4394,18 @@ ${colors.bold("Examples:")}
   }
 
   const normalizedPathPrefix = normalizePathPrefix(pathPrefix);
-  store.addRoute(hostname, port, 0, force, { protocol, pathPrefix: normalizedPathPrefix });
+  addRoutes(store, hostnames, port, 0, force, {
+    protocol,
+    pathPrefix: normalizedPathPrefix,
+  });
   const suffix = protocol === "h2c" ? " (h2c)" : "";
   const label = normalizedPathPrefix === "/" ? hostname : `${hostname}${normalizedPathPrefix}`;
-  console.log(colors.green(`Alias registered: ${label} -> 127.0.0.1:${port}${suffix}`));
+  console.log(
+    colors.green(
+      `Alias registered: ${label} (${hostnames.length} suffix${hostnames.length === 1 ? "" : "es"}) -> 127.0.0.1:${port}${suffix}`
+    )
+  );
+  await reportHostsSyncHere(hostnames, lanMode);
 }
 
 async function handleHosts(args: string[]): Promise<void> {
@@ -4015,7 +4422,9 @@ ${colors.bold("Usage:")}
 
 ${colors.bold("Auto-sync:")}
   The proxy updates ${HOSTS_DISPLAY} for route hostnames by default. Disable with
-  PORTLESS_SYNC_HOSTS=0.
+  PORTLESS_SYNC_HOSTS=0. If a route hostname will not resolve, the command that
+  registered it warns instead of failing silently and points you to:
+    ${colors.cyan("portless hosts sync")}
 `);
     process.exit(0);
   }
@@ -4078,7 +4487,7 @@ ${colors.bold("Usage: portless hosts <command>")}
     console.log(colors.yellow("No active routes to sync."));
     return;
   }
-  const hostnames = routes.map((r) => r.hostname);
+  const hostnames = deduplicateHostnames(routes.map((route) => route.hostname));
   if (syncHostsFile(hostnames)) {
     console.log(colors.green(`Synced ${hostnames.length} hostname(s) to ${HOSTS_DISPLAY}:`));
     for (const h of hostnames) {
@@ -4106,6 +4515,36 @@ ${colors.bold("Usage: portless hosts <command>")}
     colors.red(`Failed to update ${HOSTS_DISPLAY}${isWindows ? " (run as Administrator)." : "."}`)
   );
   process.exit(1);
+}
+
+function resolveRoutesCleanupIntervalSeconds(args: string[]): number {
+  const flagIndex = args.indexOf("--routes-cleanup-interval");
+  let raw: string | undefined;
+  let source: string;
+
+  if (flagIndex !== -1) {
+    raw = args[flagIndex + 1];
+    source = "--routes-cleanup-interval";
+  } else if (process.env.PORTLESS_ROUTES_CLEANUP_INTERVAL !== undefined) {
+    raw = process.env.PORTLESS_ROUTES_CLEANUP_INTERVAL;
+    source = "PORTLESS_ROUTES_CLEANUP_INTERVAL";
+  } else {
+    return DEFAULT_ROUTES_CLEANUP_INTERVAL_SECONDS;
+  }
+
+  if (!raw || raw.startsWith("--")) {
+    console.error(colors.red(`Error: ${source} requires a number of seconds.`));
+    process.exit(1);
+  }
+
+  const seconds = Number(raw);
+  if (!Number.isFinite(seconds) || !Number.isInteger(seconds) || seconds < 0) {
+    console.error(
+      colors.red(`Error: Invalid ${source}="${raw}". Must be a non-negative integer (0 disables).`)
+    );
+    process.exit(1);
+  }
+  return seconds;
 }
 
 async function handleProxy(args: string[]): Promise<void> {
@@ -4151,11 +4590,16 @@ ${colors.bold("Usage:")}
   ${colors.cyan("portless proxy start --foreground")}   Start in foreground (for debugging)
   ${colors.cyan("portless proxy start -p 1355")}        Start on a custom port (no sudo)
   ${colors.cyan("portless proxy start --suffix test")}  Use .test instead of .localhost
+  ${colors.cyan("portless proxy start --suffix test --suffix local.example.com")}
+                         Serve every app under both suffixes
   ${colors.cyan("portless proxy start --tld test")}     Compatibility alias for --suffix
   ${colors.cyan("portless proxy start --wildcard")}     Allow unregistered subdomains to fall back to parent (local only)
+  ${colors.cyan("portless proxy start --routes-cleanup-interval 60")}  Sweep dead routes every 60s (default 300, 0 disables)
   ${colors.cyan("portless proxy stop")}                 Stop the proxy
 
 ${colors.bold("LAN mode (--lan):")}
+  Without LAN mode, the proxy listens only on 127.0.0.1 and ::1.
+  LAN mode explicitly binds the proxy to 0.0.0.0 and ::.
   Makes services accessible from other devices on the same WiFi network
   via mDNS (.local domains). Useful for testing on real mobile devices.
   Auto-detects your LAN IP and follows changes automatically, or use
@@ -4170,6 +4614,7 @@ ${colors.bold("LAN mode (--lan):")}
 
   const isForeground = args.includes("--foreground");
   const skipTrust = args.includes("--skip-trust");
+  const routesCleanupIntervalSeconds = resolveRoutesCleanupIntervalSeconds(args);
 
   // HTTPS is on by default. Disable with --no-tls or PORTLESS_HTTPS=0.
   const hasHttpsFlag = args.includes("--https");
@@ -4226,30 +4671,36 @@ ${colors.bold("LAN mode (--lan):")}
     hasExplicitPort = true;
   }
 
-  // Parse --suffix / --tld flag
-  let tld: string;
+  // Parse repeatable --suffix / --tld flags. Preferred --suffix values win
+  // over compatibility --tld values when both forms are present.
+  let tlds: string[];
   try {
-    tld = getDefaultTld();
+    tlds = getDefaultTlds();
   } catch (err) {
     console.error(colors.red(`Error: ${(err as Error).message}`));
     process.exit(1);
   }
-  const suffixIdx = args.indexOf("--suffix");
-  const legacyTldIdx = args.indexOf("--tld");
-  const tldIdx = suffixIdx !== -1 ? suffixIdx : legacyTldIdx;
-  const tldFlag = suffixIdx !== -1 ? "--suffix" : "--tld";
-  if (tldIdx !== -1) {
-    const tldValue = args[tldIdx + 1];
-    if (!tldValue || tldValue.startsWith("-")) {
-      console.error(
-        colors.red(`Error: ${tldFlag} requires a suffix value (e.g. test, localhost).`)
-      );
-      process.exit(1);
+  const collectTldFlags = (flag: "--suffix" | "--tld"): string[] => {
+    const values: string[] = [];
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] !== flag) continue;
+      const value = args[i + 1];
+      if (!value || value.startsWith("-")) {
+        console.error(colors.red(`Error: ${flag} requires a suffix value (e.g. test, localhost).`));
+        process.exit(1);
+      }
+      values.push(value);
     }
-    tld = tldValue.trim().toLowerCase();
-    const tldErr = validateTld(tld);
-    if (tldErr) {
-      console.error(colors.red(`Error: ${tldErr}`));
+    return values;
+  };
+  const suffixValues = collectTldFlags("--suffix");
+  const legacyTldValues = collectTldFlags("--tld");
+  const tldFlagValues = suffixValues.length > 0 ? suffixValues : legacyTldValues;
+  if (tldFlagValues.length > 0) {
+    try {
+      tlds = normalizeTlds(tldFlagValues.flatMap((value) => parseTldList(value, "suffix flag")));
+    } catch (err) {
+      console.error(colors.red(`Error: ${(err as Error).message}`));
       process.exit(1);
     }
   }
@@ -4266,13 +4717,13 @@ ${colors.bold("LAN mode (--lan):")}
     customCert: customCertPath !== null || customKeyPath !== null,
     lanMode: process.env.PORTLESS_LAN !== undefined,
     lanIp: process.env.PORTLESS_LAN_IP !== undefined,
-    tld: tldIdx !== -1 || hasConfiguredTldEnv(),
+    tld: tldFlagValues.length > 0 || hasConfiguredTldEnv(),
     useWildcard: args.includes("--wildcard") || process.env.PORTLESS_WILDCARD !== undefined,
   };
 
   // Resolve state directory based on the port
   let stateDir = resolveStateDir(proxyPort);
-  let persistedLanMode = readLanMarker(stateDir) !== null;
+  let persistedLanMode = hasLanMarker(stateDir);
   let runningPort: number | null = null;
   if (!hasExplicitPort) {
     const currentState = await discoverState();
@@ -4290,37 +4741,27 @@ ${colors.bold("LAN mode (--lan):")}
     persistedLanMode,
     persistedUseWildcard: readWildcardMarker(stateDir),
     explicit,
-    defaultTld: getDefaultTld(),
+    defaultTlds: getDefaultTlds(),
     useHttps: wantHttps || !!(customCertPath && customKeyPath),
     customCertPath,
     customKeyPath,
     lanMode: isLanEnvEnabled(),
     lanIp: process.env.PORTLESS_LAN_IP || null,
-    tld,
+    tlds,
     useWildcard,
   });
   const lanMode = desiredConfig.lanMode;
   useHttps = desiredConfig.useHttps;
   customCertPath = desiredConfig.customCertPath;
   customKeyPath = desiredConfig.customKeyPath;
-  tld = desiredConfig.tld;
+  const tld = desiredConfig.tld;
+  tlds = desiredConfig.tlds;
   const desiredWildcard = desiredConfig.useWildcard;
   let lanIp: string | null = desiredConfig.lanIpExplicit ? desiredConfig.lanIp : null;
 
   if (!hasExplicitPort && runningPort === null) {
     proxyPort = getDefaultPort(useHttps);
     stateDir = resolveStateDir(proxyPort);
-  }
-
-  if (lanMode && tldIdx !== -1) {
-    const userTld = args[tldIdx + 1];
-    if (userTld && userTld !== "local") {
-      console.warn(
-        chalk.yellow(
-          `Warning: --lan forces .local suffix (mDNS requirement). Ignoring ${tldFlag} ${userTld}.`
-        )
-      );
-    }
   }
 
   if (lanMode && desiredWildcard) {
@@ -4332,17 +4773,21 @@ ${colors.bold("LAN mode (--lan):")}
     );
   }
 
-  const riskyReason = RISKY_TLDS.get(tld);
-  if (riskyReason && !lanMode) {
-    console.warn(colors.yellow(`Warning: .${tld}: ${riskyReason}`));
+  for (const configuredTld of tlds) {
+    if (lanMode && configuredTld === "local") continue;
+    const riskyReason = getRiskyTldReason(configuredTld);
+    if (riskyReason) {
+      console.warn(colors.yellow(`Warning: .${configuredTld}: ${riskyReason}`));
+    }
   }
 
   const syncDisabled =
     process.env.PORTLESS_SYNC_HOSTS === "0" || process.env.PORTLESS_SYNC_HOSTS === "false";
-  if (tld !== DEFAULT_TLD && !lanMode && syncDisabled) {
+  const nonDefaultTlds = tlds.filter((configuredTld) => configuredTld !== DEFAULT_TLD);
+  if (nonDefaultTlds.length > 0 && !lanMode && syncDisabled) {
     console.warn(
       colors.yellow(
-        `Warning: .${tld} domains require ${HOSTS_DISPLAY} entries to resolve to 127.0.0.1.`
+        `Warning: ${formatTldList(nonDefaultTlds)} domains require ${HOSTS_DISPLAY} entries to resolve to 127.0.0.1.`
       )
     );
     console.warn(colors.yellow("Hosts sync is disabled. To add entries manually, run:"));
@@ -4416,6 +4861,8 @@ ${colors.bold("LAN mode (--lan):")}
     lanIp: desiredConfig.lanIpExplicit ? lanIp : null,
     lanIpExplicit: desiredConfig.lanIpExplicit,
     tld,
+    tlds,
+    tldsExplicit: desiredConfig.tldsExplicit,
     useWildcard: desiredWildcard,
   };
 
@@ -4435,11 +4882,14 @@ ${colors.bold("LAN mode (--lan):")}
         lanIp: desiredConfig.lanIpExplicit ? lanIp : null,
         lanIpExplicit: desiredConfig.lanIpExplicit,
         tld,
+        tlds,
+        tldsExplicit: desiredConfig.tldsExplicit,
         useWildcard: desiredWildcard,
         foreground: isForeground,
         includePort: true,
         proxyPort,
         skipTrust,
+        routesCleanupIntervalSeconds,
       }).args,
     ];
     const fallbackCommand = formatProxyStartCommand(FALLBACK_PROXY_PORT, resolvedConfig);
@@ -4577,7 +5027,7 @@ ${colors.bold("LAN mode (--lan):")}
         cert,
         key,
         ca,
-        SNICallback: createSNICallback(stateDir, cert, key, tld, ca),
+        SNICallback: createSNICallback(stateDir, cert, key, tlds, ca),
       };
     }
   }
@@ -4585,7 +5035,18 @@ ${colors.bold("LAN mode (--lan):")}
   // Foreground mode: run the proxy directly in this process
   if (isForeground) {
     console.log(chalk.blue.bold("\nportless proxy\n"));
-    startProxyServer(store, proxyPort, tld, tlsOptions, lanIp, desiredWildcard ? false : undefined);
+    startProxyServer(
+      store,
+      proxyPort,
+      tld,
+      tlds,
+      tlsOptions,
+      lanIp,
+      desiredWildcard ? false : undefined,
+      lanMode,
+      !!(customCertPath && customKeyPath),
+      routesCleanupIntervalSeconds
+    );
     return;
   }
 
@@ -4613,11 +5074,14 @@ ${colors.bold("LAN mode (--lan):")}
         lanIp: desiredConfig.lanIpExplicit ? lanIp : null,
         lanIpExplicit: desiredConfig.lanIpExplicit,
         tld,
+        tlds,
+        tldsExplicit: desiredConfig.tldsExplicit,
         useWildcard: desiredWildcard,
         foreground: true,
         includePort: true,
         proxyPort,
         skipTrust: true,
+        routesCleanupIntervalSeconds,
       }).args,
     ];
 
@@ -4667,9 +5131,11 @@ function loadAppConfig(cwd: string = process.cwd()): LoadedAppConfig | null {
   try {
     const loaded = loadConfig(cwd);
     if (!loaded) return null;
+    const config = resolveAppConfig(loaded.config, loaded.configDir, cwd);
     return {
-      config: resolveAppConfig(loaded.config, loaded.configDir, cwd),
+      config,
       sourceLabel: configSourceLabel(loaded.sourcePath, cwd),
+      worktreeFlat: config.worktreeFlat ?? loaded.config.worktreeFlat,
     };
   } catch (err) {
     if (err instanceof ConfigValidationError) {
@@ -4759,9 +5225,13 @@ async function handleDefaultSingle(
   }
 
   const worktree = detectWorktreePrefix(cwd);
-  const effectiveName = worktree ? `${worktree.prefix}.${baseName}` : baseName;
+  const effectiveName = applyWorktreePrefix(
+    baseName,
+    worktree,
+    resolveWorktreeFlat(appConfig?.worktreeFlat)
+  );
 
-  const { dir, port, tls, tld, lanMode, lanIp } = await discoverState();
+  const { dir, port, tls, tlds, lanMode, lanIp } = await discoverState();
   const store = new RouteStore(dir, {
     onWarning: (msg) => console.warn(colors.yellow(msg)),
   });
@@ -4772,13 +5242,16 @@ async function handleDefaultSingle(
     effectiveName,
     resolved,
     tls,
-    tld,
+    tlds,
     false,
     { nameSource, prefix: worktree?.prefix, prefixSource: worktree?.source },
     appConfig?.config.appPort,
     lanMode,
     lanIp,
-    { scriptName, packageDir: cwd }
+    { scriptName, packageDir: cwd },
+    {},
+    undefined,
+    pathPrefixFromEnv() ?? appConfig?.config.path
   );
 }
 
@@ -4794,6 +5267,7 @@ interface MultiAppEntry {
   label: string;
   commandArgs: string[];
   appPort?: number;
+  path?: string;
   proxied: boolean;
 }
 
@@ -4807,8 +5281,11 @@ function spawnChildProcess(
     if (resolved) {
       const ext = path.extname(resolved).toLowerCase();
       if (ext === ".cmd" || ext === ".bat") {
-        const cmdline = [resolved, ...commandArgs.slice(1)].map(quoteWindowsCmdArg).join(" ");
-        return spawn("cmd.exe", ["/d", "/s", "/c", cmdline], {
+        const cmdline =
+          '"' +
+          [cmdEscapeCommand(resolved), ...commandArgs.slice(1).map(cmdEscape)].join(" ") +
+          '"';
+        return spawn("cmd.exe", ["/d", "/v:off", "/s", "/c", cmdline], {
           stdio: ["ignore", "pipe", "pipe"],
           env,
           cwd,
@@ -4865,12 +5342,13 @@ async function spawnProxiedApp(
   stateDir: string,
   proxyPort: number,
   tls: boolean,
-  tld: string,
+  tlds: string[],
+  lanMode: boolean,
   exitCodes: Map<string, number | null>
 ): Promise<{
   child: ReturnType<typeof spawn>;
   displayUrl: string;
-  route: { store: RouteStore; hostname: string; pathPrefix: string } | null;
+  route: { store: RouteStore; hostnames: string[]; pathPrefix: string } | null;
 }> {
   const usesPortless = app.commandArgs[0] === "portless";
 
@@ -4879,8 +5357,9 @@ async function spawnProxiedApp(
 
   let env: Record<string, string | undefined>;
   let store: RouteStore | null = null;
-  let hostname: string | null = null;
+  let hostnames: string[] | null = null;
   let routePathPrefix: string | null = null;
+  let assignedAppPort: number | undefined;
   let displayUrl: string;
 
   if (usesPortless) {
@@ -4892,23 +5371,29 @@ async function spawnProxiedApp(
     });
 
     const appPort = app.appPort ?? (await findFreePort());
-    routePathPrefix = normalizePathPrefix(pathPrefixFromEnv());
-    const url = formatUrl(`${app.name}.${tld}`, proxyPort, tls, routePathPrefix);
+    assignedAppPort = appPort;
+    routePathPrefix = normalizePathPrefix(pathPrefixFromEnv() ?? app.path);
+    hostnames = buildHostnames(app.name, tlds);
+    const url = formatUrl(hostnames[0]!, proxyPort, tls, routePathPrefix);
     displayUrl = url;
 
-    hostname = parseHostname(app.name, tld);
-    assertNotReservedHostname(hostname, tld);
-    store.addRoute(hostname, appPort, process.pid, false, {
+    for (const [index, hostname] of hostnames.entries()) {
+      assertNotReservedHostname(hostname, tlds[index]!);
+    }
+    addRoutes(store, hostnames, appPort, process.pid, false, {
       protocol: routeProtocolFromEnv(),
       pathPrefix: routePathPrefix,
       label: multiplexLabelFromEnv(),
     });
+    await reportHostsSyncHere(hostnames, lanMode);
+    const viteRouteMetadata = loadViteRouteMetadata(store, hostnames, routePathPrefix);
 
     env = {
       ...pkgEnv,
       PORT: String(appPort),
       HOST: "127.0.0.1",
       PORTLESS_URL: url,
+      __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: formatViteAllowedHosts(tlds, viteRouteMetadata),
     };
 
     if (tls) {
@@ -4919,11 +5404,16 @@ async function spawnProxiedApp(
     }
   }
 
+  if (assignedAppPort !== undefined) {
+    injectPackageScriptFrameworkFlags(app.commandArgs, assignedAppPort, app.pkg.dir);
+    injectFrameworkFlags(app.commandArgs, assignedAppPort);
+  }
+
   const child = spawnChildProcess(app.commandArgs, env, app.pkg.dir);
   pipeOutput(child, chalk.cyan(`[${app.name}]`));
 
   const capturedStore = store;
-  const capturedHostname = hostname;
+  const capturedHostnames = hostnames;
   const capturedPathPrefix = routePathPrefix;
   child.on("exit", (code, signal) => {
     exitCodes.set(app.name, code);
@@ -4932,19 +5422,17 @@ async function spawnProxiedApp(
     } else if (signal) {
       console.error(colors.yellow(`[${app.name}] killed by ${signal}`));
     }
-    if (capturedStore && capturedHostname) {
-      try {
-        capturedStore.removeRoute(capturedHostname, process.pid, {
-          pathPrefix: capturedPathPrefix ?? undefined,
-        });
-      } catch {
-        // non-fatal
-      }
+    if (capturedStore && capturedHostnames) {
+      removeRoutes(capturedStore, capturedHostnames, process.pid, {
+        pathPrefix: capturedPathPrefix ?? undefined,
+      });
     }
   });
 
   const route =
-    store && hostname && routePathPrefix ? { store, hostname, pathPrefix: routePathPrefix } : null;
+    store && hostnames && routePathPrefix
+      ? { store, hostnames, pathPrefix: routePathPrefix }
+      : null;
   return { child, displayUrl, route };
 }
 
@@ -5023,6 +5511,7 @@ async function handleDefaultMulti(
   }
 
   const worktree = detectWorktreePrefix(wsRoot);
+  const worktreeFlat = resolveWorktreeFlat(loaded?.config.worktreeFlat);
   const apps: MultiAppEntry[] = [];
 
   for (const pkg of packages) {
@@ -5064,7 +5553,7 @@ async function handleDefaultMulti(
         .split(".")
         .map((l) => truncateLabel(l))
         .join(".");
-      name = worktree ? `${worktree.prefix}.${baseName}` : baseName;
+      name = applyWorktreePrefix(baseName, worktree, worktreeFlat);
       label = appOverride.name;
     } else {
       let pkgLabel: string;
@@ -5075,11 +5564,19 @@ async function handleDefaultMulti(
         pkgLabel = rel.replace(/\//g, "-");
       }
       const baseName = pkgLabel === projectName ? projectName : `${pkgLabel}.${projectName}`;
-      name = worktree ? `${worktree.prefix}.${baseName}` : baseName;
+      name = applyWorktreePrefix(baseName, worktree, worktreeFlat);
       label = pkg.scope ? `@${pkg.scope}/${pkg.name}` : (pkg.name ?? rel);
     }
 
-    apps.push({ pkg, name, label, commandArgs, appPort: appOverride.appPort, proxied });
+    apps.push({
+      pkg,
+      name,
+      label,
+      commandArgs,
+      appPort: appOverride.appPort,
+      path: appOverride.path,
+      proxied,
+    });
   }
 
   if (apps.length === 0) {
@@ -5093,7 +5590,7 @@ async function handleDefaultMulti(
 
   console.log(chalk.blue.bold(`\nportless\n`));
 
-  let { dir, port, tls, tld } = await discoverState();
+  let { dir, port, tls, tlds, lanMode } = await discoverState();
 
   if (proxiedApps.length > 0) {
     let multiDesired: ProxyDesiredState;
@@ -5108,10 +5605,11 @@ async function handleDefaultMulti(
       dir = ensureResult.state.dir;
       port = ensureResult.state.port;
       tls = ensureResult.state.tls;
-      tld = ensureResult.state.tld;
+      tlds = ensureResult.state.tlds;
+      lanMode = ensureResult.state.lanMode;
     } else {
       // Proxy was already running; re-discover to pick up current state.
-      ({ dir, port, tls, tld } = await discoverState());
+      ({ dir, port, tls, tlds, lanMode } = await discoverState());
     }
 
     if (tls && !isCATrusted(dir)) {
@@ -5122,9 +5620,20 @@ async function handleDefaultMulti(
   const useTurbo = loaded?.config.turbo !== false && hasTurboConfig(wsRoot);
 
   if (useTurbo) {
-    await runWithTurbo(wsRoot, dir, port, tls, tld, scriptName, proxiedApps, taskApps, extraArgs);
+    await runWithTurbo(
+      wsRoot,
+      dir,
+      port,
+      tls,
+      tlds,
+      lanMode,
+      scriptName,
+      proxiedApps,
+      taskApps,
+      extraArgs
+    );
   } else {
-    await runWithDirectSpawn(dir, port, tls, tld, proxiedApps, taskApps);
+    await runWithDirectSpawn(dir, port, tls, tlds, lanMode, proxiedApps, taskApps);
   }
 }
 
@@ -5133,7 +5642,8 @@ async function runWithTurbo(
   stateDir: string,
   proxyPort: number,
   tls: boolean,
-  tld: string,
+  tlds: string[],
+  lanMode: boolean,
   scriptName: string,
   proxiedApps: MultiAppEntry[],
   taskApps: MultiAppEntry[],
@@ -5144,7 +5654,7 @@ async function runWithTurbo(
   });
 
   const manifest: Record<string, ManifestEntry> = {};
-  const routes: { hostname: string; pathPrefix: string }[] = [];
+  const routes: { hostnames: string[]; pathPrefix: string }[] = [];
   const appUrls: { label: string; url: string }[] = [];
 
   for (const app of proxiedApps) {
@@ -5155,23 +5665,28 @@ async function runWithTurbo(
     }
 
     const appPort = app.appPort ?? (await findFreePort());
-    const routePathPrefix = normalizePathPrefix(pathPrefixFromEnv());
-    const url = formatUrl(`${app.name}.${tld}`, proxyPort, tls, routePathPrefix);
+    const routePathPrefix = normalizePathPrefix(pathPrefixFromEnv() ?? app.path);
+    const hostnames = buildHostnames(app.name, tlds);
+    const url = formatUrl(hostnames[0]!, proxyPort, tls, routePathPrefix);
     appUrls.push({ label: app.label, url });
 
-    const hostname = parseHostname(app.name, tld);
-    assertNotReservedHostname(hostname, tld);
-    store.addRoute(hostname, appPort, process.pid, false, {
+    for (const [index, hostname] of hostnames.entries()) {
+      assertNotReservedHostname(hostname, tlds[index]!);
+    }
+    addRoutes(store, hostnames, appPort, process.pid, false, {
       protocol: routeProtocolFromEnv(),
       pathPrefix: routePathPrefix,
       label: multiplexLabelFromEnv(),
     });
-    routes.push({ hostname, pathPrefix: routePathPrefix });
+    await reportHostsSyncHere(hostnames, lanMode);
+    const viteRouteMetadata = loadViteRouteMetadata(store, hostnames, routePathPrefix);
+    routes.push({ hostnames, pathPrefix: routePathPrefix });
 
     const entry: ManifestEntry = {
       PORT: String(appPort),
       HOST: "127.0.0.1",
       PORTLESS_URL: url,
+      __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: formatViteAllowedHosts(tlds, viteRouteMetadata),
     };
     if (tls) {
       const caPath = path.join(stateDir, "ca.pem");
@@ -5228,12 +5743,8 @@ async function runWithTurbo(
       }
     }, SIGKILL_TIMEOUT_MS).unref();
 
-    for (const { hostname, pathPrefix } of routes) {
-      try {
-        store.removeRoute(hostname, process.pid, { pathPrefix });
-      } catch {
-        // non-fatal
-      }
+    for (const { hostnames, pathPrefix } of routes) {
+      removeRoutes(store, hostnames, process.pid, { pathPrefix });
     }
     removeManifest();
   };
@@ -5257,14 +5768,15 @@ async function runWithDirectSpawn(
   stateDir: string,
   proxyPort: number,
   tls: boolean,
-  tld: string,
+  tlds: string[],
+  lanMode: boolean,
   proxiedApps: MultiAppEntry[],
   taskApps: MultiAppEntry[]
 ): Promise<void> {
   const children: ReturnType<typeof spawn>[] = [];
   const exitCodes = new Map<string, number | null>();
   const appUrls: { label: string; url: string }[] = [];
-  const routeEntries: { store: RouteStore; hostname: string; pathPrefix: string }[] = [];
+  const routeEntries: { store: RouteStore; hostnames: string[]; pathPrefix: string }[] = [];
 
   // Sequential: each spawnProxiedApp calls findFreePort() which binds/releases
   // a port, so parallel spawning could cause port collisions.
@@ -5274,7 +5786,8 @@ async function runWithDirectSpawn(
       stateDir,
       proxyPort,
       tls,
-      tld,
+      tlds,
+      lanMode,
       exitCodes
     );
     children.push(child);
@@ -5316,12 +5829,8 @@ async function runWithDirectSpawn(
       }
     }, SIGKILL_TIMEOUT_MS).unref();
 
-    for (const { store, hostname, pathPrefix } of routeEntries) {
-      try {
-        store.removeRoute(hostname, process.pid, { pathPrefix });
-      } catch {
-        // non-fatal
-      }
+    for (const { store, hostnames, pathPrefix } of routeEntries) {
+      removeRoutes(store, hostnames, process.pid, { pathPrefix });
     }
   };
 
@@ -5399,11 +5908,16 @@ async function handleRunMode(args: string[], globalScript?: string): Promise<voi
   if (!parsed.appPort && appConfig?.config.appPort) {
     parsed.appPort = appConfig.config.appPort;
   }
+  parsed.pathPrefix ??= appConfig?.config.path;
 
   const worktree = detectWorktreePrefix();
-  const effectiveName = worktree ? `${worktree.prefix}.${baseName}` : baseName;
+  const effectiveName = applyWorktreePrefix(
+    baseName,
+    worktree,
+    resolveWorktreeFlat(appConfig?.worktreeFlat)
+  );
 
-  const { dir, port, tls, tld, lanMode, lanIp } = await discoverState();
+  const { dir, port, tls, tlds, lanMode, lanIp } = await discoverState();
   const store = new RouteStore(dir, {
     onWarning: (msg) => console.warn(colors.yellow(msg)),
   });
@@ -5414,7 +5928,7 @@ async function handleRunMode(args: string[], globalScript?: string): Promise<voi
     effectiveName,
     parsed.commandArgs,
     tls,
-    tld,
+    tlds,
     parsed.force,
     { nameSource, prefix: worktree?.prefix, prefixSource: worktree?.source },
     parsed.appPort,
@@ -5440,12 +5954,11 @@ async function handleNamedMode(args: string[]): Promise<void> {
     process.exit(1);
   }
 
-  if (!parsed.appPort) {
-    const appConfig = loadAppConfig();
-    if (appConfig?.config.appPort) {
-      parsed.appPort = appConfig.config.appPort;
-    }
+  const appConfig = loadAppConfig();
+  if (!parsed.appPort && appConfig?.config.appPort) {
+    parsed.appPort = appConfig.config.appPort;
   }
+  parsed.pathPrefix ??= appConfig?.config.path;
 
   // Truncate individual labels that exceed the DNS limit, same as handleRunMode.
   const safeName = parsed.name
@@ -5454,7 +5967,7 @@ async function handleNamedMode(args: string[]): Promise<void> {
     .join(".");
   parseHostname(safeName, DEFAULT_TLD);
 
-  const { dir, port, tls, tld, lanMode, lanIp } = await discoverState();
+  const { dir, port, tls, tlds, lanMode, lanIp } = await discoverState();
   const store = new RouteStore(dir, {
     onWarning: (msg) => console.warn(colors.yellow(msg)),
   });
@@ -5465,7 +5978,7 @@ async function handleNamedMode(args: string[]): Promise<void> {
     safeName,
     parsed.commandArgs,
     tls,
-    tld,
+    tlds,
     parsed.force,
     undefined,
     parsed.appPort,
@@ -5649,7 +6162,7 @@ async function main() {
 
   // --name flag: treat the next arg as an explicit app name, bypassing
   // subcommand dispatch. Useful when the app name collides with a reserved
-  // subcommand (run, alias, tunnel, hosts, list, trust, clean, prune, proxy, bg, service, completion).
+  // subcommand (run, alias, tunnel, hosts, list, doctor, trust, clean, prune, proxy, bg, service, completion).
   if (args[0] === "--name") {
     args.shift();
     if (!args[0]) {
@@ -5691,6 +6204,7 @@ async function main() {
       (args.length >= 2 &&
         args[0] !== "proxy" &&
         args[0] !== "clean" &&
+        args[0] !== "doctor" &&
         args[0] !== "bg" &&
         args[0] !== "service" &&
         args[0] !== "tunnel"))
@@ -5711,7 +6225,7 @@ async function main() {
     return;
   }
 
-  // Global dispatch: help, version, trust, clean, prune, list, alias, tunnel, hosts, proxy, bg, service, completion
+  // Global dispatch: help, version, trust, clean, prune, list, doctor, alias, tunnel, hosts, proxy, bg, service, completion
   // When `run` is used, skip these so args like "list" or "--help" are treated
   // as child-command tokens, not portless subcommands.
   if (!isRunCommand) {
@@ -5744,6 +6258,10 @@ async function main() {
     }
     if (args[0] === "completion") {
       handleCompletion(args);
+      return;
+    }
+    if (args[0] === "doctor") {
+      await handleDoctor(args);
       return;
     }
     if (

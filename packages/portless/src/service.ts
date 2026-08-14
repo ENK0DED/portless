@@ -11,11 +11,11 @@ import {
   getProtocolPort,
   isProxyRunning,
   LEGACY_TLD_ENV,
+  parseTldList,
   SUFFIX_ENV,
-  validateTld,
 } from "./cli-utils.js";
 import { isMdnsSupported } from "./mdns.js";
-import { fixOwnership } from "./utils.js";
+import { fixOwnership, resolveUserHome } from "./utils.js";
 
 const DEFAULT_SERVICE_PORT = getProtocolPort(true);
 const SERVICE_LABEL = "sh.portless.proxy";
@@ -25,6 +25,23 @@ const INTERNAL_ELEVATED_ENV = "PORTLESS_INTERNAL_SERVICE_ELEVATED";
 const SERVICE_ENV_KEYS = new Set(["PORTLESS_SYNC_HOSTS"]);
 
 type SupportedPlatform = "darwin" | "linux" | "win32";
+
+function normalizeTlds(tlds: readonly string[]): string[] {
+  return [...new Set(tlds.length > 0 ? tlds : [DEFAULT_TLD])];
+}
+
+function mergeLanTlds(tlds: readonly string[]): string[] {
+  const normalized = normalizeTlds(tlds);
+  return normalized.includes("local") ? normalized : [...normalized, "local"];
+}
+
+function primaryTld(tlds: readonly string[]): string {
+  return tlds[0] ?? DEFAULT_TLD;
+}
+
+function formatTldList(tlds: readonly string[]): string {
+  return tlds.map((tld) => `.${tld}`).join(", ");
+}
 
 type CommandRunner = (
   command: string,
@@ -65,6 +82,8 @@ export type ServiceInstallConfig = {
   lanIp: string | null;
   lanIpExplicit: boolean;
   tld: string;
+  tlds: string[];
+  tldsExplicit: boolean;
   useWildcard: boolean;
   extraEnv: Record<string, string>;
 };
@@ -82,6 +101,8 @@ const DEFAULT_SERVICE_CONFIG: ServiceInstallConfig = {
   lanIp: null,
   lanIpExplicit: false,
   tld: DEFAULT_TLD,
+  tlds: [DEFAULT_TLD],
+  tldsExplicit: false,
   useWildcard: false,
   extraEnv: {},
 };
@@ -113,7 +134,8 @@ export type ServiceSpec =
       scriptDir: string;
       scriptPath: string;
       script: string;
-      taskRun: string;
+      taskXmlPath: string;
+      taskXml: string;
       createArgs: string[];
       runArgs: string[];
       deleteArgs: string[];
@@ -248,6 +270,7 @@ function parseServiceInstallConfig(
 ): ServiceInstallConfig {
   const config: ServiceInstallConfig = {
     ...DEFAULT_SERVICE_CONFIG,
+    tlds: [...DEFAULT_SERVICE_CONFIG.tlds],
     extraEnv: collectServiceExtraEnv(env),
   };
 
@@ -273,9 +296,9 @@ function parseServiceInstallConfig(
 
   const configuredSuffix = getConfiguredServiceSuffix(env);
   if (configuredSuffix) {
-    const err = validateTld(configuredSuffix.value);
-    if (err) throw new Error(`${configuredSuffix.source}: ${err}`);
-    config.tld = configuredSuffix.value;
+    config.tlds = normalizeTlds(parseTldList(configuredSuffix.value, configuredSuffix.source));
+    config.tld = primaryTld(config.tlds);
+    config.tldsExplicit = true;
   }
 
   const envWildcard = parseBooleanEnv(env.PORTLESS_WILDCARD);
@@ -290,6 +313,8 @@ function parseServiceInstallConfig(
   }
 
   const tokens = args[0] === "service" ? args.slice(2) : args;
+  const hasPreferredSuffixFlag = tokens.includes("--suffix");
+  let tldFlagSeen = false;
   for (let i = 0; i < tokens.length; i += 1) {
     const token = tokens[i];
     switch (token) {
@@ -315,10 +340,16 @@ function parseServiceInstallConfig(
         break;
       case "--suffix":
       case "--tld": {
-        const tld = getFlagValue(tokens, i, token).trim().toLowerCase();
-        const err = validateTld(tld);
-        if (err) throw new Error(err);
-        config.tld = tld;
+        const value = getFlagValue(tokens, i, token);
+        if (token === "--tld" && hasPreferredSuffixFlag) {
+          i += 1;
+          break;
+        }
+        const tlds = parseTldList(value, token);
+        config.tlds = normalizeTlds([...(tldFlagSeen ? config.tlds : []), ...tlds]);
+        config.tld = primaryTld(config.tlds);
+        config.tldsExplicit = true;
+        tldFlagSeen = true;
         i += 1;
         break;
       }
@@ -364,29 +395,17 @@ function parseServiceInstallConfig(
   if (!config.lanMode) {
     config.lanIp = null;
     config.lanIpExplicit = false;
+  } else {
+    config.tlds = config.tldsExplicit ? mergeLanTlds(config.tlds) : ["local"];
+    config.tld = primaryTld(config.tlds);
   }
 
   return config;
 }
 
-function readPasswdHome(username: string): string | null {
-  try {
-    const passwd = fs.readFileSync("/etc/passwd", "utf-8");
-    for (const line of passwd.split("\n")) {
-      const fields = line.split(":");
-      if (fields[0] === username && fields[5]) {
-        return fields[5];
-      }
-    }
-  } catch {
-    // Ignore and fall back to platform conventions.
-  }
-  return null;
-}
-
 function resolveUserContext(platform: SupportedPlatform): UserContext {
   if (platform === "win32") {
-    const home = process.env.USERPROFILE || os.homedir();
+    const home = resolveUserHome({ platform });
     return { home, username: process.env.USERNAME };
   }
 
@@ -394,13 +413,7 @@ function resolveUserContext(platform: SupportedPlatform): UserContext {
   const sudoUid = process.env.SUDO_UID;
   const sudoGid = process.env.SUDO_GID;
   if (sudoUser && sudoUser !== "root") {
-    const home =
-      process.env.HOME && process.env.HOME !== "/var/root" && process.env.HOME !== "/root"
-        ? process.env.HOME
-        : readPasswdHome(sudoUser) ||
-          (platform === "darwin"
-            ? path.posix.join("/Users", sudoUser)
-            : path.posix.join("/home", sudoUser));
+    const home = resolveUserHome({ platform });
     return { home, uid: sudoUid, gid: sudoGid, username: sudoUser };
   }
 
@@ -422,6 +435,8 @@ function buildProxyCommand(entryScript: string, serviceConfig: ServiceInstallCon
     lanIp: serviceConfig.lanIp,
     lanIpExplicit: serviceConfig.lanIpExplicit,
     tld: serviceConfig.tld,
+    tlds: serviceConfig.tlds,
+    tldsExplicit: serviceConfig.tldsExplicit,
     useWildcard: serviceConfig.useWildcard,
     foreground: true,
     includePort: true,
@@ -445,10 +460,8 @@ function buildServiceEnv(ctx: ServiceContext): Record<string, string> {
     env.PORTLESS_LAN_IP = ctx.config.lanIp;
   }
 
-  if (ctx.config.lanMode) {
-    env.PORTLESS_SUFFIX = "local";
-  } else if (ctx.config.tld !== DEFAULT_TLD) {
-    env.PORTLESS_SUFFIX = ctx.config.tld;
+  if (ctx.config.lanMode || ctx.config.tlds.length > 1 || ctx.config.tld !== DEFAULT_TLD) {
+    env.PORTLESS_SUFFIX = ctx.config.tlds.join(",");
   }
 
   if (ctx.platform === "win32") {
@@ -541,6 +554,49 @@ function buildWindowsScript(ctx: ServiceContext, command: string[]): string {
   return `@echo off\r\n${setEnv}\r\n${proxyCommand}\r\n`;
 }
 
+function buildWindowsTaskXml(scriptPath: string): string {
+  const taskArguments = `/d /s /c "${windowsQuote(scriptPath)}"`;
+  return `\uFEFF<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Portless HTTPS proxy</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <BootTrigger>
+      <Enabled>true</Enabled>
+    </BootTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="System">
+      <UserId>S-1-5-18</UserId>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="System">
+    <Exec>
+      <Command>cmd.exe</Command>
+      <Arguments>${xmlEscape(taskArguments)}</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+`;
+}
+
 export function buildServiceSpec(options: {
   platform: SupportedPlatform;
   nodePath: string;
@@ -557,8 +613,21 @@ export function buildServiceSpec(options: {
   const installConfig: ServiceInstallConfig = {
     ...DEFAULT_SERVICE_CONFIG,
     ...options.installConfig,
+    tlds: normalizeTlds(
+      options.installConfig?.tlds ??
+        (options.installConfig?.tld ? [options.installConfig.tld] : DEFAULT_SERVICE_CONFIG.tlds)
+    ),
+    tldsExplicit:
+      options.installConfig?.tldsExplicit ??
+      (options.installConfig?.tlds !== undefined || options.installConfig?.tld !== undefined),
     extraEnv: options.installConfig?.extraEnv ?? {},
   };
+  installConfig.tlds = installConfig.lanMode
+    ? installConfig.tldsExplicit
+      ? mergeLanTlds(installConfig.tlds)
+      : ["local"]
+    : normalizeTlds(installConfig.tlds);
+  installConfig.tld = primaryTld(installConfig.tlds);
   const stateDir =
     options.stateDir ||
     installConfig.stateDir ||
@@ -612,8 +681,9 @@ export function buildServiceSpec(options: {
 
   const scriptDir = path.win32.join(ctx.programData, "portless", "service");
   const scriptPath = path.win32.join(scriptDir, "portless-service.cmd");
+  const taskXmlPath = path.win32.join(scriptDir, "portless-task.xml");
   const script = buildWindowsScript(ctx, proxyCommand);
-  const taskRun = windowsQuote(scriptPath);
+  const taskXml = buildWindowsTaskXml(scriptPath);
   return {
     platform: "win32",
     taskName: WINDOWS_TASK_NAME,
@@ -622,21 +692,9 @@ export function buildServiceSpec(options: {
     scriptDir,
     scriptPath,
     script,
-    taskRun,
-    createArgs: [
-      "/Create",
-      "/TN",
-      WINDOWS_TASK_NAME,
-      "/SC",
-      "ONSTART",
-      "/RU",
-      "SYSTEM",
-      "/RL",
-      "HIGHEST",
-      "/TR",
-      taskRun,
-      "/F",
-    ],
+    taskXmlPath,
+    taskXml,
+    createArgs: ["/Create", "/TN", WINDOWS_TASK_NAME, "/XML", taskXmlPath, "/F"],
     runArgs: ["/Run", "/TN", WINDOWS_TASK_NAME],
     deleteArgs: ["/Delete", "/TN", WINDOWS_TASK_NAME, "/F"],
     queryArgs: ["/Query", "/TN", WINDOWS_TASK_NAME, "/FO", "LIST", "/V"],
@@ -1026,11 +1084,12 @@ async function installService(
     runRequired(runner, "systemctl", ["enable", spec.serviceName]);
     runRequired(runner, "systemctl", ["restart", spec.serviceName]);
   } else {
-    runOptional(runner, "schtasks", ["/End", "/TN", spec.taskName]);
-    await stopExistingProxy(entryScript, runner, spec.config.proxyPort);
     fs.mkdirSync(spec.scriptDir, { recursive: true });
     fs.writeFileSync(spec.scriptPath, spec.script);
+    fs.writeFileSync(spec.taskXmlPath, spec.taskXml, "utf16le");
     runRequired(runner, "schtasks", spec.createArgs);
+    runOptional(runner, "schtasks", ["/End", "/TN", spec.taskName]);
+    await stopExistingProxy(entryScript, runner, spec.config.proxyPort);
     runOptional(runner, "schtasks", spec.runArgs);
   }
 
@@ -1168,7 +1227,7 @@ async function printServiceStatus(entryScript: string, runner: CommandRunner): P
     `  Proxy on ${config.proxyPort}: ${status.proxyRunning ? "responding" : "not responding"}`
   );
   console.log(`  HTTPS: ${config.useHttps ? "yes" : "no"}`);
-  console.log(`  Suffix: ${config.lanMode ? "local" : config.tld}`);
+  console.log(`  Suffixes: ${formatTldList(config.tlds)}`);
   console.log(`  LAN mode: ${config.lanMode ? "yes" : "no"}`);
   if (config.lanIpExplicit && config.lanIp) {
     console.log(`  LAN IP: ${config.lanIp}`);
@@ -1197,7 +1256,7 @@ ${colors.bold("Install options:")}
   --https                          Enable HTTPS
   --lan                            Enable LAN mode
   --ip <address>                   Pin a specific LAN IP
-  --suffix <suffix>                Use a custom suffix outside LAN mode
+  --suffix <suffix>                Use a custom suffix, repeatable
   --tld <tld>                      Compatibility alias for --suffix
   --wildcard                       Allow subdomain fallback
   --cert <path>                    Use a custom TLS certificate

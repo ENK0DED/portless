@@ -18,9 +18,9 @@ export interface RouteInfo {
    */
   label?: string;
   /**
-   * Public-exposure URLs, surfaced for display only (the dashboard and the
-   * `list` command). These are populated on the live route objects the proxy
-   * reads; the proxy itself never routes by them.
+   * Public-exposure URLs, surfaced in the dashboard and `list` output. The
+   * proxy also accepts each persisted URL's exact hostname as a route
+   * authority for Tailscale Serve, Funnel, and Service traffic.
    */
   tailscaleUrl?: string;
   tailscaleServiceUrl?: string;
@@ -59,6 +59,8 @@ export interface ProxyServerOptions {
   proxyPort: number;
   /** Suffix used for hostnames (default: "localhost"). */
   tld?: string;
+  /** All configured suffixes. The first remains the primary compatibility value. */
+  tlds?: string[];
   /**
    * When true, only exact hostname matches are used. Unregistered subdomain
    * prefixes return 404 instead of falling back to the base service.

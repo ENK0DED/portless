@@ -4,7 +4,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
-import { RouteStore, RouteConflictError, isRetryableLockError } from "./routes.js";
+import { FILE_MODE, RouteStore, RouteConflictError, isRetryableLockError } from "./routes.js";
 
 describe("RouteStore", () => {
   let tmpDir: string;
@@ -83,6 +83,58 @@ describe("RouteStore", () => {
       expect(loaded[0].hostname).toBe("valid.localhost");
     });
 
+    it("rewrites representational path-prefix differences in place", () => {
+      store.ensureDir();
+      fs.writeFileSync(
+        store.getRoutesPath(),
+        JSON.stringify([
+          { hostname: "api.localhost", port: 4001, pid: process.pid, pathPrefix: "/api///" },
+          { hostname: "web.localhost", port: 4002, pid: process.pid, pathPrefix: "/" },
+        ])
+      );
+
+      expect(store.loadRoutes()).toEqual([
+        { hostname: "api.localhost", port: 4001, pid: process.pid, pathPrefix: "/api" },
+        { hostname: "web.localhost", port: 4002, pid: process.pid },
+      ]);
+      expect(JSON.parse(fs.readFileSync(store.getRoutesPath(), "utf-8"))).toEqual([
+        { hostname: "api.localhost", port: 4001, pid: process.pid, pathPrefix: "/api" },
+        { hostname: "web.localhost", port: 4002, pid: process.pid },
+      ]);
+    });
+
+    it("removes an invalid persisted prefix with one actionable warning", () => {
+      const warnings: string[] = [];
+      const warnStore = new RouteStore(tmpDir, {
+        onWarning: (message) => warnings.push(message),
+      });
+      warnStore.ensureDir();
+      fs.writeFileSync(
+        warnStore.getRoutesPath(),
+        JSON.stringify([
+          {
+            hostname: "invalid.localhost",
+            port: 4001,
+            pid: process.pid,
+            pathPrefix: "/api/../admin",
+          },
+          { hostname: "valid.localhost", port: 4002, pid: process.pid, pathPrefix: "/api" },
+        ])
+      );
+
+      expect(warnStore.loadRoutes()).toEqual([
+        { hostname: "valid.localhost", port: 4002, pid: process.pid, pathPrefix: "/api" },
+      ]);
+      expect(JSON.parse(fs.readFileSync(warnStore.getRoutesPath(), "utf-8"))).toEqual([
+        { hostname: "valid.localhost", port: 4002, pid: process.pid, pathPrefix: "/api" },
+      ]);
+      expect(warnings).toEqual([
+        expect.stringMatching(
+          /invalid\.localhost\/api\/\.\.\/admin.*PID \d+.*"\.\." path segment.*portless alias invalid\.localhost 4001 --path <valid-prefix>/
+        ),
+      ]);
+    });
+
     it("loads routes from file", () => {
       const routes = [{ hostname: "app.localhost", port: 4001, pid: process.pid }];
       store.ensureDir();
@@ -122,7 +174,7 @@ describe("RouteStore", () => {
       expect(raw).toHaveLength(2);
     });
 
-    it("persists cleaned-up routes when persistCleanup is true", () => {
+    it("persists cleaned-up routes through an atomic temp file", async () => {
       const deadPid = 999999;
       const routes = [
         { hostname: "alive.localhost", port: 4001, pid: process.pid },
@@ -130,7 +182,22 @@ describe("RouteStore", () => {
       ];
       store.ensureDir();
       fs.writeFileSync(store.getRoutesPath(), JSON.stringify(routes));
-      store.loadRoutes(true);
+      const events: string[] = [];
+      // Watch the canonical spelling: Windows 8.3 short temp paths make
+      // libuv's fs-event assert and abort the vitest worker.
+      const watcher = fs.watch(fs.realpathSync.native(tmpDir), (_eventType, filename) => {
+        if (filename) events.push(filename.toString());
+      });
+      try {
+        store.loadRoutes(true);
+        for (let attempt = 0; attempt < 20; attempt++) {
+          if (events.some((entry) => entry.startsWith("routes.json.tmp-"))) break;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        expect(events.some((entry) => entry.startsWith("routes.json.tmp-"))).toBe(true);
+      } finally {
+        watcher.close();
+      }
 
       // Re-read the file directly to verify it was cleaned up
       const raw = JSON.parse(fs.readFileSync(store.getRoutesPath(), "utf-8"));
@@ -155,6 +222,41 @@ describe("RouteStore", () => {
       s.addRoute("test.localhost", 4001, process.pid);
       expect(fs.existsSync(s.getRoutesPath())).toBe(true);
     });
+
+    it("cleans the temp file when the atomic rename fails", async () => {
+      store.ensureDir();
+      fs.mkdirSync(store.getRoutesPath());
+      const events: string[] = [];
+      // Watch the canonical spelling: Windows 8.3 short temp paths make
+      // libuv's fs-event assert and abort the vitest worker.
+      const watcher = fs.watch(fs.realpathSync.native(tmpDir), (_eventType, filename) => {
+        if (filename) events.push(filename.toString());
+      });
+      try {
+        expect(() => store.addRoute("new.localhost", 4002, process.pid)).toThrow();
+        for (let attempt = 0; attempt < 20; attempt++) {
+          if (events.some((entry) => entry.startsWith("routes.json.tmp-"))) break;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        expect(events.some((entry) => entry.startsWith("routes.json.tmp-"))).toBe(true);
+        expect(fs.statSync(store.getRoutesPath()).isDirectory()).toBe(true);
+        expect(
+          fs.readdirSync(tmpDir).filter((entry) => entry.startsWith("routes.json.tmp-"))
+        ).toEqual([]);
+      } finally {
+        watcher.close();
+      }
+    });
+
+    // POSIX-only: Windows stat models just the write bit, so a 0o644
+    // request reads back as 0o666 there.
+    it.skipIf(process.platform === "win32")(
+      "writes route files with the configured file mode",
+      () => {
+        store.addRoute("mode.localhost", 4003, process.pid);
+        expect(fs.statSync(store.getRoutesPath()).mode & 0o777).toBe(FILE_MODE);
+      }
+    );
   });
 
   describe("addRoute", () => {
@@ -461,7 +563,7 @@ describe("RouteStore", () => {
       const hostnames = raw.map((r: { hostname: string }) => r.hostname).sort();
       const expected = Array.from({ length: count }, (_, i) => `app${i}.localhost`).sort();
       expect(hostnames).toEqual(expected);
-    }, 15_000);
+    }, 30_000);
 
     it("survives sustained lock contention that defeats a naive retry strategy", async () => {
       store.ensureDir();
@@ -469,7 +571,7 @@ describe("RouteStore", () => {
 
       // A child process holds the lock for 1.5s, simulating a slow writer on
       // a loaded machine. The old strategy (20 retries * 50ms = 1s budget)
-      // would time out; exponential backoff with a 5s budget survives.
+      // would time out; exponential backoff with a larger budget survives.
       const holdMs = 1500;
       const holder = spawn(
         process.execPath,

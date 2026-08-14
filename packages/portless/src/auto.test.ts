@@ -8,6 +8,8 @@ import {
   truncateLabel,
   inferProjectName,
   detectWorktreePrefix,
+  applyWorktreePrefix,
+  resolveWorktreeFlat,
 } from "./auto.js";
 
 // ---------------------------------------------------------------------------
@@ -105,6 +107,52 @@ describe("truncateLabel", () => {
     expect(result.length).toBeLessThanOrEqual(63);
     // Should not have double hyphens from trailing-hyphen stripping + hash separator
     expect(result).not.toMatch(/--/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// applyWorktreePrefix
+// ---------------------------------------------------------------------------
+
+describe("applyWorktreePrefix", () => {
+  const worktree = { prefix: "feature", source: "git branch" };
+
+  it("preserves nested worktree hostnames by default", () => {
+    expect(applyWorktreePrefix("web.api", worktree, false)).toBe("feature.web.api");
+  });
+
+  it("flattens an unambiguous worktree hostname into one DNS label", () => {
+    expect(applyWorktreePrefix("web", worktree, true)).toBe("feature-web");
+  });
+
+  it("hashes flat hostnames when label boundaries are ambiguous", () => {
+    const first = applyWorktreePrefix("web", { prefix: "feature-x", source: "git branch" }, true);
+    const second = applyWorktreePrefix("x-web", worktree, true);
+
+    expect(first).not.toBe(second);
+    expect(first).toMatch(/^feature-x-web-[a-f0-9]{6}$/);
+    expect(second).toMatch(/^feature-x-web-[a-f0-9]{6}$/);
+  });
+
+  it("keeps hashed flat hostnames within the DNS label limit", () => {
+    const result = applyWorktreePrefix(
+      "very-long-application-name-that-would-overflow-a-dns-label",
+      { prefix: "very-long-feature-branch-name", source: "git branch" },
+      true
+    );
+
+    expect(result.length).toBeLessThanOrEqual(63);
+    expect(result).not.toContain(".");
+    expect(result).toMatch(/-[a-f0-9]{6}$/);
+  });
+});
+
+describe("resolveWorktreeFlat", () => {
+  it("uses the project setting unless the environment overrides it", () => {
+    expect(resolveWorktreeFlat(undefined, {})).toBe(false);
+    expect(resolveWorktreeFlat(true, {})).toBe(true);
+    expect(resolveWorktreeFlat(true, { PORTLESS_WORKTREE_FLAT: "0" })).toBe(false);
+    expect(resolveWorktreeFlat(false, { PORTLESS_WORKTREE_FLAT: "1" })).toBe(true);
   });
 });
 

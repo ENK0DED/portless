@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach, beforeEach } from "vitest";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as net from "node:net";
@@ -9,6 +9,8 @@ import {
   buildSudoEnvArgs,
   buildProxyStartConfig,
   BLOCKED_PORTS,
+  cmdEscape,
+  cmdEscapeCommand,
   DEFAULT_TLD,
   FALLBACK_PROXY_PORT,
   hasPlaceholders,
@@ -23,27 +25,118 @@ import {
   findFreePort,
   getDefaultPort,
   getDefaultTld,
+  getDefaultTlds,
   getProtocolPort,
+  getProxyBindTargets,
+  getRiskyTldReason,
+  hasLanMarker,
+  hasConfiguredTldEnv,
+  injectPackageScriptFrameworkFlags,
   isHttpsEnvDisabled,
   injectFrameworkFlags,
   isPortListening,
   isProxyRunning,
+  listenOnProxyInterface,
   parsePidFromNetstat,
+  parseTldList,
   readLanMarker,
+  readCustomCertMarker,
+  readInternalPagesDisabledMarker,
   readPersistedProxyState,
   readTldFromDir,
+  readTldsFromDir,
   readWildcardMarker,
+  reportHostsSync,
   replacePlaceholders,
+  resolveFrameworkBasename,
   resolveWindowsCommandInvocation,
   resolveWindowsExecutable,
   resolveStateDir,
+  syncHostsWithWarning,
   validateTld,
   writeLanMarker,
+  writeCustomCertMarker,
+  writeInternalPagesDisabledMarker,
+  writeLanModeMarker,
   writeTldFile,
+  writeTldsFile,
   writeTlsMarker,
   writeWildcardMarker,
 } from "./cli-utils.js";
 import { PORTLESS_HEADER, PORTLESS_LISTENER_PORT_HEADER } from "./proxy.js";
+
+describe("proxy listener interface", () => {
+  it("uses only IPv4 and IPv6 loopback outside LAN mode", () => {
+    expect(getProxyBindTargets(false)).toEqual([
+      { host: "127.0.0.1" },
+      { host: "::1", ipv6Only: true },
+    ]);
+  });
+
+  it("uses IPv4 and IPv6 unspecified addresses in LAN mode", () => {
+    expect(getProxyBindTargets(true)).toEqual([
+      { host: "0.0.0.0" },
+      { host: "::", ipv6Only: true },
+    ]);
+  });
+
+  it("binds IPv4 loopback outside LAN mode", async () => {
+    const target = getProxyBindTargets(false)[0]!;
+    const server = net.createServer();
+
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      listenOnProxyInterface(server, 0, target, resolve);
+    });
+
+    try {
+      const address = server.address();
+      expect(address && typeof address !== "string" ? address.address : null).toBe("127.0.0.1");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("binds IPv6 loopback outside LAN mode when available", async (ctx) => {
+    const target = getProxyBindTargets(false)[1]!;
+    const server = net.createServer();
+    const ipv6Available = await new Promise<boolean>((resolve, reject) => {
+      server.once("error", (err: NodeJS.ErrnoException) => {
+        if (err.code === "EAFNOSUPPORT" || err.code === "EADDRNOTAVAIL") {
+          resolve(false);
+        } else {
+          reject(err);
+        }
+      });
+      listenOnProxyInterface(server, 0, target, () => resolve(true));
+    });
+    if (!ipv6Available) return ctx.skip();
+
+    try {
+      const address = server.address();
+      expect(address && typeof address !== "string" ? address.address : null).toBe("::1");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("binds the IPv4 unspecified address in LAN mode", async () => {
+    const target = getProxyBindTargets(true)[0]!;
+    const server = net.createServer();
+
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      listenOnProxyInterface(server, 0, target, resolve);
+    });
+
+    try {
+      const address = server.address();
+      expect(address && typeof address !== "string" ? address.address : null).toBe("0.0.0.0");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
 
 describe("findFreePort", () => {
   it("returns a port in the default range", async () => {
@@ -228,6 +321,35 @@ describe("isPortListening", () => {
   });
 });
 
+describe("isPortListening", () => {
+  const servers: http.Server[] = [];
+
+  afterEach(async () => {
+    for (const s of servers) {
+      await new Promise<void>((resolve) => s.close(() => resolve()));
+    }
+    servers.length = 0;
+  });
+
+  it("returns false when nothing is listening", async () => {
+    expect(await isPortListening(19877)).toBe(false);
+  });
+
+  it("detects a server listening on IPv6 loopback only (issue #320)", async (ctx) => {
+    const server = http.createServer((_req, res) => res.end("ok"));
+    const ipv6Available = await new Promise<boolean>((resolve) => {
+      server.once("error", () => resolve(false));
+      server.listen(0, "::1", () => resolve(true));
+    });
+    if (!ipv6Available) return ctx.skip();
+    servers.push(server);
+    const addr = server.address();
+    if (!addr || typeof addr === "string") throw new Error("no addr");
+
+    expect(await isPortListening(addr.port)).toBe(true);
+  });
+});
+
 describe("resolveStateDir", () => {
   it("returns user dir for all ports", () => {
     expect(resolveStateDir(80)).toBe(USER_STATE_DIR);
@@ -237,6 +359,31 @@ describe("resolveStateDir", () => {
     expect(resolveStateDir(8080)).toBe(USER_STATE_DIR);
     expect(resolveStateDir(3000)).toBe(USER_STATE_DIR);
   });
+
+  it.skipIf(process.platform === "win32")(
+    "uses the invoking user's home when loaded under sudo",
+    async () => {
+      const originalHome = process.env.HOME;
+      const originalSudoUser = process.env.SUDO_USER;
+      const expectedHome = process.platform === "darwin" ? "/Users/alice" : "/home/alice";
+
+      try {
+        process.env.HOME = process.platform === "darwin" ? "/var/root" : "/root";
+        process.env.SUDO_USER = "alice";
+        vi.resetModules();
+
+        const sudoModule = await import("./cli-utils.js");
+        expect(sudoModule.USER_STATE_DIR).toBe(path.join(expectedHome, ".portless"));
+        expect(sudoModule.resolveStateDir(443)).toBe(path.join(expectedHome, ".portless"));
+      } finally {
+        if (originalHome === undefined) delete process.env.HOME;
+        else process.env.HOME = originalHome;
+        if (originalSudoUser === undefined) delete process.env.SUDO_USER;
+        else process.env.SUDO_USER = originalSudoUser;
+        vi.resetModules();
+      }
+    }
+  );
 });
 
 describe("constants", () => {
@@ -910,6 +1057,320 @@ describe("injectFrameworkFlags", () => {
     injectFrameworkFlags(args, 4567);
     expect(args).toEqual(["php", "artisan", "serve", "--port", "4567", "--host", "127.0.0.1"]);
   });
+
+  it("does not inject server flags into a Vite build", () => {
+    const args = ["vite", "build"];
+    injectFrameworkFlags(args, 4567);
+    expect(args).toEqual(["vite", "build"]);
+  });
+
+  it("recognizes an existing --port=value option and still adds a missing host", () => {
+    const args = ["vite", "dev", "--port=5000"];
+    injectFrameworkFlags(args, 4567);
+    expect(args).toEqual(["vite", "dev", "--port=5000", "--host", "127.0.0.1"]);
+  });
+});
+
+describe("injectPackageScriptFrameworkFlags", () => {
+  let packageDir: string;
+
+  beforeEach(() => {
+    packageDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-script-injection-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(packageDir, { recursive: true, force: true });
+  });
+
+  function writeScript(script: string): void {
+    writeScripts({ dev: script });
+  }
+
+  function writeScripts(scripts: Record<string, string>): void {
+    fs.writeFileSync(
+      path.join(packageDir, "package.json"),
+      JSON.stringify({ name: "test-app", scripts })
+    );
+  }
+
+  it.each(["bun", "npm", "pnpm", "yarn"])("forwards Vite flags through %s run dev", (pm) => {
+    writeScript("vite dev");
+    const args = [pm, "run", "dev"];
+
+    injectPackageScriptFrameworkFlags(args, 4567, packageDir);
+
+    expect(args).toEqual([
+      pm,
+      "run",
+      "dev",
+      ...(pm === "npm" ? ["--"] : []),
+      "--port",
+      "4567",
+      "--strictPort",
+      "--host",
+      "127.0.0.1",
+    ]);
+  });
+
+  it.each([
+    ["vitepress", "vitepress dev"],
+    ["rsbuild", "rsbuild dev"],
+    ["laravel", "php artisan serve"],
+    ["wrangler", "wrangler dev"],
+  ])("forwards flags for the fork's %s injector", (_name, script) => {
+    writeScript(script);
+    const args = ["bun", "run", "dev"];
+
+    injectPackageScriptFrameworkFlags(args, 4567, packageDir);
+
+    expect(args.slice(3)).toEqual(
+      script.startsWith("vitepress")
+        ? ["--port", "4567", "--strictPort", "--host", "127.0.0.1"]
+        : script.startsWith("wrangler")
+          ? ["--port", "4567", "--ip", "127.0.0.1"]
+          : ["--port", "4567", "--host", "127.0.0.1"]
+    );
+  });
+
+  it("does not append into a compound script or a non-server command", () => {
+    writeScript("vite dev && vite build");
+    const compoundArgs = ["bun", "run", "dev"];
+    injectPackageScriptFrameworkFlags(compoundArgs, 4567, packageDir);
+    expect(compoundArgs).toEqual(["bun", "run", "dev"]);
+
+    writeScript("vite build");
+    const buildArgs = ["bun", "run", "dev"];
+    injectPackageScriptFrameworkFlags(buildArgs, 4567, packageDir);
+    expect(buildArgs).toEqual(["bun", "run", "dev"]);
+  });
+
+  it("resolves framework identity through a package script independently of append safety", () => {
+    writeScript("expo start --port 4567 # already configured");
+    expect(resolveFrameworkBasename(["bun", "run", "dev"], packageDir)).toBe("expo");
+  });
+
+  it("forwards only the missing host when the script supplies a port", () => {
+    writeScript("expo start --port 4567");
+    const args = ["bun", "run", "dev"];
+    injectPackageScriptFrameworkFlags(args, 4567, packageDir);
+    expect(args).toEqual(["bun", "run", "dev", "--host", "localhost"]);
+  });
+
+  it.each(["--localhost", "--lan", "--tunnel"])(
+    "preserves Expo connection mode %s through a package script",
+    (mode) => {
+      writeScript(`expo start ${mode}`);
+      const args = ["pnpm", "run", "dev"];
+      injectPackageScriptFrameworkFlags(args, 4567, packageDir);
+      expect(args).toEqual(["pnpm", "run", "dev", "--port", "4567"]);
+    }
+  );
+
+  it("forwards only the missing port when the script supplies a host", () => {
+    writeScript("vite dev --host 127.0.0.1");
+    const args = ["bun", "run", "dev", "--", "--host", "0.0.0.0"];
+    injectPackageScriptFrameworkFlags(args, 4567, packageDir);
+    expect(args).toEqual([
+      "bun",
+      "run",
+      "dev",
+      "--",
+      "--host",
+      "0.0.0.0",
+      "--port",
+      "4567",
+      "--strictPort",
+    ]);
+  });
+
+  it("does not duplicate a port supplied by script or user trailing args", () => {
+    writeScript("vite dev --host 127.0.0.1");
+    const userArgs = ["npm", "run", "dev", "--", "--port", "3000"];
+    injectPackageScriptFrameworkFlags(userArgs, 4567, packageDir);
+    expect(userArgs).toEqual(["npm", "run", "dev", "--", "--port", "3000"]);
+
+    writeScript("vite dev --port=5000 --host=127.0.0.1");
+    const scriptArgs = ["bun", "run", "dev"];
+    injectPackageScriptFrameworkFlags(scriptArgs, 4567, packageDir);
+    expect(scriptArgs).toEqual(["bun", "run", "dev"]);
+
+    writeScript("vite dev --host=127.0.0.1");
+    const equalsArgs = ["bun", "run", "dev", "--port=3000"];
+    injectPackageScriptFrameworkFlags(equalsArgs, 4567, packageDir);
+    expect(equalsArgs).toEqual(["bun", "run", "dev", "--port=3000"]);
+  });
+
+  it.each([
+    "vite dev && node second.js",
+    "vite dev&&node second.js",
+    "vite dev\nnode second.js",
+    "vite dev | tee log.txt",
+    "vite dev # keep this note",
+    "vite dev --open  # opens a browser",
+    "vite dev \\\n# note",
+  ])("does not append flags to unsafe shell script %s", (script) => {
+    writeScript(script);
+    const args = ["bun", "run", "dev"];
+    injectPackageScriptFrameworkFlags(args, 4567, packageDir);
+    expect(args).toEqual(["bun", "run", "dev"]);
+  });
+
+  it("preserves quoted metacharacters and redirections in a single script", () => {
+    for (const script of ["vite dev --open '/foo&bar'", "vite dev >vite.log 2>&1"]) {
+      writeScript(script);
+      const args = ["bun", "run", "dev"];
+      injectPackageScriptFrameworkFlags(args, 4567, packageDir);
+      expect(args).toEqual([
+        "bun",
+        "run",
+        "dev",
+        "--port",
+        "4567",
+        "--strictPort",
+        "--host",
+        "127.0.0.1",
+      ]);
+    }
+  });
+
+  it("does not append past a script's own option terminator", () => {
+    writeScript("vite dev -- --extra");
+    const args = ["bun", "run", "dev"];
+    injectPackageScriptFrameworkFlags(args, 4567, packageDir);
+    expect(args).toEqual(["bun", "run", "dev"]);
+  });
+
+  it("handles server and non-server framework subcommands", () => {
+    writeScripts({
+      preview: "vite preview",
+      build: "vite build",
+      optimize: "vite optimize",
+      test: "vp test",
+      export: "expo export",
+      check: "astro check",
+    });
+
+    const previewArgs = ["bun", "run", "preview"];
+    injectPackageScriptFrameworkFlags(previewArgs, 4567, packageDir);
+    expect(previewArgs).toEqual([
+      "bun",
+      "run",
+      "preview",
+      "--port",
+      "4567",
+      "--strictPort",
+      "--host",
+      "127.0.0.1",
+    ]);
+
+    for (const script of ["build", "optimize", "test", "export", "check"]) {
+      const args = ["bun", "run", script];
+      injectPackageScriptFrameworkFlags(args, 4567, packageDir);
+      expect(args).toEqual(["bun", "run", script]);
+    }
+  });
+
+  it("handles runner-wrapped and flag-prefixed build scripts conservatively", () => {
+    writeScripts({
+      build: "bunx vite build",
+      mode: "vite --mode production build",
+      dev: "bunx vite dev --host 127.0.0.1",
+    });
+
+    const buildArgs = ["bun", "run", "build"];
+    injectPackageScriptFrameworkFlags(buildArgs, 4567, packageDir);
+    expect(buildArgs).toEqual(["bun", "run", "build"]);
+
+    const modeArgs = ["bun", "run", "mode"];
+    injectPackageScriptFrameworkFlags(modeArgs, 4567, packageDir);
+    expect(modeArgs).toEqual(["bun", "run", "mode"]);
+
+    const runnerArgs = ["bun", "run", "dev"];
+    injectPackageScriptFrameworkFlags(runnerArgs, 4567, packageDir);
+    expect(runnerArgs).toEqual(["bun", "run", "dev", "--port", "4567", "--strictPort"]);
+  });
+
+  it("ignores missing scripts and commands outside package-manager run", () => {
+    writeScripts({ start: "vite dev" });
+    for (const args of [
+      ["vite", "dev"],
+      ["bun", "dev"],
+      ["bun", "run", "--bun"],
+      ["bunx", "vite", "dev"],
+      ["cargo", "run", "dev"],
+      ["bun", "run", "dev"],
+    ]) {
+      const before = [...args];
+      injectPackageScriptFrameworkFlags(args, 4567, packageDir);
+      expect(args).toEqual(before);
+    }
+  });
+
+  it("resolves an absolute package-manager path and runner inside the script", () => {
+    writeScript("bunx vite dev --host 127.0.0.1");
+    const args = ["/usr/local/bin/bun", "run", "dev"];
+    injectPackageScriptFrameworkFlags(args, 4567, packageDir);
+    expect(args).toEqual(["/usr/local/bin/bun", "run", "dev", "--port", "4567", "--strictPort"]);
+  });
+
+  it("keeps comments, escaped spaces, and substitutions classified correctly", () => {
+    writeScript("vite dev --tag v1#2");
+    const wordArgs = ["bun", "run", "dev"];
+    injectPackageScriptFrameworkFlags(wordArgs, 4567, packageDir);
+    expect(wordArgs).toContain("--port");
+
+    writeScript("vite dev --open /foo\\ #bar");
+    const escapedArgs = ["bun", "run", "dev"];
+    injectPackageScriptFrameworkFlags(escapedArgs, 4567, packageDir);
+    expect(escapedArgs).toContain("--port");
+
+    writeScript("vite dev --define SHA=$(git rev-parse HEAD)");
+    const substitutionArgs = ["bun", "run", "dev"];
+    injectPackageScriptFrameworkFlags(substitutionArgs, 4567, packageDir);
+    expect(substitutionArgs).toContain("--port");
+  });
+});
+
+describe("resolveFrameworkBasename", () => {
+  let packageDir: string;
+
+  beforeEach(() => {
+    packageDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-framework-resolution-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(packageDir, { recursive: true, force: true });
+  });
+
+  it("resolves direct and package-runner invocations", () => {
+    expect(resolveFrameworkBasename(["vite", "dev"], packageDir)).toBe("vite");
+    expect(resolveFrameworkBasename(["bunx", "--bun", "vite", "dev"], packageDir)).toBe("vite");
+  });
+
+  it("resolves framework identity through a package script", () => {
+    fs.writeFileSync(
+      path.join(packageDir, "package.json"),
+      JSON.stringify({ scripts: { dev: "expo start" } })
+    );
+    expect(resolveFrameworkBasename(["bun", "run", "dev"], packageDir)).toBe("expo");
+  });
+
+  it("keeps identity resolution independent from append safety", () => {
+    fs.writeFileSync(
+      path.join(packageDir, "package.json"),
+      JSON.stringify({ scripts: { dev: "expo start --port 4567 # note" } })
+    );
+    expect(resolveFrameworkBasename(["bun", "run", "dev"], packageDir)).toBe("expo");
+  });
+
+  it("returns null when no known framework is reached", () => {
+    fs.writeFileSync(
+      path.join(packageDir, "package.json"),
+      JSON.stringify({ scripts: { dev: "node server.js" } })
+    );
+    expect(resolveFrameworkBasename(["bun", "run", "dev"], packageDir)).toBeNull();
+    expect(resolveFrameworkBasename(["node", "server.js"], packageDir)).toBeNull();
+  });
 });
 
 describe("hasPlaceholders", () => {
@@ -1021,6 +1482,11 @@ describe("getDefaultTld", () => {
     expect(getDefaultTld()).toBe("preferred.test");
   });
 
+  it("returns the first suffix from a configured list", () => {
+    process.env[SUFFIX_ENV] = "preferred.test,localhost";
+    expect(getDefaultTld()).toBe("preferred.test");
+  });
+
   it("returns DEFAULT_TLD when both env vars are empty", () => {
     process.env[SUFFIX_ENV] = "";
     process.env[LEGACY_TLD_ENV] = "";
@@ -1028,8 +1494,141 @@ describe("getDefaultTld", () => {
   });
 });
 
+describe("getDefaultTlds", () => {
+  let originalLegacyEnv: string | undefined;
+  let originalSuffixEnv: string | undefined;
+
+  beforeEach(() => {
+    originalLegacyEnv = process.env[LEGACY_TLD_ENV];
+    originalSuffixEnv = process.env[SUFFIX_ENV];
+  });
+
+  afterEach(() => {
+    if (originalLegacyEnv === undefined) delete process.env[LEGACY_TLD_ENV];
+    else process.env[LEGACY_TLD_ENV] = originalLegacyEnv;
+    if (originalSuffixEnv === undefined) delete process.env[SUFFIX_ENV];
+    else process.env[SUFFIX_ENV] = originalSuffixEnv;
+  });
+
+  it("parses, normalizes, and deduplicates PORTLESS_SUFFIX in order", () => {
+    process.env[SUFFIX_ENV] = " TEST, server01.Acme.com, test ";
+    process.env[LEGACY_TLD_ENV] = "legacy.test";
+    expect(getDefaultTlds()).toEqual(["test", "server01.acme.com"]);
+  });
+
+  it("falls back to a PORTLESS_TLD list when PORTLESS_SUFFIX is empty", () => {
+    process.env[SUFFIX_ENV] = "";
+    process.env[LEGACY_TLD_ENV] = "legacy.test,localhost";
+    expect(getDefaultTlds()).toEqual(["legacy.test", "localhost"]);
+  });
+
+  it("does not treat empty suffix variables as explicit configuration", () => {
+    process.env[SUFFIX_ENV] = "";
+    process.env[LEGACY_TLD_ENV] = "";
+    expect(hasConfiguredTldEnv()).toBe(false);
+  });
+});
+
+describe("parseTldList", () => {
+  it("parses comma-separated suffixes and removes duplicates in order", () => {
+    expect(parseTldList(" TEST, localhost, test ")).toEqual(["test", "localhost"]);
+  });
+
+  it("rejects empty comma-separated entries", () => {
+    expect(() => parseTldList("test,,localhost")).toThrow("TLD cannot be empty");
+  });
+});
+
+describe("cmdEscape", () => {
+  it("leaves safe arguments bare (cmd built-ins print added quotes literally)", () => {
+    expect(cmdEscape("dev")).toBe("dev");
+    expect(cmdEscape("--force")).toBe("--force");
+    expect(cmdEscape("--port=3000")).toBe("--port=3000");
+    expect(cmdEscape("C:\\tools\\script.js")).toBe("C:\\tools\\script.js");
+  });
+
+  it("preserves paths with spaces as a single argument", () => {
+    expect(cmdEscape("C:\\Program Files\\nodejs\\node.exe")).toBe(
+      '^"C:\\Program^ Files\\nodejs\\node.exe^"'
+    );
+  });
+
+  it("caret-escapes cmd metacharacters", () => {
+    expect(cmdEscape("console.log(1)")).toBe('^"console.log^(1^)^"');
+    expect(cmdEscape("a&&b")).toBe('^"a^&^&b^"');
+    expect(cmdEscape("%PATH%")).toBe('^"^%PATH^%^"');
+  });
+
+  it("escapes embedded double quotes", () => {
+    expect(cmdEscape('say "hi"')).toBe('^"say^ \\^"hi\\^"^"');
+  });
+
+  it("escapes quote-toggle injection payloads", () => {
+    expect(cmdEscape('a" & echo PORTLESS_INJECTED & "b')).toBe(
+      '^"a\\^"^ ^&^ echo^ PORTLESS_INJECTED^ ^&^ \\^"b^"'
+    );
+  });
+
+  it("caret-escapes percent expansion payloads", () => {
+    expect(cmdEscape("%PATH%")).toBe('^"^%PATH^%^"');
+  });
+
+  it("doubles backslashes before quotes and before the added closing quote", () => {
+    expect(cmdEscape('dir\\"x')).toBe('^"dir\\\\\\^"x^"');
+    expect(cmdEscape("trailing \\")).toBe('^"trailing^ \\\\^"');
+  });
+
+  it("leaves a bare trailing backslash alone (no quote added, so no doubling)", () => {
+    expect(cmdEscape("trailing\\")).toBe("trailing\\");
+  });
+
+  it("handles the empty argument", () => {
+    expect(cmdEscape("")).toBe('^"^"');
+  });
+
+  it("escapes long backslash runs in linear time (regex form is quadratic)", () => {
+    const arg = "a " + "\\".repeat(64 * 1024);
+    const start = performance.now();
+    const escaped = cmdEscape(arg);
+    // The old /(\\\\*)"/g implementation takes >10s here; allow generous CI jitter.
+    expect(performance.now() - start).toBeLessThan(1000);
+    expect(escaped).toBe('^"a^ ' + "\\".repeat(128 * 1024) + '^"');
+  });
+});
+
+describe("cmdEscapeCommand", () => {
+  it("leaves bare PATH-resolved names untouched (quoting breaks %~dp0 in .cmd shims)", () => {
+    expect(cmdEscapeCommand("npm")).toBe("npm");
+    expect(cmdEscapeCommand("pnpm")).toBe("pnpm");
+    expect(cmdEscapeCommand("node")).toBe("node");
+    expect(cmdEscapeCommand("C:\\tools\\node.exe")).toBe("C:\\tools\\node.exe");
+  });
+
+  it("plain-quotes (no carets) paths with spaces", () => {
+    expect(cmdEscapeCommand("C:\\Program Files\\nodejs\\node.exe")).toBe(
+      '"C:\\Program Files\\nodejs\\node.exe"'
+    );
+  });
+
+  it("plain-quotes names containing cmd metacharacters", () => {
+    expect(cmdEscapeCommand("foo&bar")).toBe('"foo&bar"');
+    expect(cmdEscapeCommand("a(b)c")).toBe('"a(b)c"');
+  });
+
+  it("caret-escapes % in bare names (quotes cannot suppress %VAR% expansion)", () => {
+    expect(cmdEscapeCommand("probe%PATH%.cmd")).toBe("probe^%PATH^%.cmd");
+    expect(cmdEscapeCommand("100%.exe")).toBe("100^%.exe");
+  });
+
+  it("caret-escapes % in a resolved path with spaces", () => {
+    expect(cmdEscapeCommand("C:\\Program Files\\probe%PATH%.cmd")).toBe(
+      '"C:\\Program Files\\probe^%PATH^%.cmd"'
+    );
+  });
+});
+
 describe("buildProxyStartConfig", () => {
-  it("forces .local and keeps explicit --ip in LAN mode", () => {
+  it("preserves an explicit suffix list in LAN mode and appends local", () => {
     expect(
       buildProxyStartConfig({
         useHttps: true,
@@ -1037,19 +1636,28 @@ describe("buildProxyStartConfig", () => {
         lanIp: "192.168.1.42",
         lanIpExplicit: true,
         tld: "test",
+        tlds: ["test", "server01.acme.com", "test"],
+        tldsExplicit: true,
         useWildcard: true,
         foreground: true,
         includePort: true,
         proxyPort: 8080,
       })
     ).toEqual({
-      effectiveTld: "local",
+      effectiveTld: "test",
+      effectiveTlds: ["test", "server01.acme.com", "local"],
       args: [
         "--foreground",
         "--port",
         "8080",
         "--https",
         "--lan",
+        "--suffix",
+        "test",
+        "--suffix",
+        "server01.acme.com",
+        "--suffix",
+        "local",
         "--ip",
         "192.168.1.42",
         "--wildcard",
@@ -1068,6 +1676,7 @@ describe("buildProxyStartConfig", () => {
       })
     ).toEqual({
       effectiveTld: "local",
+      effectiveTlds: ["local"],
       args: ["--no-tls", "--lan", INTERNAL_LAN_IP_FLAG, "192.168.1.42"],
     });
   });
@@ -1081,8 +1690,45 @@ describe("buildProxyStartConfig", () => {
       })
     ).toEqual({
       effectiveTld: "test",
+      effectiveTlds: ["test"],
       args: ["--no-tls", "--suffix", "test"],
     });
+  });
+
+  it("emits every suffix outside LAN mode", () => {
+    expect(
+      buildProxyStartConfig({
+        useHttps: true,
+        lanMode: false,
+        tld: "localhost",
+        tlds: ["localhost", "test"],
+        tldsExplicit: true,
+      })
+    ).toEqual({
+      effectiveTld: "localhost",
+      effectiveTlds: ["localhost", "test"],
+      args: ["--https", "--suffix", "localhost", "--suffix", "test"],
+    });
+  });
+
+  it("forwards the routes cleanup interval, including zero", () => {
+    expect(
+      buildProxyStartConfig({
+        useHttps: false,
+        lanMode: false,
+        tld: "localhost",
+        routesCleanupIntervalSeconds: 60,
+      }).args
+    ).toEqual(["--no-tls", "--routes-cleanup-interval", "60"]);
+
+    expect(
+      buildProxyStartConfig({
+        useHttps: false,
+        lanMode: false,
+        tld: "localhost",
+        routesCleanupIntervalSeconds: 0,
+      }).args
+    ).toEqual(["--no-tls", "--routes-cleanup-interval", "0"]);
   });
 });
 
@@ -1135,6 +1781,12 @@ describe("readLanMarker / writeLanMarker", () => {
     expect(readLanMarker(tmpDir)).toBeNull();
   });
 
+  it("retains marker existence when LAN has temporarily lost its IP", () => {
+    writeLanModeMarker(tmpDir, true, null);
+    expect(hasLanMarker(tmpDir)).toBe(true);
+    expect(readLanMarker(tmpDir)).toBeNull();
+  });
+
   it("uses the LAN marker to remember LAN mode when the proxy is stopped", async () => {
     const prevStateDir = process.env.PORTLESS_STATE_DIR;
     const prevSuffix = process.env[SUFFIX_ENV];
@@ -1171,6 +1823,50 @@ describe("readLanMarker / writeLanMarker", () => {
         process.env[LEGACY_TLD_ENV] = prevLegacyTld;
       }
     }
+  });
+});
+
+describe("readCustomCertMarker / writeCustomCertMarker", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-custom-cert-test-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("records and clears custom certificate state for diagnostics", () => {
+    expect(readCustomCertMarker(tmpDir)).toBe(false);
+
+    writeCustomCertMarker(tmpDir, true);
+    expect(readCustomCertMarker(tmpDir)).toBe(true);
+
+    writeCustomCertMarker(tmpDir, false);
+    expect(readCustomCertMarker(tmpDir)).toBe(false);
+  });
+});
+
+describe("readInternalPagesDisabledMarker / writeInternalPagesDisabledMarker", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-pages-marker-test-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("records and clears intentionally disabled internal pages", () => {
+    expect(readInternalPagesDisabledMarker(tmpDir)).toBe(false);
+
+    writeInternalPagesDisabledMarker(tmpDir, true);
+    expect(readInternalPagesDisabledMarker(tmpDir)).toBe(true);
+
+    writeInternalPagesDisabledMarker(tmpDir, false);
+    expect(readInternalPagesDisabledMarker(tmpDir)).toBe(false);
   });
 });
 
@@ -1213,11 +1909,44 @@ describe("readTldFromDir / writeTldFile", () => {
 
   it("returns DEFAULT_TLD when file does not exist", () => {
     expect(readTldFromDir(tmpDir)).toBe(DEFAULT_TLD);
+    expect(readTldsFromDir(tmpDir)).toEqual([DEFAULT_TLD]);
   });
 
   it("writes and reads a custom TLD", () => {
     writeTldFile(tmpDir, "test");
     expect(readTldFromDir(tmpDir)).toBe("test");
+    expect(readTldsFromDir(tmpDir)).toEqual(["test"]);
+  });
+
+  it("persists a suffix list while retaining proxy.tld as the primary marker", () => {
+    writeTldsFile(tmpDir, ["server01.acme.com", "test"]);
+
+    expect(readTldsFromDir(tmpDir)).toEqual(["server01.acme.com", "test"]);
+    expect(fs.readFileSync(path.join(tmpDir, "proxy.tld"), "utf-8")).toBe("server01.acme.com");
+  });
+
+  it("skips invalid persisted list entries without discarding valid suffixes", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    fs.writeFileSync(path.join(tmpDir, "proxy.tlds"), "test\nbad_name\ninternal\n");
+
+    expect(readTldsFromDir(tmpDir)).toEqual(["test", "internal"]);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("Warning: ignoring invalid TLD entry in proxy.tlds")
+    );
+
+    warn.mockRestore();
+  });
+
+  it("ignores an invalid persisted TLD with a warning", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    fs.writeFileSync(path.join(tmpDir, "proxy.tld"), "invalid tld");
+
+    expect(readTldFromDir(tmpDir)).toBe(DEFAULT_TLD);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("Warning: ignoring invalid TLD entry in proxy.tld")
+    );
+
+    warn.mockRestore();
   });
 
   it("removes the file when writing the default TLD", () => {
@@ -1235,6 +1964,31 @@ describe("readTldFromDir / writeTldFile", () => {
   });
 });
 
+describe("getRiskyTldReason", () => {
+  it("matches exact risky TLDs", () => {
+    expect(getRiskyTldReason("dev")).toMatch(/HSTS/);
+    expect(getRiskyTldReason("app")).toMatch(/HSTS/);
+    expect(getRiskyTldReason("com")).toMatch(/public TLD/);
+  });
+
+  it("matches multi-segment TLDs under tree-wide risky suffixes", () => {
+    expect(getRiskyTldReason("example.dev")).toMatch(/HSTS/);
+    expect(getRiskyTldReason("myapp.app")).toMatch(/HSTS/);
+    expect(getRiskyTldReason("foo.local")).toMatch(/mDNS/);
+  });
+
+  it("does not suffix-match ownership-class TLDs", () => {
+    expect(getRiskyTldReason("dev.example.com")).toBeUndefined();
+    expect(getRiskyTldReason("internal.example.org")).toBeUndefined();
+  });
+
+  it("returns undefined for safe TLDs", () => {
+    expect(getRiskyTldReason("test")).toBeUndefined();
+    expect(getRiskyTldReason("dev.internal")).toBeUndefined();
+    expect(getRiskyTldReason("devx")).toBeUndefined();
+  });
+});
+
 describe("validateTld", () => {
   it("returns null for valid suffixes", () => {
     expect(validateTld("localhost")).toBeNull();
@@ -1249,14 +2003,42 @@ describe("validateTld", () => {
     expect(validateTld("")).toMatch(/cannot be empty/);
   });
 
-  it("rejects suffixes with invalid labels", () => {
-    expect(validateTld(".test")).toMatch(/must not start or end with a dot/);
-    expect(validateTld("test.")).toMatch(/must not start or end with a dot/);
-    expect(validateTld("my..tld")).toMatch(/consecutive dots/);
+  it("rejects TLDs with invalid characters", () => {
     expect(validateTld("MY_TLD")).toMatch(/must contain only/);
     expect(validateTld("tld!")).toMatch(/must contain only/);
-    expect(validateTld("-test")).toMatch(/start and end/);
-    expect(validateTld("test-")).toMatch(/start and end/);
+    expect(validateTld("my tld")).toMatch(/must contain only/);
+  });
+
+  it("accepts multi-segment TLDs", () => {
+    expect(validateTld("dev.example.com")).toBeNull();
+    expect(validateTld("local.example.dev")).toBeNull();
+    expect(validateTld("a.b.c.d.e")).toBeNull();
+  });
+
+  it("accepts hyphens inside labels", () => {
+    expect(validateTld("my-tld")).toBeNull();
+    expect(validateTld("dev.my-network.com")).toBeNull();
+  });
+
+  it("rejects empty labels", () => {
+    expect(validateTld(".example.com")).toMatch(/labels cannot be empty/);
+    expect(validateTld("example.com.")).toMatch(/labels cannot be empty/);
+    expect(validateTld("example..com")).toMatch(/labels cannot be empty/);
+  });
+
+  it("rejects hyphens at label edges", () => {
+    expect(validateTld("-bad.example.com")).toMatch(/must contain only/);
+    expect(validateTld("bad-.example.com")).toMatch(/must contain only/);
+  });
+
+  it("rejects labels over 63 characters", () => {
+    expect(validateTld(`${"a".repeat(64)}.example.com`)).toMatch(/63-character/);
+  });
+
+  it("rejects TLDs over 253 characters", () => {
+    const label = "a".repeat(63);
+    const long = [label, label, label, label, "example"].join(".");
+    expect(validateTld(long)).toMatch(/253-character/);
   });
 
   it("allows public TLDs (they produce warnings elsewhere)", () => {
@@ -1320,12 +2102,37 @@ describe("readPersistedProxyState", () => {
     expect(state!.tld).toBe("test");
   });
 
+  it("reads all suffixes from persisted state", () => {
+    fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
+    writeTldsFile(tmpDir, ["test", "local"]);
+    const state = readPersistedProxyState();
+    expect(state).not.toBeNull();
+    expect(state!.tlds).toEqual(["test", "local"]);
+  });
+
+  it("does not infer LAN mode from a local suffix without a LAN marker", () => {
+    fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
+    writeTldsFile(tmpDir, ["test", "local"]);
+    const state = readPersistedProxyState();
+    expect(state).not.toBeNull();
+    expect(state!.lanMode).toBe(false);
+  });
+
   it("reads LAN mode from persisted state", () => {
     fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
     writeLanMarker(tmpDir, "192.168.1.10");
     const state = readPersistedProxyState();
     expect(state).not.toBeNull();
     expect(state!.lanMode).toBe(true);
+  });
+
+  it("uses LAN marker existence when its current IP is unavailable", () => {
+    fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
+    fs.writeFileSync(path.join(tmpDir, "proxy.tld"), "local");
+    fs.writeFileSync(path.join(tmpDir, "proxy.lan"), "");
+    expect(hasLanMarker(tmpDir)).toBe(true);
+    expect(readLanMarker(tmpDir)).toBeNull();
+    expect(readPersistedProxyState()).toMatchObject({ lanMode: true });
   });
 
   it("returns full previous config for a custom proxy setup", () => {
@@ -1339,9 +2146,143 @@ describe("readPersistedProxyState", () => {
       port: 1355,
       tls: true,
       tld: "local",
+      tlds: ["local"],
       lanMode: true,
       useWildcard: true,
     });
+  });
+});
+
+describe("reportHostsSync", () => {
+  const warnings: string[] = [];
+
+  beforeEach(() => {
+    warnings.length = 0;
+  });
+
+  it("checks each unique hostname after the managed block is ready", async () => {
+    const checked: string[] = [];
+    let reads = 0;
+
+    await reportHostsSync(
+      ["good.test", "bad.test", "bad.test"],
+      false,
+      (message) => warnings.push(message),
+      async (hostname) => {
+        expect(reads).toBeGreaterThan(1);
+        checked.push(hostname);
+        return hostname === "good.test";
+      },
+      () => (++reads >= 2 ? ["good.test", "bad.test"] : []),
+      500
+    );
+
+    expect(checked).toEqual(["good.test", "bad.test"]);
+    expect(warnings).toEqual(["bad.test will not resolve. Run: portless hosts sync"]);
+  });
+
+  it("polls the managed block up to the bounded ceiling before warning", async () => {
+    let reads = 0;
+    const started = Date.now();
+
+    await reportHostsSync(
+      ["missing.test"],
+      false,
+      (message) => warnings.push(message),
+      async () => false,
+      () => {
+        reads += 1;
+        return [];
+      },
+      40
+    );
+
+    expect(reads).toBeGreaterThan(1);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(40);
+    expect(warnings).toEqual(["missing.test will not resolve. Run: portless hosts sync"]);
+  });
+
+  it("skips .local hostnames only while LAN mode is active", async () => {
+    let checked = 0;
+    await reportHostsSync(
+      ["device.local", "custom.test"],
+      true,
+      (message) => warnings.push(message),
+      async () => {
+        checked += 1;
+        return false;
+      },
+      () => ["custom.test"]
+    );
+
+    expect(checked).toBe(1);
+    expect(warnings).toEqual(["custom.test will not resolve. Run: portless hosts sync"]);
+  });
+
+  it("checks immediately when hosts sync is disabled", async () => {
+    const previous = process.env.PORTLESS_SYNC_HOSTS;
+    process.env.PORTLESS_SYNC_HOSTS = "0";
+    let slept = false;
+    try {
+      await reportHostsSync(
+        ["missing.test"],
+        false,
+        (message) => warnings.push(message),
+        async () => false,
+        () => [],
+        3500,
+        async () => {
+          slept = true;
+        }
+      );
+    } finally {
+      if (previous === undefined) delete process.env.PORTLESS_SYNC_HOSTS;
+      else process.env.PORTLESS_SYNC_HOSTS = previous;
+    }
+
+    expect(slept).toBe(false);
+    expect(warnings).toEqual(["missing.test will not resolve. Run: portless hosts sync"]);
+  });
+});
+
+describe("syncHostsWithWarning", () => {
+  it("warns once for repeated failed non-empty syncs", () => {
+    let warnings = 0;
+    const failedSync = () => false;
+
+    let warned = syncHostsWithWarning(["a.localhost"], false, () => warnings++, failedSync);
+    warned = syncHostsWithWarning(["a.localhost"], warned, () => warnings++, failedSync);
+
+    expect(warnings).toBe(1);
+    expect(warned).toBe(true);
+  });
+
+  it("re-arms after success and ignores an empty warm-up failure", () => {
+    let warnings = 0;
+    const stillUnwarned = syncHostsWithWarning(
+      [],
+      false,
+      () => warnings++,
+      () => false
+    );
+    expect(stillUnwarned).toBe(false);
+    expect(warnings).toBe(0);
+
+    const rearmed = syncHostsWithWarning(
+      ["a.localhost"],
+      true,
+      () => warnings++,
+      () => true
+    );
+    expect(rearmed).toBe(false);
+    const latched = syncHostsWithWarning(
+      ["a.localhost"],
+      rearmed,
+      () => warnings++,
+      () => false
+    );
+    expect(latched).toBe(true);
+    expect(warnings).toBe(1);
   });
 });
 
@@ -1483,7 +2424,7 @@ describe("resolveWindowsCommandInvocation", () => {
     }
   });
 
-  it("wraps cmd shims through cmd.exe with one quoted command line", () => {
+  it("wraps cmd shims through cmd.exe with /s-safe quoting", () => {
     process.env.PATHEXT = ".COM;.EXE;.BAT;.CMD";
     const binDir = path.join(tmpDir, "bin dir");
     fs.mkdirSync(binDir);
@@ -1492,7 +2433,7 @@ describe("resolveWindowsCommandInvocation", () => {
 
     expect(resolveWindowsCommandInvocation("cloudflared", ["version"], binDir)).toEqual({
       command: "cmd.exe",
-      args: ["/d", "/s", "/c", `"${shim}" version`],
+      args: ["/d", "/v:off", "/s", "/c", `""${shim}" version"`],
       windowsVerbatimArguments: true,
     });
   });

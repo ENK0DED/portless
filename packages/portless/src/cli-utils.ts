@@ -6,7 +6,15 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
 import { execSync, spawn } from "node:child_process";
+import { resolveScript, resolveScriptRaw } from "./config.js";
 import { LOOPBACK_DIAL_OPTIONS, PORTLESS_HEADER, PORTLESS_LISTENER_PORT_HEADER } from "./proxy.js";
+import {
+  checkHostResolution,
+  getManagedHostnames,
+  shouldAutoSyncHosts,
+  syncHostsFile,
+} from "./hosts.js";
+import { resolveUserHome } from "./utils.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -42,7 +50,7 @@ export const LEGACY_SYSTEM_STATE_DIR = isWindows
   : "/tmp/portless";
 
 /** Per-user state directory. All proxy state lives here regardless of port. */
-export const USER_STATE_DIR = path.join(os.homedir(), ".portless");
+export const USER_STATE_DIR = path.join(resolveUserHome(), ".portless");
 
 /** Minimum app port when finding a free port. */
 const MIN_APP_PORT = 4000;
@@ -90,6 +98,40 @@ export const SIGNAL_CODES: Record<string, number> = {
   SIGKILL: 9,
   SIGTERM: 15,
 };
+
+/** Listener address used when the proxy is only accessible from this machine. */
+export const IPV4_LOOPBACK_PROXY_HOST = "127.0.0.1";
+
+/** IPv6 listener address used when the proxy is only accessible from this machine. */
+export const IPV6_LOOPBACK_PROXY_HOST = "::1";
+
+/** IPv4 listener address used when LAN mode explicitly exposes the proxy. */
+export const IPV4_LAN_PROXY_HOST = "0.0.0.0";
+
+/** IPv6 listener address used when LAN mode explicitly exposes the proxy. */
+export const IPV6_LAN_PROXY_HOST = "::";
+
+export type ProxyBindTarget = {
+  host: string;
+  ipv6Only?: boolean;
+};
+
+/** Return explicit IPv4 and IPv6 listener targets for the effective proxy mode. */
+export function getProxyBindTargets(lanMode: boolean): ProxyBindTarget[] {
+  return lanMode
+    ? [{ host: IPV4_LAN_PROXY_HOST }, { host: IPV6_LAN_PROXY_HOST, ipv6Only: true }]
+    : [{ host: IPV4_LOOPBACK_PROXY_HOST }, { host: IPV6_LOOPBACK_PROXY_HOST, ipv6Only: true }];
+}
+
+/** Start a proxy listener on the selected interface and port. */
+export function listenOnProxyInterface(
+  server: net.Server,
+  port: number,
+  target: ProxyBindTarget,
+  listener?: () => void
+): void {
+  server.listen({ port, host: target.host, ipv6Only: target.ipv6Only }, listener);
+}
 
 /**
  * Kill a child process and its entire process tree. On Unix, when the child
@@ -173,6 +215,8 @@ export function readPortFromDir(dir: string): number | null {
 
 /** Name of the marker file that indicates the proxy is running with TLS. */
 const TLS_MARKER_FILE = "proxy.tls";
+const CUSTOM_CERT_MARKER_FILE = "proxy.custom-cert";
+const INTERNAL_PAGES_DISABLED_MARKER_FILE = "proxy.internal-pages-disabled";
 
 /** Read the TLS marker from a state directory. */
 export function readTlsMarker(dir: string): boolean {
@@ -187,6 +231,52 @@ export function readTlsMarker(dir: string): boolean {
 export function writeTlsMarker(dir: string, enabled: boolean): void {
   const markerPath = path.join(dir, TLS_MARKER_FILE);
   if (enabled) {
+    fs.writeFileSync(markerPath, "1", { mode: 0o644 });
+  } else {
+    try {
+      fs.unlinkSync(markerPath);
+    } catch {
+      // Marker may already be absent; non-fatal
+    }
+  }
+}
+
+/** Read whether the active HTTPS proxy uses user-provided certificate files. */
+export function readCustomCertMarker(dir: string): boolean {
+  try {
+    return fs.existsSync(path.join(dir, CUSTOM_CERT_MARKER_FILE));
+  } catch {
+    return false;
+  }
+}
+
+/** Persist custom certificate state for read-only diagnostics. */
+export function writeCustomCertMarker(dir: string, enabled: boolean): void {
+  const markerPath = path.join(dir, CUSTOM_CERT_MARKER_FILE);
+  if (enabled) {
+    fs.writeFileSync(markerPath, "1", { mode: 0o644 });
+  } else {
+    try {
+      fs.unlinkSync(markerPath);
+    } catch {
+      // Marker may already be absent; non-fatal
+    }
+  }
+}
+
+/** Read whether the active proxy intentionally disables its internal pages. */
+export function readInternalPagesDisabledMarker(dir: string): boolean {
+  try {
+    return fs.existsSync(path.join(dir, INTERNAL_PAGES_DISABLED_MARKER_FILE));
+  } catch {
+    return false;
+  }
+}
+
+/** Persist intentionally disabled internal-page state for diagnostics. */
+export function writeInternalPagesDisabledMarker(dir: string, disabled: boolean): void {
+  const markerPath = path.join(dir, INTERNAL_PAGES_DISABLED_MARKER_FILE);
+  if (disabled) {
     fs.writeFileSync(markerPath, "1", { mode: 0o644 });
   } else {
     try {
@@ -213,6 +303,15 @@ export function readLanMarker(dir: string): string | null {
   }
 }
 
+/** Return whether the LAN marker exists, regardless of whether it has an IP. */
+export function hasLanMarker(dir: string): boolean {
+  try {
+    return fs.existsSync(path.join(dir, LAN_MARKER_FILE));
+  } catch {
+    return false;
+  }
+}
+
 /** Write or remove the LAN marker in the state directory. */
 export function writeLanMarker(dir: string, ip: string | null): void {
   const markerPath = path.join(dir, LAN_MARKER_FILE);
@@ -225,6 +324,16 @@ export function writeLanMarker(dir: string, ip: string | null): void {
   } else {
     fs.writeFileSync(markerPath, ip, { mode: 0o644 });
   }
+}
+
+/** Persist LAN mode even when the current network has no usable IP. */
+export function writeLanModeMarker(dir: string, enabled: boolean, ip: string | null): void {
+  if (!enabled) {
+    writeLanMarker(dir, null);
+    return;
+  }
+
+  fs.writeFileSync(path.join(dir, LAN_MARKER_FILE), ip ?? "", { mode: 0o644 });
 }
 
 /** Name of the marker file that indicates wildcard routing is enabled. */
@@ -266,87 +375,174 @@ export const LEGACY_TLD_ENV = "PORTLESS_TLD";
 export const RISKY_TLDS = new Map<string, string>([
   ["local", "conflicts with mDNS/Bonjour on macOS"],
   ["dev", "Google-owned; browsers force HTTPS via preloaded HSTS"],
+  ["app", "Google-owned; browsers force HTTPS via preloaded HSTS"],
   ["com", "public TLD; DNS requests will leak to the internet"],
   ["org", "public TLD; DNS requests will leak to the internet"],
   ["net", "public TLD; DNS requests will leak to the internet"],
   ["io", "public TLD; DNS requests will leak to the internet"],
-  ["app", "public TLD; DNS requests will leak to the internet"],
   ["edu", "public TLD; DNS requests will leak to the internet"],
   ["gov", "public TLD; DNS requests will leak to the internet"],
   ["mil", "public TLD; DNS requests will leak to the internet"],
   ["int", "public TLD; DNS requests will leak to the internet"],
 ]);
 
-function validateDomainLabel(label: string): string | null {
-  if (!/^[a-z0-9-]+$/.test(label)) {
-    return "must contain only lowercase letters, digits, and hyphens";
+/**
+ * Risky TLDs whose failure mode applies to the whole suffix tree, so
+ * multi-segment TLDs under them inherit the risk: mDNS claims all of
+ * `*.local`, and the `.dev`/`.app` HSTS preload entries carry
+ * includeSubDomains. Ownership-class entries (com, org, ...) only matter
+ * for a bare TLD — a multi-segment TLD under a domain the user owns is
+ * the recommended setup, not a pitfall.
+ */
+const SUFFIX_RISKY_TLDS = new Set(["local", "dev", "app"]);
+
+/**
+ * Look up the risky-TLD warning for a configured TLD. Matches exact entries
+ * ("dev"), plus multi-segment TLDs whose suffix carries a tree-wide risk
+ * ("example.dev" inherits the HSTS preload).
+ */
+export function getRiskyTldReason(tld: string): string | undefined {
+  const exact = RISKY_TLDS.get(tld);
+  if (exact) return exact;
+  for (const risky of SUFFIX_RISKY_TLDS) {
+    if (tld.endsWith(`.${risky}`)) return RISKY_TLDS.get(risky);
   }
-  if (!/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label)) {
-    return "labels must start and end with a letter or digit";
-  }
-  if (label.length > 63) {
-    return "labels must be 63 characters or less";
-  }
-  return null;
+  return undefined;
 }
 
 /**
- * Validate a configured suffix. Returns an error message if invalid, or
- * null if OK. Accepts single-label values like "test" and dotted values like
- * "acme.com" or "server01.acme.com".
- *
- * Does not check for risky public suffixes (those produce warnings, not errors).
+ * Validate a TLD string. Returns an error message if invalid, or null if OK.
+ * Does not check for risky TLDs (those produce warnings, not errors).
  */
 export function validateTld(tld: string): string | null {
-  if (!tld) return "suffix cannot be empty";
-  if (tld.startsWith(".") || tld.endsWith(".")) {
-    return `Invalid suffix "${tld}": must not start or end with a dot`;
-  }
-  if (tld.includes("..")) {
-    return `Invalid suffix "${tld}": consecutive dots are not allowed`;
+  if (!tld) return "TLD cannot be empty";
+  if (tld.length > 253) {
+    return `Invalid TLD "${tld}": exceeds 253-character DNS limit`;
   }
 
+  const labelRe = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
   const labels = tld.split(".");
   for (const label of labels) {
-    const labelError = validateDomainLabel(label);
-    if (labelError) {
-      return `Invalid suffix "${tld}": ${labelError}`;
+    if (!label) {
+      return `Invalid TLD "${tld}": labels cannot be empty`;
+    }
+    if (label.length > 63) {
+      return `Invalid TLD "${tld}": label "${label}" exceeds 63-character DNS limit`;
+    }
+    if (!labelRe.test(label)) {
+      return `Invalid TLD "${tld}": labels must contain only lowercase letters, digits, and interior hyphens`;
     }
   }
 
   return null;
 }
 
-/** Return the terminal public suffix label of a configured suffix. */
-export function getRiskyTld(tld: string): string | undefined {
-  return tld.split(".").at(-1);
-}
-
 /** Name of the file that stores the proxy's active TLD. */
 const TLD_FILE = "proxy.tld";
+const TLDS_FILE = "proxy.tlds";
 
-/** Read the TLD from a state directory. Returns DEFAULT_TLD if absent. */
-export function readTldFromDir(dir: string): string {
+/** Parse a comma-separated suffix list and remove duplicates in order. */
+export function parseTldList(value: string, source = "TLD"): string[] {
+  const trimmed = value.trim();
+  if (!trimmed) return [];
+
+  const tlds: string[] = [];
+  const seen = new Set<string>();
+  for (const rawPart of trimmed.split(",")) {
+    const tld = rawPart.trim().toLowerCase();
+    const err = validateTld(tld);
+    if (err) throw new Error(source === "TLD" ? err : `${source}: ${err}`);
+    if (!seen.has(tld)) {
+      seen.add(tld);
+      tlds.push(tld);
+    }
+  }
+  return tlds;
+}
+
+function readLegacyTldFromDir(dir: string): string {
   try {
     const raw = fs.readFileSync(path.join(dir, TLD_FILE), "utf-8").trim();
-    return raw || DEFAULT_TLD;
+    if (!raw) return DEFAULT_TLD;
+
+    const error = validateTld(raw);
+    if (error) {
+      console.warn(`Warning: ignoring invalid TLD entry in ${TLD_FILE}: ${error}`);
+      return DEFAULT_TLD;
+    }
+
+    return raw;
   } catch {
     return DEFAULT_TLD;
   }
 }
 
-/** Write or remove the TLD file in the state directory. */
-export function writeTldFile(dir: string, tld: string): void {
-  const filePath = path.join(dir, TLD_FILE);
-  if (tld === DEFAULT_TLD) {
+/** Read all persisted suffixes, falling back to the compatibility marker. */
+export function readTldsFromDir(dir: string): string[] {
+  try {
+    const raw = fs.readFileSync(path.join(dir, TLDS_FILE), "utf-8").trim();
+    const parsed = raw.startsWith("[")
+      ? JSON.parse(raw)
+      : raw
+          .split(/\r?\n/)
+          .flatMap((line) => line.split(","))
+          .map((line) => line.trim())
+          .filter(Boolean);
+    if (!Array.isArray(parsed)) return [readLegacyTldFromDir(dir)];
+
+    const tlds: string[] = [];
+    const seen = new Set<string>();
+    for (const value of parsed) {
+      if (typeof value !== "string") continue;
+      try {
+        for (const tld of parseTldList(value)) {
+          if (!seen.has(tld)) {
+            seen.add(tld);
+            tlds.push(tld);
+          }
+        }
+      } catch (err) {
+        console.warn(
+          `Warning: ignoring invalid TLD entry in ${TLDS_FILE}: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
+    return tlds.length > 0 ? tlds : [DEFAULT_TLD];
+  } catch {
+    return [readLegacyTldFromDir(dir)];
+  }
+}
+
+/** Read the primary persisted suffix. */
+export function readTldFromDir(dir: string): string {
+  return readTldsFromDir(dir)[0] ?? DEFAULT_TLD;
+}
+
+/** Persist all suffixes and retain proxy.tld as the primary compatibility marker. */
+export function writeTldsFile(dir: string, tlds: readonly string[]): void {
+  const uniqueTlds = [...new Set(tlds.length > 0 ? tlds : [DEFAULT_TLD])];
+  const tldsPath = path.join(dir, TLDS_FILE);
+  const tldPath = path.join(dir, TLD_FILE);
+  if (uniqueTlds.length === 1 && uniqueTlds[0] === DEFAULT_TLD) {
     try {
-      fs.unlinkSync(filePath);
+      fs.unlinkSync(tldsPath);
+    } catch {
+      // File may already be absent; non-fatal
+    }
+    try {
+      fs.unlinkSync(tldPath);
     } catch {
       // File may already be absent; non-fatal
     }
   } else {
-    fs.writeFileSync(filePath, tld, { mode: 0o644 });
+    fs.writeFileSync(tldsPath, `${uniqueTlds.join("\n")}\n`, { mode: 0o644 });
+    fs.writeFileSync(tldPath, uniqueTlds[0] ?? DEFAULT_TLD, { mode: 0o644 });
   }
+}
+
+/** Write or remove a single suffix through the compatibility API. */
+export function writeTldFile(dir: string, tld: string): void {
+  writeTldsFile(dir, [tld]);
 }
 
 export function getConfiguredTldEnv(): {
@@ -367,7 +563,7 @@ export function getConfiguredTldEnv(): {
 }
 
 export function hasConfiguredTldEnv(): boolean {
-  return process.env[SUFFIX_ENV] !== undefined || process.env[LEGACY_TLD_ENV] !== undefined;
+  return getConfiguredTldEnv() !== null;
 }
 
 /**
@@ -376,11 +572,15 @@ export function hasConfiguredTldEnv(): boolean {
  * ("localhost"). Throws on invalid values.
  */
 export function getDefaultTld(): string {
+  return getDefaultTlds()[0] ?? DEFAULT_TLD;
+}
+
+/** Return the effective suffix list using fork precedence and validation. */
+export function getDefaultTlds(): string[] {
   const configured = getConfiguredTldEnv();
-  if (!configured) return DEFAULT_TLD;
-  const err = validateTld(configured.value);
-  if (err) throw new Error(`${configured.source}: ${err}`);
-  return configured.value;
+  if (!configured) return [DEFAULT_TLD];
+  const tlds = parseTldList(configured.value, configured.source);
+  return tlds.length > 0 ? tlds : [DEFAULT_TLD];
 }
 
 /**
@@ -430,6 +630,7 @@ export function readPersistedProxyState(): {
   port: number;
   tls: boolean;
   tld: string;
+  tlds: string[];
   lanMode: boolean;
   useWildcard: boolean;
 } | null {
@@ -437,10 +638,10 @@ export function readPersistedProxyState(): {
   const port = readPortFromDir(dir);
   if (port !== null) {
     const tls = readTlsMarker(dir);
-    const tld = readTldFromDir(dir);
-    const lanIp = readLanMarker(dir);
+    const tlds = readTldsFromDir(dir);
+    const tld = tlds[0] ?? DEFAULT_TLD;
     const useWildcard = readWildcardMarker(dir);
-    return { port, tls, tld, lanMode: lanIp !== null || tld === "local", useWildcard };
+    return { port, tls, tld, tlds, lanMode: hasLanMarker(dir), useWildcard };
   }
 
   return null;
@@ -480,13 +681,24 @@ export function buildProxyStartConfig(options: {
   lanIp?: string | null;
   lanIpExplicit?: boolean;
   tld: string;
+  tlds?: string[];
+  tldsExplicit?: boolean;
   useWildcard?: boolean;
   foreground?: boolean;
   includePort?: boolean;
   proxyPort?: number;
   skipTrust?: boolean;
-}): { effectiveTld: string; args: string[] } {
-  const effectiveTld = options.lanMode ? "local" : options.tld;
+  routesCleanupIntervalSeconds?: number;
+}): { effectiveTld: string; effectiveTlds: string[]; args: string[] } {
+  const requestedTlds = [...new Set(options.tlds?.length ? options.tlds : [options.tld])];
+  const effectiveTlds = options.lanMode
+    ? options.tldsExplicit
+      ? requestedTlds.includes("local")
+        ? requestedTlds
+        : [...requestedTlds, "local"]
+      : ["local"]
+    : requestedTlds;
+  const effectiveTld = effectiveTlds[0] ?? DEFAULT_TLD;
   const args: string[] = [];
 
   if (options.foreground) {
@@ -509,6 +721,9 @@ export function buildProxyStartConfig(options: {
 
   if (options.lanMode) {
     args.push("--lan");
+    if (options.tldsExplicit) {
+      for (const tld of effectiveTlds) args.push("--suffix", tld);
+    }
     if (options.lanIp) {
       if (options.lanIpExplicit) {
         args.push("--ip", options.lanIp);
@@ -516,8 +731,8 @@ export function buildProxyStartConfig(options: {
         args.push(INTERNAL_LAN_IP_FLAG, options.lanIp);
       }
     }
-  } else if (effectiveTld !== DEFAULT_TLD) {
-    args.push("--suffix", effectiveTld);
+  } else if (options.tldsExplicit || effectiveTlds.length > 1 || effectiveTld !== DEFAULT_TLD) {
+    for (const tld of effectiveTlds) args.push("--suffix", tld);
   }
 
   if (options.useWildcard) {
@@ -528,7 +743,11 @@ export function buildProxyStartConfig(options: {
     args.push("--skip-trust");
   }
 
-  return { effectiveTld, args };
+  if (options.routesCleanupIntervalSeconds !== undefined) {
+    args.push("--routes-cleanup-interval", options.routesCleanupIntervalSeconds.toString());
+  }
+
+  return { effectiveTld, effectiveTlds, args };
 }
 
 /**
@@ -542,6 +761,7 @@ export async function discoverState(): Promise<{
   port: number;
   tls: boolean;
   tld: string;
+  tlds: string[];
   lanMode: boolean;
   lanIp: string | null;
 }> {
@@ -552,8 +772,9 @@ export async function discoverState(): Promise<{
     const lanIp = readLanMarker(dir);
     if ((await isProxyRunning(port)) || (await isPortListening(port))) {
       const tls = readTlsMarker(dir);
-      const tld = readTldFromDir(dir);
-      return { dir, port, tls, tld, lanMode: lanIp !== null || tld === "local", lanIp };
+      const tlds = readTldsFromDir(dir);
+      const tld = tlds[0] ?? DEFAULT_TLD;
+      return { dir, port, tls, tld, tlds, lanMode: hasLanMarker(dir), lanIp };
     }
 
     return {
@@ -561,7 +782,8 @@ export async function discoverState(): Promise<{
       port,
       tls: readTlsMarker(dir),
       tld: getConfiguredTldEnv() ? getDefaultTld() : readTldFromDir(dir),
-      lanMode: lanIp !== null,
+      tlds: getConfiguredTldEnv() ? getDefaultTlds() : readTldsFromDir(dir),
+      lanMode: hasLanMarker(dir),
       lanIp: null,
     };
   }
@@ -574,14 +796,16 @@ export async function discoverState(): Promise<{
     // avoids TLS handshake timeouts that can cause false negatives.
     if (await isProxyRunning(userPort)) {
       const tls = readTlsMarker(USER_STATE_DIR);
-      const tld = readTldFromDir(USER_STATE_DIR);
+      const tlds = readTldsFromDir(USER_STATE_DIR);
+      const tld = tlds[0] ?? DEFAULT_TLD;
       const lanIp = readLanMarker(USER_STATE_DIR);
       return {
         dir: USER_STATE_DIR,
         port: userPort,
         tls,
         tld,
-        lanMode: lanIp !== null || tld === "local",
+        tlds,
+        lanMode: hasLanMarker(USER_STATE_DIR),
         lanIp,
       };
     }
@@ -593,14 +817,16 @@ export async function discoverState(): Promise<{
   if (legacyPort !== null) {
     if (await isProxyRunning(legacyPort)) {
       const tls = readTlsMarker(LEGACY_SYSTEM_STATE_DIR);
-      const tld = readTldFromDir(LEGACY_SYSTEM_STATE_DIR);
+      const tlds = readTldsFromDir(LEGACY_SYSTEM_STATE_DIR);
+      const tld = tlds[0] ?? DEFAULT_TLD;
       const lanIp = readLanMarker(LEGACY_SYSTEM_STATE_DIR);
       return {
         dir: LEGACY_SYSTEM_STATE_DIR,
         port: legacyPort,
         tls,
         tld,
-        lanMode: lanIp !== null || tld === "local",
+        tlds,
+        lanMode: hasLanMarker(LEGACY_SYSTEM_STATE_DIR),
         lanIp,
       };
     }
@@ -618,9 +844,10 @@ export async function discoverState(): Promise<{
       // When the marker is missing, infer TLS from the port:
       // 443 is always HTTPS, 80 is always HTTP.
       const tls = markerTls || port === getProtocolPort(true);
-      const tld = readTldFromDir(dir);
+      const tlds = readTldsFromDir(dir);
+      const tld = tlds[0] ?? DEFAULT_TLD;
       const lanIp = readLanMarker(dir);
-      return { dir, port, tls, tld, lanMode: lanIp !== null || tld === "local", lanIp };
+      return { dir, port, tls, tld, tlds, lanMode: hasLanMarker(dir), lanIp };
     }
   }
 
@@ -630,7 +857,8 @@ export async function discoverState(): Promise<{
     port: configuredPort,
     tls: readTlsMarker(dir),
     tld: readTldFromDir(dir),
-    lanMode: readLanMarker(dir) !== null,
+    tlds: readTldsFromDir(dir),
+    lanMode: hasLanMarker(dir),
     lanIp: null,
   };
 }
@@ -733,6 +961,76 @@ export function isProxyRunning(port: number, tls = false): Promise<boolean> {
     });
     req.end();
   });
+}
+
+/** Display text shared by every post-registration resolution warning. */
+export function hostsUnresolvedMessage(hostnames: string[]): string {
+  return `${hostnames.join(", ")} will not resolve. Run: portless hosts sync`;
+}
+
+/** Maximum time to wait for the daemon's routes watcher to publish its block. */
+export const HOSTS_SYNC_POLL_CEILING_MS = 3500;
+const HOSTS_SYNC_POLL_INTERVAL_MS = 100;
+
+/**
+ * Wait for the daemon to publish the managed hosts block, then check each
+ * hostname once through the system resolver. Polling the block avoids repeated
+ * resolver calls, which can preserve a negative DNS result after the block is
+ * written.
+ */
+export async function reportHostsSync(
+  hostnames: string[],
+  lanMode: boolean,
+  onWarn: (message: string) => void,
+  resolves: (hostname: string) => Promise<boolean> = checkHostResolution,
+  readManaged: () => string[] = getManagedHostnames,
+  ceilingMs = HOSTS_SYNC_POLL_CEILING_MS,
+  sleep: (delayMs: number) => Promise<void> = (delayMs) =>
+    new Promise<void>((resolve) => setTimeout(resolve, delayMs))
+): Promise<void> {
+  const uniqueHostnames = [...new Set(hostnames)];
+  const checkedHostnames = lanMode
+    ? uniqueHostnames.filter((hostname) => !hostname.endsWith(".local"))
+    : uniqueHostnames;
+  if (checkedHostnames.length === 0) return;
+
+  if (!shouldAutoSyncHosts(process.env.PORTLESS_SYNC_HOSTS)) {
+    const results = await Promise.all(checkedHostnames.map((hostname) => resolves(hostname)));
+    const unresolved = checkedHostnames.filter((_, index) => !results[index]);
+    if (unresolved.length > 0) onWarn(hostsUnresolvedMessage(unresolved));
+    return;
+  }
+
+  const deadline = Date.now() + Math.max(0, ceilingMs);
+  while (true) {
+    const managed = new Set(readManaged());
+    if (checkedHostnames.every((hostname) => managed.has(hostname))) break;
+
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await sleep(Math.min(HOSTS_SYNC_POLL_INTERVAL_MS, remaining));
+  }
+
+  const results = await Promise.all(checkedHostnames.map((hostname) => resolves(hostname)));
+  const unresolved = checkedHostnames.filter((_, index) => !results[index]);
+  if (unresolved.length > 0) onWarn(hostsUnresolvedMessage(unresolved));
+}
+
+/**
+ * Sync the daemon's hosts block and latch only non-empty failures. A successful
+ * sync re-arms the warning, while an empty route warm-up cannot spend it.
+ */
+export function syncHostsWithWarning(
+  hostnames: string[],
+  alreadyWarned: boolean,
+  onWarn: () => void,
+  sync: (hostnames: string[]) => boolean = syncHostsFile
+): boolean {
+  const uniqueHostnames = [...new Set(hostnames)];
+  if (sync(uniqueHostnames)) return false;
+  if (uniqueHostnames.length === 0) return alreadyWarned;
+  if (!alreadyWarned) onWarn();
+  return true;
 }
 
 /** Check whether any process is listening on the given port on loopback. */
@@ -924,9 +1222,66 @@ export function resolveWindowsExecutable(cmd: string, pathStr: string): string |
   return null;
 }
 
-export function quoteWindowsCmdArg(arg: string): string {
-  if (!/[\s"&|<>^()%!]/.test(arg)) return arg;
-  return `"${arg.replace(/"/g, '\\"')}"`;
+/** cmd.exe metacharacters that require caret-escaping. */
+const CMD_META_CHARS = /([()\][%!^"\x60<>&|;, *?])/g;
+
+/**
+ * Arguments matching this need no escaping for cmd.exe: non-empty, no
+ * whitespace, no quotes, and no cmd metacharacters. `=` is deliberately
+ * allowed, because cmd only treats it specially in the command token, not in
+ * arguments.
+ */
+const CMD_SAFE_ARG = /^[^\s()\][%!^"\x60<>&|;,*?]+$/;
+
+/**
+ * Quote a string per Windows argv rules in a single linear scan. A quote
+ * preceded by N backslashes becomes 2N+1 backslashes plus an escaped quote,
+ * and N trailing backslashes, which precede the closing quote we append,
+ * become 2N. A regex implementation can backtrack quadratically on long
+ * backslash runs, so the scan stays deliberately linear.
+ */
+function windowsArgvQuote(arg: string): string {
+  let out = "";
+  let backslashes = 0;
+  for (const ch of arg) {
+    if (ch === "\\") {
+      backslashes++;
+      continue;
+    }
+    if (ch === '"') {
+      out += "\\".repeat(2 * backslashes + 1) + '"';
+    } else {
+      out += "\\".repeat(backslashes) + ch;
+    }
+    backslashes = 0;
+  }
+  return '"' + out + "\\".repeat(2 * backslashes) + '"';
+}
+
+/**
+ * Escape a string so cmd.exe passes it to the child as a single literal
+ * argument. Safe arguments stay bare because cmd built-ins print added quotes
+ * literally. Other arguments use Windows argv quoting followed by caret
+ * escaping of cmd.exe metacharacters, including the quote characters.
+ */
+export function cmdEscape(arg: string): string {
+  if (CMD_SAFE_ARG.test(arg)) return arg;
+  return windowsArgvQuote(arg).replace(CMD_META_CHARS, "^$1");
+}
+
+/**
+ * Escape the command token of a cmd.exe command line. Bare PATH-resolved
+ * names stay unquoted so %~dp0 continues to resolve correctly in package
+ * manager shims. Resolved paths containing whitespace or other command-token
+ * metacharacters use plain quotes. Caret-escaping percent signs is required
+ * in both forms because quotes do not suppress %VAR% expansion.
+ */
+export function cmdEscapeCommand(command: string): string {
+  const escapedPercent = command.replace(/%/g, "^%");
+  if (/[\s()\][!^"\x60<>&|;,=*?]/.test(command)) {
+    return '"' + escapedPercent + '"';
+  }
+  return escapedPercent;
 }
 
 export interface WindowsCommandInvocation {
@@ -947,7 +1302,13 @@ export function resolveWindowsCommandInvocation(
   if (ext === ".cmd" || ext === ".bat") {
     return {
       command: "cmd.exe",
-      args: ["/d", "/s", "/c", [resolved, ...args].map(quoteWindowsCmdArg).join(" ")],
+      args: [
+        "/d",
+        "/v:off",
+        "/s",
+        "/c",
+        '"' + [cmdEscapeCommand(resolved), ...args.map(cmdEscape)].join(" ") + '"',
+      ],
       windowsVerbatimArguments: true,
     };
   }
@@ -1007,8 +1368,9 @@ export function spawnCommand(
 
     const ext = path.extname(resolved).toLowerCase();
     if (ext === ".cmd" || ext === ".bat") {
-      const cmdline = [resolved, ...commandArgs.slice(1)].map(quoteWindowsCmdArg).join(" ");
-      child = spawn("cmd.exe", ["/d", "/s", "/c", cmdline], {
+      const cmdline =
+        '"' + [cmdEscapeCommand(resolved), ...commandArgs.slice(1).map(cmdEscape)].join(" ") + '"';
+      child = spawn("cmd.exe", ["/d", "/v:off", "/s", "/c", cmdline], {
         stdio: "inherit",
         env,
         windowsVerbatimArguments: true,
@@ -1079,45 +1441,146 @@ export function spawnCommand(
 // ---------------------------------------------------------------------------
 
 /**
- * Frameworks that ignore the `PORT` env var. Maps command basename to the
- * flags needed. `strictPort` indicates whether `--strictPort` is supported
- * (prevents the framework from silently picking a different port). `hostFlag`
- * overrides the bind-address flag when a framework uses another name.
- *
- * SvelteKit is not listed because its dev server is Vite under the hood,
- * so the `vite` entry already covers it.
+ * Frameworks that ignore the `PORT` env var. `serverSubcommands` lists the
+ * subcommands that accept the injected flags, while `defaultIsServer` marks a
+ * bare invocation that starts a server. Unknown commands are left untouched
+ * because framework CLIs commonly reject server flags on build and inspection
+ * commands.
  */
-const FRAMEWORKS_NEEDING_PORT: Record<string, { strictPort: boolean; hostFlag?: string }> = {
-  vite: { strictPort: true },
-  vp: { strictPort: true },
-  vitepress: { strictPort: true },
-  "react-router": { strictPort: true },
-  rsbuild: { strictPort: false },
-  astro: { strictPort: false },
-  ng: { strictPort: false },
-  "laravel-artisan": { strictPort: false },
-  "react-native": { strictPort: false },
-  expo: { strictPort: false },
-  wrangler: { strictPort: false, hostFlag: "--ip" },
+type FrameworkSpec = {
+  strictPort: boolean;
+  hostFlag?: string;
+  serverSubcommands: string[];
+  nonServerSubcommands?: string[];
+  defaultIsServer: boolean;
+  positionalRootIsServer?: boolean;
+  valueFlags?: string[];
+};
+
+const FRAMEWORKS_NEEDING_PORT: Record<string, FrameworkSpec> = {
+  vite: {
+    strictPort: true,
+    serverSubcommands: ["dev", "serve", "preview"],
+    nonServerSubcommands: ["build", "optimize"],
+    defaultIsServer: true,
+    positionalRootIsServer: true,
+    valueFlags: [
+      "--assetsDir",
+      "--assetsInlineLimit",
+      "--base",
+      "--configLoader",
+      "--host",
+      "--manifest",
+      "--minify",
+      "--open",
+      "--outDir",
+      "--port",
+      "--sourcemap",
+      "--ssr",
+      "--ssrManifest",
+      "--target",
+      "-c",
+      "--config",
+      "-d",
+      "--debug",
+      "-f",
+      "--filter",
+      "-l",
+      "--logLevel",
+      "-m",
+      "--mode",
+    ],
+  },
+  vp: { strictPort: true, serverSubcommands: ["dev"], defaultIsServer: false },
+  vitepress: {
+    strictPort: true,
+    serverSubcommands: ["dev", "preview"],
+    defaultIsServer: false,
+  },
+  "react-router": { strictPort: true, serverSubcommands: ["dev"], defaultIsServer: false },
+  rsbuild: {
+    strictPort: false,
+    serverSubcommands: ["dev", "preview"],
+    defaultIsServer: true,
+    valueFlags: [
+      "--base",
+      "--config-loader",
+      "--dist-path",
+      "--env-dir",
+      "--env-mode",
+      "--environment",
+      "--host",
+      "--log-level",
+      "--output",
+      "--port",
+      "-c",
+      "--config",
+      "-m",
+      "--mode",
+      "-o",
+      "--open",
+      "-r",
+      "--root",
+    ],
+  },
+  astro: { strictPort: false, serverSubcommands: ["dev", "preview"], defaultIsServer: false },
+  ng: {
+    strictPort: false,
+    serverSubcommands: ["serve", "dev", "s"],
+    defaultIsServer: false,
+  },
+  "laravel-artisan": {
+    strictPort: false,
+    serverSubcommands: [],
+    defaultIsServer: true,
+  },
+  "react-native": { strictPort: false, serverSubcommands: ["start"], defaultIsServer: false },
+  expo: {
+    strictPort: false,
+    serverSubcommands: ["start", "serve"],
+    defaultIsServer: true,
+  },
+  wrangler: {
+    strictPort: false,
+    hostFlag: "--ip",
+    serverSubcommands: ["dev"],
+    defaultIsServer: false,
+  },
+};
+
+type PackageRunnerSpec = {
+  subcommands: string[];
+  valueFlags?: string[];
 };
 
 /** Known package runners. Values list subcommands that run a package. */
-const PACKAGE_RUNNERS: Record<string, string[]> = {
-  npm: ["exec"],
-  npx: [],
-  bunx: [],
+const PACKAGE_RUNNERS: Record<string, PackageRunnerSpec> = {
+  npm: { subcommands: ["exec"], valueFlags: ["-p", "--package"] },
+  npx: {
+    subcommands: [],
+    valueFlags: ["-c", "--call", "-p", "--package", "-w", "--workspace", "--allow-scripts"],
+  },
+  bunx: { subcommands: [] },
   // `bun <bin>` and `bun run <bin>` can both execute framework CLIs.
-  bun: ["run"],
-  pnpx: [],
-  yarn: ["dlx", "exec"],
-  pnpm: ["dlx", "exec"],
+  bun: { subcommands: ["run"] },
+  pnpx: { subcommands: [], valueFlags: ["-p", "--package"] },
+  yarn: { subcommands: ["dlx", "exec"] },
+  pnpm: { subcommands: ["dlx", "exec"] },
+};
+
+type FrameworkInvocation = {
+  basename: string;
+  framework: FrameworkSpec;
+  frameworkIndex: number;
+  frameworkArgs: string[];
+  insertionIndex: number;
 };
 
 /**
- * Find the basename of the framework command inside `commandArgs`, looking
- * past known package runners (npx, bunx, yarn dlx, …) and their flags.
+ * Find the framework command inside `commandArgs`, looking past known package
+ * runners and preserving the insertion point before a framework `--` marker.
  */
-function findFrameworkBasename(commandArgs: string[]): string | null {
+function parseFrameworkInvocation(commandArgs: string[]): FrameworkInvocation | null {
   if (commandArgs.length === 0) return null;
 
   const first = path.basename(commandArgs[0]);
@@ -1126,34 +1589,107 @@ function findFrameworkBasename(commandArgs: string[]): string | null {
     path.basename(commandArgs[1] ?? "") === "artisan" &&
     commandArgs[2] === "serve"
   ) {
-    return "laravel-artisan";
+    const framework = FRAMEWORKS_NEEDING_PORT["laravel-artisan"]!;
+    const frameworkIndex = 2;
+    const optionEnd = commandArgs.indexOf("--", frameworkIndex + 1);
+    const insertionIndex = optionEnd === -1 ? commandArgs.length : optionEnd;
+    return {
+      basename: "laravel-artisan",
+      framework,
+      frameworkIndex,
+      frameworkArgs: commandArgs.slice(frameworkIndex + 1, insertionIndex),
+      insertionIndex,
+    };
   }
 
-  if (FRAMEWORKS_NEEDING_PORT[first]) return first;
+  let frameworkIndex: number | null = FRAMEWORKS_NEEDING_PORT[first] ? 0 : null;
 
-  const subcommands = PACKAGE_RUNNERS[first];
-  if (!subcommands) return null;
+  if (frameworkIndex === null) {
+    const runner = PACKAGE_RUNNERS[first];
+    if (!runner) return null;
 
-  let i = 1;
+    let i = 1;
+    const skipRunnerOptions = () => {
+      while (i < commandArgs.length && commandArgs[i]!.startsWith("-")) {
+        const option = commandArgs[i]!;
+        i++;
+        if (option === "--") break;
+        if (!option.includes("=") && runner.valueFlags?.includes(option)) i++;
+      }
+    };
 
-  if (subcommands.length > 0) {
-    // Skip flags before the subcommand
-    while (i < commandArgs.length && commandArgs[i].startsWith("-")) i++;
-    if (i >= commandArgs.length) return null;
-    if (!subcommands.includes(commandArgs[i])) {
-      // Not a recognized subcommand — might be an implicit bin (e.g. `yarn vite`)
-      const name = path.basename(commandArgs[i]);
-      return FRAMEWORKS_NEEDING_PORT[name] ? name : null;
+    if (runner.subcommands.length > 0) {
+      skipRunnerOptions();
+      if (i >= commandArgs.length) return null;
+      if (!runner.subcommands.includes(commandArgs[i]!)) {
+        const name = path.basename(commandArgs[i]!);
+        frameworkIndex = FRAMEWORKS_NEEDING_PORT[name] ? i : null;
+      } else {
+        i++;
+      }
     }
-    i++;
+
+    if (frameworkIndex === null) {
+      skipRunnerOptions();
+      if (i >= commandArgs.length) return null;
+      const name = path.basename(commandArgs[i]!);
+      frameworkIndex = FRAMEWORKS_NEEDING_PORT[name] ? i : null;
+    }
   }
 
-  // Skip runner flags (e.g. `--bun`, `--yes`)
-  while (i < commandArgs.length && commandArgs[i].startsWith("-")) i++;
+  if (frameworkIndex === null) return null;
+  const basename = path.basename(commandArgs[frameworkIndex]!);
+  const framework = FRAMEWORKS_NEEDING_PORT[basename];
+  if (!framework) return null;
+  const optionEnd = commandArgs.indexOf("--", frameworkIndex + 1);
+  const insertionIndex = optionEnd === -1 ? commandArgs.length : optionEnd;
+  return {
+    basename,
+    framework,
+    frameworkIndex,
+    frameworkArgs: commandArgs.slice(frameworkIndex + 1, insertionIndex),
+    insertionIndex,
+  };
+}
 
-  if (i >= commandArgs.length) return null;
-  const name = path.basename(commandArgs[i]);
-  return FRAMEWORKS_NEEDING_PORT[name] ? name : null;
+function findFrameworkBasename(commandArgs: string[]): string | null {
+  return parseFrameworkInvocation(commandArgs)?.basename ?? null;
+}
+
+/**
+ * Return framework positionals while consuming known flag values. This keeps
+ * a value such as `production` from being mistaken for a build subcommand.
+ */
+function frameworkPositionals(args: string[], framework: FrameworkSpec): string[] | null {
+  const positionals: string[] = [];
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === "--") break;
+    if (!arg.startsWith("-")) {
+      positionals.push(arg);
+      continue;
+    }
+    if (arg.includes("=")) continue;
+    if (framework.valueFlags?.includes(arg)) {
+      i++;
+      continue;
+    }
+    if (!framework.valueFlags && positionals.length === 0) return null;
+  }
+
+  return positionals;
+}
+
+function invokesFrameworkServer(frameworkArgs: string[], framework: FrameworkSpec): boolean {
+  const positionals = frameworkPositionals(frameworkArgs, framework);
+  if (positionals === null) return false;
+
+  const [subcommand] = positionals;
+  if (subcommand === undefined) return framework.defaultIsServer;
+  if (framework.serverSubcommands.includes(subcommand)) return true;
+  if (framework.nonServerSubcommands?.includes(subcommand)) return false;
+  return framework.positionalRootIsServer === true;
 }
 
 const PLACEHOLDERS = ["{PORT}", "{HOST}", "{PORTLESS_URL}"] as const;
@@ -1200,28 +1736,153 @@ export function replacePlaceholders(commandArgs: string[], vars: PlaceholderVars
  * HMR WebSocket to degrade. Outside LAN mode, `--host localhost` keeps the
  * server local.
  */
-export function injectFrameworkFlags(commandArgs: string[], port: number): void {
-  const basename = findFrameworkBasename(commandArgs);
-  if (!basename) return;
+export function injectFrameworkFlags(commandArgs: string[], port: number): string[] {
+  const invocation = parseFrameworkInvocation(commandArgs);
+  if (!invocation) return [];
+  const { basename, framework, frameworkArgs, insertionIndex } = invocation;
 
-  const framework = FRAMEWORKS_NEEDING_PORT[basename];
+  if (!invokesFrameworkServer(frameworkArgs, framework)) return [];
 
-  if (!commandArgs.includes("--port")) {
-    commandArgs.push("--port", port.toString());
-    if (framework.strictPort) {
-      commandArgs.push("--strictPort");
-    }
+  const flags: string[] = [];
+  if (!hasCliOption(frameworkArgs, "--port")) {
+    flags.push("--port", port.toString());
+    if (framework.strictPort) flags.push("--strictPort");
   }
 
   const hostFlag = framework.hostFlag ?? "--host";
-  if (!commandArgs.includes(hostFlag)) {
-    // In LAN mode, let Expo use its default (LAN) — injecting --host alongside
-    // HOST=127.0.0.1 causes Metro's HMR WebSocket to break after a few reloads.
+  const hasHostChoice =
+    hasCliOption(frameworkArgs, hostFlag) ||
+    (basename === "expo" &&
+      ["--localhost", "--lan", "--tunnel"].some((option) => hasCliOption(frameworkArgs, option)));
+  if (!hasHostChoice) {
     const isExpoLan = basename === "expo" && isLanEnvEnabled();
-    if (isExpoLan) return;
-    const hostValue = basename === "expo" ? "localhost" : "127.0.0.1";
-    commandArgs.push(hostFlag, hostValue);
+    if (!isExpoLan) {
+      flags.push(hostFlag, basename === "expo" ? "localhost" : "127.0.0.1");
+    }
   }
+
+  commandArgs.splice(insertionIndex, 0, ...flags);
+  return flags;
+}
+
+/** Package managers whose `run` command delegates to package.json scripts. */
+const PACKAGE_SCRIPT_MANAGERS = new Set(["bun", "npm", "pnpm", "yarn"]);
+
+/**
+ * Return true when shell syntax means flags appended to the raw script would
+ * be sent to a different command or discarded by the shell.
+ */
+function isUnsafeToAppendArgs(command: string): boolean {
+  let inSingle = false;
+  let inDouble = false;
+  let escaped = false;
+  let atWordStart = true;
+  const chars = Array.from(command);
+
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i]!;
+    if (escaped) {
+      escaped = false;
+      if (ch === "\n" || ch === "\r") continue;
+      atWordStart = false;
+      continue;
+    }
+    if (ch === "\\" && !inSingle) {
+      escaped = true;
+      continue;
+    }
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      atWordStart = false;
+      continue;
+    }
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      atWordStart = false;
+      continue;
+    }
+    if (inSingle || inDouble) continue;
+
+    if (ch === ";" || ch === "\n" || ch === "\r" || ch === "|") return true;
+    if (ch === "#" && atWordStart) return true;
+    if (ch === "&") {
+      const prev = chars[i - 1];
+      const next = chars[i + 1];
+      if (prev === ">" && next !== undefined && /[0-9-]/.test(next)) continue;
+      return true;
+    }
+    atWordStart = ch === " " || ch === "\t";
+  }
+  return false;
+}
+
+function hasCliOption(args: string[], option: string): boolean {
+  return args.some((arg) => arg === option || arg.startsWith(`${option}=`));
+}
+
+function resolvePackageScriptTokens(commandArgs: string[], packageDir: string): string[] | null {
+  if (commandArgs.length < 3) return null;
+
+  const runner = path.basename(commandArgs[0]!);
+  if (!PACKAGE_SCRIPT_MANAGERS.has(runner)) return null;
+
+  const [, runSubcommand, scriptName] = commandArgs;
+  if (runSubcommand !== "run" || !scriptName || scriptName.startsWith("-")) return null;
+
+  return resolveScript(scriptName, packageDir);
+}
+
+function isSafeToInjectIntoScript(
+  scriptName: string,
+  rawScript: string[],
+  packageDir: string
+): boolean {
+  const rawScriptText = resolveScriptRaw(scriptName, packageDir);
+  if (rawScriptText && isUnsafeToAppendArgs(rawScriptText)) return false;
+  if (rawScript.includes("--")) return false;
+  return true;
+}
+
+/**
+ * Resolve the framework reached by a direct command, package runner, or one
+ * package-manager script indirection. This identity is intentionally separate
+ * from append safety so Expo's LAN environment carve-out still works when a
+ * script is deliberately left untouched.
+ */
+export function resolveFrameworkBasename(
+  commandArgs: string[],
+  packageDir: string = process.cwd()
+): string | null {
+  const direct = findFrameworkBasename(commandArgs);
+  if (direct) return direct;
+  const scriptTokens = resolvePackageScriptTokens(commandArgs, packageDir);
+  return scriptTokens ? findFrameworkBasename(scriptTokens) : null;
+}
+
+/**
+ * Forward framework flags through `<pm> run <script>` without changing the
+ * package manager's Windows spawn path. npm needs `--` before script args;
+ * Bun, pnpm, and yarn forward the appended args directly.
+ */
+export function injectPackageScriptFrameworkFlags(
+  commandArgs: string[],
+  port: number,
+  packageDir: string = process.cwd()
+): void {
+  const rawScript = resolvePackageScriptTokens(commandArgs, packageDir);
+  if (!rawScript) return;
+  const [, , scriptName] = commandArgs;
+  if (!scriptName || !isSafeToInjectIntoScript(scriptName, rawScript, packageDir)) return;
+
+  const userExtras = commandArgs.slice(3).filter((arg) => arg !== "--");
+  const probe = [...rawScript, ...userExtras];
+  const forwardedFlags = injectFrameworkFlags(probe, port);
+  if (forwardedFlags.length === 0) return;
+
+  if (path.basename(commandArgs[0]!) === "npm" && !commandArgs.includes("--")) {
+    commandArgs.push("--");
+  }
+  commandArgs.push(...forwardedFlags);
 }
 
 /**

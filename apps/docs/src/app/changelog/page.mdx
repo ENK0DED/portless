@@ -1,5 +1,88 @@
 # Changelog
 
+## 0.15.6002
+
+### Backport Batch
+
+- **Hosts and mDNS deduplication**: Same-hostname routes no longer create duplicate managed hosts-file lines or restart the mDNS publisher when only a backend port changes
+- **Atomic route persistence and cleanup**: `routes.json` writes now use atomic replacement, and a periodic stale-route sweep removes dead entries without terminating the process behind a route. Configure or disable it with `--routes-cleanup-interval` or `PORTLESS_ROUTES_CLEANUP_INTERVAL`
+- **Hostname resolution and LAN inference**: Registration warns when hostnames remain unresolvable, the daemon latches non-empty hosts-sync failures until recovery, and LAN mode follows the marker file even while its IP is temporarily unavailable
+- **Keep-alive backend connections**: Ordinary HTTP/1.1 forwarding now reuses capped loopback connections while upgrade, WebSocket, and HTTP/2 paths keep their existing connection handling
+- **Sharing hostnames in Vite**: Exact persisted Tailscale, ngrok, managed tunnel, and NetBird hostnames are added to Vite's allowed-hosts list across all sharing modes without introducing wildcards
+- **Linux and WSL CA trust guidance**: NixOS and unknown Linux distributions receive manual trust-store guidance instead of a silent Debian fallback, and WSL trust-state detection remains consistent across Linux and Windows stores
+- **Windows cmd.exe escaping security fix**: Hardened `.cmd` and `.bat` shim invocation against metacharacter injection through the shim path. The vulnerable path was reachable from `portless run … -- …` arguments and package scripts
+- **Flat worktree hostnames**: Opt-in flat worktree hostnames now use a shared prefix helper with collision hashing while preserving nested defaults
+- **Path-aware routing and configuration**: Adds strict path-prefix registration, raw-match verbatim forwarding, absolute-form handling, per-app `path` configuration, multi-app path splitting, and path-aware display output. During migration, now-invalid persisted path prefixes are removed from `routes.json` with a warning naming the `portless alias ... --path <valid-prefix>` re-registration command
+
+### Contributors
+
+- @enk0ded
+
+## 0.15.6001
+
+### Feature Batch
+
+- **Ordered suffix lists and LAN behavior**: `PORTLESS_SUFFIX` now supports ordered suffix lists with repeatable suffix flags, preserves explicit LAN suffix configuration, and publishes mDNS only for `.local` entries while routes, TLS, service, and state handling use the complete list
+- **Loopback-by-default binding**: Proxy and redirect listeners bind only to `127.0.0.1` and `::1` by default. LAN reachability now requires explicit `--lan`, which widens the listeners to all interfaces
+- **Tailscale hostname routing**: Exact persisted Tailscale Serve, Funnel, and Service hostnames now route to their matching apps while tunnel aliases remain strict
+- **Framework flag injection through package scripts**: Framework flags now pass safely through Bun, npm, pnpm, and yarn package scripts while preserving fork injectors, placeholders, and the Windows spawn design
+- **Residual WebSocket behaviors**: Cleartext HTTP/1.1 WebSocket upgrades on the TLS port now use strict route handling, and malformed backend handshakes return 502 instead of silently destroying the socket
+- **Fork-aware `portless doctor`**: The read-only diagnostics command now covers fork state including suffixes, bind scope, sudo handoff, CA trust, hosts and mDNS, background apps, and tunnel, Tailscale, and NetBird readiness
+
+## 0.15.6000
+
+### Fork Sync
+
+- **Upstream v0.15 sync**: Merges upstream v0.15.0 through v0.15.5 at `326e893`, including `portless doctor`, multi-TLD proxy support, loopback-only binding, sudo state and Windows/WSL CA trust, Tailscale hostname routing, IPv6 loopback dialing, worktree prefixes, RFC 8441 WebSocket proxying, multi-segment custom TLD validation, package-manager script flag injection, and the Windows service timeout fix
+- **Fork release mapping**: Tracks upstream `0.15.5` as `0.15.6000` for `@enk0ded/portless` and reserves `0.15.6001` for the feature batch that follows this merge
+- **Fork package identity**: Keeps the npm package under `@enk0ded/portless` while preserving the `portless` CLI command
+- **Bun workspace policy**: Keeps Bun as the repository package manager and preserves the fork's package, documentation, and workflow invariants
+
+## 0.15.5
+
+### Bug Fixes
+
+- **Multi-segment custom TLDs**: `--tld` and `PORTLESS_TLD` now accept dotted DNS names such as `dev.example.com`, so local URLs can mirror production structure. Validation checks per-label DNS rules and the 253-character total limit, and overlapping TLDs resolve by longest match
+- **WebSocket over HTTP/2**: Proxy now advertises RFC 8441 extended CONNECT and bridges WebSocket streams to an HTTP/1.1 upgrade against the backend, fixing dev server HMR for browsers that negotiate h2 over ALPN. Plain-HTTP upgrades on the TLS port are proxied instead of dropped
+
+## 0.15.4
+
+### Bug Fixes
+
+- **Loopback-only proxy binding**: Outside LAN mode, the proxy and HTTP redirect listeners now bind only to `127.0.0.1` and `::1`, so Portless routes cannot be reached through LAN, VPN, or other network interfaces. LAN mode still binds to all interfaces explicitly
+
+## 0.15.3
+
+### Bug Fixes
+
+- **State directory under sudo**: Portless now resolves per-user state from the original sudo user's home, so an elevated proxy and unprivileged app processes share the same routes instead of writing to separate state directories
+- **Windows and WSL CA trust**: On WSL, `portless trust` now installs the local CA in both Linux and Windows trust stores, while `portless clean` removes the exact certificate from both. Failed trust-store cleanup preserves the CA identity for safe retries, including on native Windows
+
+## 0.15.2
+
+### Bug Fixes
+
+- **Tailscale funnel routing**: Proxy now routes requests addressed to a route's Tailscale funnel or serve hostname, so `--funnel` and `--tailscale` apps reached at `<device>.ts.net` no longer return a 404, including when several apps share one hostname on different ports
+- **IPv6-only dev servers return 502**: Proxy now dials upstreams over both loopback families, fixing 502s when a dev server binds `::1` only, such as Vite on Node 17+
+- **Worktree prefix in multi-app mode**: Bare `portless` in a monorepo worktree now applies the branch prefix in multi-app mode as it already did for single apps, so hostnames no longer collide across worktrees
+
+## 0.15.1
+
+### New Features
+
+- **Multi-TLD proxy support**: `--tld` is now repeatable and `PORTLESS_TLD` accepts comma separated values, so one proxy can serve the same app names across multiple TLDs. Routes, TLS, service state, hosts sync, framework environment, and workspace launches now use the full configured TLD list
+
+## 0.15.0
+
+### New Features
+
+- **`portless doctor`**: New read only diagnostics command checks Node.js, the state directory, proxy liveness, route entries, hostname resolution, HTTPS CA trust, and LAN prerequisites, then prints suggested fixes
+
+### Bug Fixes
+
+- **HTTP/2 Host forwarding**: Proxy now forwards HTTP/2 `:authority` as `Host` to HTTP/1.1 backends, fixing apps that depend on Host and previously saw `127.0.0.1` for browser traffic
+- **`--force` takeover cleanup**: Exit cleanup now removes only routes still owned by the exiting process, so a forced takeover does not deregister the new owner's route
+
 ## 0.14.1003
 
 ### Bug Fixes

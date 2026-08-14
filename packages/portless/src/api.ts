@@ -1,5 +1,6 @@
-import { detectWorktreePrefix } from "./auto.js";
+import { applyWorktreePrefix, detectWorktreePrefix, resolveWorktreeFlat } from "./auto.js";
 import { discoverState } from "./cli-utils.js";
+import { loadConfig } from "./config.js";
 import { formatUrl, normalizePathPrefix, parseHostname } from "./utils.js";
 
 export interface ServiceUrl {
@@ -25,6 +26,8 @@ export interface GetUrlOptions {
    * such as OAuth callbacks that must not vary by branch.
    */
   worktree?: boolean;
+  /** Override the project worktreeFlat setting for this lookup. */
+  worktreeFlat?: boolean;
   /** Working directory used for git worktree detection. */
   cwd?: string;
   /** Optional route path prefix to append to the resolved URL. */
@@ -39,8 +42,15 @@ export interface GetUrlOptions {
  * and returns both the URL string and its components.
  */
 export async function getUrl(name: string, options: GetUrlOptions = {}): Promise<ServiceUrl> {
-  const worktree = options.worktree === false ? null : detectWorktreePrefix(options.cwd);
-  const effectiveName = worktree ? `${worktree.prefix}.${name}` : name;
+  const cwd = options.cwd ?? process.cwd();
+  const worktree = options.worktree === false ? null : detectWorktreePrefix(cwd);
+  const configuredFlat =
+    options.worktreeFlat ?? (worktree ? loadConfig(cwd)?.config.worktreeFlat : undefined);
+  const effectiveName = applyWorktreePrefix(
+    name,
+    worktree,
+    options.worktreeFlat ?? resolveWorktreeFlat(configuredFlat)
+  );
 
   const { port, tls, tld } = await discoverState();
   const hostname = parseHostname(effectiveName, tld);

@@ -1,5 +1,16 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { startLanIpMonitor } from "./mdns.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { EventEmitter } from "node:events";
+import { cleanupAll, getPublished, mdnsFqdn, publish, startLanIpMonitor } from "./mdns.js";
+
+const spawnMock = vi.hoisted(() => vi.fn());
+
+vi.mock("node:child_process", async (importOriginal) => {
+  const original = await importOriginal<typeof import("node:child_process")>();
+  return {
+    ...original,
+    spawn: spawnMock,
+  };
+});
 
 describe("startLanIpMonitor", () => {
   afterEach(() => {
@@ -94,4 +105,54 @@ describe("startLanIpMonitor", () => {
 
     expect(onChange).not.toHaveBeenCalled();
   });
+});
+
+describe("mdnsFqdn", () => {
+  it("keeps exact local hostnames", () => {
+    expect(mdnsFqdn("myapp.local")).toBe("myapp.local");
+    expect(mdnsFqdn("api.myapp.local")).toBe("api.myapp.local");
+  });
+
+  it("rejects non-local suffixes instead of appending local", () => {
+    expect(mdnsFqdn("myapp.test")).toBeNull();
+    expect(mdnsFqdn("myapp.localhost")).toBeNull();
+    expect(mdnsFqdn("myapp.example.localhost")).toBeNull();
+  });
+});
+
+describe("publish", () => {
+  beforeEach(() => {
+    spawnMock.mockImplementation(() => {
+      const child = new EventEmitter() as EventEmitter & { kill: ReturnType<typeof vi.fn> };
+      child.kill = vi.fn();
+      return child;
+    });
+  });
+
+  afterEach(() => {
+    cleanupAll();
+    spawnMock.mockReset();
+  });
+
+  it("does not track or publish custom-suffix routes from a LAN suffix list", () => {
+    publish("myapp.test", 3000, "192.168.1.10");
+    publish("myapp.local", 3000, "192.168.1.10");
+    publish("myapp.test", 3001, "192.168.1.10");
+
+    expect(getPublished()).not.toContain("myapp.test");
+    expect(getPublished()).not.toContain("myapp.test.local");
+  });
+
+  // Positive publish requires a platform mDNS publisher (dns-sd/avahi);
+  // Windows has none, so publish() intentionally no-ops there.
+  it.skipIf(process.platform === "win32")(
+    "publishes one local record for same-hostname path routes",
+    () => {
+      publish("myapp.local", 3000, "192.168.1.10");
+      publish("myapp.local", 3000, "192.168.1.10");
+
+      expect(getPublished()).toEqual(["myapp.local"]);
+      expect(spawnMock).toHaveBeenCalledTimes(1);
+    }
+  );
 });

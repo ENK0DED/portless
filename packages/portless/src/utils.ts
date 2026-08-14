@@ -1,4 +1,52 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+
+type UserHomeOptions = {
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  homedir?: string;
+  passwdHome?: (username: string) => string | null;
+};
+
+function readPasswdHome(username: string): string | null {
+  try {
+    const passwd = fs.readFileSync("/etc/passwd", "utf-8");
+    for (const line of passwd.split("\n")) {
+      const fields = line.split(":");
+      if (fields[0] === username && fields[5]) return fields[5];
+    }
+  } catch {
+    // Fall back to the platform's conventional home directory.
+  }
+  return null;
+}
+
+/**
+ * Resolve the home directory that owns portless state. When sudo changes the
+ * effective user to root, retain the invoking user's home so elevated proxy
+ * processes and unprivileged app processes share the same route store.
+ */
+export function resolveUserHome(options: UserHomeOptions = {}): string {
+  const platform = options.platform ?? process.platform;
+  const env = options.env ?? process.env;
+  const homedir = options.homedir ?? os.homedir();
+
+  if (platform === "win32") return env.USERPROFILE || homedir;
+
+  const sudoUser = env.SUDO_USER;
+  if (!sudoUser || sudoUser === "root") return homedir;
+
+  const home = env.HOME;
+  if (home && home !== "/root" && home !== "/var/root") return home;
+
+  const passwdHome = (options.passwdHome ?? readPasswdHome)(sudoUser);
+  if (passwdHome) return passwdHome;
+
+  return platform === "darwin"
+    ? path.posix.join("/Users", sudoUser)
+    : path.posix.join("/home", sudoUser);
+}
 
 /**
  * When running under sudo, fix file ownership so the real user can
@@ -50,21 +98,58 @@ function hasControlCharacters(value: string): boolean {
   return false;
 }
 
+/**
+ * Reject path prefixes that cannot be authored safely and unambiguously.
+ * The accepted alphabet is RFC 3986 pchar plus the slash delimiter.
+ */
+export function assertRegistrablePathPrefix(value: string): void {
+  const invalid = (reason: string): never => {
+    throw new Error(`Invalid path prefix "${value}": ${reason}`);
+  };
+
+  if (!value.startsWith("/")) invalid("must start with /");
+  if (hasControlCharacters(value)) invalid("control characters are not allowed");
+  if (value.includes(" ")) invalid("raw space is not allowed; use %20");
+  if (value.includes("?")) invalid("query delimiter ? is not allowed");
+  if (value.includes("#")) invalid("fragment delimiter # is not allowed");
+  if (value.includes("\\")) invalid("backslash is not allowed");
+
+  for (let index = value.indexOf("%"); index !== -1; index = value.indexOf("%", index + 3)) {
+    const escape = value.slice(index, index + 3);
+    if (!/^%[0-9A-Fa-f]{2}$/.test(escape)) invalid(`malformed percent escape "${escape}"`);
+    if (/^%2f$/i.test(escape)) invalid("percent-encoded slash %2F is not allowed");
+    if (/^%2e$/i.test(escape)) invalid("percent-encoded dot %2E is not allowed");
+  }
+
+  const normalized = value.replace(/\/+$/, "") || "/";
+  if (normalized.includes("//")) invalid("empty path segments (//) are not allowed");
+  for (const segment of normalized.split("/")) {
+    if (segment === ".") invalid('"." path segments are not allowed');
+    if (segment === "..") invalid('".." path segments are not allowed');
+  }
+
+  for (let index = 0; index < value.length; index++) {
+    const char = value[index];
+    if (char === "%") {
+      index += 2;
+      continue;
+    }
+    if (/^[A-Za-z0-9\-._~!$&'()*+,;=:@/]$/.test(char)) continue;
+    if (char.charCodeAt(0) > 0x7f) {
+      const suggestion = value
+        .split("/")
+        .map((segment) => encodeURIComponent(segment))
+        .join("/");
+      invalid(`character "${char}" is not allowed; use "${suggestion}"`);
+    }
+    invalid(`character "${char}" is not allowed`);
+  }
+}
+
 export function normalizePathPrefix(value: string | undefined): string {
   if (value === undefined) return "/";
-  const trimmed = value.trim();
-  if (
-    trimmed === "" ||
-    !trimmed.startsWith("/") ||
-    trimmed.includes("?") ||
-    trimmed.includes("#") ||
-    hasControlCharacters(trimmed)
-  ) {
-    throw new Error(
-      `Invalid path prefix "${value}": must start with / and cannot include query strings, fragments, or control characters`
-    );
-  }
-  return trimmed.replace(/\/+$/, "") || "/";
+  assertRegistrablePathPrefix(value);
+  return value.replace(/\/+$/, "") || "/";
 }
 
 export function matchesPathPrefix(requestPath: string, prefix: string): boolean {
@@ -144,5 +229,50 @@ export function parseHostname(input: string, tld = "localhost"): string {
     }
   }
 
+  if (hostname.length > 253) {
+    throw new Error(`Invalid hostname "${hostname}": exceeds 253-character DNS limit`);
+  }
+
   return hostname;
+}
+
+/**
+ * Parse a hostname input for every configured TLD. If the input already ends
+ * with one of those TLDs, use the stripped base name for the full set.
+ */
+export function parseHostnames(input: string, tlds: readonly string[] = ["localhost"]): string[] {
+  const uniqueTlds = [...new Set(tlds)];
+  let baseInput = input
+    .trim()
+    .replace(/^https?:\/\//, "")
+    .split("/")[0]
+    .toLowerCase();
+
+  for (const tld of [...uniqueTlds].sort((a, b) => b.length - a.length)) {
+    const suffix = `.${tld}`;
+    if (baseInput.endsWith(suffix)) {
+      baseInput = baseInput.slice(0, -suffix.length);
+      break;
+    }
+  }
+
+  // Skip a TLD that fails for TLD-specific reasons (e.g. app.TLD exceeds the
+  // 253-char DNS limit) instead of losing the valid TLDs in the same list.
+  // Throw only when no TLD survives, so input-wide errors still surface.
+  const hostnames: string[] = [];
+  const skipped: string[] = [];
+  let firstError: unknown;
+  for (const tld of uniqueTlds) {
+    try {
+      hostnames.push(parseHostname(baseInput, tld));
+    } catch (err) {
+      firstError ??= err;
+      skipped.push(`"${tld}": ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  if (hostnames.length === 0) throw firstError;
+  for (const detail of skipped) {
+    console.warn(`Warning: skipping TLD ${detail}`);
+  }
+  return hostnames;
 }

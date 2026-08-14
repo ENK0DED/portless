@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { randomUUID } from "node:crypto";
 import type { RouteInfo, RouteProtocol, TunnelProviderName } from "./types.js";
 import { fixOwnership, isErrnoException, normalizePathPrefix } from "./utils.js";
 
@@ -7,13 +8,13 @@ import { fixOwnership, isErrnoException, normalizePathPrefix } from "./utils.js"
 const STALE_LOCK_THRESHOLD_MS = 10_000;
 
 /** Total time budget (ms) for acquiring the file lock before giving up. */
-const LOCK_TIMEOUT_MS = 5_000;
+const LOCK_TIMEOUT_MS = 15_000;
 
 /** Initial delay (ms) between lock acquisition retries (doubles each attempt). */
 const LOCK_RETRY_BASE_MS = 10;
 
 /** Maximum delay (ms) between lock acquisition retries. */
-const LOCK_RETRY_CAP_MS = 500;
+const LOCK_RETRY_CAP_MS = 100;
 
 /** File permission mode for route and state files. */
 export const FILE_MODE = 0o644;
@@ -113,6 +114,20 @@ function isValidRoute(value: unknown): value is RouteMapping {
   const label = (value as RouteMapping).label;
   if (label !== undefined && typeof label !== "string") return false;
   return true;
+}
+
+function invalidPersistedRouteWarning(route: {
+  hostname: string;
+  port: number;
+  pid: number;
+  pathPrefix: unknown;
+  reason: string;
+}): string {
+  const displayedPrefix = typeof route.pathPrefix === "string" ? route.pathPrefix : "<invalid>";
+  return (
+    `Removed invalid route "${route.hostname}${displayedPrefix}" (PID ${route.pid}) from routes.json: ${route.reason}. ` +
+    `Re-register with: portless alias ${route.hostname} ${route.port} --path <valid-prefix>`
+  );
 }
 
 function routePathPrefix(route: Pick<RouteMapping, "pathPrefix">): string {
@@ -265,13 +280,7 @@ export class RouteStore {
     }
   }
 
-  /**
-   * Load routes from disk, filtering out stale entries whose owning process
-   * is no longer alive. Stale-route cleanup is only persisted when the caller
-   * already holds the lock (i.e. inside addRoute/removeRoute) to avoid
-   * unprotected concurrent writes.
-   */
-  loadRoutes(persistCleanup = false): RouteMapping[] {
+  private loadAndMigrateRoutes(): RouteMapping[] {
     if (!fs.existsSync(this.routesPath)) {
       return [];
     }
@@ -288,29 +297,139 @@ export class RouteStore {
         this.onWarning?.(`Corrupted routes file (expected array): ${this.routesPath}`);
         return [];
       }
-      const routes: RouteMapping[] = parsed.filter(isValidRoute);
-      // Filter out stale routes whose owning process is no longer alive
-      const alive = routes.filter((r) => r.pid === 0 || this.isProcessAlive(r.pid));
-      if (persistCleanup && alive.length !== routes.length) {
-        // Persist the cleaned-up list so stale entries don't accumulate.
-        // Only safe when caller holds the lock.
+      let migrationChanged = false;
+      const routes: RouteMapping[] = [];
+      for (const value of parsed) {
+        if (
+          typeof value === "object" &&
+          value !== null &&
+          typeof (value as RouteMapping).hostname === "string" &&
+          typeof (value as RouteMapping).port === "number" &&
+          typeof (value as RouteMapping).pid === "number" &&
+          (value as RouteMapping).pathPrefix !== undefined
+        ) {
+          try {
+            if (typeof (value as RouteMapping).pathPrefix !== "string") {
+              throw new Error("path prefix must be a string");
+            }
+            normalizePathPrefix((value as RouteMapping).pathPrefix);
+          } catch (err) {
+            this.onWarning?.(
+              invalidPersistedRouteWarning({
+                hostname: (value as RouteMapping).hostname,
+                port: (value as RouteMapping).port,
+                pid: (value as RouteMapping).pid,
+                pathPrefix: (value as RouteMapping).pathPrefix,
+                reason: err instanceof Error ? err.message : "invalid path prefix",
+              })
+            );
+            migrationChanged = true;
+            continue;
+          }
+        }
+
+        if (!isValidRoute(value)) {
+          migrationChanged = true;
+          continue;
+        }
+
+        const route = { ...value };
+        const normalizedPathPrefix = normalizePathPrefix(route.pathPrefix);
+        if (normalizedPathPrefix === "/") {
+          if (route.pathPrefix !== undefined) {
+            delete route.pathPrefix;
+            migrationChanged = true;
+          }
+        } else if (route.pathPrefix !== normalizedPathPrefix) {
+          route.pathPrefix = normalizedPathPrefix;
+          migrationChanged = true;
+        }
+        routes.push(route);
+      }
+      if (migrationChanged) {
+        // Migration writes happen on the first load through either public
+        // reader so legacy entries cannot remain silently unusable.
         try {
-          fs.writeFileSync(this.routesPath, JSON.stringify(alive, null, 2), {
-            mode: FILE_MODE,
-          });
+          this.saveRoutes(routes);
         } catch {
           // Write may fail (permissions); non-fatal
         }
       }
-      return alive;
+      return routes;
     } catch {
       return [];
     }
   }
 
+  /**
+   * Load routes from disk, filtering out stale entries whose owning process
+   * is no longer alive. Stale-route cleanup is only persisted when the caller
+   * already holds the lock (i.e. inside addRoute/removeRoute) to avoid
+   * unprotected concurrent writes.
+   */
+  loadRoutes(persistCleanup = false): RouteMapping[] {
+    const routes = this.loadAndMigrateRoutes();
+    const alive = routes.filter((r) => r.pid === 0 || this.isProcessAlive(r.pid));
+    if (persistCleanup && alive.length !== routes.length) {
+      try {
+        this.saveRoutes(alive);
+      } catch {
+        // Write may fail (permissions); non-fatal
+      }
+    }
+    return alive;
+  }
+
   private saveRoutes(routes: RouteMapping[]): void {
-    fs.writeFileSync(this.routesPath, JSON.stringify(routes, null, 2), { mode: FILE_MODE });
-    fixOwnership(this.routesPath);
+    const content = JSON.stringify(routes, null, 2);
+    const tempPrefix = `${path.basename(this.routesPath)}.tmp-${process.pid}-`;
+    let tempPath: string | undefined;
+
+    try {
+      for (let attempt = 0; attempt < 10; attempt++) {
+        const candidate = path.join(this.dir, `${tempPrefix}${randomUUID()}`);
+        let fd: number | undefined;
+        try {
+          fd = fs.openSync(
+            candidate,
+            fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+            FILE_MODE
+          );
+          tempPath = candidate;
+          fs.writeFileSync(fd, content, "utf-8");
+          break;
+        } catch (err: unknown) {
+          if (isErrnoException(err) && err.code === "EEXIST" && tempPath === undefined) {
+            continue;
+          }
+          throw err;
+        } finally {
+          if (fd !== undefined) fs.closeSync(fd);
+        }
+      }
+
+      if (tempPath === undefined) {
+        throw new Error(`Failed to create a unique temporary routes file in ${this.dir}`);
+      }
+
+      try {
+        fs.chmodSync(tempPath, FILE_MODE);
+      } catch {
+        // May fail if the file is owned by another user; non-fatal
+      }
+      fixOwnership(tempPath);
+      fs.renameSync(tempPath, this.routesPath);
+      tempPath = undefined;
+      fixOwnership(this.routesPath);
+    } finally {
+      if (tempPath !== undefined) {
+        try {
+          fs.rmSync(tempPath, { force: true });
+        } catch {
+          // Best-effort cleanup; non-fatal
+        }
+      }
+    }
   }
 
   private buildEntry(
@@ -442,24 +561,7 @@ export class RouteStore {
    * but whose dev server may still be holding a port.
    */
   loadRoutesRaw(): RouteMapping[] {
-    if (!fs.existsSync(this.routesPath)) {
-      return [];
-    }
-    try {
-      const raw = fs.readFileSync(this.routesPath, "utf-8");
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(raw);
-      } catch {
-        return [];
-      }
-      if (!Array.isArray(parsed)) {
-        return [];
-      }
-      return parsed.filter(isValidRoute);
-    } catch {
-      return [];
-    }
+    return this.loadAndMigrateRoutes();
   }
 
   /**

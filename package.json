@@ -10,6 +10,7 @@
   "scripts": {
     "build": "turbo build",
     "check:fork-ledger": "bun run scripts/check-fork-ledger.ts",
+    "check:upstream-drift": "bun run scripts/check-upstream-drift.ts",
     "dev": "turbo dev",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
@@ -18,6 +19,7 @@
     "test": "turbo test",
     "test:e2e": "turbo test:e2e",
     "test:fork-ledger": "bun test scripts/check-fork-ledger.test.ts",
+    "test:upstream-drift": "bun test scripts/check-upstream-drift.test.ts",
     "test:coverage": "turbo test:coverage",
     "test:watch": "turbo test:watch",
     "type-check": "turbo type-check",

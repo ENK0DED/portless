@@ -144,8 +144,7 @@ function textSafe(value: string): string {
   return value.replace(/[\r\n]/g, " ");
 }
 
-function activeAppLinkSuffix(req: http.IncomingMessage): string {
-  const url = req.url ?? "/";
+function activeAppLinkSuffix(url: string): string {
   if (!url || url === "/" || !url.startsWith("/")) return "";
   return url;
 }
@@ -164,6 +163,41 @@ const HOP_BY_HOP_HEADERS = new Set([
   "upgrade",
 ]);
 
+/** Cap ordinary upstream connections so multiplexed clients cannot overload a backend. */
+const MAX_UPSTREAM_SOCKETS = 64;
+const REPLAYABLE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+/** Remove Connection and every header named by its comma-separated token list. */
+function stripConnectionHeaders(headers: http.OutgoingHttpHeaders): void {
+  const connectionTokens = new Set<string>();
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() !== "connection") continue;
+    const values = Array.isArray(value) ? value : [value];
+    for (const item of values) {
+      if (typeof item !== "string") continue;
+      for (const token of item.split(",")) {
+        const normalized = token.trim().toLowerCase();
+        if (normalized) connectionTokens.add(normalized);
+      }
+    }
+  }
+
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() === "connection" || connectionTokens.has(key.toLowerCase())) {
+      delete headers[key];
+    }
+  }
+}
+
+/** A request can be replayed only when its headers prove it has no body. */
+function isBodylessRequest(req: http.IncomingMessage): boolean {
+  if (req.headers["transfer-encoding"] !== undefined) return false;
+  const contentLength = req.headers["content-length"];
+  if (contentLength === undefined) return true;
+  const values = Array.isArray(contentLength) ? contentLength : [contentLength];
+  return values.every((value) => value.trim() === "0");
+}
+
 /**
  * Get the effective host value from a request.
  * HTTP/2 uses the :authority pseudo-header; HTTP/1.1 uses Host.
@@ -173,6 +207,66 @@ function getRequestHost(req: http.IncomingMessage): string {
   const authority = req.headers[":authority"];
   if (typeof authority === "string" && authority) return authority;
   return req.headers.host || "";
+}
+
+interface ClassifiedRequestTarget {
+  /** Raw origin-form spelling used for route selection. */
+  matchPath: string;
+  /** Target sent to the backend. Absolute-form is rewritten to origin-form. */
+  forwardTarget: string;
+}
+
+/**
+ * Classify a request target without decoding or canonicalizing its path.
+ * Absolute-form is accepted only when its canonical origin agrees with the
+ * connection authority, then its raw path and query are forwarded as
+ * origin-form. Other non-origin forms are unroutable.
+ */
+function classifyRequestTarget(
+  rawTarget: string,
+  method: string | undefined,
+  authority: string,
+  tls: boolean
+): ClassifiedRequestTarget | undefined {
+  if (rawTarget === "*") {
+    return method === "OPTIONS" ? { matchPath: "/", forwardTarget: "*" } : undefined;
+  }
+  if (rawTarget.startsWith("/")) {
+    return { matchPath: rawTarget, forwardTarget: rawTarget };
+  }
+
+  const absolute = /^([A-Za-z][A-Za-z0-9+.-]*):\/\/([^/?#]*)(.*)$/.exec(rawTarget);
+  if (!absolute || !authority || absolute[3].includes("#")) return undefined;
+
+  const scheme = absolute[1].toLowerCase();
+  const connectionScheme = tls ? "https" : "http";
+  if (scheme !== connectionScheme) return undefined;
+
+  try {
+    const targetUrl = new URL(rawTarget);
+    const connectionUrl = new URL(`${connectionScheme}://${authority}`);
+    if (
+      targetUrl.username ||
+      targetUrl.password ||
+      connectionUrl.username ||
+      connectionUrl.password ||
+      targetUrl.origin !== connectionUrl.origin
+    ) {
+      return undefined;
+    }
+  } catch {
+    return undefined;
+  }
+
+  const remainder = absolute[3];
+  const originForm =
+    remainder === "" ? "/" : remainder.startsWith("?") ? `/${remainder}` : remainder;
+  return { matchPath: originForm, forwardTarget: originForm };
+}
+
+function writeBadRequest(res: http.ServerResponse): void {
+  res.writeHead(400, { "Content-Type": "text/plain" });
+  res.end("Bad Request: unsupported or mismatched request target\n");
 }
 
 /** Return the local TCP port that accepted this request. */
@@ -260,12 +354,13 @@ function h2cResponseHeaders(headers: http2.IncomingHttpHeaders): {
 function h2cRequestHeaders(
   req: http.IncomingMessage,
   reqTls: boolean,
-  hops: number
+  hops: number,
+  forwardTarget: string
 ): http2.OutgoingHttpHeaders {
   const forwardedHeaders = buildForwardedHeaders(req, reqTls);
   const headers: http2.OutgoingHttpHeaders = {
     ":method": req.method || "GET",
-    ":path": req.url || "/",
+    ":path": forwardTarget,
     ":scheme": "http",
     ":authority": getRequestHost(req),
   };
@@ -306,10 +401,11 @@ function proxyH2c(
   reqTls: boolean,
   hops: number,
   sessions: H2cSessionCache,
-  onError: (message: string) => void
+  onError: (message: string) => void,
+  forwardTarget: string
 ): void {
   const session = getH2cSession(route.port, sessions);
-  const proxyReq = session.request(h2cRequestHeaders(req, reqTls, hops));
+  const proxyReq = session.request(h2cRequestHeaders(req, reqTls, hops, forwardTarget));
 
   proxyReq.on("response", (headers) => {
     const response = h2cResponseHeaders(headers);
@@ -366,14 +462,41 @@ const PORTLESS_HOPS_HEADER = "x-portless-hops";
  */
 const MAX_PROXY_HOPS = 5;
 
-/**
- * Find the route matching a given host. Matches exact hostname first, then
- * falls back to wildcard subdomain matching (e.g. tenant.myapp.localhost
- * matches a route registered for myapp.localhost).
- *
- * When `strict` is true, only exact matches are returned; unregistered
- * subdomain prefixes will not fall back to the base service.
- */
+/** Normalize an authority for case-insensitive matching and default HTTPS port handling. */
+function normalizeAuthority(authority: string): string {
+  const lower = authority.toLowerCase();
+  return lower.endsWith(":443") ? lower.slice(0, -4) : lower;
+}
+
+/** Extract the hostname portion from a normalized request authority. */
+function authorityHostname(authority: string): string {
+  if (authority.startsWith("[")) {
+    const closingBracket = authority.indexOf("]");
+    return closingBracket === -1 ? authority : authority.slice(0, closingBracket + 1);
+  }
+
+  const lastColon = authority.lastIndexOf(":");
+  const port = authority.slice(lastColon + 1);
+  return lastColon > -1 && /^\d+$/.test(port) ? authority.slice(0, lastColon) : authority;
+}
+
+/** Return the normalized authority stored in a Tailscale URL, or undefined if invalid. */
+function tailscaleAuthority(url: string | undefined): string | undefined {
+  if (!url) return undefined;
+  try {
+    return normalizeAuthority(new URL(url).host);
+  } catch {
+    return undefined;
+  }
+}
+
+function routeTailscaleAuthorities(route: RouteInfo): string[] {
+  return [route.tailscaleUrl, route.tailscaleServiceUrl]
+    .map(tailscaleAuthority)
+    .filter((authority): authority is string => authority !== undefined);
+}
+
+/** Pick the route with the longest matching path prefix. */
 function pickLongestPathRoute(routes: RouteInfo[], requestPath: string): RouteInfo | undefined {
   let best: RouteInfo | undefined;
   let bestLength = -1;
@@ -388,6 +511,12 @@ function pickLongestPathRoute(routes: RouteInfo[], requestPath: string): RouteIn
   return best;
 }
 
+/**
+ * Find the route matching a request authority. Exact local routes win first,
+ * followed by exact tunnel aliases, exact Tailscale authorities, and then
+ * Tailscale hostnames when the request port differs. The final non-strict
+ * fallback is the existing local subdomain match.
+ */
 function findRoute(
   routes: RouteInfo[],
   tunnelAliases: TunnelAlias[],
@@ -395,13 +524,15 @@ function findRoute(
   requestPath: string,
   strict?: boolean
 ): RouteInfo | undefined {
+  const authority = normalizeAuthority(host);
+  const hostname = authorityHostname(authority);
   const exact = pickLongestPathRoute(
-    routes.filter((r) => r.hostname === host),
+    routes.filter((r) => r.hostname === hostname),
     requestPath
   );
   if (exact) return exact;
 
-  const alias = tunnelAliases.find((entry) => entry.externalHostname === host);
+  const alias = tunnelAliases.find((entry) => entry.externalHostname === hostname);
   if (alias) {
     const targetPathPrefix = normalizePathPrefix(alias.targetPathPrefix);
     if (matchesPathPrefix(requestPath, targetPathPrefix)) {
@@ -413,9 +544,25 @@ function findRoute(
     }
   }
 
+  const tailscaleAuthorityRoute = pickLongestPathRoute(
+    routes.filter((route) => routeTailscaleAuthorities(route).includes(authority)),
+    requestPath
+  );
+  if (tailscaleAuthorityRoute) return tailscaleAuthorityRoute;
+
+  const tailscaleHostnameRoute = pickLongestPathRoute(
+    routes.filter((route) =>
+      routeTailscaleAuthorities(route).some(
+        (routeAuthority) => authorityHostname(routeAuthority) === hostname
+      )
+    ),
+    requestPath
+  );
+  if (tailscaleHostnameRoute) return tailscaleHostnameRoute;
+
   if (strict) return undefined;
   return pickLongestPathRoute(
-    routes.filter((r) => host.endsWith("." + r.hostname)),
+    routes.filter((r) => hostname.endsWith("." + r.hostname)),
     requestPath
   );
 }
@@ -424,9 +571,16 @@ interface H2WebSocketRouteSelection {
   host: string;
   authority: string;
   path: string;
+  matchPath: string;
   hops: number;
   route?: RouteInfo;
-  rejectReason?: "missing-host" | "internal-host" | "loop" | "missing-route" | "h2c-route";
+  rejectReason?:
+    | "missing-host"
+    | "internal-host"
+    | "loop"
+    | "bad-target"
+    | "missing-route"
+    | "h2c-route";
 }
 
 function singleHeaderValue(value: string | string[] | number | undefined): string | undefined {
@@ -464,21 +618,41 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     getTunnelAliases = () => [],
     proxyPort,
     tld = "localhost",
+    tlds = [tld],
     strict = true,
     onError = (msg: string) => console.error(msg),
     tls,
     internalPages = true,
     getCaTrusted,
   } = options;
-  const tldSuffix = `.${tld}`;
+  const configuredTlds = [...new Set(tlds.length > 0 ? tlds : [tld])];
+  const primaryTld = configuredTlds[0] ?? "localhost";
+  const tldSuffix = `.${primaryTld}`;
+  const tldSuffixes = configuredTlds
+    .map((configuredTld) => `.${configuredTld}`)
+    .sort((a, b) => b.length - a.length);
   const h2cSessions: H2cSessionCache = new Map();
 
   // Reserved internal hostnames. Intercepted before route dispatch so a user
   // app can never shadow them, and derived from the live suffix so they follow
   // a custom PORTLESS_SUFFIX (e.g. portless.test / cert.test).
-  const dashboardHost = `portless${tldSuffix}`;
-  const certHost = `cert${tldSuffix}`;
+  const dashboardHosts = new Set(configuredTlds.map((suffix) => `portless.${suffix}`));
+  const certHosts = new Set(configuredTlds.map((suffix) => `cert.${suffix}`));
+  const isInternalHost = (host: string): boolean => dashboardHosts.has(host) || certHosts.has(host);
+  const suffixForHost = (host: string): string => {
+    const matched = tldSuffixes.find((suffix) => host.endsWith(suffix));
+    return matched?.slice(1) ?? primaryTld;
+  };
   const caFingerprint = tls?.ca ? formatFingerprint(tls.ca) : undefined;
+  const upstreamAgent = new http.Agent({
+    keepAlive: true,
+    maxSockets: MAX_UPSTREAM_SOCKETS,
+  });
+  upstreamAgent.createConnection = (options) =>
+    net.connect({
+      ...LOOPBACK_DIAL_OPTIONS,
+      port: options.port as number,
+    });
 
   const hostPort = (reqTls: boolean): string =>
     proxyPort === (reqTls ? 443 : 80) ? "" : `:${proxyPort}`;
@@ -491,10 +665,14 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     req: http.IncomingMessage,
     res: http.ServerResponse,
     host: string,
-    reqTls: boolean
+    reqTls: boolean,
+    requestTarget: string
   ): boolean => {
     if (!internalPages) return false;
-    if (host !== dashboardHost && host !== certHost) return false;
+    if (!isInternalHost(host)) return false;
+    const pageSuffix = suffixForHost(host);
+    const dashboardHost = `portless.${pageSuffix}`;
+    const certHost = `cert.${pageSuffix}`;
 
     const method = req.method || "GET";
     if (method !== "GET" && method !== "HEAD") {
@@ -503,8 +681,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       return true;
     }
     const isHead = method === "HEAD";
-    const url = req.url || "/";
-    const pathname = url.split(/[?#]/, 1)[0] || "/";
+    const pathname = requestTarget.split(/[?#]/, 1)[0] || "/";
 
     if (host === certHost) {
       if (pathname === "/portless-ca.pem" || pathname === "/ca.pem") {
@@ -522,7 +699,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
         return true;
       }
       const body = renderCertPage({
-        suffix: tld,
+        suffix: pageSuffix,
         downloadPath: "/portless-ca.pem",
         fingerprint: caFingerprint,
         trustedHere: getCaTrusted?.(),
@@ -551,7 +728,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       routes,
       proxyPort,
       tls: reqTls,
-      suffix: tld,
+      suffix: pageSuffix,
       caTrusted: getCaTrusted?.(),
       certHost,
       signature,
@@ -576,6 +753,8 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     reqTls: boolean
   ): RouteInfo | undefined => {
     const pathname = requestPath.split(/[?#]/, 1)[0] || "/";
+    const pageSuffix = suffixForHost(host);
+    const certHost = `cert.${pageSuffix}`;
     const base = `${reqTls ? "https" : "http"}://${host}${hostPort(reqTls)}`;
     const liveLabels = new Set(members.map((m) => m.label).filter(Boolean) as string[]);
     const selected = readSelectionCookie(req);
@@ -590,7 +769,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
         })),
         selectPath: MULTIPLEX_SELECT_PATH,
         current: selected && liveLabels.has(selected) ? selected : undefined,
-        suffix: tld,
+        suffix: pageSuffix,
         proxyPort,
         tls: reqTls,
         caTrusted: getCaTrusted?.(),
@@ -649,12 +828,16 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
   ): H2WebSocketRouteSelection => {
     const authority = String(headers[":authority"] || "");
     const host = authority.split(":")[0];
-    const path = String(headers[":path"] || "/");
+    const rawPath = String(headers[":path"] || "/");
+    const target = classifyRequestTarget(rawPath, "CONNECT", authority, true);
+    const path = target?.forwardTarget ?? rawPath;
+    const matchPath = target?.matchPath ?? rawPath;
     const hops = parseInt(headers[PORTLESS_HOPS_HEADER] as string, 10) || 0;
-    const base = { host, authority, path, hops };
+    const base = { host, authority, path, matchPath, hops };
 
     if (!host) return { ...base, rejectReason: "missing-host" };
-    if (internalPages && (host === dashboardHost || host === certHost)) {
+    if (!target) return { ...base, rejectReason: "bad-target" };
+    if (internalPages && isInternalHost(host)) {
       return { ...base, rejectReason: "internal-host" };
     }
     if (hops >= MAX_PROXY_HOPS) {
@@ -667,7 +850,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
 
     const routes = getRoutes();
     const tunnelAliases = getTunnelAliases();
-    const members = multiplexMembersFor(routes, host, path);
+    const members = multiplexMembersFor(routes, host, matchPath);
     let route: RouteInfo | undefined;
     if (members.length > 0) {
       const selected = parseCookieHeader(cookieHeaderValue(headers.cookie))[SELECTION_COOKIE];
@@ -675,7 +858,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
         (selected ? members.find((member) => member.label === selected) : undefined) ??
         defaultMember(members);
     } else {
-      route = findRoute(routes, tunnelAliases, host, path, strict);
+      route = findRoute(routes, tunnelAliases, authority, matchPath, strict);
     }
 
     if (!route) return { ...base, rejectReason: "missing-route" };
@@ -799,14 +982,15 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     stream.on("aborted", cleanup);
   };
 
-  const handleRequest = (req: http.IncomingMessage, res: http.ServerResponse) => {
+  const handleRequest = (req: http.IncomingMessage, res: http.ServerResponse, isReplay = false) => {
     const reqTls = isEncrypted(req);
     res.setHeader(PORTLESS_HEADER, "1");
     res.setHeader(PORTLESS_LISTENER_PORT_HEADER, getListenerPort(req, proxyPort));
 
     const routes = getRoutes();
     const tunnelAliases = getTunnelAliases();
-    const host = getRequestHost(req).split(":")[0];
+    const rawHost = getRequestHost(req);
+    const host = rawHost.split(":")[0];
 
     if (!host) {
       res.writeHead(400, { "Content-Type": "text/plain" });
@@ -814,9 +998,15 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       return;
     }
 
+    const target = classifyRequestTarget(req.url || "/", req.method, rawHost, reqTls);
+    if (!target) {
+      writeBadRequest(res);
+      return;
+    }
+
     // Reserved portless pages (dashboard, certificate trust) win before any
     // route lookup or loop detection, so a user app can never shadow them.
-    if (serveInternalPage(req, res, host, reqTls)) return;
+    if (serveInternalPage(req, res, host, reqTls, target.forwardTarget)) return;
 
     const hops = parseInt(req.headers[PORTLESS_HOPS_HEADER] as string, 10) || 0;
     if (hops >= MAX_PROXY_HOPS) {
@@ -853,19 +1043,23 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       return;
     }
 
-    const requestPath = req.url || "/";
+    const requestPath = target.matchPath;
     const members = multiplexMembersFor(routes, host, requestPath);
     let route: RouteInfo | undefined;
     if (members.length > 0) {
       route = resolveMultiplex(req, res, members, host, requestPath, reqTls);
       if (!route) return; // a picker page or selection redirect was served
     } else {
-      route = findRoute(routes, tunnelAliases, host, requestPath, strict);
+      route = findRoute(routes, tunnelAliases, rawHost, requestPath, strict);
     }
 
     if (!route) {
       const safeHost = escapeHtml(host);
-      const strippedHost = host.endsWith(tldSuffix) ? host.slice(0, -tldSuffix.length) : host;
+      const matchedSuffix = tldSuffixes.find((suffix) => host.endsWith(suffix));
+      const strippedHost =
+        matchedSuffix && matchedSuffix.length < host.length
+          ? host.slice(0, -matchedSuffix.length)
+          : host;
       const safeSuggestion = escapeHtml(strippedHost);
       if (!wantsHtml(req)) {
         const lines = [`No app registered for ${textSafe(host)}.`];
@@ -884,7 +1078,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
         res.end(lines.join("\n") + "\n");
         return;
       }
-      const linkSuffix = activeAppLinkSuffix(req);
+      const linkSuffix = activeAppLinkSuffix(target.forwardTarget);
       const routesList =
         routes.length > 0
           ? `<div class="section"><p class="label">Apps <span class="count">${routes.length}</span></p>${appList(
@@ -909,7 +1103,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     }
 
     if (route.protocol === "h2c") {
-      proxyH2c(req, res, route, reqTls, hops, h2cSessions, onError);
+      proxyH2c(req, res, route, reqTls, hops, h2cSessions, onError, target.forwardTarget);
       return;
     }
 
@@ -919,6 +1113,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       proxyReqHeaders[key] = value;
     }
     proxyReqHeaders[PORTLESS_HOPS_HEADER] = String(hops + 1);
+    stripConnectionHeaders(proxyReqHeaders);
     // Remove HTTP/2 pseudo-headers before forwarding to HTTP/1.1 backend
     for (const key of Object.keys(proxyReqHeaders)) {
       if (key.startsWith(":")) {
@@ -934,9 +1129,9 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
 
     const proxyReq = http.request(
       {
-        ...LOOPBACK_DIAL_OPTIONS,
+        agent: upstreamAgent,
         port: route.port,
-        path: req.url,
+        path: target.forwardTarget,
         method: req.method,
         headers: proxyReqHeaders,
       },
@@ -964,9 +1159,21 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     );
 
     proxyReq.on("error", (err) => {
+      const errWithCode = err as NodeJS.ErrnoException;
+      if (
+        !isReplay &&
+        proxyReq.reusedSocket &&
+        errWithCode.code === "ECONNRESET" &&
+        !res.headersSent &&
+        REPLAYABLE_METHODS.has(req.method || "") &&
+        isBodylessRequest(req)
+      ) {
+        req.unpipe(proxyReq);
+        handleRequest(req, res, true);
+        return;
+      }
       onError(`Proxy error for ${getRequestHost(req)}: ${dialErrorMessage(err)}`);
       if (!res.headersSent) {
-        const errWithCode = err as NodeJS.ErrnoException;
         const detail =
           errWithCode.code === "ECONNREFUSED"
             ? "The target app is not responding. It may have crashed."
@@ -1006,7 +1213,11 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       }
     });
 
-    req.pipe(proxyReq);
+    if (isReplay) {
+      proxyReq.end();
+    } else {
+      req.pipe(proxyReq);
+    }
   };
 
   const handleUpgrade = (req: http.IncomingMessage, socket: net.Socket, head: Buffer) => {
@@ -1031,15 +1242,28 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
 
     const routes = getRoutes();
     const tunnelAliases = getTunnelAliases();
-    const host = getRequestHost(req).split(":")[0];
+    const rawHost = getRequestHost(req);
+    const host = rawHost.split(":")[0];
 
     // Reserved internal hosts have no WebSocket surface.
-    if (internalPages && (host === dashboardHost || host === certHost)) {
+    if (internalPages && isInternalHost(host)) {
       socket.destroy();
       return;
     }
 
-    const requestPath = req.url || "/";
+    const target = classifyRequestTarget(req.url || "/", req.method, rawHost, isEncrypted(req));
+    if (!target) {
+      socket.end(
+        "HTTP/1.1 400 Bad Request\r\n" +
+          "Content-Type: text/plain\r\n" +
+          "Connection: close\r\n" +
+          "\r\n" +
+          "Bad Request: unsupported or mismatched request target\n"
+      );
+      return;
+    }
+
+    const requestPath = target.matchPath;
     const members = multiplexMembersFor(routes, host, requestPath);
     let route: RouteInfo | undefined;
     if (members.length > 0) {
@@ -1049,7 +1273,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
         (selected ? members.find((m) => m.label === selected) : undefined) ??
         defaultMember(members);
     } else {
-      route = findRoute(routes, tunnelAliases, host, requestPath, strict);
+      route = findRoute(routes, tunnelAliases, rawHost, requestPath, strict);
     }
 
     if (!route) {
@@ -1077,14 +1301,21 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     }
 
     const proxyReq = http.request({
+      agent: false,
       ...LOOPBACK_DIAL_OPTIONS,
       port: route.port,
-      path: req.url,
+      path: target.forwardTarget,
       method: req.method,
       headers: proxyReqHeaders,
     });
 
+    // Once a handshake answer has reached the client, the connection may be
+    // carrying WebSocket frames. Before that point, a proxy error can still
+    // be reported as an HTTP response.
+    let handshakeRelayed = false;
+
     proxyReq.on("upgrade", (proxyRes, proxySocket, proxyHead) => {
+      handshakeRelayed = true;
       // Forward the backend's actual 101 response including Sec-WebSocket-Accept,
       // subprotocol negotiation, and extension headers.
       let response = `HTTP/1.1 101 Switching Protocols\r\n`;
@@ -1116,10 +1347,21 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
 
     proxyReq.on("error", (err) => {
       onError(`WebSocket proxy error for ${getRequestHost(req)}: ${dialErrorMessage(err)}`);
-      socket.destroy();
+      if (!handshakeRelayed && socket.writable) {
+        socket.end(
+          "HTTP/1.1 502 Bad Gateway\r\n" +
+            "Content-Type: text/plain\r\n" +
+            "Connection: close\r\n" +
+            "\r\n" +
+            "Bad Gateway: the target app is not responding or sent an invalid response to the WebSocket handshake.\n"
+        );
+      } else {
+        socket.destroy();
+      }
     });
 
     proxyReq.on("response", (res) => {
+      handshakeRelayed = true;
       // The backend responded with a normal HTTP response instead of upgrading.
       // Forward the rejection to the client.
       if (!socket.destroyed) {
@@ -1201,17 +1443,23 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     // The redirect targets the same port because the wrapper net.Server
     // demuxes TLS and plain HTTP on a single listener (peek at first byte).
     const plainServer = http.createServer((req, res) => {
-      const host = getRequestHost(req).split(":")[0] || "localhost";
-      const location = `https://${host}${proxyPort === 443 ? "" : `:${proxyPort}`}${req.url || "/"}`;
+      const authority = getRequestHost(req);
+      const host = authority.split(":")[0] || "localhost";
+      const target = classifyRequestTarget(req.url || "/", req.method, authority, false);
+      if (!target) {
+        writeBadRequest(res);
+        return;
+      }
+      const location = `https://${host}${proxyPort === 443 ? "" : `:${proxyPort}`}${target.forwardTarget}`;
       res.writeHead(302, { Location: location, [PORTLESS_HEADER]: "1" });
       res.end();
     });
-    plainServer.on("upgrade", (req: http.IncomingMessage, socket: net.Socket) => {
+    plainServer.on("upgrade", (req: http.IncomingMessage, socket: net.Socket, head: Buffer) => {
       const host = getRequestHost(req);
       console.warn(
-        `[portless] Dropped plain-HTTP WebSocket upgrade for ${host}; use wss:// instead`
+        `[portless] Plain HTTP WebSocket upgrade received for ${host}; use wss:// instead`
       );
-      socket.destroy();
+      handleUpgrade(req, socket, head);
     });
 
     // Wrap both in a net.Server that peeks at the first byte to decide
@@ -1244,6 +1492,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     const origClose = wrapper.close.bind(wrapper);
     wrapper.close = function (cb?: (err?: Error) => void) {
       closeH2cSessions(h2cSessions);
+      upstreamAgent.destroy();
       h2Server.close();
       plainServer.close();
       return origClose(cb);
@@ -1254,7 +1503,10 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
 
   const httpServer = http.createServer(handleRequest);
   httpServer.on("upgrade", handleUpgrade);
-  httpServer.on("close", () => closeH2cSessions(h2cSessions));
+  httpServer.on("close", () => {
+    closeH2cSessions(h2cSessions);
+    upstreamAgent.destroy();
+  });
 
   return httpServer;
 }
@@ -1265,9 +1517,15 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
  */
 export function createHttpRedirectServer(httpsPort: number): http.Server {
   return http.createServer((req, res) => {
-    const host = (req.headers.host || "localhost").split(":")[0];
+    const authority = req.headers.host || "localhost";
+    const host = authority.split(":")[0];
+    const target = classifyRequestTarget(req.url || "/", req.method, authority, false);
+    if (!target) {
+      writeBadRequest(res);
+      return;
+    }
     const portSuffix = httpsPort === 443 ? "" : `:${httpsPort}`;
-    const location = `https://${host}${portSuffix}${req.url || "/"}`;
+    const location = `https://${host}${portSuffix}${target.forwardTarget}`;
     res.writeHead(302, { Location: location, [PORTLESS_HEADER]: "1" });
     res.end();
   });
