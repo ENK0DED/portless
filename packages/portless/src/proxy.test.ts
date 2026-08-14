@@ -262,6 +262,45 @@ describe("createProxyServer", () => {
       expect(res.body).toBe("via alias");
     });
 
+    it("uses the tunnel alias provider as the only alias source for repeated requests", async () => {
+      const backend = trackServer(http.createServer((_req, res) => res.end("via provider")));
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const routes: RouteInfo[] = [{ hostname: "myapp.localhost", port: backendAddr.port }];
+      const aliases: TunnelAlias[] = [
+        {
+          externalHostname: "public.example.com",
+          targetHostname: "myapp.localhost",
+          targetPathPrefix: "/",
+        },
+      ];
+      const getTunnelAliases = vi.fn(() => aliases);
+      const server = trackServer(
+        createProxyServer({
+          getRoutes: () => routes,
+          getTunnelAliases,
+          proxyPort: TEST_PROXY_PORT,
+        })
+      );
+      await listen(server);
+
+      const responses = await Promise.all([
+        request(server, { host: "public.example.com" }),
+        request(server, { host: "public.example.com" }),
+        request(server, { host: "public.example.com" }),
+      ]);
+
+      expect(responses.map((response) => response.body)).toEqual([
+        "via provider",
+        "via provider",
+        "via provider",
+      ]);
+      expect(getTunnelAliases).toHaveBeenCalledTimes(3);
+      expect(getTunnelAliases.mock.results.every(({ value }) => value === aliases)).toBe(true);
+    });
+
     it("does not route arbitrary public hosts without an explicit tunnel alias", async () => {
       const backend = trackServer(http.createServer((_req, res) => res.end("private app")));
       await listen(backend);

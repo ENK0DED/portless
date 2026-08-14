@@ -732,12 +732,13 @@ function startProxyServer(
   fixOwnership(routesPath);
 
   // Cache routes in memory and reload on file change (debounced)
+  const tunnelAliasStore = new TunnelAliasStore(store.dir);
   let cachedRoutes = store.loadRoutes();
+  let cachedTunnelAliases = tunnelAliasStore.loadAliases();
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;
   let watcher: fs.FSWatcher | null = null;
   let pollingInterval: ReturnType<typeof setInterval> | null = null;
   let routesCleanupInterval: ReturnType<typeof setInterval> | null = null;
-  const tunnelAliasStore = new TunnelAliasStore(store.dir);
 
   const autoSyncHosts = shouldAutoSyncHosts(process.env.PORTLESS_SYNC_HOSTS);
   let hostsSyncWarned = false;
@@ -808,8 +809,17 @@ function startProxyServer(
     }
   };
 
+  const reloadTunnelAliases = () => {
+    try {
+      cachedTunnelAliases = tunnelAliasStore.loadAliases();
+    } catch {
+      // File may be mid-write; keep the existing cached aliases
+    }
+  };
+
   try {
     const routesFilename = path.basename(routesPath);
+    const aliasesFilename = path.basename(tunnelAliasStore.getAliasesPath());
     // Canonicalize the watched directory: on Windows, watching an 8.3
     // short-path spelling (e.g. RUNNER~1) makes libuv assert in fs-event.c
     // when events arrive under the long name, aborting the process.
@@ -820,14 +830,21 @@ function startProxyServer(
       // Fall back to the configured spelling if the path cannot be resolved
     }
     watcher = fs.watch(watchDir, (_eventType, filename) => {
-      if (filename && filename.toString() !== routesFilename) return;
+      const name = filename?.toString();
+      if (name && name !== routesFilename && name !== aliasesFilename) return;
       if (debounceTimer) clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(reloadRoutes, DEBOUNCE_MS);
+      debounceTimer = setTimeout(() => {
+        reloadRoutes();
+        reloadTunnelAliases();
+      }, DEBOUNCE_MS);
     });
   } catch {
     // fs.watch may not be supported; fall back to periodic polling
     console.warn(colors.yellow("fs.watch unavailable; falling back to polling for route changes"));
-    pollingInterval = setInterval(reloadRoutes, POLL_INTERVAL_MS);
+    pollingInterval = setInterval(() => {
+      reloadRoutes();
+      reloadTunnelAliases();
+    }, POLL_INTERVAL_MS);
   }
 
   if (routesCleanupIntervalSeconds > 0) {
@@ -886,7 +903,7 @@ function startProxyServer(
   const createServer = () =>
     createProxyServer({
       getRoutes: () => cachedRoutes,
-      getTunnelAliases: () => new TunnelAliasStore(store.dir).loadAliases(),
+      getTunnelAliases: () => cachedTunnelAliases,
       proxyPort,
       tld,
       tlds,
