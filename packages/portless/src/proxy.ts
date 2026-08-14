@@ -1157,7 +1157,13 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       headers: proxyReqHeaders,
     });
 
+    // Once a handshake answer has reached the client, the connection may be
+    // carrying WebSocket frames. Before that point, a proxy error can still
+    // be reported as an HTTP response.
+    let handshakeRelayed = false;
+
     proxyReq.on("upgrade", (proxyRes, proxySocket, proxyHead) => {
+      handshakeRelayed = true;
       // Forward the backend's actual 101 response including Sec-WebSocket-Accept,
       // subprotocol negotiation, and extension headers.
       let response = `HTTP/1.1 101 Switching Protocols\r\n`;
@@ -1189,10 +1195,21 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
 
     proxyReq.on("error", (err) => {
       onError(`WebSocket proxy error for ${getRequestHost(req)}: ${dialErrorMessage(err)}`);
-      socket.destroy();
+      if (!handshakeRelayed && socket.writable) {
+        socket.end(
+          "HTTP/1.1 502 Bad Gateway\r\n" +
+            "Content-Type: text/plain\r\n" +
+            "Connection: close\r\n" +
+            "\r\n" +
+            "Bad Gateway: the target app is not responding or sent an invalid response to the WebSocket handshake.\n"
+        );
+      } else {
+        socket.destroy();
+      }
     });
 
     proxyReq.on("response", (res) => {
+      handshakeRelayed = true;
       // The backend responded with a normal HTTP response instead of upgrading.
       // Forward the rejection to the client.
       if (!socket.destroyed) {
@@ -1279,12 +1296,12 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       res.writeHead(302, { Location: location, [PORTLESS_HEADER]: "1" });
       res.end();
     });
-    plainServer.on("upgrade", (req: http.IncomingMessage, socket: net.Socket) => {
+    plainServer.on("upgrade", (req: http.IncomingMessage, socket: net.Socket, head: Buffer) => {
       const host = getRequestHost(req);
       console.warn(
-        `[portless] Dropped plain-HTTP WebSocket upgrade for ${host}; use wss:// instead`
+        `[portless] Plain HTTP WebSocket upgrade received for ${host}; use wss:// instead`
       );
-      socket.destroy();
+      handleUpgrade(req, socket, head);
     });
 
     // Wrap both in a net.Server that peeks at the first byte to decide
