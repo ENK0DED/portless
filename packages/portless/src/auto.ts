@@ -159,6 +159,49 @@ export interface WorktreePrefix {
   source: string;
 }
 
+const WORKTREE_FLAT_ENV = "PORTLESS_WORKTREE_FLAT";
+const FLAT_WORKTREE_HASH_LENGTH = 6;
+
+/**
+ * Resolve the flat hostname setting from project configuration and the
+ * environment. The environment takes precedence when it contains a boolean
+ * value, including an explicit `0` to turn off a project setting.
+ */
+export function resolveWorktreeFlat(
+  configured: boolean | undefined,
+  env: NodeJS.ProcessEnv = process.env
+): boolean {
+  const value = env[WORKTREE_FLAT_ENV];
+  if (value === "1" || value === "true") return true;
+  if (value === "0" || value === "false") return false;
+  return configured === true;
+}
+
+/**
+ * Apply a worktree prefix to a base hostname, or return the base name
+ * unchanged when not in a worktree. Flat names use a tuple hash whenever
+ * replacing structured labels with hyphens could make two names identical.
+ */
+export function applyWorktreePrefix(
+  baseName: string,
+  worktree: WorktreePrefix | null,
+  flat: boolean = resolveWorktreeFlat(undefined)
+): string {
+  if (!worktree) return baseName;
+  if (!flat) return `${worktree.prefix}.${baseName}`;
+
+  const flattened = `${worktree.prefix}-${baseName.replace(/\./g, "-")}`;
+  const isAmbiguous =
+    worktree.prefix.includes("-") || baseName.includes("-") || baseName.includes(".");
+  if (!isAmbiguous) return truncateLabel(flattened);
+
+  const tupleHash = createHash("sha256")
+    .update(JSON.stringify([worktree.prefix, baseName]))
+    .digest("hex")
+    .slice(0, FLAT_WORKTREE_HASH_LENGTH);
+  return truncateLabel(`${flattened}-${tupleHash}`);
+}
+
 /** Branch names that represent the default/primary checkout — no prefix needed. */
 const DEFAULT_BRANCHES = new Set(["main", "master"]);
 

@@ -49,7 +49,9 @@ import {
 } from "./netbird.js";
 import {
   inferProjectName,
+  applyWorktreePrefix,
   detectWorktreePrefix,
+  resolveWorktreeFlat,
   truncateLabel,
   sanitizeForHostname,
 } from "./auto.js";
@@ -148,6 +150,7 @@ const chalk = colors;
 type LoadedAppConfig = {
   config: AppConfig;
   sourceLabel: string;
+  worktreeFlat?: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -2482,6 +2485,8 @@ ${colors.bold("Name inference (in order):")}
   Use --name to override the inferred name while keeping worktree prefixes.
   In git worktrees, the branch name is prepended as a subdomain prefix
   (e.g. feature-auth.myapp.localhost).
+  Set PORTLESS_WORKTREE_FLAT=1 to join worktree and app names into one label
+  (e.g. feature-auth-myapp.localhost). Use 0 to override a project setting.
 
 ${colors.bold("Command placeholders:")}
   {PORT}                 Assigned app port
@@ -3225,6 +3230,7 @@ ${colors.bold("Configuration (portless.json or .config/portless.json):")}
 
   Override name:   { "name": "myapp" }
   Override script: { "name": "myapp", "script": "start" }
+  Flat worktree:   { "worktreeFlat": true }
   Monorepo:        { "apps": { "apps/web": { "name": "myapp" } } }
 
 ${colors.bold("In package.json:")}
@@ -3414,6 +3420,8 @@ ${colors.bold("Environment variables:")}
   PORTLESS_WILDCARD=1           Allow unregistered subdomains to fall back to parent route
                                 Local proxy mode only; mDNS LAN mode cannot resolve wildcards
   PORTLESS_SYNC_HOSTS=0         Disable auto-sync of ${HOSTS_DISPLAY} (on by default)
+  PORTLESS_WORKTREE_FLAT=1      Join worktree and app names into one DNS label
+                                Set to 0 to override worktreeFlat in project config
   PORTLESS_TAILSCALE=1          Share apps on your Tailscale network (same as --tailscale)
   PORTLESS_TAILSCALE_SERVICE=1  Share apps as Tailscale Services
   PORTLESS_TAILSCALE_SERVICE_NAME=<n>
@@ -4877,9 +4885,11 @@ function loadAppConfig(cwd: string = process.cwd()): LoadedAppConfig | null {
   try {
     const loaded = loadConfig(cwd);
     if (!loaded) return null;
+    const config = resolveAppConfig(loaded.config, loaded.configDir, cwd);
     return {
-      config: resolveAppConfig(loaded.config, loaded.configDir, cwd),
+      config,
       sourceLabel: configSourceLabel(loaded.sourcePath, cwd),
+      worktreeFlat: config.worktreeFlat ?? loaded.config.worktreeFlat,
     };
   } catch (err) {
     if (err instanceof ConfigValidationError) {
@@ -4969,7 +4979,11 @@ async function handleDefaultSingle(
   }
 
   const worktree = detectWorktreePrefix(cwd);
-  const effectiveName = worktree ? `${worktree.prefix}.${baseName}` : baseName;
+  const effectiveName = applyWorktreePrefix(
+    baseName,
+    worktree,
+    resolveWorktreeFlat(appConfig?.worktreeFlat)
+  );
 
   const { dir, port, tls, tlds, lanMode, lanIp } = await discoverState();
   const store = new RouteStore(dir, {
@@ -5241,6 +5255,7 @@ async function handleDefaultMulti(
   }
 
   const worktree = detectWorktreePrefix(wsRoot);
+  const worktreeFlat = resolveWorktreeFlat(loaded?.config.worktreeFlat);
   const apps: MultiAppEntry[] = [];
 
   for (const pkg of packages) {
@@ -5282,7 +5297,7 @@ async function handleDefaultMulti(
         .split(".")
         .map((l) => truncateLabel(l))
         .join(".");
-      name = worktree ? `${worktree.prefix}.${baseName}` : baseName;
+      name = applyWorktreePrefix(baseName, worktree, worktreeFlat);
       label = appOverride.name;
     } else {
       let pkgLabel: string;
@@ -5293,7 +5308,7 @@ async function handleDefaultMulti(
         pkgLabel = rel.replace(/\//g, "-");
       }
       const baseName = pkgLabel === projectName ? projectName : `${pkgLabel}.${projectName}`;
-      name = worktree ? `${worktree.prefix}.${baseName}` : baseName;
+      name = applyWorktreePrefix(baseName, worktree, worktreeFlat);
       label = pkg.scope ? `@${pkg.scope}/${pkg.name}` : (pkg.name ?? rel);
     }
 
@@ -5614,7 +5629,11 @@ async function handleRunMode(args: string[], globalScript?: string): Promise<voi
   }
 
   const worktree = detectWorktreePrefix();
-  const effectiveName = worktree ? `${worktree.prefix}.${baseName}` : baseName;
+  const effectiveName = applyWorktreePrefix(
+    baseName,
+    worktree,
+    resolveWorktreeFlat(appConfig?.worktreeFlat)
+  );
 
   const { dir, port, tls, tlds, lanMode, lanIp } = await discoverState();
   const store = new RouteStore(dir, {
