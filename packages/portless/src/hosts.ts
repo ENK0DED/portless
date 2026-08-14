@@ -7,6 +7,7 @@ const isWindows = process.platform === "win32";
 const HOSTS_PATH = isWindows
   ? path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "drivers", "etc", "hosts")
   : "/etc/hosts";
+const LOOPBACK_ADDRESS = "127.0.0.1";
 const MARKER_START = "# portless-start";
 const MARKER_END = "# portless-end";
 
@@ -57,7 +58,9 @@ export function removeBlock(content: string): string {
 export function buildBlock(hostnames: string[]): string {
   const uniqueHostnames = deduplicateHostnames(hostnames);
   if (uniqueHostnames.length === 0) return "";
-  const entries = uniqueHostnames.map((h) => `127.0.0.1 ${assertSafeHostsHostname(h)}`).join("\n");
+  const entries = uniqueHostnames
+    .map((h) => `${LOOPBACK_ADDRESS} ${assertSafeHostsHostname(h)}`)
+    .join("\n");
   return `${MARKER_START}\n${entries}\n${MARKER_END}`;
 }
 
@@ -101,14 +104,42 @@ export function shouldAutoSyncHosts(syncVal: string | undefined): boolean {
 }
 
 /**
- * Sync /etc/hosts to include entries for all given hostnames.
- * Replaces any existing portless-managed block. Requires root access.
- * Returns true on success, false on failure.
+ * Whether the managed block is exactly these hostnames, with every hostname
+ * mapped to loopback. A stale extra entry is not a match because it would keep
+ * a removed route resolving indefinitely.
+ */
+export function blockMatchesHostnames(content: string, hostnames: string[]): boolean {
+  const lines = extractManagedBlock(content);
+  const wanted = new Set(hostnames);
+  if (wanted.size !== hostnames.length) return false;
+
+  const seen = new Set<string>();
+  for (const line of lines) {
+    const uncommented = line.split("#", 1)[0].trim();
+    if (!uncommented) continue;
+    const tokens = uncommented.split(/\s+/);
+    const [address, ...aliases] = tokens;
+    if (address !== LOOPBACK_ADDRESS || aliases.length === 0) return false;
+
+    for (const hostname of aliases) {
+      if (!wanted.has(hostname) || seen.has(hostname)) return false;
+      seen.add(hostname);
+    }
+  }
+
+  return seen.size === wanted.size;
+}
+
+/**
+ * Rewrite the managed block to include exactly these hostnames. Requires root
+ * access. Returns whether the desired block is present after the operation.
  */
 export function syncHostsFile(hostnames: string[]): boolean {
+  const uniqueHostnames = deduplicateHostnames(hostnames);
+  const content = readHostsFile();
+  if (blockMatchesHostnames(content, uniqueHostnames)) return true;
+
   try {
-    const uniqueHostnames = deduplicateHostnames(hostnames);
-    const content = readHostsFile();
     const cleaned = removeBlock(content);
 
     if (uniqueHostnames.length === 0) {
@@ -117,10 +148,11 @@ export function syncHostsFile(hostnames: string[]): boolean {
       const block = buildBlock(uniqueHostnames);
       fs.writeFileSync(HOSTS_PATH, cleaned.trimEnd() + "\n\n" + block + "\n");
     }
-    return true;
   } catch {
     return false;
   }
+
+  return blockMatchesHostnames(readHostsFile(), uniqueHostnames);
 }
 
 /**
@@ -143,12 +175,10 @@ export function cleanHostsFile(): boolean {
  */
 export function getManagedHostnames(): string[] {
   const content = readHostsFile();
-  return extractManagedBlock(content)
-    .map((line) => {
-      const parts = line.split(/\s+/);
-      return parts.length >= 2 ? parts[1] : "";
-    })
-    .filter(Boolean);
+  return extractManagedBlock(content).flatMap((line) => {
+    const [, ...aliases] = line.split("#", 1)[0].trim().split(/\s+/);
+    return aliases;
+  });
 }
 
 /**

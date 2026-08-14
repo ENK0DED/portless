@@ -798,6 +798,8 @@ portless hosts clean   # Clean up later
 
 Auto-syncs `/etc/hosts` for route hostnames by default (`.localhost`, custom suffixes, LAN `.local`). Set `PORTLESS_SYNC_HOSTS=0` to disable.
 
+If a route hostname will not resolve, the command that registered it warns instead of failing silently and points you to `portless hosts sync`.
+
 ## Proxying Between Portless Apps
 
 If your frontend dev server (e.g. Vite, webpack) proxies API requests to another portless app, make sure the proxy rewrites the `Host` header. Without this, portless routes the request back to the frontend in an infinite loop.

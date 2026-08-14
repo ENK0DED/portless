@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  blockMatchesHostnames,
   checkHostResolution,
   extractManagedBlock,
   removeBlock,
@@ -191,5 +192,50 @@ describe("checkHostResolution", () => {
   it("returns false for a nonexistent domain", async () => {
     const result = await checkHostResolution("this-should-never-exist.invalid");
     expect(result).toBe(false);
+  });
+});
+
+describe("blockMatchesHostnames", () => {
+  const block = "# portless-start\n127.0.0.1 a.localhost\n127.0.0.1 b.localhost\n# portless-end";
+
+  it("accepts the exact managed hostname set regardless of order", () => {
+    expect(blockMatchesHostnames(block, ["b.localhost", "a.localhost"])).toBe(true);
+  });
+
+  it("rejects missing, stale, duplicate, or non-loopback entries", () => {
+    expect(blockMatchesHostnames(block, ["a.localhost"])).toBe(false);
+    expect(blockMatchesHostnames(block, ["a.localhost", "c.localhost"])).toBe(false);
+    expect(
+      blockMatchesHostnames("# portless-start\n127.0.0.1 a.localhost a.localhost\n# portless-end", [
+        "a.localhost",
+      ])
+    ).toBe(false);
+    expect(
+      blockMatchesHostnames("# portless-start\n10.0.0.1 a.localhost\n# portless-end", [
+        "a.localhost",
+      ])
+    ).toBe(false);
+  });
+
+  it("accepts aliases and inline comments in a managed line", () => {
+    expect(
+      blockMatchesHostnames(
+        "# portless-start\n127.0.0.1 a.localhost b.localhost # managed\n# portless-end",
+        ["a.localhost", "b.localhost"]
+      )
+    ).toBe(true);
+  });
+
+  it("ignores standalone comments inside the managed block", () => {
+    expect(
+      blockMatchesHostnames("# portless-start\n# routes\n127.0.0.1 a.localhost\n# portless-end", [
+        "a.localhost",
+      ])
+    ).toBe(true);
+  });
+
+  it("treats an absent managed block as correct only for no hostnames", () => {
+    expect(blockMatchesHostnames("127.0.0.1 localhost\n", [])).toBe(true);
+    expect(blockMatchesHostnames("127.0.0.1 localhost\n", ["a.localhost"])).toBe(false);
   });
 });

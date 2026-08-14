@@ -29,6 +29,7 @@ import {
   getProtocolPort,
   getProxyBindTargets,
   getRiskyTldReason,
+  hasLanMarker,
   hasConfiguredTldEnv,
   injectPackageScriptFrameworkFlags,
   isHttpsEnvDisabled,
@@ -45,15 +46,18 @@ import {
   readTldFromDir,
   readTldsFromDir,
   readWildcardMarker,
+  reportHostsSync,
   replacePlaceholders,
   resolveFrameworkBasename,
   resolveWindowsCommandInvocation,
   resolveWindowsExecutable,
   resolveStateDir,
+  syncHostsWithWarning,
   validateTld,
   writeLanMarker,
   writeCustomCertMarker,
   writeInternalPagesDisabledMarker,
+  writeLanModeMarker,
   writeTldFile,
   writeTldsFile,
   writeTlsMarker,
@@ -1777,6 +1781,12 @@ describe("readLanMarker / writeLanMarker", () => {
     expect(readLanMarker(tmpDir)).toBeNull();
   });
 
+  it("retains marker existence when LAN has temporarily lost its IP", () => {
+    writeLanModeMarker(tmpDir, true, null);
+    expect(hasLanMarker(tmpDir)).toBe(true);
+    expect(readLanMarker(tmpDir)).toBeNull();
+  });
+
   it("uses the LAN marker to remember LAN mode when the proxy is stopped", async () => {
     const prevStateDir = process.env.PORTLESS_STATE_DIR;
     const prevSuffix = process.env[SUFFIX_ENV];
@@ -2116,6 +2126,15 @@ describe("readPersistedProxyState", () => {
     expect(state!.lanMode).toBe(true);
   });
 
+  it("uses LAN marker existence when its current IP is unavailable", () => {
+    fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
+    fs.writeFileSync(path.join(tmpDir, "proxy.tld"), "local");
+    fs.writeFileSync(path.join(tmpDir, "proxy.lan"), "");
+    expect(hasLanMarker(tmpDir)).toBe(true);
+    expect(readLanMarker(tmpDir)).toBeNull();
+    expect(readPersistedProxyState()).toMatchObject({ lanMode: true });
+  });
+
   it("returns full previous config for a custom proxy setup", () => {
     fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
     writeTlsMarker(tmpDir, true);
@@ -2131,6 +2150,139 @@ describe("readPersistedProxyState", () => {
       lanMode: true,
       useWildcard: true,
     });
+  });
+});
+
+describe("reportHostsSync", () => {
+  const warnings: string[] = [];
+
+  beforeEach(() => {
+    warnings.length = 0;
+  });
+
+  it("checks each unique hostname after the managed block is ready", async () => {
+    const checked: string[] = [];
+    let reads = 0;
+
+    await reportHostsSync(
+      ["good.test", "bad.test", "bad.test"],
+      false,
+      (message) => warnings.push(message),
+      async (hostname) => {
+        expect(reads).toBeGreaterThan(1);
+        checked.push(hostname);
+        return hostname === "good.test";
+      },
+      () => (++reads >= 2 ? ["good.test", "bad.test"] : []),
+      500
+    );
+
+    expect(checked).toEqual(["good.test", "bad.test"]);
+    expect(warnings).toEqual(["bad.test will not resolve. Run: portless hosts sync"]);
+  });
+
+  it("polls the managed block up to the bounded ceiling before warning", async () => {
+    let reads = 0;
+    const started = Date.now();
+
+    await reportHostsSync(
+      ["missing.test"],
+      false,
+      (message) => warnings.push(message),
+      async () => false,
+      () => {
+        reads += 1;
+        return [];
+      },
+      40
+    );
+
+    expect(reads).toBeGreaterThan(1);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(40);
+    expect(warnings).toEqual(["missing.test will not resolve. Run: portless hosts sync"]);
+  });
+
+  it("skips .local hostnames only while LAN mode is active", async () => {
+    let checked = 0;
+    await reportHostsSync(
+      ["device.local", "custom.test"],
+      true,
+      (message) => warnings.push(message),
+      async () => {
+        checked += 1;
+        return false;
+      },
+      () => ["custom.test"]
+    );
+
+    expect(checked).toBe(1);
+    expect(warnings).toEqual(["custom.test will not resolve. Run: portless hosts sync"]);
+  });
+
+  it("checks immediately when hosts sync is disabled", async () => {
+    const previous = process.env.PORTLESS_SYNC_HOSTS;
+    process.env.PORTLESS_SYNC_HOSTS = "0";
+    let slept = false;
+    try {
+      await reportHostsSync(
+        ["missing.test"],
+        false,
+        (message) => warnings.push(message),
+        async () => false,
+        () => [],
+        3500,
+        async () => {
+          slept = true;
+        }
+      );
+    } finally {
+      if (previous === undefined) delete process.env.PORTLESS_SYNC_HOSTS;
+      else process.env.PORTLESS_SYNC_HOSTS = previous;
+    }
+
+    expect(slept).toBe(false);
+    expect(warnings).toEqual(["missing.test will not resolve. Run: portless hosts sync"]);
+  });
+});
+
+describe("syncHostsWithWarning", () => {
+  it("warns once for repeated failed non-empty syncs", () => {
+    let warnings = 0;
+    const failedSync = () => false;
+
+    let warned = syncHostsWithWarning(["a.localhost"], false, () => warnings++, failedSync);
+    warned = syncHostsWithWarning(["a.localhost"], warned, () => warnings++, failedSync);
+
+    expect(warnings).toBe(1);
+    expect(warned).toBe(true);
+  });
+
+  it("re-arms after success and ignores an empty warm-up failure", () => {
+    let warnings = 0;
+    const stillUnwarned = syncHostsWithWarning(
+      [],
+      false,
+      () => warnings++,
+      () => false
+    );
+    expect(stillUnwarned).toBe(false);
+    expect(warnings).toBe(0);
+
+    const rearmed = syncHostsWithWarning(
+      ["a.localhost"],
+      true,
+      () => warnings++,
+      () => true
+    );
+    expect(rearmed).toBe(false);
+    const latched = syncHostsWithWarning(
+      ["a.localhost"],
+      rearmed,
+      () => warnings++,
+      () => false
+    );
+    expect(latched).toBe(true);
+    expect(warnings).toBe(1);
   });
 });
 
