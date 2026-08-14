@@ -469,12 +469,12 @@ export function isCATrusted(stateDir: string): boolean {
   if (process.platform === "darwin") {
     return isCATrustedMacOS(caCertPath);
   } else if (process.platform === "linux") {
-    if (!isCATrustedLinux(stateDir)) return false;
-    if (!isWSL()) return true;
+    const trustedLinux = isCATrustedLinux(stateDir);
+    if (!isWSL()) return trustedLinux;
     try {
-      return isWindowsCATrusted(caCertPath, wslWindowsCAStoreOptions());
+      return trustedLinux || isWindowsCATrusted(caCertPath, wslWindowsCAStoreOptions());
     } catch {
-      return false;
+      return trustedLinux;
     }
   } else if (process.platform === "win32") {
     return isWindowsCATrusted(caCertPath);
@@ -535,8 +535,9 @@ function loginKeychainPath(): string {
  * Each entry maps a distro family to its CA certificate directory and update command.
  */
 export interface LinuxCATrustConfig {
-  certDir: string;
-  updateCommand: string;
+  certDir?: string;
+  updateCommand?: string;
+  manualSetupMessage?: string;
 }
 
 export interface LinuxCATrustRemovalOptions {
@@ -562,6 +563,10 @@ const LINUX_CA_TRUST_CONFIGS: Record<string, LinuxCATrustConfig> = {
     certDir: "/etc/pki/trust/anchors",
     updateCommand: "update-ca-certificates",
   },
+  nixos: {
+    manualSetupMessage:
+      'NixOS does not support automatic CA trust updates via update-ca-certificates. Add the generated CA file to your NixOS config (for example: `security.pki.certificateFiles = ["{CERT_PATH}"];`) and run `sudo nixos-rebuild switch`.',
+  },
 };
 
 /**
@@ -572,6 +577,7 @@ function detectLinuxDistro(): string | undefined {
   try {
     const osRelease = fs.readFileSync("/etc/os-release", "utf-8").toLowerCase();
     // ID_LIKE often lists parent distros (e.g., "ID_LIKE=arch" or "ID_LIKE=debian")
+    if (osRelease.includes("nixos")) return "nixos";
     if (osRelease.includes("arch")) return "arch";
     if (osRelease.includes("fedora") || osRelease.includes("rhel") || osRelease.includes("centos"))
       return "fedora";
@@ -583,6 +589,7 @@ function detectLinuxDistro(): string | undefined {
 
   // Fallback: probe for known update commands
   for (const [distro, config] of Object.entries(LINUX_CA_TRUST_CONFIGS)) {
+    if (!config.updateCommand || !config.certDir) continue;
     try {
       execFileSync("which", [config.updateCommand], { stdio: "pipe", timeout: 5000 });
       if (fs.existsSync(path.dirname(config.certDir))) return distro;
@@ -596,11 +603,21 @@ function detectLinuxDistro(): string | undefined {
 
 /**
  * Get the CA trust config for the current Linux distro.
- * Falls back to Debian layout if detection fails.
+ * Returns undefined when automatic trust is not available.
  */
-function getLinuxCATrustConfig(): LinuxCATrustConfig {
+function getLinuxCATrustConfig(): LinuxCATrustConfig | undefined {
   const distro = detectLinuxDistro();
-  return LINUX_CA_TRUST_CONFIGS[distro ?? "debian"];
+  if (!distro) return undefined;
+  return LINUX_CA_TRUST_CONFIGS[distro];
+}
+
+function linuxCATrustErrorMessage(caCertPath: string, config?: LinuxCATrustConfig): string {
+  const customMessage = config?.manualSetupMessage?.replace("{CERT_PATH}", caCertPath);
+  return (
+    customMessage ||
+    "Portless does not have automatic CA trust wiring for this Linux distribution. " +
+      "Install and trust this CA manually in your distro trust store, then rebuild as needed."
+  );
 }
 
 /**
@@ -609,8 +626,9 @@ function getLinuxCATrustConfig(): LinuxCATrustConfig {
  */
 function isCATrustedLinux(
   stateDir: string,
-  config: LinuxCATrustConfig = getLinuxCATrustConfig()
+  config: LinuxCATrustConfig | undefined = getLinuxCATrustConfig()
 ): boolean {
+  if (!config?.certDir) return false;
   const systemCertPath = path.join(config.certDir, "portless-ca.crt");
   if (!fileExists(systemCertPath)) return false;
 
@@ -956,13 +974,22 @@ export function trustCA(stateDir: string): TrustCAResult {
 
     try {
       const config = getLinuxCATrustConfig();
-      if (!fs.existsSync(config.certDir)) {
-        fs.mkdirSync(config.certDir, { recursive: true });
+      if (!config?.certDir || !config.updateCommand) {
+        const linuxMessage = linuxCATrustErrorMessage(caCertPath, config);
+        if (trustedWindows) {
+          warnings.push("Could not add CA to the WSL Linux trust store. " + linuxMessage);
+        } else {
+          errors.push("Could not add CA to the WSL Linux trust store. " + linuxMessage);
+        }
+      } else {
+        if (!fs.existsSync(config.certDir)) {
+          fs.mkdirSync(config.certDir, { recursive: true });
+        }
+        const dest = path.join(config.certDir, "portless-ca.crt");
+        fs.copyFileSync(caCertPath, dest);
+        execFileSync(config.updateCommand, [], { stdio: "pipe", timeout: 30_000 });
+        trustedLinux = true;
       }
-      const dest = path.join(config.certDir, "portless-ca.crt");
-      fs.copyFileSync(caCertPath, dest);
-      execFileSync(config.updateCommand, [], { stdio: "pipe", timeout: 30_000 });
-      trustedLinux = true;
     } catch (err: unknown) {
       const linuxMessage = formatTrustError(err);
       if (trustedWindows) {
@@ -1014,6 +1041,9 @@ export function trustCA(stateDir: string): TrustCAResult {
       return { trusted: true };
     } else if (process.platform === "linux") {
       const config = getLinuxCATrustConfig();
+      if (!config?.certDir || !config.updateCommand) {
+        return { trusted: false, error: linuxCATrustErrorMessage(caCertPath, config) };
+      }
       if (!fs.existsSync(config.certDir)) {
         fs.mkdirSync(config.certDir, { recursive: true });
       }
@@ -1137,6 +1167,7 @@ export function untrustCALinux(
     });
 
   for (const config of configs) {
+    if (!config.certDir) continue;
     const dest = path.join(config.certDir, "portless-ca.crt");
     try {
       if (fileExists(dest)) {
@@ -1157,10 +1188,14 @@ export function untrustCALinux(
   }
 
   if (refreshNeeded) {
-    try {
-      runUpdate(activeConfig.updateCommand);
-    } catch (err: unknown) {
-      errors.push(err instanceof Error ? err.message : String(err));
+    if (!activeConfig?.updateCommand) {
+      errors.push(linuxCATrustErrorMessage(path.join(stateDir, CA_CERT_FILE), activeConfig));
+    } else {
+      try {
+        runUpdate(activeConfig.updateCommand);
+      } catch (err: unknown) {
+        errors.push(err instanceof Error ? err.message : String(err));
+      }
     }
   }
 

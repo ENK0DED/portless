@@ -3333,7 +3333,9 @@ ${colors.bold("HTTP/2 + HTTPS (default):")}
   On first use, portless generates a local CA and adds it to your
   system trust store. Generated certs are stored in the state directory
   and reused across restarts. In WSL, the CA is also added to the Windows
-  user trust store for Windows browsers. No browser warnings.
+  user trust store for Windows browsers. On NixOS and unrecognized Linux
+  distributions, portless prints manual CA setup guidance instead of using
+  an unsupported trust-store layout. No browser warnings.
   Use --skip-trust to skip adding the CA to the trust store.
   Disable with --no-tls.
 

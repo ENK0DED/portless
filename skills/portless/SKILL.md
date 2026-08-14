@@ -275,7 +275,7 @@ portless proxy start --no-tls                       # Disable HTTPS (plain HTTP)
 portless trust                                      # Add CA to trust store later
 ```
 
-On Linux, `portless trust` supports Debian/Ubuntu, Arch, Fedora/RHEL/CentOS, and openSUSE (via `update-ca-certificates` or `update-ca-trust`). On Windows, it uses `certutil` to add the CA to the system trust store. In WSL, portless also installs the CA into the Windows CurrentUser Root store so Windows browsers trust WSL-served portless HTTPS URLs.
+On Linux, `portless trust` supports Debian/Ubuntu, Arch, Fedora/RHEL/CentOS, and openSUSE (via `update-ca-certificates` or `update-ca-trust`). NixOS and unrecognized Linux distributions receive manual setup guidance instead of being written to an unsupported trust layout. On Windows, it uses `certutil` to add the CA to the system trust store. In WSL, portless also installs the CA into the Windows CurrentUser Root store so Windows browsers trust WSL-served portless HTTPS URLs.
 
 To trust the CA on another device (a phone over LAN mode, a second machine, or a browser with its own store), open `https://cert.localhost` (`cert.<suffix>`) in that browser. It serves the **public** CA only (`/portless-ca.pem`, with its SHA-256 fingerprint) plus per-OS install steps; the private key is never exposed. On the host machine, `portless trust` already does this.
 
