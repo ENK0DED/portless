@@ -1,8 +1,28 @@
 # Changelog
 
-## 0.15.6001
+## 0.15.6002
 
 <!-- release:start -->
+
+### Backport Batch
+
+- **Hosts and mDNS deduplication**: Same-hostname routes no longer create duplicate managed hosts-file lines or restart the mDNS publisher when only a backend port changes.
+- **Atomic route persistence and cleanup**: `routes.json` writes now use atomic replacement, and a periodic stale-route sweep removes dead entries without terminating the process behind a route. Configure or disable it with `--routes-cleanup-interval` or `PORTLESS_ROUTES_CLEANUP_INTERVAL`.
+- **Hostname resolution and LAN inference**: Registration warns when hostnames remain unresolvable, the daemon latches non-empty hosts-sync failures until recovery, and LAN mode follows the marker file even while its IP is temporarily unavailable.
+- **Keep-alive backend connections**: Ordinary HTTP/1.1 forwarding now reuses capped loopback connections while upgrade, WebSocket, and HTTP/2 paths keep their existing connection handling.
+- **Sharing hostnames in Vite**: Exact persisted Tailscale, ngrok, managed tunnel, and NetBird hostnames are added to Vite's allowed-hosts list across all sharing modes without introducing wildcards.
+- **Linux and WSL CA trust guidance**: NixOS and unknown Linux distributions receive manual trust-store guidance instead of a silent Debian fallback, and WSL trust-state detection remains consistent across Linux and Windows stores.
+- **Windows cmd.exe escaping security fix**: Hardened `.cmd` and `.bat` shim invocation against metacharacter injection through the shim path. The vulnerable path was reachable from `portless run … -- …` arguments and package scripts.
+- **Flat worktree hostnames**: Opt-in flat worktree hostnames now use a shared prefix helper with collision hashing while preserving nested defaults.
+- **Path-aware routing and configuration**: Adds strict path-prefix registration, raw-match verbatim forwarding, absolute-form handling, per-app `path` configuration, multi-app path splitting, and path-aware display output. During migration, now-invalid persisted path prefixes are removed from `routes.json` with a warning naming the `portless alias ... --path <valid-prefix>` re-registration command.
+
+### Contributors
+
+- @enk0ded
+
+<!-- release:end -->
+
+## 0.15.6001
 
 ### Feature Batch
 
@@ -16,8 +36,6 @@
 ### Contributors
 
 - @enk0ded
-
-<!-- release:end -->
 
 ## 0.15.6000
 

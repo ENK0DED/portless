@@ -195,7 +195,7 @@ Examples:
 
 This avoids prerelease semantics and keeps room for local-only releases between upstream syncs.
 
-The current fork release `0.15.6001` tracks upstream `0.15.5` plus the feature batch of ordered suffix lists with explicit LAN suffix behavior, loopback-by-default binding, exact Tailscale hostname routing, package-script framework flag injection, residual #363 WebSocket handling, and fork-aware `portless doctor`. Release `0.15.6002` is reserved for the upstream-PR backport batch from tickets 20–28; those changes are not included in this release. If upstream publishes `0.15.6`, the first synced fork release should be `0.15.7000`. If the fork ships another local-only change after the reserved backport release and before the next upstream patch, use `0.15.6003`.
+The current fork release `0.15.6002` tracks upstream `0.15.5` plus the upstream-PR backport batch from tickets 20–28: hosts and mDNS deduplication, atomic route persistence and stale-route cleanup, hostname resolution warnings and LAN inference, keep-alive backend connections, exact sharing hostnames in Vite's allowlist, NixOS and WSL CA trust fixes, hardened Windows cmd.exe escaping, flat worktree hostnames, and path-aware routing and configuration. If the fork ships another local-only change before upstream publishes `0.15.6`, use `0.15.6003`. If upstream publishes `0.15.6`, the first synced fork release should be `0.15.7000`.
 
 ### Package Manager
 
