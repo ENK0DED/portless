@@ -5,7 +5,9 @@ import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { buildRestartStartArgs, parseBgStartArgs } from "./bg.js";
 import { getBgLogPaths } from "./bg-logs.js";
+import type { BgStartIntent } from "./bg-store.js";
 import { ensureCerts } from "./certs.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -174,6 +176,24 @@ function makeBgEntry(
         ngrok: false,
         netbird: false,
       },
+    },
+    ...overrides,
+  };
+}
+
+function makeRestartIntent(overrides: Partial<BgStartIntent> = {}): BgStartIntent {
+  return {
+    cwd: process.cwd(),
+    commandArgs: ["bun", "run", "dev"],
+    explicitCommand: true,
+    force: false,
+    pathPrefix: "/",
+    sharing: {
+      tailscale: false,
+      tailscaleService: false,
+      funnel: false,
+      ngrok: false,
+      netbird: false,
     },
     ...overrides,
   };
@@ -1517,6 +1537,80 @@ describe("CLI", () => {
         } finally {
           fs.rmSync(appDir, { recursive: true, force: true });
         }
+      });
+
+      it("restart flags stay out of the explicit child command", () => {
+        const intent = makeRestartIntent();
+        const startArgs = buildRestartStartArgs(intent, {
+          force: false,
+          waitSeconds: undefined,
+          keep: false,
+          json: false,
+        });
+        const separatorIndex = startArgs.indexOf("--");
+
+        expect(startArgs.slice(separatorIndex + 1)).toEqual(intent.commandArgs);
+        expect(startArgs.slice(separatorIndex + 1)).not.toContain("--no-wait");
+      });
+
+      it("restart honors --no-wait without waiting for readiness", async () => {
+        const appPort = await getFreePort();
+        expect(
+          run(
+            [
+              "bg",
+              "start",
+              "--name",
+              "restart-no-wait",
+              "--app-port",
+              String(appPort),
+              ...longRunningCommand(),
+            ],
+            { env: bgEnv() }
+          ).status
+        ).toBe(0);
+        const [before] = readBgRegistry(tmpDir);
+
+        const { status } = run(["bg", "restart", "restart-no-wait", "--no-wait"], {
+          env: bgEnv(),
+        });
+        const [after] = readBgRegistry(tmpDir);
+
+        expect(status).toBe(0);
+        expect(after.pid).not.toBe(before.pid);
+        expect(after.state).toBe("starting");
+      });
+
+      it("restart keeps the command separator after every portless flag", () => {
+        const intent = makeRestartIntent();
+        const startArgs = buildRestartStartArgs(intent, {
+          force: true,
+          waitSeconds: 12,
+          keep: true,
+          json: true,
+        });
+        const separatorIndex = startArgs.indexOf("--");
+
+        expect(separatorIndex).toBeGreaterThan(-1);
+        for (const flag of ["--force", "--wait", "--keep", "--json"]) {
+          expect(startArgs.indexOf(flag)).toBeLessThan(separatorIndex);
+        }
+        expect(startArgs.slice(separatorIndex + 1)).toEqual(intent.commandArgs);
+      });
+
+      it("restart omits the separator when there is no explicit command", () => {
+        const startArgs = buildRestartStartArgs(
+          makeRestartIntent({ explicitCommand: false, commandArgs: [] }),
+          { force: false, waitSeconds: 30, keep: false, json: false }
+        );
+
+        expect(startArgs).not.toContain("--");
+      });
+
+      it("bg start rejects a portless flag after the command separator", () => {
+        expect(() =>
+          parseBgStartArgs(["--name", "web", "--", "bun", "run", "dev", "--json"])
+        ).toThrow("command separator");
       });
 
       it("bg clean removes dead entries and their logs", async () => {

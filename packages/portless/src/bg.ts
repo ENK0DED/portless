@@ -40,6 +40,13 @@ export interface ParsedBgStartArgs {
   json: boolean;
 }
 
+export interface BgRestartStartOptions {
+  force: boolean;
+  waitSeconds: number | undefined;
+  keep: boolean;
+  json: boolean;
+}
+
 interface ParsedRunIntent {
   intent: BgStartIntent;
   label: string;
@@ -77,6 +84,9 @@ const RUN_BOOLEAN_FLAGS = new Set([
   "--ngrok",
   "--netbird",
 ]);
+
+/** Flags that belong to portless and must never reach the child command. */
+const BG_ONLY_FLAGS = new Set(["--no-wait", "--wait", "--keep", "--json"]);
 
 function printBgHelp(): void {
   console.log(`
@@ -581,8 +591,28 @@ function runArgsFromIntent(intent: BgStartIntent, force: boolean): string[] {
     args.push("--netbird-password", intent.sharing.netbirdPassword);
   if (intent.sharing.netbirdPin) args.push("--netbird-pin", intent.sharing.netbirdPin);
   if (intent.sharing.netbirdGroups) args.push("--netbird-groups", intent.sharing.netbirdGroups);
-  if (intent.explicitCommand) args.push("--", ...intent.commandArgs);
   return args;
+}
+
+export function buildRestartStartArgs(
+  intent: BgStartIntent,
+  parsed: BgRestartStartOptions
+): string[] {
+  const runArgs = runArgsFromIntent(intent, parsed.force);
+  return [
+    ...runArgs,
+    ...(parsed.waitSeconds === undefined
+      ? ["--no-wait"]
+      : parsed.waitSeconds !== DEFAULT_BG_WAIT_SECONDS
+        ? ["--wait", String(parsed.waitSeconds)]
+        : []),
+    ...(parsed.keep ? ["--keep"] : []),
+    ...(parsed.json ? ["--json"] : []),
+    // The separator must stay last: parseBgStartArgs treats everything after
+    // it as the child command, so any portless flag placed later would be
+    // handed to the user's dev server instead.
+    ...(intent.explicitCommand ? ["--", ...intent.commandArgs] : []),
+  ];
 }
 
 function withLogs(stateDir: string, entry: BgProcessEntry): EntryView {
@@ -953,17 +983,7 @@ async function handleBgRestart(args: string[], options: { entryScript: string })
       console.error(colors.red(`Error: ${entry.label} did not exit after SIGTERM.`));
       process.exit(1);
     }
-    const runArgs = runArgsFromIntent(entry.intent, parsed.force);
-    const startArgs = [
-      ...runArgs,
-      ...(parsed.waitSeconds === undefined
-        ? ["--no-wait"]
-        : parsed.waitSeconds !== DEFAULT_BG_WAIT_SECONDS
-          ? ["--wait", String(parsed.waitSeconds)]
-          : []),
-      ...(parsed.keep ? ["--keep"] : []),
-      ...(parsed.json ? ["--json"] : []),
-    ];
+    const startArgs = buildRestartStartArgs(entry.intent, parsed);
     await handleBgStart(startArgs, options, { cwd: entry.cwd });
   } catch (err) {
     console.error(colors.red(`Error: ${(err as Error).message}`));
@@ -1193,7 +1213,15 @@ export function parseBgStartArgs(tokens: string[]): ParsedBgStartArgs {
     const token = tokens[i];
 
     if (token === "--") {
-      runArgs.push(...tokens.slice(i));
+      const tail = tokens.slice(i);
+      const stray = tail.find((t) => BG_ONLY_FLAGS.has(t));
+      if (stray) {
+        throw new Error(
+          `Internal error: ${stray} was placed after the command separator. ` +
+            `Report this as a portless bug.`
+        );
+      }
+      runArgs.push(...tail);
       break;
     }
 
