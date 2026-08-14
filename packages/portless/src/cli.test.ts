@@ -6,6 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getBgLogPaths } from "./bg-logs.js";
+import { ensureCerts } from "./certs.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLI_PATH = path.resolve(__dirname, "../dist/cli.js");
@@ -358,6 +359,7 @@ describe("CLI", () => {
       expect(stdout).toContain("portless bg status");
       expect(stdout).toContain("portless bg logs");
       expect(stdout).toContain("portless bg restart");
+      expect(stdout).toContain("portless doctor");
       expect(stdout).toContain("--no-wait");
       expect(stdout).toContain("portless completion <shell>");
       expect(stdout).toContain("run [--name <name>]");
@@ -432,6 +434,7 @@ describe("CLI", () => {
       expect(stdout).toContain("_portless_completions");
       expect(stdout).toContain("complete -F _portless_completions portless");
       expect(stdout).toContain("bg");
+      expect(stdout).toContain("doctor");
       expect(stdout).toContain("service");
       expect(stdout).toContain("clean");
       expect(stdout).toContain("prune");
@@ -448,6 +451,7 @@ describe("CLI", () => {
       expect(stdout).toContain("#compdef portless");
       expect(stdout).toContain("_portless");
       expect(stdout).toContain("service:Manage startup service");
+      expect(stdout).toContain("doctor:Check local portless health");
       expect(stdout).toContain("--netbird-groups");
       expect(stdout).toContain("--suffix");
     });
@@ -458,6 +462,7 @@ describe("CLI", () => {
       expect(stdout).toContain("complete -c portless");
       expect(stdout).toContain('complete -c portless -n "__fish_is_nth_token 1" -f');
       expect(stdout).toContain('-a "service"');
+      expect(stdout).toContain('-a "doctor"');
       expect(stdout).toContain("-l netbird-groups");
       expect(stdout).toContain("-l suffix");
     });
@@ -466,6 +471,59 @@ describe("CLI", () => {
       const { status, stderr } = run(["completion", "pwsh"]);
       expect(status).toBe(1);
       expect(stderr).toContain('Unknown shell "pwsh"');
+    });
+  });
+
+  describe("doctor", () => {
+    it("prints command help", () => {
+      const { status, stdout } = run(["doctor", "--help"]);
+
+      expect(status).toBe(0);
+      expect(stdout).toContain("portless doctor");
+      expect(stdout).toContain("read-only");
+      expect(stdout).toContain("suffixes");
+      expect(stdout).toContain("background apps");
+      expect(stdout).toContain("Tailscale");
+      expect(stdout).toContain("NetBird");
+    });
+
+    it("still dispatches when PORTLESS=0", () => {
+      const { status, stdout } = run(["doctor", "--help"], {
+        env: { PORTLESS: "0" },
+      });
+
+      expect(status).toBe(0);
+      expect(stdout).toContain("portless doctor");
+    });
+
+    it("diagnoses an empty custom state directory without modifying it", () => {
+      const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-doctor-cli-"));
+      try {
+        const before = fs.readdirSync(stateDir);
+        const { status, stdout, stderr } = run(["doctor"], {
+          env: { PORTLESS_STATE_DIR: stateDir, PORTLESS_HTTPS: "0" },
+        });
+
+        expect(status).toBe(0);
+        expect(stderr).toBe("");
+        expect(stdout).toContain("portless doctor");
+        expect(stdout).toContain(`State dir: ${stateDir}`);
+        expect(stdout).toContain("Configured suffixes: .localhost.");
+        expect(stdout).toContain("Configured local mode binds only to 127.0.0.1 and ::1.");
+        expect(stdout).toContain("No background apps are registered.");
+        expect(stdout).toContain("Summary:");
+        expect(fs.readdirSync(stateDir)).toEqual(before);
+      } finally {
+        fs.rmSync(stateDir, { recursive: true, force: true });
+      }
+    });
+
+    it("rejects unknown arguments", () => {
+      const { status, stderr } = run(["doctor", "--fix"]);
+
+      expect(status).toBe(1);
+      expect(stderr).toContain('Unknown argument "--fix"');
+      expect(stderr).toContain("portless doctor --help");
     });
   });
 
@@ -2893,6 +2951,31 @@ describe("CLI", () => {
       const stop = run(["proxy", "stop"], { env: proxyEnv() });
       expect(stop.status).toBe(0);
       expect(fs.existsSync(path.join(tmpDir, "proxy.wildcard"))).toBe(false);
+    });
+
+    it("persists custom certificate mode while the proxy runs and clears it on stop", () => {
+      const certs = ensureCerts(tmpDir);
+      const start = run(
+        ["proxy", "start", "--cert", certs.certPath, "--key", certs.keyPath, "--skip-trust"],
+        { env: proxyEnv() }
+      );
+      expect(start.status, start.stdout + start.stderr).toBe(0);
+      expect(fs.existsSync(path.join(tmpDir, "proxy.custom-cert"))).toBe(true);
+
+      const stop = run(["proxy", "stop"], { env: proxyEnv() });
+      expect(stop.status).toBe(0);
+      expect(fs.existsSync(path.join(tmpDir, "proxy.custom-cert"))).toBe(false);
+    });
+
+    it("persists intentionally disabled internal pages while the proxy runs", () => {
+      const env = { ...proxyEnv(), PORTLESS_DASHBOARD: "0" };
+      const start = run(["proxy", "start"], { env });
+      expect(start.status, start.stdout + start.stderr).toBe(0);
+      expect(fs.existsSync(path.join(tmpDir, "proxy.internal-pages-disabled"))).toBe(true);
+
+      const stop = run(["proxy", "stop"], { env });
+      expect(stop.status).toBe(0);
+      expect(fs.existsSync(path.join(tmpDir, "proxy.internal-pages-disabled"))).toBe(false);
     });
   });
 

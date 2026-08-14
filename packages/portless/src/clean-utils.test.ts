@@ -42,6 +42,8 @@ describe("removePortlessStateFiles", () => {
     fs.writeFileSync(path.join(tmpDir, "ca.trusted"), "fingerprint");
     fs.writeFileSync(path.join(tmpDir, "ca.trust-refresh-pending"), "1");
     fs.writeFileSync(path.join(tmpDir, "proxy.port"), "443");
+    fs.writeFileSync(path.join(tmpDir, "proxy.custom-cert"), "1");
+    fs.writeFileSync(path.join(tmpDir, "proxy.internal-pages-disabled"), "1");
     fs.writeFileSync(path.join(tmpDir, "proxy.wildcard"), "1");
     fs.mkdirSync(path.join(tmpDir, "host-certs"));
     fs.writeFileSync(path.join(tmpDir, "host-certs", "x.pem"), "x");
@@ -53,6 +55,8 @@ describe("removePortlessStateFiles", () => {
     removePortlessStateFiles(tmpDir);
 
     expect(fs.existsSync(path.join(tmpDir, "routes.json"))).toBe(false);
+    expect(fs.existsSync(path.join(tmpDir, "proxy.custom-cert"))).toBe(false);
+    expect(fs.existsSync(path.join(tmpDir, "proxy.internal-pages-disabled"))).toBe(false);
     expect(fs.existsSync(path.join(tmpDir, "ca.pem"))).toBe(false);
     expect(fs.existsSync(path.join(tmpDir, "proxy.wildcard"))).toBe(false);
     expect(fs.existsSync(path.join(tmpDir, "ca.trusted"))).toBe(false);

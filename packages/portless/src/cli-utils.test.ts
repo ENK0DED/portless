@@ -37,6 +37,8 @@ import {
   parsePidFromNetstat,
   parseTldList,
   readLanMarker,
+  readCustomCertMarker,
+  readInternalPagesDisabledMarker,
   readPersistedProxyState,
   readTldFromDir,
   readTldsFromDir,
@@ -48,6 +50,8 @@ import {
   resolveStateDir,
   validateTld,
   writeLanMarker,
+  writeCustomCertMarker,
+  writeInternalPagesDisabledMarker,
   writeTldFile,
   writeTldsFile,
   writeTlsMarker,
@@ -1699,6 +1703,50 @@ describe("readLanMarker / writeLanMarker", () => {
         process.env[LEGACY_TLD_ENV] = prevLegacyTld;
       }
     }
+  });
+});
+
+describe("readCustomCertMarker / writeCustomCertMarker", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-custom-cert-test-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("records and clears custom certificate state for diagnostics", () => {
+    expect(readCustomCertMarker(tmpDir)).toBe(false);
+
+    writeCustomCertMarker(tmpDir, true);
+    expect(readCustomCertMarker(tmpDir)).toBe(true);
+
+    writeCustomCertMarker(tmpDir, false);
+    expect(readCustomCertMarker(tmpDir)).toBe(false);
+  });
+});
+
+describe("readInternalPagesDisabledMarker / writeInternalPagesDisabledMarker", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-pages-marker-test-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("records and clears intentionally disabled internal pages", () => {
+    expect(readInternalPagesDisabledMarker(tmpDir)).toBe(false);
+
+    writeInternalPagesDisabledMarker(tmpDir, true);
+    expect(readInternalPagesDisabledMarker(tmpDir)).toBe(true);
+
+    writeInternalPagesDisabledMarker(tmpDir, false);
+    expect(readInternalPagesDisabledMarker(tmpDir)).toBe(false);
   });
 });
 

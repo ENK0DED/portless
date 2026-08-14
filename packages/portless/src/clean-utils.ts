@@ -12,6 +12,8 @@ const PORTLESS_STATE_FILES = [
   "proxy.port",
   "proxy.log",
   "proxy.tls",
+  "proxy.custom-cert",
+  "proxy.internal-pages-disabled",
   "proxy.tld",
   "proxy.tlds",
   "proxy.lan",

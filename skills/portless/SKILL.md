@@ -452,6 +452,7 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 | `portless ls`                                    | Alias for `portless list`                                      |
 | `portless status`                                | Alias for `portless list`                                      |
 | `portless list --json`                           | Show active routes as JSON                                     |
+| `portless doctor`                                | Run read-only diagnostics across local portless state          |
 | `portless trust`                                 | Add local CA to system trust store (for HTTPS)                 |
 | `portless clean`                                 | Remove state, CA trust entry, and /etc/hosts block             |
 | `portless prune`                                 | Kill orphaned dev servers from crashed sessions                |
@@ -505,10 +506,10 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 | `portless <name> KEY=value <cmd>`                | Pass `KEY` only to the child command                           |
 | `portless <name> -- <cmd> [args...]`             | Stop flag parsing; everything after `--` is passed to child    |
 | `portless --help` / `-h`                         | Show help                                                      |
-| `portless run --help`                            | Show help for a subcommand (also: alias, hosts, clean)         |
+| `portless run --help`                            | Show help for a subcommand (also: alias, hosts, doctor, clean) |
 | `portless --version` / `-v`                      | Show version                                                   |
 
-**Reserved names:** `run`, `get`, `url`, `alias`, `tunnel`, `hosts`, `list`, `ls`, `status`, `trust`, `clean`, `prune`, `proxy`, `bg`, `service`, and `completion` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name, or `portless --name <name> <cmd>` to force any name including reserved ones.
+**Reserved names:** `run`, `get`, `url`, `alias`, `tunnel`, `hosts`, `list`, `ls`, `status`, `doctor`, `trust`, `clean`, `prune`, `proxy`, `bg`, `service`, and `completion` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name, or `portless --name <name> <cmd>` to force any name including reserved ones.
 
 ### Shell completion
 
@@ -579,6 +580,10 @@ Lookup order:
 For workspace package overrides, precedence is: CLI flags > package `package.json` `"portless"` key > root config `apps` entry > defaults.
 
 ## Troubleshooting
+
+### Run diagnostics first
+
+Run `portless doctor` before changing state. It is read-only and checks the resolved state directory and sudo handoff, ordered and dotted suffixes, local or LAN proxy bind mode, route and background-app liveness, generated or custom certificates, `cert.<suffix>` pages, hosts sync, mDNS tooling, tunnel provider binaries, Tailscale, and NetBird. Follow its printed hints only after reviewing the reported state.
 
 ### Proxy not running
 

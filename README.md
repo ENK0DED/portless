@@ -577,6 +577,7 @@ portless list                    # Show active routes
 portless list --json             # Show active routes as JSON
 portless ls                      # Alias for portless list
 portless status                  # Alias for portless list
+portless doctor                  # Run read-only local diagnostics
 portless trust                   # Add local CA to system trust store
 portless clean                   # Remove state, CA trust entry, and hosts block
 portless prune                   # Kill orphaned dev servers from crashed sessions
@@ -612,6 +613,16 @@ portless service install --wildcard  # Persist wildcard routing in the service
 portless service status          # Show service and proxy status
 portless service uninstall       # Remove the startup service
 ```
+
+### Doctor
+
+Run `portless doctor` first when routing, HTTPS, LAN access, or sharing does not behave as expected:
+
+```bash
+portless doctor
+```
+
+Doctor is read-only. It inspects the active state directory and sudo handoff, ordered suffix lists including dotted suffixes, loopback or LAN proxy bind mode, proxy and route liveness, generated or custom certificate state, every `cert.<suffix>` page, hosts sync, mDNS tooling, background apps, Cloudflare and ngrok binaries, and Tailscale and NetBird availability. It prints suggested commands but never starts, stops, trusts, syncs, prunes, cleans, or modifies portless state.
 
 ### Options
 
@@ -704,7 +715,7 @@ Command args can use exact placeholders `{PORT}`, `{HOST}`, and `{PORTLESS_URL}`
 
 Prefer `PORTLESS_SUFFIX` for new configuration. It accepts comma-separated single-label and dotted suffixes, preserves order, and removes duplicates. `PORTLESS_TLD` is only a compatibility alias and is ignored when `PORTLESS_SUFFIX` is set.
 
-> **Reserved names:** `run`, `get`, `url`, `alias`, `tunnel`, `hosts`, `list`, `ls`, `status`, `trust`, `clean`, `prune`, `proxy`, `bg`, `service`, and `completion` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name from your project, or `portless --name <name> <cmd>` to force any name including reserved ones.
+> **Reserved names:** `run`, `get`, `url`, `alias`, `tunnel`, `hosts`, `list`, `ls`, `status`, `doctor`, `trust`, `clean`, `prune`, `proxy`, `bg`, `service`, and `completion` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name from your project, or `portless --name <name> <cmd>` to force any name including reserved ones.
 
 ## Shell completion
 

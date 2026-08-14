@@ -100,6 +100,8 @@ import {
   parseTldList,
   waitForProxy,
   writeLanMarker,
+  writeCustomCertMarker,
+  writeInternalPagesDisabledMarker,
   writeTldsFile,
   writeTlsMarker,
   writeWildcardMarker,
@@ -142,6 +144,12 @@ import type { ManifestEntry } from "./turbo.js";
 import { buildServiceUninstallSudoArgs, handleService, tryUninstallService } from "./service.js";
 import { handleBg, pruneBgEntriesForState, stopBgEntriesForState } from "./bg.js";
 import { PORTLESS_BG_ID_ENV, PORTLESS_BG_READY_PATH_ENV, writeBgReadyFile } from "./bg-ready.js";
+import {
+  collectDoctorSnapshot,
+  evaluateDoctor,
+  type DoctorFinding,
+  type DoctorStatus,
+} from "./doctor.js";
 
 const chalk = colors;
 
@@ -611,6 +619,8 @@ function removeRoutes(
 
 function resetProxyRuntimeMarkers(dir: string): void {
   writeTlsMarker(dir, false);
+  writeCustomCertMarker(dir, false);
+  writeInternalPagesDisabledMarker(dir, false);
   writeTldsFile(dir, [DEFAULT_TLD]);
   writeLanMarker(dir, null);
   writeWildcardMarker(dir, false);
@@ -656,7 +666,8 @@ function startProxyServer(
   tlsOptions?: { cert: Buffer; key: Buffer },
   lanIp?: string | null,
   strict?: boolean,
-  lanMode = false
+  lanMode = false,
+  customCert = false
 ): void {
   store.ensureDir();
 
@@ -891,6 +902,8 @@ function startProxyServer(
     fs.writeFileSync(store.pidPath, process.pid.toString(), { mode: FILE_MODE });
     fs.writeFileSync(store.portFilePath, proxyPort.toString(), { mode: FILE_MODE });
     writeTlsMarker(store.dir, isTls);
+    writeCustomCertMarker(store.dir, isTls && customCert);
+    writeInternalPagesDisabledMarker(store.dir, process.env.PORTLESS_DASHBOARD === "0");
     writeTldsFile(store.dir, tlds);
     writeLanMarker(store.dir, activeLanIp);
     writeWildcardMarker(store.dir, strict === false);
@@ -903,7 +916,7 @@ function startProxyServer(
     if (activeLanIp) {
       console.log(chalk.green(`LAN mode: ${activeLanIp}`));
       console.log(chalk.gray("Services are discoverable as <name>.local on your network"));
-      if (isTls) {
+      if (isTls && !customCert) {
         console.log(chalk.yellow("For HTTPS on devices, install the CA certificate:"));
         console.log(chalk.gray(`  ${path.join(store.dir, "ca.pem")}`));
       }
@@ -2717,6 +2730,7 @@ const TOP_LEVEL_COMPLETION_COMMANDS: CompletionCommand[] = [
   { name: "list", description: "Show active routes" },
   { name: "ls", description: "Alias for list" },
   { name: "status", description: "Alias for list" },
+  { name: "doctor", description: "Check local portless health" },
   { name: "trust", description: "Add local CA to system trust store" },
   { name: "clean", description: "Remove portless artifacts from this machine" },
   { name: "prune", description: "Kill orphaned dev servers from crashed sessions" },
@@ -2943,7 +2957,7 @@ _portless_completions() {
         COMPREPLY=( $(compgen -W "--help -h" -- "$cur") )
       fi
       ;;
-    clean)
+    doctor|clean)
       COMPREPLY=( $(compgen -W "--help -h" -- "$cur") )
       ;;
     prune)
@@ -3034,7 +3048,7 @@ _portless() {
         hosts)
           _values 'hosts command' sync clean
           ;;
-        clean)
+        doctor|clean)
           _arguments '--help[Show help]' '-h[Show help]'
           ;;
         prune)
@@ -3092,7 +3106,7 @@ ${commandLines}
 
 ${fishFlagLines(GLOBAL_COMPLETION_FLAGS)}
 ${fishFlagLines(RUN_COMPLETION_FLAGS, "__fish_seen_subcommand_from run")}
-${fishFlagLines(APP_COMPLETION_FLAGS, "not __fish_seen_subcommand_from run get url list ls status alias tunnel hosts clean prune proxy bg service completion")}
+${fishFlagLines(APP_COMPLETION_FLAGS, "not __fish_seen_subcommand_from run get url list ls status doctor alias tunnel hosts clean prune proxy bg service completion")}
 complete -c portless -n "__fish_seen_subcommand_from get url list ls status" -l json -d "Print JSON"
 complete -c portless -n "__fish_seen_subcommand_from get url" -l path -d "Scope URL to path prefix" -r
 complete -c portless -n "__fish_seen_subcommand_from alias" -l remove -d "Remove route"
@@ -3103,6 +3117,7 @@ complete -c portless -n "__fish_seen_subcommand_from tunnel; and __fish_is_nth_t
 complete -c portless -n "__fish_seen_subcommand_from tunnel" -l path -d "Scope target route to path prefix" -r
 complete -c portless -n "__fish_seen_subcommand_from tunnel" -l json -d "Print JSON"
 complete -c portless -n "__fish_seen_subcommand_from hosts; and __fish_is_nth_token 2" -a "sync clean"
+complete -c portless -n "__fish_seen_subcommand_from doctor" -l help -s h -d "Show help"
 complete -c portless -n "__fish_seen_subcommand_from clean" -l help -s h -d "Show help"
 complete -c portless -n "__fish_seen_subcommand_from prune" -l force -d "Send SIGKILL"
 complete -c portless -n "__fish_seen_subcommand_from prune" -l help -s h -d "Show help"
@@ -3186,6 +3201,7 @@ ${colors.bold("Usage:")}
   ${colors.cyan("portless list")}                    Show active routes
   ${colors.cyan("portless list --json")}             Show active routes as JSON
   ${colors.cyan("portless ls")} / ${colors.cyan("portless status")}   Aliases for portless list
+  ${colors.cyan("portless doctor")}                  Check local portless health
   ${colors.cyan("portless trust")}                   Add local CA to system trust store
   ${colors.cyan("portless clean")}                   Remove portless state, trust entry, and hosts block
   ${colors.cyan("portless prune")}                   Kill orphaned dev servers from crashed sessions
@@ -3207,6 +3223,7 @@ ${colors.bold("Examples:")}
   portless get backend                # -> https://backend.localhost
   portless get backend --json         # Service info for scripts and agents
   portless url backend                # Alias for get
+  portless doctor                     # Run read-only diagnostics
   portless myapp API_URL=1 next dev   # Pass API_URL only to the child command
   portless myapp --h2c grpc-server    # Proxy to an h2c or gRPC upstream
   portless myapp --path /api api-dev  # -> https://myapp.localhost/api
@@ -3467,7 +3484,7 @@ ${colors.bold("Skip portless:")}
   PORTLESS=0 bun dev            # Runs command directly without proxy
 
 ${colors.bold("Reserved names:")}
-  run, get, url, alias, tunnel, hosts, list, ls, status, trust, clean, prune, proxy, bg, service, completion are subcommands and
+  run, get, url, alias, tunnel, hosts, list, ls, status, doctor, trust, clean, prune, proxy, bg, service, completion are subcommands and
   cannot be used as app names directly. Use "portless run" to infer the name,
   or "portless --name <name>" to force any name including reserved ones.
 `);
@@ -3794,6 +3811,74 @@ ${colors.bold("Options:")}
       `\nPruned ${stale.length} stale ${routeWord} and ${staleAliases.length} tunnel ${aliasWord}, killed ${killed} orphaned ${procWord}.`
     )
   );
+}
+
+function doctorStatusColor(status: DoctorStatus): (value: string) => string {
+  if (status === "fail") return colors.red;
+  if (status === "warn") return colors.yellow;
+  if (status === "ok") return colors.green;
+  return colors.gray;
+}
+
+function printDoctorFinding(finding: DoctorFinding): void {
+  console.log(`${doctorStatusColor(finding.status)(finding.status.padEnd(5))} ${finding.message}`);
+  if (finding.hint) console.log(colors.gray(`      ${finding.hint}`));
+}
+
+async function handleDoctor(args: string[]): Promise<void> {
+  if (args[1] === "--help" || args[1] === "-h") {
+    console.log(`
+${colors.bold("portless doctor")} - Run read-only diagnostics for the local portless installation.
+
+${colors.bold("Usage:")}
+  ${colors.cyan("portless doctor")}
+
+Checks Node.js, state and sudo handoff, ordered and dotted suffixes, proxy bind
+mode, routes, generated or custom certificates, cert.<suffix> pages, hosts sync,
+mDNS tooling, background apps, tunnel providers, Tailscale, and NetBird.
+
+Doctor never starts, stops, trusts, syncs, prunes, cleans, or modifies portless
+state.
+
+${colors.bold("Options:")}
+  --help, -h             Show this help
+`);
+    process.exit(0);
+  }
+
+  if (args.length > 1) {
+    console.error(colors.red(`Error: Unknown argument "${args[1]}".`));
+    console.error(colors.cyan("  portless doctor --help"));
+    process.exit(1);
+  }
+
+  const report = evaluateDoctor(await collectDoctorSnapshot({ version: __VERSION__ }));
+  const { snapshot } = report;
+  console.log(colors.blue.bold("\nportless doctor\n"));
+  console.log(`Version: ${snapshot.version}`);
+  console.log(`Node.js: ${snapshot.nodeVersion}`);
+  console.log(`Platform: ${snapshot.platform} ${snapshot.arch}`);
+  console.log(`State dir: ${snapshot.state.path}`);
+  console.log(
+    `Proxy: ${snapshot.proxy.tls ? "HTTPS" : "HTTP"} on port ${snapshot.proxy.port}, ${
+      snapshot.proxy.lanMode ? "LAN" : "local"
+    } mode`
+  );
+  console.log("");
+
+  for (const finding of report.findings) printDoctorFinding(finding);
+
+  const failures = report.findings.filter((finding) => finding.status === "fail").length;
+  const warnings = report.findings.filter((finding) => finding.status === "warn").length;
+  console.log("");
+  console.log(
+    (failures > 0 ? colors.red : colors.green)(
+      `Summary: ${failures} ${failures === 1 ? "failure" : "failures"}, ${warnings} ${
+        warnings === 1 ? "warning" : "warnings"
+      }.`
+    )
+  );
+  if (report.exitCode !== 0) process.exit(report.exitCode);
 }
 
 async function handleList(args: string[] = []): Promise<void> {
@@ -4792,7 +4877,8 @@ ${colors.bold("LAN mode (--lan):")}
       tlsOptions,
       lanIp,
       desiredWildcard ? false : undefined,
-      lanMode
+      lanMode,
+      !!(customCertPath && customKeyPath)
     );
     return;
   }
@@ -5862,7 +5948,7 @@ async function main() {
 
   // --name flag: treat the next arg as an explicit app name, bypassing
   // subcommand dispatch. Useful when the app name collides with a reserved
-  // subcommand (run, alias, tunnel, hosts, list, trust, clean, prune, proxy, bg, service, completion).
+  // subcommand (run, alias, tunnel, hosts, list, doctor, trust, clean, prune, proxy, bg, service, completion).
   if (args[0] === "--name") {
     args.shift();
     if (!args[0]) {
@@ -5904,6 +5990,7 @@ async function main() {
       (args.length >= 2 &&
         args[0] !== "proxy" &&
         args[0] !== "clean" &&
+        args[0] !== "doctor" &&
         args[0] !== "bg" &&
         args[0] !== "service" &&
         args[0] !== "tunnel"))
@@ -5924,7 +6011,7 @@ async function main() {
     return;
   }
 
-  // Global dispatch: help, version, trust, clean, prune, list, alias, tunnel, hosts, proxy, bg, service, completion
+  // Global dispatch: help, version, trust, clean, prune, list, doctor, alias, tunnel, hosts, proxy, bg, service, completion
   // When `run` is used, skip these so args like "list" or "--help" are treated
   // as child-command tokens, not portless subcommands.
   if (!isRunCommand) {
@@ -5957,6 +6044,10 @@ async function main() {
     }
     if (args[0] === "completion") {
       handleCompletion(args);
+      return;
+    }
+    if (args[0] === "doctor") {
+      await handleDoctor(args);
       return;
     }
     if (

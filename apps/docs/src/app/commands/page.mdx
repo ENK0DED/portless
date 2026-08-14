@@ -319,6 +319,16 @@ portless list --json
 
 Path-scoped routes report their prefix in `path_prefix`, and h2c routes report `"upstream_protocol": "h2c"`.
 
+## Doctor
+
+```bash
+portless doctor
+```
+
+Runs read-only diagnostics across the local portless installation. Doctor checks Node.js, the resolved state directory and sudo handoff, ordered suffix lists including dotted suffixes, loopback or LAN proxy bind mode, proxy and route liveness, generated or custom certificate state, each `cert.<suffix>` page, hosts sync, mDNS tooling, background apps, Cloudflare and ngrok binaries, and Tailscale and NetBird availability.
+
+Doctor prints suggested commands when it finds a problem. It never starts, stops, trusts, syncs, prunes, cleans, or modifies portless state.
+
 ## Dashboard
 
 While the proxy runs it serves a read-only dashboard in the browser at `https://portless.localhost` (or `https://portless.<suffix>` for a custom suffix). The dashboard URL is also printed when the proxy starts.

@@ -209,6 +209,8 @@ export function readPortFromDir(dir: string): number | null {
 
 /** Name of the marker file that indicates the proxy is running with TLS. */
 const TLS_MARKER_FILE = "proxy.tls";
+const CUSTOM_CERT_MARKER_FILE = "proxy.custom-cert";
+const INTERNAL_PAGES_DISABLED_MARKER_FILE = "proxy.internal-pages-disabled";
 
 /** Read the TLS marker from a state directory. */
 export function readTlsMarker(dir: string): boolean {
@@ -223,6 +225,52 @@ export function readTlsMarker(dir: string): boolean {
 export function writeTlsMarker(dir: string, enabled: boolean): void {
   const markerPath = path.join(dir, TLS_MARKER_FILE);
   if (enabled) {
+    fs.writeFileSync(markerPath, "1", { mode: 0o644 });
+  } else {
+    try {
+      fs.unlinkSync(markerPath);
+    } catch {
+      // Marker may already be absent; non-fatal
+    }
+  }
+}
+
+/** Read whether the active HTTPS proxy uses user-provided certificate files. */
+export function readCustomCertMarker(dir: string): boolean {
+  try {
+    return fs.existsSync(path.join(dir, CUSTOM_CERT_MARKER_FILE));
+  } catch {
+    return false;
+  }
+}
+
+/** Persist custom certificate state for read-only diagnostics. */
+export function writeCustomCertMarker(dir: string, enabled: boolean): void {
+  const markerPath = path.join(dir, CUSTOM_CERT_MARKER_FILE);
+  if (enabled) {
+    fs.writeFileSync(markerPath, "1", { mode: 0o644 });
+  } else {
+    try {
+      fs.unlinkSync(markerPath);
+    } catch {
+      // Marker may already be absent; non-fatal
+    }
+  }
+}
+
+/** Read whether the active proxy intentionally disables its internal pages. */
+export function readInternalPagesDisabledMarker(dir: string): boolean {
+  try {
+    return fs.existsSync(path.join(dir, INTERNAL_PAGES_DISABLED_MARKER_FILE));
+  } catch {
+    return false;
+  }
+}
+
+/** Persist intentionally disabled internal-page state for diagnostics. */
+export function writeInternalPagesDisabledMarker(dir: string, disabled: boolean): void {
+  const markerPath = path.join(dir, INTERNAL_PAGES_DISABLED_MARKER_FILE);
+  if (disabled) {
     fs.writeFileSync(markerPath, "1", { mode: 0o644 });
   } else {
     try {
