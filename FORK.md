@@ -111,6 +111,7 @@ Current fork-owned commits and what they protect:
 | `d3c3f57` | Resolved Wayfinder ticket 12 with implementation decisions, coverage, and verification evidence.                                                                                                   |
 | `92370cb` | Finalized the suffix-list ledger before the loopback-bind implementation.                                                                                                                          |
 | `a8fc980` | Added loopback-by-default proxy and redirect binds with per-target TLS wrappers, LAN-mode widening, and socket-level bind coverage.                                                                |
+| `c405ea9` | Added exact persisted Tailscale Serve, Funnel, and Service hostname routing while preserving exact tunnel aliases and rejecting unrelated public hosts.                                            |
 
 ## Fork-Owned Invariants
 
@@ -347,6 +348,7 @@ Rechecked against upstream on 2026-06-18: GitHub reported 48 open PRs. Every ope
 - h2c upstream support remains explicit through `--h2c` or `PORTLESS_H2C=1`; no backend protocol probing.
 - HTTP/2 Extended CONNECT WebSockets reject internal hosts, h2c routes, missing routes, and looped requests; they forward a single negotiated subprotocol such as `vite-hmr` and validate backend `Sec-WebSocket-Accept` before forwarding payload.
 - Path routing uses strict segment boundaries and forwards full paths unchanged.
+- Tailscale Serve, Funnel, and Service traffic routes only through exact persisted route hostnames. Unrelated `.ts.net` hosts and arbitrary public Host passthrough remain rejected.
 - Public tunnel traffic routes only through exact managed aliases. Arbitrary public Host passthrough remains rejected.
 
 ### Retained Source And Coverage Notes
@@ -368,6 +370,7 @@ Retained coverage anchors:
 - #242 h2c coverage: route protocol persistence, alias and run flag parsing, `PORTLESS_H2C=1`, list/JSON markers, h2c request and body streaming, header and trailer forwarding, session reuse and reconnect, mixed HTTP/1.1 and h2c dispatch, and safe 502 behavior.
 - #165 path routing coverage: path normalization, invalid path rejection, route identity by hostname and prefix, root-route compatibility, force/remove precision, longest-prefix dispatch, segment-boundary checks, full-path forwarding, alias/get/list visibility, and env/flag precedence.
 - #104 tunnel coverage: alias store persistence and validation, exact alias routing, unknown provider rejection, Cloudflare URL parsing and missing-binary errors, structured provider spawning, managed alias cleanup, public Host passthrough rejection, list/JSON output, and `PORTLESS_TUNNEL_URL` child env.
+- #352 Tailscale hostname coverage: exact `tailscaleUrl` and `tailscaleServiceUrl` routing, path-aware and port-normalized authority selection, and rejection of unrelated `.ts.net` hosts.
 - #212, #240, and #264 UI coverage: shared page shell in `packages/portless/src/pages.ts`, reserved host interception in `proxy.ts`, reserved-name registration rejection, read-only dashboard behavior, public CA-only certificate page, and non-invasive multiplex app picker.
 
 ### Full Open Upstream PR State on 2026-06-18
