@@ -98,21 +98,58 @@ function hasControlCharacters(value: string): boolean {
   return false;
 }
 
+/**
+ * Reject path prefixes that cannot be authored safely and unambiguously.
+ * The accepted alphabet is RFC 3986 pchar plus the slash delimiter.
+ */
+export function assertRegistrablePathPrefix(value: string): void {
+  const invalid = (reason: string): never => {
+    throw new Error(`Invalid path prefix "${value}": ${reason}`);
+  };
+
+  if (!value.startsWith("/")) invalid("must start with /");
+  if (hasControlCharacters(value)) invalid("control characters are not allowed");
+  if (value.includes(" ")) invalid("raw space is not allowed; use %20");
+  if (value.includes("?")) invalid("query delimiter ? is not allowed");
+  if (value.includes("#")) invalid("fragment delimiter # is not allowed");
+  if (value.includes("\\")) invalid("backslash is not allowed");
+
+  for (let index = value.indexOf("%"); index !== -1; index = value.indexOf("%", index + 3)) {
+    const escape = value.slice(index, index + 3);
+    if (!/^%[0-9A-Fa-f]{2}$/.test(escape)) invalid(`malformed percent escape "${escape}"`);
+    if (/^%2f$/i.test(escape)) invalid("percent-encoded slash %2F is not allowed");
+    if (/^%2e$/i.test(escape)) invalid("percent-encoded dot %2E is not allowed");
+  }
+
+  const normalized = value.replace(/\/+$/, "") || "/";
+  if (normalized.includes("//")) invalid("empty path segments (//) are not allowed");
+  for (const segment of normalized.split("/")) {
+    if (segment === ".") invalid('"." path segments are not allowed');
+    if (segment === "..") invalid('".." path segments are not allowed');
+  }
+
+  for (let index = 0; index < value.length; index++) {
+    const char = value[index];
+    if (char === "%") {
+      index += 2;
+      continue;
+    }
+    if (/^[A-Za-z0-9\-._~!$&'()*+,;=:@/]$/.test(char)) continue;
+    if (char.charCodeAt(0) > 0x7f) {
+      const suggestion = value
+        .split("/")
+        .map((segment) => encodeURIComponent(segment))
+        .join("/");
+      invalid(`character "${char}" is not allowed; use "${suggestion}"`);
+    }
+    invalid(`character "${char}" is not allowed`);
+  }
+}
+
 export function normalizePathPrefix(value: string | undefined): string {
   if (value === undefined) return "/";
-  const trimmed = value.trim();
-  if (
-    trimmed === "" ||
-    !trimmed.startsWith("/") ||
-    trimmed.includes("?") ||
-    trimmed.includes("#") ||
-    hasControlCharacters(trimmed)
-  ) {
-    throw new Error(
-      `Invalid path prefix "${value}": must start with / and cannot include query strings, fragments, or control characters`
-    );
-  }
-  return trimmed.replace(/\/+$/, "") || "/";
+  assertRegistrablePathPrefix(value);
+  return value.replace(/\/+$/, "") || "/";
 }
 
 export function matchesPathPrefix(requestPath: string, prefix: string): boolean {

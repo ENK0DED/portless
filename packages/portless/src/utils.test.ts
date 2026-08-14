@@ -1,5 +1,6 @@
 import { afterEach, describe, it, expect, vi } from "vitest";
 import {
+  assertRegistrablePathPrefix,
   escapeHtml,
   formatUrl,
   isErrnoException,
@@ -152,6 +153,49 @@ describe("normalizePathPrefix", () => {
       expect(() => normalizePathPrefix(input)).toThrow("Invalid path prefix");
     }
   );
+});
+
+describe("assertRegistrablePathPrefix", () => {
+  it.each([
+    "/",
+    "/api",
+    "/api/",
+    "/docs/v1",
+    "/v1.0",
+    "/caf%C3%A9",
+    "/~user",
+    "/a:b@c",
+    "/a,b;c=d",
+    "/!$&'()*+",
+    "/encoded%20space",
+  ])("accepts the registrable prefix %s", (prefix) => {
+    expect(() => assertRegistrablePathPrefix(prefix)).not.toThrow();
+  });
+
+  it.each([
+    ["", "must start with /"],
+    ["api", "must start with /"],
+    ["/a b", "space"],
+    ["/a\tb", "control character"],
+    ["/a?b", "query delimiter"],
+    ["/a#b", "fragment delimiter"],
+    ["/a\\b", "backslash"],
+    ["/a//b", "empty path segment"],
+    ["/a/./b", '"." path segment'],
+    ["/a/../b", '".." path segment'],
+    ["/a%", "malformed percent escape"],
+    ["/a%2", "malformed percent escape"],
+    ["/a%GG", "malformed percent escape"],
+    ["/a%2Fb", "percent-encoded slash"],
+    ["/a%2eb", "percent-encoded dot"],
+    ["/a[b", 'character "["'],
+  ])("rejects %s because it contains an offending construct", (prefix, reason) => {
+    expect(() => assertRegistrablePathPrefix(prefix)).toThrow(reason);
+  });
+
+  it("tells users how to encode a non-ASCII prefix", () => {
+    expect(() => assertRegistrablePathPrefix("/café")).toThrow('use "/caf%C3%A9"');
+  });
 });
 
 describe("matchesPathPrefix", () => {

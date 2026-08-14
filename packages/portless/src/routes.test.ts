@@ -83,6 +83,58 @@ describe("RouteStore", () => {
       expect(loaded[0].hostname).toBe("valid.localhost");
     });
 
+    it("rewrites representational path-prefix differences in place", () => {
+      store.ensureDir();
+      fs.writeFileSync(
+        store.getRoutesPath(),
+        JSON.stringify([
+          { hostname: "api.localhost", port: 4001, pid: process.pid, pathPrefix: "/api///" },
+          { hostname: "web.localhost", port: 4002, pid: process.pid, pathPrefix: "/" },
+        ])
+      );
+
+      expect(store.loadRoutes()).toEqual([
+        { hostname: "api.localhost", port: 4001, pid: process.pid, pathPrefix: "/api" },
+        { hostname: "web.localhost", port: 4002, pid: process.pid },
+      ]);
+      expect(JSON.parse(fs.readFileSync(store.getRoutesPath(), "utf-8"))).toEqual([
+        { hostname: "api.localhost", port: 4001, pid: process.pid, pathPrefix: "/api" },
+        { hostname: "web.localhost", port: 4002, pid: process.pid },
+      ]);
+    });
+
+    it("removes an invalid persisted prefix with one actionable warning", () => {
+      const warnings: string[] = [];
+      const warnStore = new RouteStore(tmpDir, {
+        onWarning: (message) => warnings.push(message),
+      });
+      warnStore.ensureDir();
+      fs.writeFileSync(
+        warnStore.getRoutesPath(),
+        JSON.stringify([
+          {
+            hostname: "invalid.localhost",
+            port: 4001,
+            pid: process.pid,
+            pathPrefix: "/api/../admin",
+          },
+          { hostname: "valid.localhost", port: 4002, pid: process.pid, pathPrefix: "/api" },
+        ])
+      );
+
+      expect(warnStore.loadRoutes()).toEqual([
+        { hostname: "valid.localhost", port: 4002, pid: process.pid, pathPrefix: "/api" },
+      ]);
+      expect(JSON.parse(fs.readFileSync(warnStore.getRoutesPath(), "utf-8"))).toEqual([
+        { hostname: "valid.localhost", port: 4002, pid: process.pid, pathPrefix: "/api" },
+      ]);
+      expect(warnings).toEqual([
+        expect.stringMatching(
+          /invalid\.localhost\/api\/\.\.\/admin.*PID \d+.*"\.\." path segment.*portless alias invalid\.localhost 4001 --path <valid-prefix>/
+        ),
+      ]);
+    });
+
     it("loads routes from file", () => {
       const routes = [{ hostname: "app.localhost", port: 4001, pid: process.pid }];
       store.ensureDir();

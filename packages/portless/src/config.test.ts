@@ -134,10 +134,10 @@ describe("loadConfig", () => {
   });
 
   it("loads config with all fields", () => {
-    const config = { name: "myapp", script: "start", appPort: 3000 };
+    const config = { name: "myapp", script: "start", appPort: 3000, path: "/api/" };
     fs.writeFileSync(path.join(tmpDir, "portless.json"), JSON.stringify(config));
     const result = loadConfig(tmpDir);
-    expect(result!.config).toEqual(config);
+    expect(result!.config).toEqual({ ...config, path: "/api" });
   });
 
   it("loads config with proxy field", () => {
@@ -153,13 +153,14 @@ describe("loadConfig", () => {
     const config = {
       apps: {
         "apps/web": { name: "web" },
-        "apps/api": { name: "api", script: "start" },
+        "apps/api": { name: "api", script: "start", path: "/api/" },
       },
     };
     fs.writeFileSync(path.join(tmpDir, "portless.json"), JSON.stringify(config));
     const result = loadConfig(tmpDir);
     expect(result!.config.apps).toBeDefined();
     expect(Object.keys(result!.config.apps!)).toHaveLength(2);
+    expect(result!.config.apps!["apps/api"].path).toBe("/api");
   });
 
   it("loads empty object config", () => {
@@ -303,6 +304,22 @@ describe("loadConfig validation", () => {
     expect(() => loadConfig(tmpDir)).toThrow(ConfigValidationError);
   });
 
+  it.each([
+    ["path", "api", "must start with /"],
+    ["path", "/api/../admin", '".." path segment'],
+  ])("rejects invalid top-level %s config", (key, value, reason) => {
+    fs.writeFileSync(path.join(tmpDir, "portless.json"), JSON.stringify({ [key]: value }));
+    expect(() => loadConfig(tmpDir)).toThrow(reason);
+  });
+
+  it("rejects an invalid per-app path through the shared path normalizer", () => {
+    fs.writeFileSync(
+      path.join(tmpDir, "portless.json"),
+      JSON.stringify({ apps: { "apps/api": { path: "/api//v1" } } })
+    );
+    expect(() => loadConfig(tmpDir)).toThrow("empty path segment");
+  });
+
   it("throws when apps entry is not an object", () => {
     fs.writeFileSync(
       path.join(tmpDir, "portless.json"),
@@ -369,9 +386,15 @@ describe("loadConfig validation", () => {
 
 describe("resolveAppConfig", () => {
   it("returns top-level fields when no apps key", () => {
-    const config = { name: "myapp", script: "dev" };
+    const config = { name: "myapp", script: "dev", path: "/api" };
     const result = resolveAppConfig(config, "/repo", "/repo");
-    expect(result).toEqual({ name: "myapp", script: "dev", appPort: undefined, proxy: undefined });
+    expect(result).toEqual({
+      name: "myapp",
+      script: "dev",
+      appPort: undefined,
+      proxy: undefined,
+      path: "/api",
+    });
   });
 
   it("returns proxy field from top-level config", () => {

@@ -144,8 +144,7 @@ function textSafe(value: string): string {
   return value.replace(/[\r\n]/g, " ");
 }
 
-function activeAppLinkSuffix(req: http.IncomingMessage): string {
-  const url = req.url ?? "/";
+function activeAppLinkSuffix(url: string): string {
   if (!url || url === "/" || !url.startsWith("/")) return "";
   return url;
 }
@@ -208,6 +207,66 @@ function getRequestHost(req: http.IncomingMessage): string {
   const authority = req.headers[":authority"];
   if (typeof authority === "string" && authority) return authority;
   return req.headers.host || "";
+}
+
+interface ClassifiedRequestTarget {
+  /** Raw origin-form spelling used for route selection. */
+  matchPath: string;
+  /** Target sent to the backend. Absolute-form is rewritten to origin-form. */
+  forwardTarget: string;
+}
+
+/**
+ * Classify a request target without decoding or canonicalizing its path.
+ * Absolute-form is accepted only when its canonical origin agrees with the
+ * connection authority, then its raw path and query are forwarded as
+ * origin-form. Other non-origin forms are unroutable.
+ */
+function classifyRequestTarget(
+  rawTarget: string,
+  method: string | undefined,
+  authority: string,
+  tls: boolean
+): ClassifiedRequestTarget | undefined {
+  if (rawTarget === "*") {
+    return method === "OPTIONS" ? { matchPath: "/", forwardTarget: "*" } : undefined;
+  }
+  if (rawTarget.startsWith("/")) {
+    return { matchPath: rawTarget, forwardTarget: rawTarget };
+  }
+
+  const absolute = /^([A-Za-z][A-Za-z0-9+.-]*):\/\/([^/?#]*)(.*)$/.exec(rawTarget);
+  if (!absolute || !authority || absolute[3].includes("#")) return undefined;
+
+  const scheme = absolute[1].toLowerCase();
+  const connectionScheme = tls ? "https" : "http";
+  if (scheme !== connectionScheme) return undefined;
+
+  try {
+    const targetUrl = new URL(rawTarget);
+    const connectionUrl = new URL(`${connectionScheme}://${authority}`);
+    if (
+      targetUrl.username ||
+      targetUrl.password ||
+      connectionUrl.username ||
+      connectionUrl.password ||
+      targetUrl.origin !== connectionUrl.origin
+    ) {
+      return undefined;
+    }
+  } catch {
+    return undefined;
+  }
+
+  const remainder = absolute[3];
+  const originForm =
+    remainder === "" ? "/" : remainder.startsWith("?") ? `/${remainder}` : remainder;
+  return { matchPath: originForm, forwardTarget: originForm };
+}
+
+function writeBadRequest(res: http.ServerResponse): void {
+  res.writeHead(400, { "Content-Type": "text/plain" });
+  res.end("Bad Request: unsupported or mismatched request target\n");
 }
 
 /** Return the local TCP port that accepted this request. */
@@ -295,12 +354,13 @@ function h2cResponseHeaders(headers: http2.IncomingHttpHeaders): {
 function h2cRequestHeaders(
   req: http.IncomingMessage,
   reqTls: boolean,
-  hops: number
+  hops: number,
+  forwardTarget: string
 ): http2.OutgoingHttpHeaders {
   const forwardedHeaders = buildForwardedHeaders(req, reqTls);
   const headers: http2.OutgoingHttpHeaders = {
     ":method": req.method || "GET",
-    ":path": req.url || "/",
+    ":path": forwardTarget,
     ":scheme": "http",
     ":authority": getRequestHost(req),
   };
@@ -341,10 +401,11 @@ function proxyH2c(
   reqTls: boolean,
   hops: number,
   sessions: H2cSessionCache,
-  onError: (message: string) => void
+  onError: (message: string) => void,
+  forwardTarget: string
 ): void {
   const session = getH2cSession(route.port, sessions);
-  const proxyReq = session.request(h2cRequestHeaders(req, reqTls, hops));
+  const proxyReq = session.request(h2cRequestHeaders(req, reqTls, hops, forwardTarget));
 
   proxyReq.on("response", (headers) => {
     const response = h2cResponseHeaders(headers);
@@ -510,9 +571,16 @@ interface H2WebSocketRouteSelection {
   host: string;
   authority: string;
   path: string;
+  matchPath: string;
   hops: number;
   route?: RouteInfo;
-  rejectReason?: "missing-host" | "internal-host" | "loop" | "missing-route" | "h2c-route";
+  rejectReason?:
+    | "missing-host"
+    | "internal-host"
+    | "loop"
+    | "bad-target"
+    | "missing-route"
+    | "h2c-route";
 }
 
 function singleHeaderValue(value: string | string[] | number | undefined): string | undefined {
@@ -597,7 +665,8 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     req: http.IncomingMessage,
     res: http.ServerResponse,
     host: string,
-    reqTls: boolean
+    reqTls: boolean,
+    requestTarget: string
   ): boolean => {
     if (!internalPages) return false;
     if (!isInternalHost(host)) return false;
@@ -612,8 +681,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       return true;
     }
     const isHead = method === "HEAD";
-    const url = req.url || "/";
-    const pathname = url.split(/[?#]/, 1)[0] || "/";
+    const pathname = requestTarget.split(/[?#]/, 1)[0] || "/";
 
     if (host === certHost) {
       if (pathname === "/portless-ca.pem" || pathname === "/ca.pem") {
@@ -760,11 +828,15 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
   ): H2WebSocketRouteSelection => {
     const authority = String(headers[":authority"] || "");
     const host = authority.split(":")[0];
-    const path = String(headers[":path"] || "/");
+    const rawPath = String(headers[":path"] || "/");
+    const target = classifyRequestTarget(rawPath, "CONNECT", authority, true);
+    const path = target?.forwardTarget ?? rawPath;
+    const matchPath = target?.matchPath ?? rawPath;
     const hops = parseInt(headers[PORTLESS_HOPS_HEADER] as string, 10) || 0;
-    const base = { host, authority, path, hops };
+    const base = { host, authority, path, matchPath, hops };
 
     if (!host) return { ...base, rejectReason: "missing-host" };
+    if (!target) return { ...base, rejectReason: "bad-target" };
     if (internalPages && isInternalHost(host)) {
       return { ...base, rejectReason: "internal-host" };
     }
@@ -778,7 +850,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
 
     const routes = getRoutes();
     const tunnelAliases = getTunnelAliases();
-    const members = multiplexMembersFor(routes, host, path);
+    const members = multiplexMembersFor(routes, host, matchPath);
     let route: RouteInfo | undefined;
     if (members.length > 0) {
       const selected = parseCookieHeader(cookieHeaderValue(headers.cookie))[SELECTION_COOKIE];
@@ -786,7 +858,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
         (selected ? members.find((member) => member.label === selected) : undefined) ??
         defaultMember(members);
     } else {
-      route = findRoute(routes, tunnelAliases, authority, path, strict);
+      route = findRoute(routes, tunnelAliases, authority, matchPath, strict);
     }
 
     if (!route) return { ...base, rejectReason: "missing-route" };
@@ -926,9 +998,15 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       return;
     }
 
+    const target = classifyRequestTarget(req.url || "/", req.method, rawHost, reqTls);
+    if (!target) {
+      writeBadRequest(res);
+      return;
+    }
+
     // Reserved portless pages (dashboard, certificate trust) win before any
     // route lookup or loop detection, so a user app can never shadow them.
-    if (serveInternalPage(req, res, host, reqTls)) return;
+    if (serveInternalPage(req, res, host, reqTls, target.forwardTarget)) return;
 
     const hops = parseInt(req.headers[PORTLESS_HOPS_HEADER] as string, 10) || 0;
     if (hops >= MAX_PROXY_HOPS) {
@@ -965,7 +1043,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       return;
     }
 
-    const requestPath = req.url || "/";
+    const requestPath = target.matchPath;
     const members = multiplexMembersFor(routes, host, requestPath);
     let route: RouteInfo | undefined;
     if (members.length > 0) {
@@ -1000,7 +1078,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
         res.end(lines.join("\n") + "\n");
         return;
       }
-      const linkSuffix = activeAppLinkSuffix(req);
+      const linkSuffix = activeAppLinkSuffix(target.forwardTarget);
       const routesList =
         routes.length > 0
           ? `<div class="section"><p class="label">Apps <span class="count">${routes.length}</span></p>${appList(
@@ -1025,7 +1103,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     }
 
     if (route.protocol === "h2c") {
-      proxyH2c(req, res, route, reqTls, hops, h2cSessions, onError);
+      proxyH2c(req, res, route, reqTls, hops, h2cSessions, onError, target.forwardTarget);
       return;
     }
 
@@ -1053,7 +1131,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       {
         agent: upstreamAgent,
         port: route.port,
-        path: req.url,
+        path: target.forwardTarget,
         method: req.method,
         headers: proxyReqHeaders,
       },
@@ -1173,7 +1251,19 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       return;
     }
 
-    const requestPath = req.url || "/";
+    const target = classifyRequestTarget(req.url || "/", req.method, rawHost, isEncrypted(req));
+    if (!target) {
+      socket.end(
+        "HTTP/1.1 400 Bad Request\r\n" +
+          "Content-Type: text/plain\r\n" +
+          "Connection: close\r\n" +
+          "\r\n" +
+          "Bad Request: unsupported or mismatched request target\n"
+      );
+      return;
+    }
+
+    const requestPath = target.matchPath;
     const members = multiplexMembersFor(routes, host, requestPath);
     let route: RouteInfo | undefined;
     if (members.length > 0) {
@@ -1214,7 +1304,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       agent: false,
       ...LOOPBACK_DIAL_OPTIONS,
       port: route.port,
-      path: req.url,
+      path: target.forwardTarget,
       method: req.method,
       headers: proxyReqHeaders,
     });
@@ -1353,8 +1443,14 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     // The redirect targets the same port because the wrapper net.Server
     // demuxes TLS and plain HTTP on a single listener (peek at first byte).
     const plainServer = http.createServer((req, res) => {
-      const host = getRequestHost(req).split(":")[0] || "localhost";
-      const location = `https://${host}${proxyPort === 443 ? "" : `:${proxyPort}`}${req.url || "/"}`;
+      const authority = getRequestHost(req);
+      const host = authority.split(":")[0] || "localhost";
+      const target = classifyRequestTarget(req.url || "/", req.method, authority, false);
+      if (!target) {
+        writeBadRequest(res);
+        return;
+      }
+      const location = `https://${host}${proxyPort === 443 ? "" : `:${proxyPort}`}${target.forwardTarget}`;
       res.writeHead(302, { Location: location, [PORTLESS_HEADER]: "1" });
       res.end();
     });
@@ -1421,9 +1517,15 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
  */
 export function createHttpRedirectServer(httpsPort: number): http.Server {
   return http.createServer((req, res) => {
-    const host = (req.headers.host || "localhost").split(":")[0];
+    const authority = req.headers.host || "localhost";
+    const host = authority.split(":")[0];
+    const target = classifyRequestTarget(req.url || "/", req.method, authority, false);
+    if (!target) {
+      writeBadRequest(res);
+      return;
+    }
     const portSuffix = httpsPort === 443 ? "" : `:${httpsPort}`;
-    const location = `https://${host}${portSuffix}${req.url || "/"}`;
+    const location = `https://${host}${portSuffix}${target.forwardTarget}`;
     res.writeHead(302, { Location: location, [PORTLESS_HEADER]: "1" });
     res.end();
   });

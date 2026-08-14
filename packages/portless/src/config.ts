@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { normalizePathPrefix } from "./utils.js";
 
 export class ConfigValidationError extends Error {
   constructor(message: string) {
@@ -12,6 +13,7 @@ export interface AppConfig {
   name?: string;
   script?: string;
   appPort?: number;
+  path?: string;
   proxy?: boolean;
   worktreeFlat?: boolean;
 }
@@ -142,6 +144,7 @@ export function resolveAppConfig(
     name: config.name,
     script: config.script,
     appPort: config.appPort,
+    path: config.path,
     proxy: config.proxy,
     ...(config.worktreeFlat !== undefined ? { worktreeFlat: config.worktreeFlat } : {}),
   };
@@ -334,12 +337,25 @@ const KNOWN_TOP_KEYS = new Set([
   "name",
   "script",
   "appPort",
+  "path",
   "proxy",
   "worktreeFlat",
   "apps",
   "turbo",
 ]);
-const KNOWN_APP_KEYS = new Set(["name", "script", "appPort", "proxy", "worktreeFlat"]);
+const KNOWN_APP_KEYS = new Set(["name", "script", "appPort", "path", "proxy", "worktreeFlat"]);
+
+function validatePathConfig(obj: Record<string, unknown>, key: string, configPath: string): void {
+  if (obj.path === undefined) return;
+  if (typeof obj.path !== "string") {
+    throw new ConfigValidationError(`"${key}" in ${configPath} must be a string.`);
+  }
+  try {
+    obj.path = normalizePathPrefix(obj.path);
+  } catch (err) {
+    throw new ConfigValidationError(`"${key}" in ${configPath}: ${(err as Error).message}`);
+  }
+}
 
 function validateConfig(config: unknown, configPath: string): asserts config is PortlessConfig {
   if (typeof config !== "object" || config === null || Array.isArray(config)) {
@@ -372,6 +388,8 @@ function validateConfig(config: unknown, configPath: string): asserts config is 
       );
     }
   }
+
+  validatePathConfig(obj, "path", configPath);
 
   if (obj.proxy !== undefined) {
     if (typeof obj.proxy !== "boolean") {
@@ -433,6 +451,7 @@ function validateAppConfig(obj: Record<string, unknown>, prefix: string, configP
       );
     }
   }
+  validatePathConfig(obj, `${prefix}.path`, configPath);
   if (obj.proxy !== undefined) {
     if (typeof obj.proxy !== "boolean") {
       throw new ConfigValidationError(`"${prefix}.proxy" in ${configPath} must be a boolean.`);

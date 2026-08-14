@@ -556,6 +556,133 @@ describe("createProxyServer", () => {
       expect(res.body).toBe("/api/users?active=1");
     });
 
+    it.each(["/api/../admin?raw=1", "/api/%2Fadmin?raw=1"])(
+      "matches and forwards the raw request target %s verbatim",
+      async (target) => {
+        const backend = trackServer(http.createServer((req, res) => res.end(req.url)));
+        await listen(backend);
+        const backendAddr = backend.address();
+        if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+        const server = trackServer(
+          createProxyServer({
+            getRoutes: () => [
+              { hostname: "myapp.localhost", port: backendAddr.port, pathPrefix: "/api" },
+            ],
+            proxyPort: TEST_PROXY_PORT,
+          })
+        );
+        await listen(server);
+
+        const res = await request(server, { host: "myapp.localhost", path: target });
+        expect(res.status).toBe(200);
+        expect(res.body).toBe(target);
+      }
+    );
+
+    it("accepts matching absolute-form targets and forwards origin-form", async () => {
+      const backend = trackServer(http.createServer((req, res) => res.end(req.url)));
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const server = trackServer(
+        createProxyServer({
+          getRoutes: () => [
+            { hostname: "myapp.localhost", port: backendAddr.port, pathPrefix: "/api" },
+          ],
+          proxyPort: TEST_PROXY_PORT,
+        })
+      );
+      await listen(server);
+
+      const res = await request(server, {
+        host: "myapp.localhost",
+        path: "http://MYAPP.localhost:80/api/../admin?raw=1",
+      });
+      expect(res.status).toBe(200);
+      expect(res.body).toBe("/api/../admin?raw=1");
+    });
+
+    it.each([
+      "http://other.localhost/api",
+      "https://myapp.localhost/api",
+      "http://myapp.localhost:8080/api",
+    ])("returns 400 for an absolute-form authority mismatch: %s", async (target) => {
+      let backendRequests = 0;
+      const backend = trackServer(
+        http.createServer((_req, res) => {
+          backendRequests++;
+          res.end("unexpected");
+        })
+      );
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const server = trackServer(
+        createProxyServer({
+          getRoutes: () => [{ hostname: "myapp.localhost", port: backendAddr.port }],
+          proxyPort: TEST_PROXY_PORT,
+        })
+      );
+      await listen(server);
+
+      const res = await request(server, { host: "myapp.localhost", path: target });
+      expect(res.status).toBe(400);
+      expect(backendRequests).toBe(0);
+    });
+
+    it("returns 400 for authority-form outside CONNECT instead of routing it as root", async () => {
+      let backendRequests = 0;
+      const backend = trackServer(
+        http.createServer((_req, res) => {
+          backendRequests++;
+          res.end("unexpected");
+        })
+      );
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const server = trackServer(
+        createProxyServer({
+          getRoutes: () => [{ hostname: "myapp.localhost", port: backendAddr.port }],
+          proxyPort: TEST_PROXY_PORT,
+        })
+      );
+      await listen(server);
+
+      const res = await request(server, { host: "myapp.localhost", path: "other.localhost:80" });
+      expect(res.status).toBe(400);
+      expect(backendRequests).toBe(0);
+    });
+
+    it("preserves OPTIONS * for a root route", async () => {
+      const backend = trackServer(
+        http.createServer((req, res) => res.end(`${req.method} ${req.url}`))
+      );
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const server = trackServer(
+        createProxyServer({
+          getRoutes: () => [{ hostname: "myapp.localhost", port: backendAddr.port }],
+          proxyPort: TEST_PROXY_PORT,
+        })
+      );
+      await listen(server);
+
+      const res = await request(server, {
+        host: "myapp.localhost",
+        path: "*",
+        method: "OPTIONS",
+      });
+      expect(res.status).toBe(200);
+      expect(res.body).toBe("OPTIONS *");
+    });
+
     it("routes wildcard subdomains with path prefixes when strict is false", async () => {
       const backend = trackServer(http.createServer((_req, res) => res.end("wildcard path")));
       await listen(backend);
