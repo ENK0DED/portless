@@ -146,6 +146,9 @@ Current fork-owned commits and what they protect:
 | `1d5ddd2` | Pooled HTTP/1.1 backend connections with a capped loopback keep-alive agent, idempotent-only replay, and shutdown cleanup while keeping upgrade paths unpooled.                                    |
 | `accac85` | Merged the ticket 23 worktree branch bringing keep-alive backend pooling into the sync branch.                                                                                                     |
 | `3580990` | Recorded the ticket 22 integration rows in the fork-only ledger.                                                                                                                                   |
+| `89b151b` | Injected exact persisted Tailscale, ngrok, tunnel, and NetBird hostnames into the Vite allowed-hosts list with no wildcards.                                                                       |
+| `0a53cc3` | Merged the ticket 24 worktree branch bringing sharing-hostname Vite allowlisting into the sync branch.                                                                                             |
+| `f032b71` | Recorded the ticket 23 integration rows in the fork-only ledger.                                                                                                                                   |
 
 ## Fork-Owned Invariants
 
