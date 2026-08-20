@@ -168,6 +168,9 @@ Current fork-owned commits and what they protect:
 | `ea9dc6a` | Recorded the Windows test stabilization rows in the fork-only ledger.                                                                                                                                  |
 | `7ecd54c` | Scoped the routes file-mode assertion to POSIX platforms where 0o644 is representable.                                                                                                                 |
 | `40163d6` | Recorded the routes watcher canonicalization rows in the fork-only ledger.                                                                                                                             |
+| `93b3af6` | Recorded the routes file-mode test scoping in the fork-only ledger.                                                                                                                                    |
+| `c87fd13` | Merged the `upstream-sync-v015` branch into `main` through PR #2, shipping fork release `0.15.6002`.                                                                                                   |
+| `755e112` | Relayed backend-negotiated WebSocket extensions and subprotocols over the RFC 8441 HTTP/2 bridge by deferring the CONNECT response until the backend's `101`.                                          |
 
 ## Fork-Owned Invariants
 
@@ -205,7 +208,7 @@ Examples:
 
 This avoids prerelease semantics and keeps room for local-only releases between upstream syncs.
 
-The current fork release `0.15.6002` tracks upstream `0.15.5` plus the upstream-PR backport batch from tickets 20–28: hosts and mDNS deduplication, atomic route persistence and stale-route cleanup, hostname resolution warnings and LAN inference, keep-alive backend connections, exact sharing hostnames in Vite's allowlist, NixOS and WSL CA trust fixes, hardened Windows cmd.exe escaping, flat worktree hostnames, and path-aware routing and configuration. If the fork ships another local-only change before upstream publishes `0.15.6`, use `0.15.6003`. If upstream publishes `0.15.6`, the first synced fork release should be `0.15.7000`.
+The current fork release `0.15.6003` tracks upstream `0.15.5` plus the `0.15.6002` backport batch and a fix to the RFC 8441 WebSocket bridge: the Extended CONNECT response now waits for the backend's `101` and relays the negotiated `Sec-WebSocket-Extensions` and `Sec-WebSocket-Protocol`, so `permessage-deflate` backends no longer drop HTTP/2 WebSockets on the first compressed frame. If the fork ships another local-only change before upstream publishes `0.15.6`, use `0.15.6004`. If upstream publishes `0.15.6`, the first synced fork release should be `0.15.7000`.
 
 ### Package Manager
 
