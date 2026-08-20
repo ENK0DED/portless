@@ -1,8 +1,20 @@
 # Changelog
 
-## 0.15.6002
+## 0.15.6003
 
 <!-- release:start -->
+
+### Bug Fixes
+
+- **WebSocket extensions over HTTP/2**: The RFC 8441 Extended CONNECT bridge now answers the client only after the backend's `101` handshake and relays the backend's negotiated `Sec-WebSocket-Extensions` and `Sec-WebSocket-Protocol` verbatim. Backends that accept `permessage-deflate` previously sent compressed frames the browser was never told to expect, so HTTP/2 WebSockets dropped on the first frame in a reconnect loop. A backend handshake that fails validation now resets the stream instead of opening a WebSocket that dies immediately.
+
+### Contributors
+
+- @enk0ded
+
+<!-- release:end -->
+
+## 0.15.6002
 
 ### Backport Batch
 
@@ -19,8 +31,6 @@
 ### Contributors
 
 - @enk0ded
-
-<!-- release:end -->
 
 ## 0.15.6001
 
@@ -126,8 +136,6 @@
 
 ## 0.14.1003
 
-<!-- release:start -->
-
 ### Bug Fixes
 
 - **Vite and Nuxt HMR over HTTP/2**: HTTP/2 Extended CONNECT WebSocket responses now include the negotiated `Sec-WebSocket-Protocol` header, so Vite's `vite-hmr` subprotocol works through the HTTPS proxy.
@@ -142,8 +150,6 @@
 ### Contributors
 
 - @enk0ded
-
-<!-- release:end -->
 
 ## 0.14.1002
 
