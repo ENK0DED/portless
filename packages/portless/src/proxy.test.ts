@@ -2633,6 +2633,80 @@ describe("createProxyServer with TLS (HTTP/2)", () => {
       expect(result.headers["sec-websocket-protocol"]).toBe("vite-hmr");
     });
 
+    it("forwards negotiated WebSocket extensions in Extended CONNECT response", async () => {
+      // A backend that accepts permessage-deflate sets RSV1 on its frames. If the
+      // negotiated extension never reaches the client, the client reads the first
+      // compressed frame as a protocol error and drops the connection.
+      const backend = trackServer(http.createServer());
+      backend.on("upgrade", (req, socket) => {
+        const key = req.headers["sec-websocket-key"] as string;
+        socket.write(
+          "HTTP/1.1 101 Switching Protocols\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            `Sec-WebSocket-Accept: ${computeWebSocketAccept(key)}\r\n` +
+            "Sec-WebSocket-Extensions: permessage-deflate\r\n" +
+            "\r\n"
+        );
+      });
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const routes: RouteInfo[] = [{ hostname: "ws.localhost", port: backendAddr.port }];
+      const server = trackServer(
+        createProxyServer({
+          getRoutes: () => routes,
+          proxyPort: TEST_PROXY_PORT,
+          tls: { cert: tlsCert, key: tlsKey },
+        })
+      );
+      await listen(server);
+
+      const result = await openH2WebSocket(
+        server,
+        {
+          ":path": "/ws",
+          ":authority": "ws.localhost",
+          "sec-websocket-extensions": "permessage-deflate; client_max_window_bits",
+        },
+        (stream) => setTimeout(() => stream.close(), 25)
+      );
+
+      expect(result.status).toBe(200);
+      expect(result.headers["sec-websocket-extensions"]).toBe("permessage-deflate");
+    });
+
+    it("omits WebSocket extensions when the backend declines them", async () => {
+      const backend = websocketEchoBackend();
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const routes: RouteInfo[] = [{ hostname: "ws.localhost", port: backendAddr.port }];
+      const server = trackServer(
+        createProxyServer({
+          getRoutes: () => routes,
+          proxyPort: TEST_PROXY_PORT,
+          tls: { cert: tlsCert, key: tlsKey },
+        })
+      );
+      await listen(server);
+
+      const result = await openH2WebSocket(
+        server,
+        {
+          ":path": "/ws",
+          ":authority": "ws.localhost",
+          "sec-websocket-extensions": "permessage-deflate; client_max_window_bits",
+        },
+        (stream) => setTimeout(() => stream.close(), 25)
+      );
+
+      expect(result.status).toBe(200);
+      expect(result.headers["sec-websocket-extensions"]).toBeUndefined();
+    });
+
     it("selects path-scoped routes and forwards the full path unchanged", async () => {
       let receivedUrl = "";
       const backend = websocketEchoBackend((req) => {
@@ -2816,7 +2890,10 @@ describe("createProxyServer with TLS (HTTP/2)", () => {
 
       const result = await openH2WebSocket(server, { ":path": "/", ":authority": "bad.localhost" });
 
-      expect(result.status).toBe(200);
+      // The CONNECT is answered only once the backend's 101 validates, so a
+      // bad handshake is reported as a reset stream rather than a WebSocket
+      // that opens and then dies.
+      expect(result.status).toBe(0);
       expect(result.closed).toBe(true);
       expect(result.data.toString("utf8")).toBe("");
     });

@@ -589,13 +589,39 @@ function singleHeaderValue(value: string | string[] | number | undefined): strin
   return String(value);
 }
 
-function h2WebSocketResponseHeaders(headers: http2.IncomingHttpHeaders): http2.OutgoingHttpHeaders {
+/**
+ * Build the RFC 8441 response headers from the backend's own 101 handshake.
+ *
+ * Whatever the backend negotiated has to reach the client verbatim. A backend
+ * that accepts `permessage-deflate` starts setting RSV1 on its frames
+ * immediately; a client that was never told the extension was negotiated reads
+ * the first such frame as a protocol error and drops the connection. Echoing
+ * the request's own values instead would guess at a negotiation the backend
+ * alone performs.
+ */
+function h2WebSocketResponseHeaders(
+  backendHeaders: Record<string, string>
+): http2.OutgoingHttpHeaders {
   const responseHeaders: http2.OutgoingHttpHeaders = { ":status": 200 };
-  const protocol = singleHeaderValue(headers["sec-websocket-protocol"]);
-  if (protocol && !protocol.includes(",")) {
+  const protocol = backendHeaders["sec-websocket-protocol"];
+  if (protocol) {
     responseHeaders["sec-websocket-protocol"] = protocol;
   }
+  const extensions = backendHeaders["sec-websocket-extensions"];
+  if (extensions) {
+    responseHeaders["sec-websocket-extensions"] = extensions;
+  }
   return responseHeaders;
+}
+
+/** Subprotocols the client offered, in order, for validating the backend's pick. */
+function requestedWebSocketProtocols(headers: http2.IncomingHttpHeaders): Array<string> {
+  const offered = singleHeaderValue(headers["sec-websocket-protocol"]);
+  if (!offered) return [];
+  return offered
+    .split(",")
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
 }
 
 /** Server type returned by createProxyServer (plain HTTP/1.1 or net.Server TLS wrapper). */
@@ -878,14 +904,10 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     headers: http2.IncomingHttpHeaders
   ): void => {
     stream.on("error", () => stream.destroy());
-    const responseHeaders = h2WebSocketResponseHeaders(headers);
-    const responseProtocol = singleHeaderValue(responseHeaders["sec-websocket-protocol"]);
-    try {
-      stream.respond(responseHeaders, { endStream: false });
-    } catch {
-      stream.destroy();
-      return;
-    }
+    // The response is deferred until the backend's 101 arrives so its
+    // negotiated subprotocol and extensions can be relayed. RFC 8441 clients
+    // wait for the 2xx before sending frames, so nothing is lost by waiting.
+    const offeredProtocols = requestedWebSocketProtocols(headers);
 
     const selection = selectH2WebSocketRoute(headers);
     if (!selection.route || selection.rejectReason) {
@@ -934,12 +956,14 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       if (cleaned) return;
       cleaned = true;
       backendSocket.destroy();
-      if (!stream.destroyed) {
-        try {
-          stream.close(http2.constants.NGHTTP2_CANCEL);
-        } catch {
-          stream.destroy();
-        }
+      if (stream.destroyed) return;
+      // The response is deferred until the backend's 101 arrives, so a
+      // handshake that never completes leaves the stream unanswered: reset it
+      // so the client reports a failed WebSocket rather than waiting.
+      try {
+        stream.close(http2.constants.NGHTTP2_CANCEL);
+      } catch {
+        stream.destroy();
       }
     };
 
@@ -952,7 +976,18 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
         cleanup();
         return;
       }
-      if (responseProtocol && parsed.headers["sec-websocket-protocol"] !== responseProtocol) {
+      const selectedProtocol = parsed.headers["sec-websocket-protocol"];
+      if (selectedProtocol && !offeredProtocols.includes(selectedProtocol)) {
+        cleanup();
+        return;
+      }
+      if (stream.destroyed) {
+        cleanup();
+        return;
+      }
+      try {
+        stream.respond(h2WebSocketResponseHeaders(parsed.headers), { endStream: false });
+      } catch {
         cleanup();
         return;
       }
@@ -1401,19 +1436,27 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     // abrupt client disconnects) so they don't crash the proxy.
     h2Server.on("sessionError", () => {});
 
+    // Streams claimed below, so the "connect" listener can tell an Extended
+    // CONNECT WebSocket apart from a plain CONNECT tunnel request.
+    const claimedWebSocketStreams = new WeakSet<http2.ServerHttp2Stream>();
+
     h2Server.prependListener(
       "stream",
       (stream: http2.ServerHttp2Stream, headers: http2.IncomingHttpHeaders) => {
         if (!isH2WebSocketConnect(headers)) return;
-        const streamWithNoEnd = stream as unknown as {
-          end: (...args: unknown[]) => http2.ServerHttp2Stream;
-        };
-        streamWithNoEnd.end = function () {
-          return stream;
-        };
+        claimedWebSocketStreams.add(stream);
         handleH2WebSocket(stream, headers);
       }
     );
+
+    // Node's compat layer answers every CONNECT stream with 405 unless the
+    // server has a "connect" listener. The WebSocket bridge answers only after
+    // the backend's 101 handshake, so that 405 would land first and win.
+    h2Server.on("connect", (req: http2.Http2ServerRequest, res: http2.Http2ServerResponse) => {
+      if (req.stream && claimedWebSocketStreams.has(req.stream)) return;
+      res.statusCode = 405;
+      res.end();
+    });
 
     // With allowHTTP1, the 'request' event receives objects compatible with
     // http.IncomingMessage / http.ServerResponse. Cast explicitly to satisfy TypeScript.
@@ -1421,17 +1464,6 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       // Absorb RST_STREAM errors from cancelled requests (browser navigation,
       // HMR) so they don't propagate to the HTTP/2 session.
       req.stream?.on("error", () => {});
-      if (req.method === "CONNECT") {
-        const response = res as unknown as {
-          end: (...args: unknown[]) => http2.Http2ServerResponse;
-          writeHead: (...args: unknown[]) => http2.Http2ServerResponse;
-          write: (...args: unknown[]) => boolean;
-        };
-        response.end = () => res;
-        response.writeHead = () => res;
-        response.write = () => false;
-        return;
-      }
       handleRequest(req as unknown as http.IncomingMessage, res as unknown as http.ServerResponse);
     });
     // WebSocket upgrades arrive over HTTP/1.1 connections (allowHTTP1)
