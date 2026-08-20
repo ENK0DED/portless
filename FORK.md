@@ -171,6 +171,7 @@ Current fork-owned commits and what they protect:
 | `93b3af6` | Recorded the routes file-mode test scoping in the fork-only ledger.                                                                                                                                    |
 | `c87fd13` | Merged the `upstream-sync-v015` branch into `main` through PR #2, shipping fork release `0.15.6002`.                                                                                                   |
 | `755e112` | Relayed backend-negotiated WebSocket extensions and subprotocols over the RFC 8441 HTTP/2 bridge by deferring the CONNECT response until the backend's `101`.                                          |
+| `8b515df` | Prepared fork release `0.15.6003` with the HTTP/2 WebSocket extension relay fix, single release markers in the changelog, and ledger rows for the `0.15.6002` merge.                                   |
 
 ## Fork-Owned Invariants
 
