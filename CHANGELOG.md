@@ -1,8 +1,20 @@
 # Changelog
 
-## 0.15.6003
+## 0.15.6004
 
 <!-- release:start -->
+
+### Bug Fixes
+
+- **HTTP/2 request bodies without content-length**: An HTTP/2 request that carried a body but no `content-length` (a `GET`, `DELETE`, or `OPTIONS` with DATA) was forwarded to the HTTP/1.1 backend without framing. On a pooled keep-alive socket the backend parsed those bytes as a second request that skipped the proxy's `X-Forwarded-*` and hop-count headers, reachable through shared URLs. The proxy now sends such bodies with `transfer-encoding: chunked`, and the stale-socket retry no longer replays an HTTP/2 request whose body was already consumed.
+
+### Contributors
+
+- @enk0ded
+
+<!-- release:end -->
+
+## 0.15.6003
 
 ### Bug Fixes
 
@@ -11,8 +23,6 @@
 ### Contributors
 
 - @enk0ded
-
-<!-- release:end -->
 
 ## 0.15.6002
 

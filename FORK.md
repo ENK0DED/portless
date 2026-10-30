@@ -172,6 +172,7 @@ Current fork-owned commits and what they protect:
 | `c87fd13` | Merged the `upstream-sync-v015` branch into `main` through PR #2, shipping fork release `0.15.6002`.                                                                                                   |
 | `755e112` | Relayed backend-negotiated WebSocket extensions and subprotocols over the RFC 8441 HTTP/2 bridge by deferring the CONNECT response until the backend's `101`.                                          |
 | `8b515df` | Prepared fork release `0.15.6003` with the HTTP/2 WebSocket extension relay fix, single release markers in the changelog, and ledger rows for the `0.15.6002` merge.                                   |
+| `d401df5` | Framed HTTP/2 request bodies sent without `content-length` as chunked on the HTTP/1.1 forward path and made the stale-socket replay guard HTTP/2-aware (upstream #478).                                |
 
 ## Fork-Owned Invariants
 
@@ -209,7 +210,7 @@ Examples:
 
 This avoids prerelease semantics and keeps room for local-only releases between upstream syncs.
 
-The current fork release `0.15.6003` tracks upstream `0.15.5` plus the `0.15.6002` backport batch and a fix to the RFC 8441 WebSocket bridge: the Extended CONNECT response now waits for the backend's `101` and relays the negotiated `Sec-WebSocket-Extensions` and `Sec-WebSocket-Protocol`, so `permessage-deflate` backends no longer drop HTTP/2 WebSockets on the first compressed frame. If the fork ships another local-only change before upstream publishes `0.15.6`, use `0.15.6004`. If upstream publishes `0.15.6`, the first synced fork release should be `0.15.7000`.
+The current fork release `0.15.6004` tracks upstream `0.15.5` plus the `0.15.6002` backport batch, the `0.15.6003` fix to the RFC 8441 WebSocket bridge, and a fix that frames HTTP/2 request bodies sent without `content-length` (upstream #478): such bodies now reach the HTTP/1.1 backend as `transfer-encoding: chunked`, so they can no longer run as a second request on a pooled keep-alive socket, and the stale-socket retry never replays an HTTP/2 request that carried DATA. If the fork ships another local-only change before the sync to upstream `0.15.12`, use `0.15.6005`. The first synced fork release after upstream `0.15.12` is `0.15.13000`.
 
 ### Package Manager
 
