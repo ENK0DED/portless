@@ -189,8 +189,19 @@ function stripConnectionHeaders(headers: http.OutgoingHttpHeaders): void {
   }
 }
 
-/** A request can be replayed only when its headers prove it has no body. */
+/** The HTTP/2 stream behind a compatibility-API request, or undefined for HTTP/1.1. */
+function getHttp2Stream(req: http.IncomingMessage): http2.ServerHttp2Stream | undefined {
+  return (req as unknown as http2.Http2ServerRequest).stream;
+}
+
+/**
+ * A request can be replayed only when it provably has no body. HTTP/2 frames
+ * bodies itself, so a stream with DATA may carry neither content-length nor
+ * transfer-encoding; only HEADERS with END_STREAM proves it is bodyless.
+ */
 function isBodylessRequest(req: http.IncomingMessage): boolean {
+  const h2Stream = getHttp2Stream(req);
+  if (h2Stream && !h2Stream.endAfterHeaders) return false;
   if (req.headers["transfer-encoding"] !== undefined) return false;
   const contentLength = req.headers["content-length"];
   if (contentLength === undefined) return true;
@@ -1160,6 +1171,15 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     // host allow-lists) see the original hostname instead of 127.0.0.1.
     if (!proxyReqHeaders.host) {
       proxyReqHeaders.host = getRequestHost(req);
+    }
+    // HTTP/2 frames the body itself, so a stream can carry DATA with no
+    // content-length. Node only adds chunked framing by default for methods
+    // that usually have a body, so a GET, DELETE or OPTIONS body would reach
+    // the backend unframed. On a keep-alive socket the backend would parse
+    // those bytes as a second request that skips the forwarding headers.
+    const h2Stream = getHttp2Stream(req);
+    if (h2Stream && !h2Stream.endAfterHeaders && proxyReqHeaders["content-length"] === undefined) {
+      proxyReqHeaders["transfer-encoding"] = "chunked";
     }
 
     const proxyReq = http.request(

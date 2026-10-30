@@ -2304,6 +2304,190 @@ describe("createProxyServer with TLS (HTTP/2)", () => {
     expect(result.protocol).toBe("h2");
   });
 
+  it("frames h2 request bodies sent without content-length", async () => {
+    const received: { method?: string; te?: string; body: string }[] = [];
+    const clientErrors: string[] = [];
+    const backend = trackServer(
+      http.createServer((req, res) => {
+        let body = "";
+        req.on("data", (chunk) => (body += chunk));
+        req.on("end", () => {
+          received.push({ method: req.method, te: req.headers["transfer-encoding"], body });
+          res.end("ok");
+        });
+      })
+    );
+    backend.on("clientError", (err: NodeJS.ErrnoException, socket: net.Socket) => {
+      clientErrors.push(err.code ?? err.message);
+      socket.destroy();
+    });
+    await listen(backend);
+    const backendAddr = backend.address();
+    if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+    const routes: RouteInfo[] = [{ hostname: "myapp.localhost", port: backendAddr.port }];
+    const server = trackServer(
+      createProxyServer({
+        getRoutes: () => routes,
+        proxyPort: TEST_PROXY_PORT,
+        tls: { cert: tlsCert, key: tlsKey },
+      })
+    );
+    await listen(server);
+    const addr = server.address();
+    if (!addr || typeof addr === "string") throw new Error("no addr");
+
+    const client = http2.connect(`https://127.0.0.1:${addr.port}`, { rejectUnauthorized: false });
+    const send = (method: string, body?: string, headers: http2.OutgoingHttpHeaders = {}) =>
+      new Promise<number>((resolve, reject) => {
+        const req = client.request(
+          { ":method": method, ":path": "/", ":authority": "myapp.localhost", ...headers },
+          { endStream: body === undefined }
+        );
+        req.on("response", (headers) => resolve(headers[":status"] as number));
+        req.on("error", reject);
+        req.resume();
+        if (body !== undefined) req.end(body);
+      });
+
+    try {
+      expect(await send("DELETE", '{"id":1}')).toBe(200);
+      expect(await send("GET", "x")).toBe(200);
+      expect(await send("GET")).toBe(200);
+      expect(await send("DELETE", "{}", { "content-length": "2" })).toBe(200);
+    } finally {
+      client.close();
+    }
+
+    expect(clientErrors).toEqual([]);
+    expect(received).toEqual([
+      { method: "DELETE", te: "chunked", body: '{"id":1}' },
+      { method: "GET", te: "chunked", body: "x" },
+      { method: "GET", te: undefined, body: "" },
+      { method: "DELETE", te: undefined, body: "{}" },
+    ]);
+  });
+
+  it("does not let an h2 GET body run as a second request on a pooled backend socket", async () => {
+    const seen: { url?: string; forwardedFor?: string }[] = [];
+    const backend = trackServer(
+      http.createServer((req, res) => {
+        seen.push({ url: req.url, forwardedFor: req.headers["x-forwarded-for"] as string });
+        req.resume();
+        req.on("end", () => res.end("ok"));
+      })
+    );
+    await listen(backend);
+    const backendAddr = backend.address();
+    if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+    const routes: RouteInfo[] = [{ hostname: "myapp.localhost", port: backendAddr.port }];
+    const server = trackServer(
+      createProxyServer({
+        getRoutes: () => routes,
+        proxyPort: TEST_PROXY_PORT,
+        tls: { cert: tlsCert, key: tlsKey },
+      })
+    );
+    await listen(server);
+    const addr = server.address();
+    if (!addr || typeof addr === "string") throw new Error("no addr");
+
+    const client = http2.connect(`https://127.0.0.1:${addr.port}`, { rejectUnauthorized: false });
+    const send = (path: string, body?: string) =>
+      new Promise<number>((resolve, reject) => {
+        const req = client.request(
+          { ":method": "GET", ":path": path, ":authority": "myapp.localhost" },
+          { endStream: body === undefined }
+        );
+        req.on("response", (headers) => resolve(headers[":status"] as number));
+        req.on("error", reject);
+        req.resume();
+        if (body !== undefined) req.end(body);
+      });
+
+    try {
+      // Warm the pool so the smuggling attempt rides a reused keep-alive socket.
+      expect(await send("/warm")).toBe(200);
+      expect(await send("/first", "GET /smuggled HTTP/1.1\r\nHost: myapp.localhost\r\n\r\n")).toBe(
+        200
+      );
+      expect(await send("/second")).toBe(200);
+    } finally {
+      client.close();
+    }
+
+    expect(seen.map((entry) => entry.url)).toEqual(["/warm", "/first", "/second"]);
+    for (const entry of seen) expect(entry.forwardedFor).toBeDefined();
+  });
+
+  it("replays a bodyless h2 GET but never an h2 GET that carried DATA", async () => {
+    const handled = new WeakMap<net.Socket, number>();
+    let requests = 0;
+    let resets = 0;
+    const backend = trackServer(
+      http.createServer((req, res) => {
+        requests++;
+        const count = (handled.get(req.socket) ?? 0) + 1;
+        handled.set(req.socket, count);
+        if (count === 1) {
+          req.resume();
+          req.on("end", () => res.end("ok"));
+          return;
+        }
+        resets++;
+        req.socket.resetAndDestroy();
+      })
+    );
+    await listen(backend);
+    const backendAddr = backend.address();
+    if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+    const errors: string[] = [];
+    const routes: RouteInfo[] = [{ hostname: "myapp.localhost", port: backendAddr.port }];
+    const server = trackServer(
+      createProxyServer({
+        getRoutes: () => routes,
+        proxyPort: TEST_PROXY_PORT,
+        tls: { cert: tlsCert, key: tlsKey },
+        onError: (message) => errors.push(message),
+      })
+    );
+    await listen(server);
+    const addr = server.address();
+    if (!addr || typeof addr === "string") throw new Error("no addr");
+
+    const client = http2.connect(`https://127.0.0.1:${addr.port}`, { rejectUnauthorized: false });
+    const send = (body?: string) =>
+      new Promise<number>((resolve, reject) => {
+        const req = client.request(
+          { ":method": "GET", ":path": "/", ":authority": "myapp.localhost" },
+          { endStream: body === undefined }
+        );
+        req.on("response", (headers) => resolve(headers[":status"] as number));
+        req.on("error", reject);
+        req.resume();
+        if (body !== undefined) req.end(body);
+      });
+
+    try {
+      // 1: fresh socket, ok. 2: reused socket resets, headers-only GET is replayed.
+      expect(await send()).toBe(200);
+      expect(await send()).toBe(200);
+      expect(requests).toBe(3);
+      expect(resets).toBe(1);
+      expect(errors).toEqual([]);
+
+      // 3: reused socket resets and the body was already consumed, so no replay.
+      expect(await send("payload")).toBe(502);
+      expect(requests).toBe(4);
+      expect(resets).toBe(2);
+      expect(errors).toHaveLength(1);
+    } finally {
+      client.close();
+    }
+  });
+
   it("forwards the :authority hostname as Host to the backend (h2 -> HTTP/1.1)", async () => {
     let receivedHost = "";
     const backend = trackServer(
