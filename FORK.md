@@ -176,6 +176,8 @@ Current fork-owned commits and what they protect:
 | `85457bc` | Merged the `prepare-v0.15.6003` branch into `main` through PR #3, shipping fork release `0.15.6003`.                                                                                                   |
 | `d401df5` | Framed HTTP/2 request bodies sent without `content-length` as chunked on the HTTP/1.1 forward path and made the stale-socket replay guard HTTP/2-aware (upstream #478).                                |
 | `2768320` | Prepared fork release `0.15.6004` with the HTTP/2 request body framing fix, release markers moved to the new changelog entry, and the version mapping paragraph updated.                               |
+| `d4ba817` | Recorded the `0.15.6004` release commit and the missing `0.15.6003` merge rows in the fork-only ledger.                                                                                                |
+| `1a4ab70` | Ended the `0.15.6004` docs changelog entry with a period.                                                                                                                                              |
 
 ## Fork-Owned Invariants
 
