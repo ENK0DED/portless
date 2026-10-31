@@ -31,8 +31,6 @@ When a change affects how humans or agents use portless (new/changed/removed com
 3. `packages/portless/src/cli.ts` (`--help` output)
 4. `packages/portless/src/mcp.ts` (MCP tools and `portless mcp --help` output)
 
-Use the `technical-writer` skill (`.agents/skills/technical-writer/SKILL.md`) when you write or edit prose for this repo, including docs pages, READMEs, changelog entries, commit messages, PR descriptions, and issues.
-
 ## MCP Tools
 
 Any change to a CLI command, flag, output, or environment variable must update the MCP tools in `packages/portless/src/mcp.ts` in the same change. `mcp.test.ts` reads `portless --help` and each tool command's `--help`, and fails when a command or flag is neither handled by a tool nor listed as omitted.
