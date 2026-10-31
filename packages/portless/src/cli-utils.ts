@@ -1397,23 +1397,37 @@ export async function triggerHostsSync(
   });
 }
 
-/** Maximum time to wait for the daemon's routes watcher to publish its block. */
+/**
+ * How long to wait for a daemon that cannot be asked to sync (an older proxy
+ * without the authenticated endpoint) to publish the managed block through its
+ * own routes watcher.
+ */
 export const HOSTS_SYNC_POLL_CEILING_MS = 3500;
 const HOSTS_SYNC_POLL_INTERVAL_MS = 100;
 
 /**
- * Wait for the daemon to publish the managed hosts block, then check each
- * hostname once through the system resolver. Polling the block avoids repeated
- * resolver calls, which can preserve a negative DNS result after the block is
- * written.
+ * Warn if a route hostname will not resolve. Issue #364.
+ *
+ * Reports resolution, not whether the file was written. `.localhost` resolves
+ * without a hosts entry on current macOS and glibc, so a skipped write there is
+ * invisible; a custom suffix resolves on neither.
+ *
+ * Asks the daemon to sync first (the authenticated hosts-sync endpoint). When it
+ * answers, the block is already written, so the resolver is checked once. An
+ * older daemon that cannot be asked is waited on by reading the hosts file, not
+ * by re-querying the resolver, because a negative lookup can be cached and a name
+ * that is about to resolve would stay negative.
  */
 export async function reportHostsSync(
   hostnames: string[],
+  port: number,
+  tls: boolean,
   lanMode: boolean,
   onWarn: (message: string) => void,
+  trigger: (port: number, tls: boolean) => Promise<HostsSyncTrigger> = triggerHostsSync,
   resolves: (hostname: string) => Promise<boolean> = checkHostResolution,
-  readManaged: () => string[] = getManagedHostnames,
   ceilingMs = HOSTS_SYNC_POLL_CEILING_MS,
+  readManaged: () => string[] = getManagedHostnames,
   sleep: (delayMs: number) => Promise<void> = (delayMs) =>
     new Promise<void>((resolve) => setTimeout(resolve, delayMs))
 ): Promise<void> {
@@ -1423,10 +1437,24 @@ export async function reportHostsSync(
     : uniqueHostnames;
   if (checkedHostnames.length === 0) return;
 
+  const unresolved = async () => {
+    const checked = await Promise.all(checkedHostnames.map((hostname) => resolves(hostname)));
+    return checkedHostnames.filter((_, index) => !checked[index]);
+  };
+  const warnUnresolved = async () => {
+    const missing = await unresolved();
+    if (missing.length > 0) onWarn(hostsUnresolvedMessage(missing));
+  };
+
+  // Nothing will write the block, so there is nothing to wait for.
   if (!shouldAutoSyncHosts(process.env.PORTLESS_SYNC_HOSTS)) {
-    const results = await Promise.all(checkedHostnames.map((hostname) => resolves(hostname)));
-    const unresolved = checkedHostnames.filter((_, index) => !results[index]);
-    if (unresolved.length > 0) onWarn(hostsUnresolvedMessage(unresolved));
+    await warnUnresolved();
+    return;
+  }
+
+  const found = await trigger(port, tls);
+  if (found !== "mute") {
+    await warnUnresolved();
     return;
   }
 
@@ -1439,10 +1467,7 @@ export async function reportHostsSync(
     if (remaining <= 0) break;
     await sleep(Math.min(HOSTS_SYNC_POLL_INTERVAL_MS, remaining));
   }
-
-  const results = await Promise.all(checkedHostnames.map((hostname) => resolves(hostname)));
-  const unresolved = checkedHostnames.filter((_, index) => !results[index]);
-  if (unresolved.length > 0) onWarn(hostsUnresolvedMessage(unresolved));
+  await warnUnresolved();
 }
 
 /**

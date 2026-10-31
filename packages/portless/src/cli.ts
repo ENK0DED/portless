@@ -27,6 +27,11 @@ import {
   shouldAutoSyncHosts,
   deduplicateHostnames,
 } from "./hosts.js";
+import {
+  generateHostsSyncToken,
+  removeHostsSyncToken,
+  writeHostsSyncToken,
+} from "./hosts-sync-auth.js";
 import { FILE_MODE, RouteConflictError, RouteStore, type RouteMapping } from "./routes.js";
 import { TunnelAliasStore, normalizeTunnelHostname } from "./tunnel-aliases.js";
 import {
@@ -724,11 +729,19 @@ function recordChildProcessGroup(
 }
 
 /** Warn on this terminal when a registered route still has no resolution. */
-function reportHostsSyncHere(hostnames: string[], lanMode: boolean): Promise<void> {
-  return reportHostsSync(hostnames, lanMode, (message) => console.warn(colors.yellow(message)));
+function reportHostsSyncHere(
+  hostnames: string[],
+  port: number,
+  tls: boolean,
+  lanMode: boolean
+): Promise<void> {
+  return reportHostsSync(hostnames, port, tls, lanMode, (message) =>
+    console.warn(colors.yellow(message))
+  );
 }
 
 function resetProxyRuntimeMarkers(dir: string): void {
+  removeHostsSyncToken(dir);
   writeTlsMarker(dir, false);
   writeCustomCertMarker(dir, false);
   writeInternalPagesDisabledMarker(dir, false);
@@ -826,12 +839,29 @@ function startProxyServer(
   let routesCleanupInterval: ReturnType<typeof setInterval> | null = null;
 
   const autoSyncHosts = !unprivileged && shouldAutoSyncHosts(process.env.PORTLESS_SYNC_HOSTS);
+  const hostsSyncToken = generateHostsSyncToken();
   let hostsSyncWarned = false;
 
   const syncHostsAndLatch = (hostnames: string[]): void => {
     hostsSyncWarned = syncHostsWithWarning(hostnames, hostsSyncWarned, () =>
       console.warn(colors.yellow(`Could not write ${HOSTS_DISPLAY} for route hostnames.`))
     );
+  };
+
+  // Answers the authenticated hosts-sync endpoint: a registering CLI asks the
+  // daemon to write the managed block now instead of waiting for the watcher.
+  // Reads the routes file, not the cache, because the request can arrive before
+  // the debounced reload has run.
+  const onHostsSyncRequest = (): "acted" | "disabled" => {
+    if (!autoSyncHosts) return "disabled";
+    let hostnames: string[];
+    try {
+      hostnames = store.loadRoutes().map((route) => route.hostname);
+    } catch {
+      hostnames = cachedRoutes.map((route) => route.hostname);
+    }
+    syncHostsAndLatch(deduplicateHostnames(hostnames));
+    return "acted";
   };
 
   const onMdnsError = (msg: string) => console.warn(chalk.yellow(msg));
@@ -1002,6 +1032,8 @@ function startProxyServer(
       tls: tlsOptions,
       internalPages: process.env.PORTLESS_DASHBOARD !== "0",
       getCaTrusted,
+      onHostsSyncRequest,
+      hostsSyncToken,
     });
   const server = createServer();
   const additionalServers = new Set<ReturnType<typeof createProxyServer>>();
@@ -1087,6 +1119,9 @@ function startProxyServer(
   }
 
   listenOnProxyInterface(server, proxyPort, primaryBindTarget, () => {
+    if (!writeHostsSyncToken(store.dir, hostsSyncToken)) {
+      console.warn(colors.yellow("Could not publish hosts sync authorization."));
+    }
     // Save PID and port once the server is actually listening
     fs.writeFileSync(store.pidPath, process.pid.toString(), { mode: FILE_MODE });
     fs.writeFileSync(store.portFilePath, proxyPort.toString(), { mode: FILE_MODE });
@@ -1845,7 +1880,7 @@ async function runApp(
     }
     throw err;
   }
-  await reportHostsSyncHere(hostnames, lanMode);
+  await reportHostsSyncHere(hostnames, proxyPort, tls, lanMode);
   for (const killedPid of killedPids) {
     console.log(colors.yellow(`Killed existing process (PID ${killedPid})`));
   }
@@ -4505,7 +4540,7 @@ ${colors.bold("Examples:")}
     process.exit(0);
   }
 
-  const { dir, tlds, lanMode } = await discoverState();
+  const { dir, port: proxyPort, tls, tlds, lanMode } = await discoverState();
   const store = new RouteStore(dir, {
     onWarning: (msg) => console.warn(colors.yellow(msg)),
   });
@@ -4600,7 +4635,7 @@ ${colors.bold("Examples:")}
       `Alias registered: ${label} (${hostnames.length} suffix${hostnames.length === 1 ? "" : "es"}) -> 127.0.0.1:${port}${suffix}`
     )
   );
-  await reportHostsSyncHere(hostnames, lanMode);
+  await reportHostsSyncHere(hostnames, proxyPort, tls, lanMode);
 }
 
 async function handleHosts(args: string[]): Promise<void> {
@@ -4613,6 +4648,7 @@ subdomains. This command adds entries to ${HOSTS_DISPLAY} as a workaround.
 
 ${colors.bold("Usage:")}
   ${colors.cyan("portless hosts sync")}    Add current routes to ${HOSTS_DISPLAY}
+                         (removes stale entries; with no routes it clears them)
   ${colors.cyan("portless hosts clean")}   Remove portless entries from ${HOSTS_DISPLAY}
 
 ${colors.bold("Auto-sync:")}
@@ -4678,12 +4714,14 @@ ${colors.bold("Usage: portless hosts <command>")}
   });
 
   const routes = store.loadRoutes();
-  if (routes.length === 0) {
-    console.log(colors.yellow("No active routes to sync."));
-    return;
-  }
   const hostnames = deduplicateHostnames(routes.map((route) => route.hostname));
+  // With no routes, syncing clears a stale managed block left by a proxy that
+  // was killed before it could clean up. It is a no-op when none exists.
   if (syncHostsFile(hostnames)) {
+    if (hostnames.length === 0) {
+      console.log(colors.yellow(`No active routes. ${HOSTS_DISPLAY} has no portless entries.`));
+      return;
+    }
     console.log(colors.green(`Synced ${hostnames.length} hostname(s) to ${HOSTS_DISPLAY}:`));
     for (const h of hostnames) {
       console.log(colors.cyan(`  127.0.0.1 ${h}`));
@@ -5612,7 +5650,7 @@ async function spawnProxiedApp(
       pathPrefix: routePathPrefix,
       label: multiplexLabelFromEnv(),
     });
-    await reportHostsSyncHere(hostnames, lanMode);
+    await reportHostsSyncHere(hostnames, proxyPort, tls, lanMode);
     const viteRouteMetadata = loadViteRouteMetadata(store, hostnames, routePathPrefix);
 
     env = {
@@ -5912,7 +5950,7 @@ async function runWithTurbo(
       pathPrefix: routePathPrefix,
       label: multiplexLabelFromEnv(),
     });
-    await reportHostsSyncHere(hostnames, lanMode);
+    await reportHostsSyncHere(hostnames, proxyPort, tls, lanMode);
     const viteRouteMetadata = loadViteRouteMetadata(store, hostnames, routePathPrefix);
     routes.push({ hostnames, pathPrefix: routePathPrefix });
 
