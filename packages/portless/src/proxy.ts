@@ -13,7 +13,15 @@ import * as crypto from "node:crypto";
 import { parsePort } from "./utils.js";
 import type { ProxyServerOptions, RouteInfo, TunnelAlias } from "./types.js";
 import { escapeHtml, formatUrl, matchesPathPrefix, normalizePathPrefix } from "./utils.js";
-import { APP_SCRIPT, appList, renderPage } from "./pages.js";
+import {
+  APP_FILTER_CONTROLS,
+  APP_FILTER_NO_MATCH,
+  APP_FILTER_SCRIPT,
+  APP_FILTER_THRESHOLD,
+  APP_SCRIPT,
+  appList,
+  renderPage,
+} from "./pages.js";
 import {
   dashboardStateJson,
   renderAppPicker,
@@ -149,8 +157,53 @@ function wantsHtml(req: http.IncomingMessage): boolean {
   return value.split(",").some((entry) => entry.trim().toLowerCase().split(";")[0] === "text/html");
 }
 
-function textSafe(value: string): string {
-  return value.replace(/[\r\n]/g, " ");
+/**
+ * Send a portless-generated error. Clients that accept text/html get the
+ * branded page; everything else gets a small JSON body of the form
+ * `{ error, upstream, message }`. `Vary: Accept` is always set so shared
+ * caches keep the two representations apart. `renderHtml` only runs for HTML
+ * clients, so JSON clients never pay for building the page.
+ */
+function sendProxyError(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  status: number,
+  error: string,
+  message: string,
+  upstream: string,
+  renderHtml: () => string
+): void {
+  res.setHeader("Vary", "Accept");
+  if (wantsHtml(req)) {
+    res.writeHead(status, { "Content-Type": "text/html" });
+    res.end(renderHtml());
+    return;
+  }
+  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify({ error, upstream, message }));
+}
+
+/** Send the 502 shared by the HTTP/1.1 and h2c forwarding paths. */
+function sendBadGateway(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  route: { port: number },
+  detail: string
+): void {
+  sendProxyError(
+    req,
+    res,
+    502,
+    "bad_gateway",
+    `${detail} Target: 127.0.0.1:${route.port}. Check active routes with: portless list`,
+    getRequestHost(req),
+    () =>
+      renderPage(
+        502,
+        "Bad Gateway",
+        `<div class="content"><p class="desc">${escapeHtml(detail)}</p></div>`
+      )
+  );
 }
 
 function activeAppLinkSuffix(url: string): string {
@@ -171,6 +224,9 @@ const HOP_BY_HOP_HEADERS = new Set([
   "transfer-encoding",
   "upgrade",
 ]);
+
+/** Hop-by-hop request headers that never belong on a forwarded plain HTTP request. */
+const REQUEST_HOP_BY_HOP_HEADERS = ["connection", "keep-alive", "proxy-connection", "upgrade"];
 
 /** Cap ordinary upstream connections so multiplexed clients cannot overload a backend. */
 const MAX_UPSTREAM_SOCKETS = 64;
@@ -402,21 +458,6 @@ function h2cRequestHeaders(
   return headers;
 }
 
-function writePlainBadGateway(
-  res: http.ServerResponse,
-  route: { port: number },
-  detail = "The target app may not be running."
-): void {
-  res.writeHead(502, { "Content-Type": "text/plain" });
-  res.end(
-    [
-      `Bad Gateway: ${detail}`,
-      `Target: 127.0.0.1:${route.port}`,
-      "Check active routes with: portless list",
-    ].join("\n") + "\n"
-  );
-}
-
 function proxyH2c(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -448,8 +489,10 @@ function proxyH2c(
 
   proxyReq.on("error", (err) => {
     onError(`h2c proxy error for ${getRequestHost(req)}: ${dialErrorMessage(err)}`);
+    req.unpipe(proxyReq);
+    req.resume();
     if (!res.headersSent) {
-      writePlainBadGateway(res, route);
+      sendBadGateway(req, res, route, "The target app may not be running.");
     } else {
       res.destroy();
     }
@@ -590,10 +633,46 @@ function findRoute(
   if (tailscaleHostnameRoute) return tailscaleHostnameRoute;
 
   if (strict) return undefined;
+
+  // Wildcard tier: the most specific parent hostname wins, then the longest
+  // path prefix within it. Storage order never decides.
+  const parents = routes.filter(
+    (r) =>
+      hostname.endsWith("." + r.hostname) &&
+      matchesPathPrefix(requestPath, normalizePathPrefix(r.pathPrefix))
+  );
+  const longestParent = parents.reduce((max, r) => Math.max(max, r.hostname.length), 0);
   return pickLongestPathRoute(
-    routes.filter((r) => hostname.endsWith("." + r.hostname)),
+    parents.filter((r) => r.hostname.length === longestParent),
     requestPath
   );
+}
+
+/**
+ * True when the request authority is an exact public hostname the proxy
+ * accepts through a tunnel alias or a persisted Tailscale URL. Such a host
+ * reaching the no-route branch means only its path missed, and the visitor may
+ * be anyone on the internet.
+ */
+function isKnownPublicHost(
+  rawHost: string,
+  routes: RouteInfo[],
+  tunnelAliases: TunnelAlias[]
+): boolean {
+  const hostname = authorityHostname(normalizeAuthority(rawHost));
+  return (
+    tunnelAliases.some((alias) => alias.externalHostname === hostname) ||
+    routes.some((route) =>
+      routeTailscaleAuthorities(route).some(
+        (authority) => authorityHostname(authority) === hostname
+      )
+    )
+  );
+}
+
+/** True for IPv4 and bracketed IPv6 request hosts. */
+function isIpLiteral(host: string, rawHost: string): boolean {
+  return net.isIPv4(host) || rawHost.startsWith("[");
 }
 
 interface H2WebSocketRouteSelection {
@@ -688,6 +767,12 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
   const tldSuffixes = configuredTlds
     .map((configuredTld) => `.${configuredTld}`)
     .sort((a, b) => b.length - a.length);
+  /** A name under one of the configured suffixes; a trailing dot still counts. */
+  const isPortlessName = (host: string): boolean => {
+    const lower = host.toLowerCase();
+    const name = lower.endsWith(".") ? lower.slice(0, -1) : lower;
+    return tldSuffixes.some((suffix) => name === suffix.slice(1) || name.endsWith(suffix));
+  };
   const h2cSessions: H2cSessionCache = new Map();
 
   // Reserved internal hostnames. Intercepted before route dispatch so a user
@@ -1115,30 +1200,27 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
           `This usually means a backend is proxying back through portless without rewriting ` +
           `the Host header. If you use Vite/webpack proxy, set changeOrigin: true.`
       );
-      if (!wantsHtml(req)) {
-        res.writeHead(508, { "Content-Type": "text/plain" });
-        res.end(
-          [
-            `Loop Detected: request for ${textSafe(host)} has passed through portless ${hops} times.`,
-            "This usually means a dev server proxy is forwarding back through portless without rewriting the Host header.",
-            "Set changeOrigin: true in your dev server proxy config.",
-            `Example target: ${reqTls ? "https" : "http"}://<backend>${tldSuffix}${reqTls ? "" : ":<port>"}`,
-          ].join("\n") + "\n"
-        );
-        return;
-      }
-      res.writeHead(508, { "Content-Type": "text/html" });
-      res.end(
-        renderPage(
-          508,
-          "Loop Detected",
-          `<div class="content"><p class="desc">This request has passed through portless ${hops} times. This usually means a dev server (Vite, webpack, etc.) is proxying requests back through portless without rewriting the Host header.</p><div class="section"><p class="label">Fix: add changeOrigin to your proxy config</p><pre class="terminal">proxy: {
+      sendProxyError(
+        req,
+        res,
+        508,
+        "loop_detected",
+        `Request for ${host} has passed through portless ${hops} times. ` +
+          "This usually means a dev server proxy is forwarding back through portless without rewriting the Host header. " +
+          "Set changeOrigin: true in your dev server proxy config. " +
+          `Example target: ${reqTls ? "https" : "http"}://<backend>${tldSuffix}${reqTls ? "" : ":<port>"}`,
+        host,
+        () =>
+          renderPage(
+            508,
+            "Loop Detected",
+            `<div class="content"><p class="desc">This request has passed through portless ${hops} times. This usually means a dev server (Vite, webpack, etc.) is proxying requests back through portless without rewriting the Host header.</p><div class="section"><p class="label">Fix: add changeOrigin to your proxy config</p><pre class="terminal">proxy: {
   "/api": {
     target: "${reqTls ? "https" : "http"}://&lt;backend&gt;${escapeHtml(tldSuffix)}${reqTls ? "" : ":&lt;port&gt;"}",
     changeOrigin: true,
   },
 }</pre></div></div>`
-        )
+          )
       );
       return;
     }
@@ -1161,6 +1243,33 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     }
 
     if (!route) {
+      if (isKnownPublicHost(rawHost, routes, tunnelAliases)) {
+        // An exact tunnel alias or Tailscale host reached us with a path that
+        // matches no route. The visitor may be on the public internet, so do
+        // not reveal the local app list or the registration command.
+        const message = `No app registered for ${host} at this path.`;
+        sendProxyError(req, res, 404, "not_found", message, host, () =>
+          renderPage(
+            404,
+            "Not Found",
+            `<div class="content"><p class="desc">No app registered for <strong>${escapeHtml(host)}</strong> at this path.</p></div>`
+          )
+        );
+        return;
+      }
+
+      if (!isPortlessName(host) && !isIpLiteral(host, rawHost)) {
+        const message = `DNS sent ${host} to this computer. This is not the real site.`;
+        sendProxyError(req, res, 421, "misdirected_request", message, host, () =>
+          renderPage(
+            421,
+            "Misdirected Request",
+            `<div class="content"><p class="desc">${escapeHtml(message)}</p></div>`
+          )
+        );
+        return;
+      }
+
       const safeHost = escapeHtml(host);
       const matchedSuffix = tldSuffixes.find((suffix) => host.endsWith(suffix));
       const strippedHost =
@@ -1168,43 +1277,40 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
           ? host.slice(0, -matchedSuffix.length)
           : host;
       const safeSuggestion = escapeHtml(strippedHost);
-      if (!wantsHtml(req)) {
-        const lines = [`No app registered for ${textSafe(host)}.`];
-        if (routes.length > 0) {
-          lines.push("Active apps:");
-          for (const route of routes) {
-            const pathPrefix = normalizePathPrefix(route.pathPrefix);
-            const label = pathPrefix === "/" ? route.hostname : `${route.hostname}${pathPrefix}`;
-            lines.push(`- ${textSafe(label)} -> 127.0.0.1:${route.port}`);
-          }
-        } else {
-          lines.push("No apps running.");
-        }
-        lines.push(`Register it with: portless ${textSafe(strippedHost)} your-command`);
-        res.writeHead(404, { "Content-Type": "text/plain" });
-        res.end(lines.join("\n") + "\n");
-        return;
-      }
       const linkSuffix = activeAppLinkSuffix(target.forwardTarget);
-      const routesList =
-        routes.length > 0
-          ? `<div class="section"><p class="label">Apps <span class="count">${routes.length}</span></p>${appList(
-              routes.map((r) => {
-                const pathPrefix = normalizePathPrefix(r.pathPrefix);
-                const hrefSuffix = pathPrefix === "/" ? linkSuffix : "";
-                const url = `${formatUrl(r.hostname, proxyPort, reqTls, pathPrefix)}${hrefSuffix}`;
-                return renderRouteRow(r, { url, copyUrl: url, status: "active", newTab: true });
-              })
-            )}</div>`
-          : '<p class="empty">No apps running.</p>';
-      res.writeHead(404, { "Content-Type": "text/html" });
-      res.end(
-        renderPage(
-          404,
-          "Not Found",
-          `<div class="content"><p class="desc">No app registered for <strong>${safeHost}</strong></p>${routesList}<div class="section"><div class="terminal"><span class="prompt">$ </span>portless ${safeSuggestion} your-command</div></div></div>`,
-          APP_SCRIPT
-        )
+      sendProxyError(
+        req,
+        res,
+        404,
+        "not_found",
+        `No app registered for ${host}. Register it with: portless ${strippedHost} your-command. List active apps with: portless list`,
+        host,
+        () => {
+          const now = Date.now();
+          const routesList =
+            routes.length > 0
+              ? `<div class="section"><p class="label">Apps <span class="count">${routes.length}</span></p>${routes.length > APP_FILTER_THRESHOLD ? APP_FILTER_CONTROLS : ""}${appList(
+                  routes.map((r) => {
+                    const pathPrefix = normalizePathPrefix(r.pathPrefix);
+                    const hrefSuffix = pathPrefix === "/" ? linkSuffix : "";
+                    const url = `${formatUrl(r.hostname, proxyPort, reqTls, pathPrefix)}${hrefSuffix}`;
+                    return renderRouteRow(r, {
+                      url,
+                      copyUrl: url,
+                      status: "active",
+                      newTab: true,
+                      now,
+                    });
+                  })
+                )}${routes.length > APP_FILTER_THRESHOLD ? APP_FILTER_NO_MATCH : ""}</div>`
+              : '<p class="empty">No apps running.</p>';
+          return renderPage(
+            404,
+            "Not Found",
+            `<div class="content"><p class="desc">No app registered for <strong>${safeHost}</strong></p>${routesList}<div class="section"><div class="terminal"><span class="prompt">$ </span>portless ${safeSuggestion} your-command</div></div></div>`,
+            routes.length > APP_FILTER_THRESHOLD ? APP_SCRIPT + APP_FILTER_SCRIPT : APP_SCRIPT
+          );
+        }
       );
       return;
     }
@@ -1221,6 +1327,10 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     }
     proxyReqHeaders[PORTLESS_HOPS_HEADER] = String(hops + 1);
     stripConnectionHeaders(proxyReqHeaders);
+    // These are hop-by-hop whether or not Connection names them. Forwarding
+    // them leaves the backend with an unlistened keep-alive socket, or asks it
+    // to switch protocols for a plain request.
+    for (const header of REQUEST_HOP_BY_HOP_HEADERS) delete proxyReqHeaders[header];
     // Remove HTTP/2 pseudo-headers before forwarding to HTTP/1.1 backend
     for (const key of Object.keys(proxyReqHeaders)) {
       if (key.startsWith(":")) {
@@ -1288,31 +1398,18 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
         handleRequest(req, res, true);
         return;
       }
+      // Drain whatever the client still sends so a kept-alive connection stays
+      // usable after the error response. This must come after the replay early
+      // return above, which still needs the request.
+      req.unpipe(proxyReq);
+      req.resume();
       onError(`Proxy error for ${getRequestHost(req)}: ${dialErrorMessage(err)}`);
       if (!res.headersSent) {
         const detail =
           errWithCode.code === "ECONNREFUSED"
             ? "The target app is not responding. It may have crashed."
             : "The target app may not be running.";
-        if (!wantsHtml(req)) {
-          res.writeHead(502, { "Content-Type": "text/plain" });
-          res.end(
-            [
-              `Bad Gateway: ${detail}`,
-              `Target: 127.0.0.1:${route.port}`,
-              "Check active routes with: portless list",
-            ].join("\n") + "\n"
-          );
-          return;
-        }
-        res.writeHead(502, { "Content-Type": "text/html" });
-        res.end(
-          renderPage(
-            502,
-            "Bad Gateway",
-            `<div class="content"><p class="desc">${escapeHtml(detail)}</p></div>`
-          )
-        );
+        sendBadGateway(req, res, route, detail);
       }
     });
 
