@@ -5,10 +5,17 @@ import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildRestartStartArgs, parseBgStartArgs, stopEntry, runArgsFromIntent } from "./bg.js";
+import {
+  BG_STOP_WAIT_MS,
+  buildRestartStartArgs,
+  parseBgStartArgs,
+  runArgsFromIntent,
+  stopEntry,
+} from "./bg.js";
 import { getBgLogPaths } from "./bg-logs.js";
 import { BgStore, type BgProcessEntry, type BgStartIntent } from "./bg-store.js";
 import { ensureCerts } from "./certs.js";
+import { getProcessStartTime } from "./process-group.js";
 import { RouteStore } from "./routes.js";
 import { TunnelAliasStore } from "./tunnel-aliases.js";
 
@@ -45,7 +52,10 @@ VeuruL5f30jD8PbGa2A91T5e1oaoL5ap6bdl
 `;
 
 /** Run the CLI with the given args and optional env/cwd overrides. */
-function run(args: string[], options?: { env?: Record<string, string | undefined>; cwd?: string }) {
+function run(
+  args: string[],
+  options?: { env?: Record<string, string | undefined>; cwd?: string; timeoutMs?: number }
+) {
   const env: Record<string, string | undefined> = {
     ...process.env,
     NO_COLOR: "1",
@@ -75,7 +85,7 @@ function run(args: string[], options?: { env?: Record<string, string | undefined
   }
   const result = spawnSync(process.execPath, [CLI_PATH, ...args], {
     encoding: "utf-8",
-    timeout: 10_000,
+    timeout: options?.timeoutMs ?? 10_000,
     env,
     // Default to a non-repository directory so parallel worktrees created by
     // other test or agent processes cannot change an unrelated test's name.
@@ -739,6 +749,57 @@ describe("CLI", () => {
         },
       ]);
     });
+
+    it.skipIf(process.platform === "win32")(
+      "lists a dead-owner route whose command still runs as orphaned",
+      () => {
+        const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+          detached: true,
+          stdio: "ignore",
+        });
+        sleeper.unref();
+        const pgid = sleeper.pid!;
+        try {
+          const dead = spawnSync(
+            process.execPath,
+            ["-e", "process.stdout.write(String(process.pid))"],
+            {
+              encoding: "utf-8",
+            }
+          );
+          fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
+          fs.writeFileSync(
+            path.join(tmpDir, "routes.json"),
+            JSON.stringify([
+              {
+                hostname: "ghost.localhost",
+                port: 4200,
+                pid: Number(dead.stdout),
+                childPgid: pgid,
+                childStartTime: getProcessStartTime(pgid),
+              },
+            ])
+          );
+
+          const json = run(["list", "--json"], { env: { PORTLESS_STATE_DIR: tmpDir } });
+          expect(json.status).toBe(0);
+          expect(JSON.parse(json.stdout)).toMatchObject([
+            { hostname: "ghost.localhost", kind: "orphan", orphaned: true, process_group: pgid },
+          ]);
+
+          const text = run(["list"], { env: { PORTLESS_STATE_DIR: tmpDir, NO_COLOR: "1" } });
+          expect(text.stdout).toContain("Orphaned");
+          expect(text.stdout).toContain("ghost.localhost");
+          expect(text.stdout).toContain("portless prune");
+        } finally {
+          try {
+            process.kill(-pgid, "SIGKILL");
+          } catch {
+            // already gone
+          }
+        }
+      }
+    );
 
     it("appends path prefixes to every sharing URL in text and JSON output", () => {
       fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
@@ -1553,7 +1614,11 @@ describe("CLI", () => {
           }),
         ]);
 
-        const { status, stderr } = run(["bg", "stop", "stubborn"], { env: bgEnv() });
+        // A graceful stop waits past portless's own 10 second escalation.
+        const { status, stderr } = run(["bg", "stop", "stubborn"], {
+          env: bgEnv(),
+          timeoutMs: 20_000,
+        });
 
         expect(status).toBe(1);
         expect(stderr).toContain("did not exit");
@@ -1564,7 +1629,7 @@ describe("CLI", () => {
         } catch {
           // Process may already be gone.
         }
-      }, 8000);
+      }, 25_000);
 
       it("force stop removes only the exact route owned by the bg pid", async () => {
         const appPort = await getFreePort();
@@ -1804,6 +1869,77 @@ describe("CLI", () => {
 
         expect(result).toEqual({ stopped: true, alreadyStopped: false });
         expect(store.loadEntries()).toEqual([]);
+      });
+
+      describe("stop and the command's process group", () => {
+        function stopContext(entryPid: number) {
+          const entry = makeBgEntry({
+            id: "group-stop",
+            label: "group-stop",
+            pid: entryPid,
+            route: { hostname: "group-stop.localhost", pathPrefix: "/" },
+          }) as BgProcessEntry;
+          const store = new BgStore(tmpDir);
+          store.upsertEntry(entry);
+          const routeStore = new RouteStore(tmpDir);
+          routeStore.addRoute("group-stop.localhost", 4777, entryPid);
+          routeStore.updateRoute("group-stop.localhost", {
+            childPgid: 5555,
+            childStartTime: "started-at",
+          });
+          return {
+            entry,
+            context: {
+              stateDir: tmpDir,
+              store,
+              routeStore,
+              tunnelAliasStore: new TunnelAliasStore(tmpDir),
+            },
+          };
+        }
+
+        it("a default stop waits past the 10 second escalation with SIGTERM only", async () => {
+          const { entry, context } = stopContext(process.pid);
+          const signalProcessGroup = vi.fn();
+          const killChildGroup = vi.fn(() => true);
+          const waitForProcessExit = vi.fn(async () => true);
+
+          await stopEntry(
+            context,
+            entry,
+            {},
+            {
+              isProcessAlive: () => true,
+              signalProcessGroup,
+              waitForProcessExit,
+              killChildGroup,
+            }
+          );
+
+          expect(BG_STOP_WAIT_MS).toBeGreaterThan(10_000);
+          expect(signalProcessGroup.mock.calls).toEqual([[process.pid, "SIGTERM"]]);
+          expect(waitForProcessExit).toHaveBeenCalledWith(process.pid, BG_STOP_WAIT_MS);
+          expect(killChildGroup).not.toHaveBeenCalled();
+        });
+
+        it("a forced stop also kills the verified child group", async () => {
+          const { entry, context } = stopContext(process.pid);
+          const killChildGroup = vi.fn(() => true);
+
+          await stopEntry(
+            context,
+            entry,
+            { force: true },
+            {
+              isProcessAlive: () => true,
+              signalProcessGroup: vi.fn(),
+              waitForProcessExit: async () => true,
+              killChildGroup,
+            }
+          );
+
+          expect(killChildGroup).toHaveBeenCalledWith(5555, "started-at", "SIGKILL");
+        });
       });
 
       it("bg clean removes dead entries and their logs", async () => {

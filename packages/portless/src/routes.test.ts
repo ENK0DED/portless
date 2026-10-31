@@ -3,8 +3,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { pathToFileURL } from "node:url";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { FILE_MODE, RouteStore, RouteConflictError, isRetryableLockError } from "./routes.js";
+import { getProcessStartTime } from "./process-group.js";
 
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
@@ -918,5 +919,150 @@ describe("RouteStore multiplex", { timeout: 15_000 }, () => {
     const routes = store.loadRoutes();
     expect(routes[0].label).toBeUndefined();
     expect(isAlive(sleepers[0])).toBe(true);
+  });
+});
+
+describe.skipIf(process.platform === "win32")("orphaned routes", () => {
+  let tmpDir: string;
+  let store: RouteStore;
+  let group: number | undefined;
+
+  /** A detached process leading its own group, like a dev server portless spawned. */
+  function startGroup(): number {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    child.unref();
+    group = child.pid!;
+    return group;
+  }
+
+  /** A pid that is guaranteed dead, standing in for the exited portless owner. */
+  function deadPid(): number {
+    const result = spawnSync(
+      process.execPath,
+      ["-e", "process.stdout.write(String(process.pid))"],
+      {
+        encoding: "utf-8",
+      }
+    );
+    return Number(result.stdout);
+  }
+
+  function writeOrphan(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    const pgid = startGroup();
+    const route = {
+      hostname: "orphan.localhost",
+      port: 4555,
+      pid: deadPid(),
+      childPgid: pgid,
+      childStartTime: getProcessStartTime(pgid),
+      ...overrides,
+    };
+    store.ensureDir();
+    fs.writeFileSync(store.getRoutesPath(), JSON.stringify([route]));
+    return route;
+  }
+
+  const raw = (): Array<{ hostname: string; ngrokPid?: number }> =>
+    JSON.parse(fs.readFileSync(store.getRoutesPath(), "utf-8"));
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-orphans-test-"));
+    store = new RouteStore(tmpDir);
+  });
+
+  afterEach(() => {
+    if (group) {
+      try {
+        process.kill(-group, "SIGKILL");
+      } catch {
+        // already gone
+      }
+    }
+    group = undefined;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("is not routable but is reported as orphaned", () => {
+    writeOrphan();
+
+    expect(store.loadRoutes()).toEqual([]);
+    expect(store.loadOrphanedRoutes().map((r) => r.hostname)).toEqual(["orphan.localhost"]);
+  });
+
+  it("does not treat a route without a verified group as orphaned", () => {
+    writeOrphan({ childStartTime: "Thu Jan  1 00:00:00 1970" });
+    expect(store.loadOrphanedRoutes()).toEqual([]);
+
+    writeOrphan({ childPgid: undefined, childStartTime: undefined });
+    expect(store.loadOrphanedRoutes()).toEqual([]);
+  });
+
+  it("keeps the orphan on file when another route is registered or removed", () => {
+    writeOrphan();
+
+    store.addRoute("other.localhost", 4556, process.pid);
+    expect(
+      raw()
+        .map((r) => r.hostname)
+        .sort()
+    ).toEqual(["orphan.localhost", "other.localhost"]);
+
+    store.updateRoute("other.localhost", { childPgid: 1234 });
+    store.removeRoute("other.localhost", process.pid);
+    expect(raw().map((r) => r.hostname)).toEqual(["orphan.localhost"]);
+  });
+
+  it("drops the orphan when a new owner registers the same slot", () => {
+    writeOrphan();
+
+    store.addRoute("orphan.localhost", 4557, process.pid);
+
+    expect(raw()).toHaveLength(1);
+    expect(store.loadRoutes()[0]).toMatchObject({ hostname: "orphan.localhost", port: 4557 });
+  });
+
+  it("drops a dead-owner route once its group is gone", async () => {
+    writeOrphan();
+    process.kill(-group!, "SIGKILL");
+    // The leader is a child of this process, so the event loop must run to reap it.
+    for (let i = 0; i < 100 && store.loadOrphanedRoutes().length > 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    store.addRoute("other.localhost", 4556, process.pid);
+
+    expect(raw().map((r) => r.hostname)).toEqual(["other.localhost"]);
+  });
+
+  describe("pruneStaleRoutes", () => {
+    it("removes orphaned routes by default", () => {
+      writeOrphan();
+
+      expect(store.pruneStaleRoutes().map((r) => r.hostname)).toEqual(["orphan.localhost"]);
+      expect(raw()).toEqual([]);
+    });
+
+    it("keeps orphaned routes when asked, and strips their sharing once", () => {
+      writeOrphan({ ngrokPid: 99_999_991, ngrokUrl: "https://x.ngrok.app" });
+
+      const first = store.pruneStaleRoutes({ keepOrphaned: true });
+      expect(first.map((r) => r.ngrokPid)).toEqual([99_999_991]);
+      expect(raw()).toHaveLength(1);
+      expect(raw()[0].ngrokPid).toBeUndefined();
+      expect(store.loadOrphanedRoutes()).toHaveLength(1);
+
+      expect(store.pruneStaleRoutes({ keepOrphaned: true })).toEqual([]);
+      expect(raw()).toHaveLength(1);
+    });
+
+    it("still removes dead-owner routes without a live group when keeping orphans", () => {
+      writeOrphan({ childStartTime: "Thu Jan  1 00:00:00 1970" });
+
+      expect(store.pruneStaleRoutes({ keepOrphaned: true })).toHaveLength(1);
+      expect(raw()).toEqual([]);
+    });
   });
 });

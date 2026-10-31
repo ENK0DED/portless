@@ -3,7 +3,13 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import colors from "./colors.js";
-import { discoverState, isWindows, killTree } from "./cli-utils.js";
+import {
+  COMMAND_SHUTDOWN_FORCE_MS,
+  discoverState,
+  isWindows,
+  killOrphanedProcessGroup,
+  killTree,
+} from "./cli-utils.js";
 import {
   appendBgLifecycleLog,
   getBgLogPaths,
@@ -59,7 +65,16 @@ export interface BgCommandContext {
   tunnelAliasStore: TunnelAliasStore;
 }
 
+/**
+ * How long `bg stop` waits after SIGTERM before giving up. `portless run`
+ * shuts its command down gracefully and escalates to SIGKILL after
+ * COMMAND_SHUTDOWN_FORCE_MS, so waiting a little longer lets it finish that
+ * work instead of being killed mid-shutdown with its command's group orphaned.
+ */
+export const BG_STOP_WAIT_MS = COMMAND_SHUTDOWN_FORCE_MS + 2000;
+
 export interface BgStopEntryOperations {
+  killChildGroup?: (pgid: number, startTime: string | undefined, signal: NodeJS.Signals) => boolean;
   isProcessAlive?: (pid: number) => boolean;
   signalProcessGroup?: (pid: number, signal: NodeJS.Signals) => void;
   waitForProcessExit?: (pid: number, timeoutMs: number) => Promise<boolean>;
@@ -167,9 +182,13 @@ ${colors.bold("Usage:")}
 
 ${colors.bold("Options:")}
   --path <prefix>               Resolve a path-scoped background route
-  --force                       Send SIGKILL after graceful stop and clean exact owned route state
+  --force                       Send SIGKILL to the app and the command it spawned, and clean exact
+                                owned route state
   --json                        Print machine-readable output
   --help, -h                    Show this help
+
+Without --force, bg stop sends SIGTERM and waits up to 12 seconds for the app to shut
+its command down (portless escalates to SIGKILL after 10 seconds on its own).
 `);
 }
 
@@ -464,8 +483,8 @@ function isProcessAlive(pid: number): boolean {
 
 async function terminateChild(child: ChildProcess): Promise<void> {
   killTree(child, "SIGTERM");
-  await sleep(500);
-  if (child.pid && isProcessAlive(child.pid)) {
+  // Let `portless run` finish its own graceful-then-forced shutdown of the command.
+  if (child.pid && !(await waitForProcessExit(child.pid, BG_STOP_WAIT_MS))) {
     killTree(child, "SIGKILL");
   }
 }
@@ -578,10 +597,20 @@ export async function stopEntry(
   const isAlive = operations.isProcessAlive ?? isProcessAlive;
   const signal = operations.signalProcessGroup ?? signalProcessGroup;
   const wait = operations.waitForProcessExit ?? waitForProcessExit;
+  const killChildGroup = operations.killChildGroup ?? killOrphanedProcessGroup;
+  // The command portless spawned leads its own process group, so killing the
+  // wrapper's group alone leaves it running. Read the recorded group before the
+  // wrapper dies; only a forced stop kills it, a graceful one lets the wrapper
+  // shut the command down itself.
+  const ownRoute = options.force ? findExactRoute(context, entry) : undefined;
+  const childGroup =
+    ownRoute && ownRoute.pid === entry.pid && ownRoute.childPgid
+      ? { pgid: ownRoute.childPgid, startTime: ownRoute.childStartTime }
+      : undefined;
   const alive = isAlive(entry.pid);
   if (alive) {
     signal(entry.pid, options.force ? "SIGKILL" : "SIGTERM");
-    const exited = await wait(entry.pid, options.force ? 1000 : 5000);
+    const exited = await wait(entry.pid, options.force ? 1000 : BG_STOP_WAIT_MS);
     if (!exited && !options.force) {
       context.store.updateEntry(entry.id, { state: "unknown" });
       return { stopped: false, alreadyStopped: false };
@@ -596,6 +625,7 @@ export async function stopEntry(
     }
   }
 
+  if (childGroup) killChildGroup(childGroup.pgid, childGroup.startTime, "SIGKILL");
   cleanupExactRoute(context, entry);
   context.store.removeEntry(entry.id);
   if (options.removeLogs) removeEntryLogs(context.stateDir, entry.id);

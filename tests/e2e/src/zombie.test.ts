@@ -197,7 +197,7 @@ async function startCliApp(
   spawnSync(
     process.execPath,
     [CLI_PATH, "proxy", "start", "--no-tls", "-p", PROXY_PORT.toString()],
-    { env: baseEnv, timeout: 15_000 }
+    { env: { ...baseEnv, ...extraEnv }, timeout: 15_000 }
   );
 
   state.cliChild = spawn(process.execPath, [CLI_PATH, appName, "node", script], {
@@ -355,9 +355,15 @@ describe("orphaned process groups", () => {
     state.appPort = undefined;
   });
 
-  async function startAndCrash(appName: string): Promise<number> {
+  async function startAndCrash(
+    appName: string,
+    extraEnv: Record<string, string> = {}
+  ): Promise<number> {
     const pidFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "portless-sidecar-")), "pid");
-    await startCliApp(appName, state, "sidecar-wrapper.js", { SIDECAR_PID_FILE: pidFile });
+    await startCliApp(appName, state, "sidecar-wrapper.js", {
+      SIDECAR_PID_FILE: pidFile,
+      ...extraEnv,
+    });
     sidecarPid = parseInt(fs.readFileSync(pidFile, "utf-8"), 10);
 
     state.cliChild!.kill("SIGKILL");
@@ -367,8 +373,7 @@ describe("orphaned process groups", () => {
     return sidecarPid;
   }
 
-  // pending ticket 19 (#451 fork-shaped port)
-  it.skip("prune kills the whole process group, not only the route port", async () => {
+  it("prune kills the whole process group, not only the route port", async () => {
     if (isWindows) return;
 
     const pid = await startAndCrash("orphan-prune");
@@ -390,8 +395,50 @@ describe("orphaned process groups", () => {
     expect(await waitForPortToClose(state.appPort!, 5000)).toBe(true);
   });
 
-  // pending ticket 19 (#451 fork-shaped port)
-  it.skip("run stops the orphaned process group of a crashed session", async () => {
+  it("the proxy sweep keeps an orphaned route and never kills its group", async () => {
+    if (isWindows) return;
+
+    const pid = await startAndCrash("orphan-sweep", { PORTLESS_ROUTES_CLEANUP_INTERVAL: "1" });
+
+    // Several sweeps run while the owner is dead and the group is alive.
+    await sleep(3500);
+
+    expect(isAlive(pid)).toBe(true);
+    const routes: Array<{ hostname: string }> = JSON.parse(
+      fs.readFileSync(path.join(state.stateDir!, "routes.json"), "utf-8")
+    );
+    expect(routes.map((r) => r.hostname)).toContain("orphan-sweep.localhost");
+
+    const env = {
+      ...process.env,
+      PORTLESS_PORT: PROXY_PORT.toString(),
+      PORTLESS_HTTPS: "0",
+      PORTLESS_STATE_DIR: state.stateDir,
+      NO_COLOR: "1",
+    };
+    const list = spawnSync(process.execPath, [CLI_PATH, "list", "--json"], {
+      env,
+      encoding: "utf-8",
+      timeout: 10_000,
+    });
+    const listed: Array<{ hostname: string; kind: string; orphaned?: boolean }> = JSON.parse(
+      list.stdout
+    );
+    expect(listed.length).toBeGreaterThan(0);
+    expect(listed.every((r) => r.kind === "orphan" && r.orphaned === true)).toBe(true);
+    expect(listed.map((r) => r.hostname)).toContain("orphan-sweep.localhost");
+
+    // The kill is left to the user: prune stops the group.
+    const prune = spawnSync(process.execPath, [CLI_PATH, "prune"], {
+      env,
+      encoding: "utf-8",
+      timeout: 10_000,
+    });
+    expect(prune.stdout).toContain("killed process group");
+    expect(await waitForPidToExit(pid, 5000)).toBe(true);
+  });
+
+  it("run stops the orphaned process group of a crashed session", async () => {
     if (isWindows) return;
 
     const pid = await startAndCrash("orphan-restart");

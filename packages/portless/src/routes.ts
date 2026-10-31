@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { RouteInfo, RouteProtocol, TunnelProviderName } from "./types.js";
+import { isRecordedProcessGroupAlive } from "./process-group.js";
 import {
   fixOwnership,
   isErrnoException,
@@ -58,6 +59,36 @@ export interface RouteMapping extends RouteInfo {
   netbirdPid?: number;
   cloudflareUrl?: string;
   cloudflarePid?: number;
+}
+
+/** Route fields describing public exposure, all owned by the session that died. */
+const SHARING_FIELDS = [
+  "tailscaleUrl",
+  "tailscaleHttpsPort",
+  "tailscaleFunnel",
+  "tailscaleServiceName",
+  "tailscaleServiceUrl",
+  "tailscaleServicePending",
+  "ngrokUrl",
+  "ngrokPid",
+  "tunnelProvider",
+  "tunnelUrl",
+  "tunnelExternalHostname",
+  "tunnelPid",
+  "netbirdUrl",
+  "netbirdPid",
+  "cloudflareUrl",
+  "cloudflarePid",
+] as const satisfies readonly (keyof RouteMapping)[];
+
+function hasSharing(route: RouteMapping): boolean {
+  return SHARING_FIELDS.some((field) => route[field] !== undefined);
+}
+
+function withoutSharing(route: RouteMapping): RouteMapping {
+  const copy = { ...route };
+  for (const field of SHARING_FIELDS) delete copy[field];
+  return copy;
 }
 
 type RouteMetadataPatch = {
@@ -291,6 +322,17 @@ export class RouteStore {
     return pid === 0 || isPidAlive(pid);
   }
 
+  /**
+   * A route whose owning portless process is gone while the command it spawned
+   * still runs, verified by the process group and leader start time recorded at
+   * spawn. It no longer routes, but its record is the only link that lets the
+   * next `run` or `prune` stop the orphaned dev server.
+   */
+  isOrphaned(route: RouteMapping): boolean {
+    if (route.pid === 0 || this.isProcessAlive(route.pid)) return false;
+    return isRecordedProcessGroupAlive(route.childPgid, route.childStartTime);
+  }
+
   private loadAndMigrateRoutes(strict = false): RouteMapping[] {
     if (!fs.existsSync(this.routesPath)) {
       return [];
@@ -386,20 +428,42 @@ export class RouteStore {
    * unprotected concurrent writes.
    */
   loadRoutes(persistCleanup = false, strict = false): RouteMapping[] {
-    const routes = this.loadAndMigrateRoutes(strict);
-    const alive = routes.filter((r) => r.pid === 0 || this.isProcessAlive(r.pid));
-    if (persistCleanup && alive.length !== routes.length) {
+    return this.loadRoutesForWrite(persistCleanup, strict).routes;
+  }
+
+  /**
+   * Like loadRoutes, but also returns the orphaned routes (see isOrphaned).
+   * They are not routable, yet persisting cleanup must not drop them, so a
+   * caller that rewrites the file passes them back to saveRoutes.
+   */
+  private loadRoutesForWrite(
+    persistCleanup = false,
+    strict = false
+  ): { routes: RouteMapping[]; orphans: RouteMapping[] } {
+    const all = this.loadAndMigrateRoutes(strict);
+    const routes: RouteMapping[] = [];
+    const orphans: RouteMapping[] = [];
+    for (const r of all) {
+      if (r.pid === 0 || this.isProcessAlive(r.pid)) routes.push(r);
+      else if (this.isOrphaned(r)) orphans.push(r);
+    }
+    if (persistCleanup && routes.length + orphans.length !== all.length) {
       try {
-        this.saveRoutes(alive);
+        this.saveRoutes(routes, orphans);
       } catch {
         // Write may fail (permissions); non-fatal
       }
     }
-    return alive;
+    return { routes, orphans };
   }
 
-  private saveRoutes(routes: RouteMapping[]): void {
-    const content = JSON.stringify(routes, null, 2);
+  /** Routes whose owner exited but whose spawned process group still runs. */
+  loadOrphanedRoutes(): RouteMapping[] {
+    return this.loadAndMigrateRoutes().filter((r) => this.isOrphaned(r));
+  }
+
+  private saveRoutes(routes: RouteMapping[], orphans: RouteMapping[] = []): void {
+    const content = JSON.stringify([...routes, ...orphans], null, 2);
     const tempPrefix = `${path.basename(this.routesPath)}.tmp-${process.pid}-`;
     let tempPath: string | undefined;
 
@@ -500,9 +564,11 @@ export class RouteStore {
     this.lockDepth++;
     let killedPid: number | undefined;
     try {
-      const routes = this.loadRoutes(true, true);
+      const { routes, orphans: allOrphans } = this.loadRoutesForWrite(true, true);
       const pathPrefix = normalizePathPrefix(options.pathPrefix);
       const label = normalizeLabel(options.label);
+      // The new owner takes the slot, so an orphan on it is no longer needed.
+      const orphans = allOrphans.filter((r) => !routeMatchesKey(r, hostname, pathPrefix));
 
       // Other live routes already occupying this hostname+pathPrefix slot.
       const group = routes.filter(
@@ -534,7 +600,7 @@ export class RouteStore {
         filtered.push(
           this.buildEntry(hostname, port, pid, pathPrefix, options.protocol, undefined)
         );
-        this.saveRoutes(filtered);
+        this.saveRoutes(filtered, orphans);
       } else {
         // Multiplex member registration.
         const soleOwner = group.find((r) => r.label === undefined);
@@ -566,7 +632,7 @@ export class RouteStore {
           return true;
         });
         filtered.push(this.buildEntry(hostname, port, pid, pathPrefix, options.protocol, label));
-        this.saveRoutes(filtered);
+        this.saveRoutes(filtered, orphans);
       }
     } finally {
       this.lockDepth--;
@@ -586,9 +652,14 @@ export class RouteStore {
 
   /**
    * Remove all route entries whose owning process is dead and persist the
-   * result. Returns the removed stale entries so the caller can act on them.
+   * result. Returns the stale entries so the caller can act on them.
+   *
+   * With `keepOrphaned`, a route whose spawned process group still runs (see
+   * isOrphaned) stays in the file so the next `run` or `prune` can stop that
+   * group. Its public exposure is stripped from the stored entry, and the
+   * pre-strip entry is returned so the caller tears the sharing down once.
    */
-  pruneStaleRoutes(): RouteMapping[] {
+  pruneStaleRoutes(options: { keepOrphaned?: boolean } = {}): RouteMapping[] {
     this.ensureDir();
     if (!this.acquireLock()) {
       throw new Error("Failed to acquire route lock");
@@ -596,17 +667,27 @@ export class RouteStore {
     this.lockDepth++;
     try {
       const all = this.loadRoutesRaw();
-      const alive: RouteMapping[] = [];
+      const kept: RouteMapping[] = [];
       const stale: RouteMapping[] = [];
+      let changed = false;
       for (const r of all) {
         if (r.pid === 0 || this.isProcessAlive(r.pid)) {
-          alive.push(r);
+          kept.push(r);
+        } else if (options.keepOrphaned && this.isOrphaned(r)) {
+          if (hasSharing(r)) {
+            stale.push(r);
+            kept.push(withoutSharing(r));
+            changed = true;
+          } else {
+            kept.push(r);
+          }
         } else {
           stale.push(r);
+          changed = true;
         }
       }
-      if (stale.length > 0) {
-        this.saveRoutes(alive);
+      if (changed) {
+        this.saveRoutes(kept);
       }
       return stale;
     } finally {
@@ -626,7 +707,7 @@ export class RouteStore {
     }
     this.lockDepth++;
     try {
-      const routes = this.loadRoutes(true, true);
+      const { routes, orphans } = this.loadRoutesForWrite(true, true);
       const pathPrefix = normalizePathPrefix(options.pathPrefix);
       const label = normalizeLabel(options.label);
       const route = routes.find(
@@ -712,7 +793,7 @@ export class RouteStore {
         if (fields.cloudflarePid === null) delete route.cloudflarePid;
         else if (fields.cloudflarePid !== undefined) route.cloudflarePid = fields.cloudflarePid;
       }
-      this.saveRoutes(routes);
+      this.saveRoutes(routes, orphans);
     } finally {
       this.lockDepth--;
       this.releaseLock();
@@ -734,13 +815,14 @@ export class RouteStore {
     try {
       const pathPrefix = normalizePathPrefix(options.pathPrefix);
       const label = normalizeLabel(options.label);
-      const routes = this.loadRoutes(true, true).filter((r) => {
+      const loaded = this.loadRoutesForWrite(true, true);
+      const routes = loaded.routes.filter((r) => {
         if (!routeMatchesKey(r, hostname, pathPrefix)) return true;
         if (ownerPid !== undefined && r.pid !== ownerPid) return true;
         if (label !== undefined && r.label !== label) return true;
         return false;
       });
-      this.saveRoutes(routes);
+      this.saveRoutes(routes, loaded.orphans);
     } finally {
       this.lockDepth--;
       this.releaseLock();

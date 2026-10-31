@@ -29,6 +29,29 @@ describe("renderDashboard", () => {
     expect(html).toContain("<html");
   });
 
+  it("lists orphaned apps separately and explains how to stop them", () => {
+    const html = renderDashboard({
+      ...base,
+      routes: [{ hostname: "web.localhost", port: 4001 }],
+      orphaned: [{ hostname: "ghost.localhost", port: 4002 }],
+    });
+    expect(html).toContain("Orphaned");
+    expect(html).toContain("ghost.localhost");
+    expect(html).toContain("portless prune");
+    expect(renderDashboard({ ...base, routes: [] })).not.toContain("Orphaned");
+  });
+
+  it("reports orphaned apps in the live-refresh snapshot", () => {
+    const json = JSON.parse(
+      dashboardStateJson({
+        routes: [],
+        orphaned: [{ hostname: "ghost.localhost", port: 4002 }],
+        signature: "s",
+      })
+    );
+    expect(json.orphaned).toEqual(["ghost.localhost"]);
+  });
+
   it("renders an empty state with a starter command when no apps run", () => {
     const html = renderDashboard({ ...base, routes: [] });
     expect(html).toContain("No apps running");

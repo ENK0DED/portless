@@ -111,6 +111,9 @@ import {
   replacePlaceholders,
   resolveFrameworkBasename,
   spawnCommand,
+  getProcessStartTime,
+  guardWindowsOrphans,
+  killOrphanedProcessGroup,
   augmentedPath,
   parseTldList,
   syncHostsWithWarning,
@@ -675,6 +678,49 @@ function removeRoutes(
   }
 }
 
+/**
+ * Stop dev servers left running by portless sessions that died without
+ * cleanup (SIGKILL, crash). Their routes keep the recorded process group, the
+ * only link to the orphaned tree; the group is signaled only while its leader
+ * still has the start time recorded at spawn. Called before a new route
+ * registers, because registration drops dead-owner routes.
+ */
+function stopOrphanedProcessGroups(store: RouteStore): void {
+  const seen = new Set<number>();
+  for (const route of store.loadOrphanedRoutes()) {
+    const pgid = route.childPgid;
+    if (!pgid || seen.has(pgid)) continue;
+    seen.add(pgid);
+    if (killOrphanedProcessGroup(pgid, route.childStartTime)) {
+      console.log(
+        colors.yellow(`Stopped orphaned dev server from a previous session (process group ${pgid})`)
+      );
+    }
+  }
+}
+
+/**
+ * Record the process group portless spawned for these routes, with its
+ * leader's start time, so a later `run` or `prune` can stop the tree if this
+ * process dies without cleanup. Unix only: Windows has no process groups.
+ */
+function recordChildProcessGroup(
+  store: RouteStore,
+  hostnames: readonly string[],
+  pgid: number,
+  options: Pick<RouteRegistrationOptions, "pathPrefix" | "label">
+): void {
+  if (isWindows) return;
+  const childStartTime = getProcessStartTime(pgid) ?? undefined;
+  for (const hostname of hostnames) {
+    try {
+      store.updateRoute(hostname, { childPgid: pgid, childStartTime }, options);
+    } catch {
+      // Without the group, prune falls back to the route port; non-fatal.
+    }
+  }
+}
+
 /** Warn on this terminal when a registered route still has no resolution. */
 function reportHostsSyncHere(hostnames: string[], lanMode: boolean): Promise<void> {
   return reportHostsSync(hostnames, lanMode, (message) => console.warn(colors.yellow(message)));
@@ -770,6 +816,7 @@ function startProxyServer(
   // Cache routes in memory and reload on file change (debounced)
   const tunnelAliasStore = new TunnelAliasStore(store.dir);
   let cachedRoutes = store.loadRoutes();
+  let cachedOrphanedRoutes = store.loadOrphanedRoutes();
   let cachedTunnelAliases = tunnelAliasStore.loadAliases();
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;
   let watcher: fs.FSWatcher | null = null;
@@ -821,6 +868,7 @@ function startProxyServer(
         deduplicateHostnames(cachedRoutes.map((route) => route.hostname))
       );
       cachedRoutes = store.loadRoutes();
+      cachedOrphanedRoutes = store.loadOrphanedRoutes();
       const currentHostnames = new Set(
         deduplicateHostnames(cachedRoutes.map((route) => route.hostname))
       );
@@ -886,7 +934,9 @@ function startProxyServer(
   if (routesCleanupIntervalSeconds > 0) {
     routesCleanupInterval = setInterval(() => {
       try {
-        const staleRoutes = store.pruneStaleRoutes();
+        // Never kill here. A dead-owner route whose spawned process group still
+        // runs stays on file, marked orphaned, until the next run or prune.
+        const staleRoutes = store.pruneStaleRoutes({ keepOrphaned: true });
         for (const route of staleRoutes) {
           try {
             cleanupRouteSharing(route, { tunnelAliasStore });
@@ -939,6 +989,7 @@ function startProxyServer(
   const createServer = () =>
     createProxyServer({
       getRoutes: () => cachedRoutes,
+      getOrphanedRoutes: () => cachedOrphanedRoutes,
       getTunnelAliases: () => cachedTunnelAliases,
       proxyPort,
       tld,
@@ -1287,8 +1338,20 @@ function listRoutes(
   aliases: TunnelAlias[] = []
 ): void {
   const routes = store.loadRoutes();
+  const orphaned = store.loadOrphanedRoutes();
 
   if (asJson) {
+    const orphanPayload = orphaned.map((route) => ({
+      hostname: route.hostname,
+      url: formatUrl(route.hostname, proxyPort, tls, route.pathPrefix),
+      target_port: route.port,
+      path_prefix: normalizePathPrefix(route.pathPrefix),
+      upstream_protocol: route.protocol ?? "http1",
+      pid: route.pid,
+      kind: "orphan",
+      orphaned: true,
+      process_group: route.childPgid,
+    }));
     const payload = routes.map((route) => {
       const pathPrefix = normalizePathPrefix(route.pathPrefix);
       const routeAliases = aliasesForRoute(aliases, route.hostname, pathPrefix);
@@ -1322,14 +1385,14 @@ function listRoutes(
         ...(route.netbirdUrl ? { netbird_url: formatSharedUrl(route.netbirdUrl, pathPrefix) } : {}),
       };
     });
-    process.stdout.write(JSON.stringify(payload, null, 2) + "\n");
+    process.stdout.write(JSON.stringify([...payload, ...orphanPayload], null, 2) + "\n");
     return;
   }
 
   if (routes.length === 0) {
     console.log(colors.yellow("No active routes."));
     console.log(colors.gray("Start an app with: portless <name> <command>"));
-    if (aliases.length === 0) return;
+    if (aliases.length === 0 && orphaned.length === 0) return;
   } else {
     console.log(colors.blue.bold("\nActive routes:\n"));
   }
@@ -1370,6 +1433,19 @@ function listRoutes(
         `    ${colors.gray("netbird:")} ${colors.green(formatSharedUrl(route.netbirdUrl, pathPrefix))}`
       );
     }
+  }
+  if (orphaned.length > 0) {
+    console.log(colors.yellow("\nOrphaned (owner exited, dev server still running):\n"));
+    for (const route of orphaned) {
+      const pathPrefix = normalizePathPrefix(route.pathPrefix);
+      const url = formatUrl(route.hostname, proxyPort, tls, pathPrefix);
+      console.log(
+        `  ${colors.cyan(url)}  ${colors.gray("->")}  ${colors.white(`localhost:${route.port}`)}  ${colors.gray(`(was pid ${route.pid}, process group ${route.childPgid})`)}`
+      );
+    }
+    console.log(
+      colors.gray("  Run portless prune to stop them, or start the app again with portless run.")
+    );
   }
   if (aliases.length > 0) {
     console.log(colors.blue.bold("\nTunnel aliases:\n"));
@@ -1750,6 +1826,7 @@ async function runApp(
   for (const [index, configuredHostname] of hostnames.entries()) {
     assertNotReservedHostname(configuredHostname, tlds[index]!);
   }
+  stopOrphanedProcessGroups(store);
   let killedPids: number[];
   try {
     killedPids = addRoutes(store, hostnames, port, process.pid, force, {
@@ -2280,6 +2357,11 @@ async function runApp(
   );
 
   spawnCommand(commandArgs, {
+    onSpawn: (pid) =>
+      recordChildProcessGroup(store, hostnames, pid, {
+        pathPrefix: routePathPrefix,
+        label: multiplexLabelFromEnv(),
+      }),
     env: {
       ...baseChildEnv,
       ...childEnv,
@@ -3928,7 +4010,12 @@ ${colors.bold("portless prune")} - Kill orphaned dev servers left behind by cras
 When portless is killed with SIGKILL (kill -9) or crashes, child dev servers
 may survive and continue holding their ports. This command finds those orphans
 by checking routes whose owning CLI process is dead but whose port is still in
-use, then terminates them and cleans up the stale route entries.
+use, then terminates them and cleans up the stale route entries. When the route
+recorded the command's process group and start time, the whole group is stopped
+(only while its leader still has that start time); otherwise the process on the
+route port is stopped. portless run does the same for orphans before it starts.
+The proxy never kills orphans: it keeps their routes, and portless list shows
+them as orphaned until you run or prune.
 
 ${colors.bold("Usage:")}
   ${colors.cyan("portless prune")}
@@ -3997,8 +4084,23 @@ ${colors.bold("Options:")}
   }
 
   let killed = 0;
+  const signal = forceKill ? "SIGKILL" : "SIGTERM";
+  const killedGroups = new Set<number>();
+  for (const route of stale) {
+    const pgid = route.childPgid;
+    if (!pgid || killedGroups.has(pgid)) continue;
+    if (killOrphanedProcessGroup(pgid, route.childStartTime, signal)) {
+      killedGroups.add(pgid);
+      killed++;
+      console.log(
+        colors.gray(`  ${formatRouteLabel(route)} - killed process group ${pgid} (${signal})`)
+      );
+    }
+  }
+
   for (const route of stale) {
     const routeLabel = formatRouteLabel(route);
+    if (route.childPgid && killedGroups.has(route.childPgid)) continue;
     const pids = findPidsOnPort(route.port);
     if (pids.length === 0) {
       console.log(
@@ -4006,7 +4108,6 @@ ${colors.bold("Options:")}
       );
       continue;
     }
-    const signal = forceKill ? "SIGKILL" : "SIGTERM";
     for (const pid of pids) {
       try {
         process.kill(pid, signal);
@@ -4120,7 +4221,9 @@ ${colors.bold("JSON fields:")}
   path_prefix            Route path prefix
   upstream_protocol      "http1" or "h2c"
   pid                    Owning process PID (0 for alias)
-  kind                   "app" or "alias"
+  kind                   "app", "alias", or "orphan"
+  orphaned               true on orphan entries: the owner exited but its dev server
+                         still runs; "portless prune" stops it
 `);
       process.exit(0);
     } else {
@@ -5377,6 +5480,17 @@ function spawnChildProcess(
   env: Record<string, string | undefined>,
   cwd: string
 ): ReturnType<typeof spawn> {
+  const spawnedAt = Date.now();
+  const child = spawnUnguardedChildProcess(commandArgs, env, cwd);
+  guardWindowsOrphans(child, spawnedAt);
+  return child;
+}
+
+function spawnUnguardedChildProcess(
+  commandArgs: string[],
+  env: Record<string, string | undefined>,
+  cwd: string
+): ReturnType<typeof spawn> {
   if (isWindows) {
     const resolved = resolveWindowsExecutable(commandArgs[0], env.PATH ?? env.Path ?? "");
     if (resolved) {
@@ -5481,6 +5595,7 @@ async function spawnProxiedApp(
     for (const [index, hostname] of hostnames.entries()) {
       assertNotReservedHostname(hostname, tlds[index]!);
     }
+    stopOrphanedProcessGroups(store);
     addRoutes(store, hostnames, appPort, process.pid, false, {
       protocol: routeProtocolFromEnv(),
       pathPrefix: routePathPrefix,
@@ -5512,6 +5627,12 @@ async function spawnProxiedApp(
 
   const child = spawnChildProcess(app.commandArgs, env, app.pkg.dir);
   pipeOutput(child, chalk.cyan(`[${app.name}]`));
+  if (store && hostnames && routePathPrefix && child.pid) {
+    recordChildProcessGroup(store, hostnames, child.pid, {
+      pathPrefix: routePathPrefix,
+      label: multiplexLabelFromEnv(),
+    });
+  }
 
   const capturedStore = store;
   const capturedHostnames = hostnames;
@@ -5774,6 +5895,7 @@ async function runWithTurbo(
     for (const [index, hostname] of hostnames.entries()) {
       assertNotReservedHostname(hostname, tlds[index]!);
     }
+    stopOrphanedProcessGroups(store);
     addRoutes(store, hostnames, appPort, process.pid, false, {
       protocol: routeProtocolFromEnv(),
       pathPrefix: routePathPrefix,
@@ -5820,6 +5942,7 @@ async function runWithTurbo(
         ? ["bunx", "turbo", "run", scriptName, ...extraArgs]
         : [pm, "exec", "turbo", "run", scriptName, ...extraArgs];
 
+  const turboSpawnedAt = Date.now();
   const turboChild = spawn(turboArgs[0], turboArgs.slice(1), {
     stdio: "inherit",
     cwd: wsRoot,
@@ -5829,6 +5952,16 @@ async function runWithTurbo(
     },
     ...(isWindows ? {} : { detached: true }),
   });
+  guardWindowsOrphans(turboChild, turboSpawnedAt);
+  if (turboChild.pid) {
+    // Turbo's apps share its process group, so one record covers every route.
+    for (const { hostnames, pathPrefix } of routes) {
+      recordChildProcessGroup(store, hostnames, turboChild.pid, {
+        pathPrefix,
+        label: multiplexLabelFromEnv(),
+      });
+    }
+  }
 
   const SIGKILL_TIMEOUT_MS = 5_000;
 

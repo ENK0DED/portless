@@ -670,6 +670,7 @@ export type ProxyServer = http.Server | net.Server;
 export function createProxyServer(options: ProxyServerOptions): ProxyServer {
   const {
     getRoutes,
+    getOrphanedRoutes,
     onHostsSyncRequest,
     hostsSyncToken,
     getTunnelAliases = () => [],
@@ -774,17 +775,20 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
 
     // Dashboard host
     const routes = getRoutes();
-    const signature = routeSignature(routes);
+    const orphaned = getOrphanedRoutes?.() ?? [];
+    const signature =
+      routeSignature(routes) + (orphaned.length > 0 ? `\n!${routeSignature(orphaned)}` : "");
     if (pathname === "/__portless/state.json") {
       res.writeHead(200, {
         "Content-Type": "application/json; charset=utf-8",
         "Cache-Control": "no-store",
       });
-      res.end(isHead ? undefined : dashboardStateJson({ routes, signature }));
+      res.end(isHead ? undefined : dashboardStateJson({ routes, orphaned, signature }));
       return true;
     }
     const body = renderDashboard({
       routes,
+      orphaned,
       proxyPort,
       tls: reqTls,
       suffix: pageSuffix,

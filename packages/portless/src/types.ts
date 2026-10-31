@@ -57,6 +57,12 @@ export interface TunnelAlias {
 export interface ProxyServerOptions {
   /** Called on each request to get the current route table. */
   getRoutes: () => RouteInfo[];
+  /**
+   * Routes whose owning portless process exited while the command it spawned
+   * still runs. They are not routable; the dashboard lists them so the user
+   * can see what `portless prune` would stop.
+   */
+  getOrphanedRoutes?: () => RouteInfo[];
   /** Called on each request to get exact public tunnel aliases. */
   getTunnelAliases?: () => TunnelAlias[];
   /** The port the proxy is listening on (used to build correct URLs). */
