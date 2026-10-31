@@ -1,4 +1,5 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as net from "node:net";
@@ -27,6 +28,7 @@ import {
   getDefaultTld,
   getDefaultTlds,
   getProtocolPort,
+  getProcessStartTime,
   getProxyBindTargets,
   getRiskyTldReason,
   hasLanMarker,
@@ -36,7 +38,9 @@ import {
   injectFrameworkFlags,
   isPortListening,
   isProxyRunning,
+  killOrphanedProcessGroup,
   listenOnProxyInterface,
+  ownedProcessIds,
   parsePidFromNetstat,
   parseTldList,
   readLanMarker,
@@ -2451,5 +2455,121 @@ describe("resolveWindowsCommandInvocation", () => {
 
   it("returns null when the command cannot be resolved", () => {
     expect(resolveWindowsCommandInvocation("cloudflared", ["version"], tmpDir)).toBeNull();
+  });
+});
+
+describe("ownedProcessIds", () => {
+  const started = 1_000;
+
+  it("collects the root and its descendants in creation order", () => {
+    const rows = [
+      [10, 1, 900],
+      [11, 10, 950],
+      [12, 11, 1_200],
+      [20, 1, 960],
+    ] as const;
+    expect(ownedProcessIds(rows, 10, started).sort()).toEqual([10, 11, 12]);
+  });
+
+  it("leaves a reused root pid and anything it spawned alone", () => {
+    const rows = [
+      [10, 1, 1_500],
+      [11, 10, 950],
+      [12, 10, 1_600],
+    ] as const;
+    expect(ownedProcessIds(rows, 10, started)).toEqual([11]);
+  });
+
+  it("still finds orphaned children once the root exited", () => {
+    const rows = [
+      [11, 10, 950],
+      [12, 11, 1_100],
+    ] as const;
+    expect(ownedProcessIds(rows, 10, started).sort()).toEqual([11, 12]);
+  });
+
+  it("does not follow a descendant pid that was reused by an unrelated process", () => {
+    // pid 11 belonged to our child, exited, and was reused later by a process
+    // that is not ours. Its former child (12) points at it but predates it.
+    const rows = [
+      [10, 1, 900],
+      [11, 1, 1_700],
+      [12, 11, 1_200],
+      [13, 11, 1_800],
+    ] as const;
+    expect(ownedProcessIds(rows, 10, started)).toEqual([10]);
+  });
+
+  it("does not adopt a process that predates its claimed parent", () => {
+    const rows = [
+      [10, 1, 900],
+      [11, 10, 1_100],
+      [12, 11, 1_050],
+    ] as const;
+    expect(ownedProcessIds(rows, 10, started).sort()).toEqual([10, 11]);
+  });
+
+  it("works when evaluated standalone, as the watcher script embeds it", () => {
+    const standalone = new Function(
+      `return (${ownedProcessIds.toString()});`
+    )() as typeof ownedProcessIds;
+    const rows = [
+      [10, 1, 900],
+      [11, 10, 950],
+    ] as const;
+    expect(standalone(rows, 10, started).sort()).toEqual([10, 11]);
+  });
+});
+
+describe.skipIf(process.platform === "win32")("killOrphanedProcessGroup", () => {
+  let orphanPid: number | undefined;
+
+  // A detached grandchild leads its own group and outlives its parent, like
+  // an orphaned dev server.
+  function spawnUnrelatedOrphan(): number {
+    const script = `
+      const { spawn } = require("node:child_process");
+      const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+        detached: true,
+        stdio: "ignore",
+      });
+      child.unref();
+      process.stdout.write(String(child.pid));
+    `;
+    return Number(execFileSync(process.execPath, ["-e", script], { encoding: "utf-8" }));
+  }
+
+  function isAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  afterEach(() => {
+    if (orphanPid && isAlive(orphanPid)) process.kill(orphanPid, "SIGKILL");
+    orphanPid = undefined;
+  });
+
+  it("does not signal a group leader whose start time was not recorded or differs", () => {
+    orphanPid = spawnUnrelatedOrphan();
+
+    expect(killOrphanedProcessGroup(orphanPid, undefined)).toBe(false);
+    expect(killOrphanedProcessGroup(orphanPid, "Thu Jan  1 00:00:00 1970")).toBe(false);
+    expect(isAlive(orphanPid)).toBe(true);
+  });
+
+  it("signals the group when the leader start time matches the recorded one", async () => {
+    orphanPid = spawnUnrelatedOrphan();
+    const startTime = getProcessStartTime(orphanPid);
+    expect(startTime).toBeTruthy();
+
+    expect(killOrphanedProcessGroup(orphanPid, startTime!, "SIGKILL")).toBe(true);
+    for (let i = 0; i < 50 && isAlive(orphanPid); i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(isAlive(orphanPid)).toBe(false);
   });
 });
