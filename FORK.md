@@ -196,6 +196,9 @@ Current fork-owned commits and what they protect:
 | `dba7902` | Temporarily skipped upstream's two #451 orphan-group e2e cases until the fork-shaped lifecycle port lands.                                                                                                                                                                                                 |
 | `7ab592c` | Recorded the advisor batch, upstream merge, declines, and placeholder commits in the fork-only ledger.                                                                                                                                                                                                     |
 | `1de1aa5` | Routed managed Cloudflare and ngrok tunnels directly to the app port with Host rewritten, consolidated providers on upstream's tunnel runner, added `--cloudflare` aliases, PID binary checks, and multiplex-aware manual aliases.                                                                         |
+| `bf5d732` | Recorded the ticket 21 tunnel port in the fork-only ledger.                                                                                                                                                                                                                                                |
+| `7ab9deb` | Adopted upstream #529 `--unprivileged` with a loopback-only peer guard on every listener and the HTTP/2 Extended CONNECT stream path, and #528 probe-first elevation that still elevates when hosts entries are needed, keeping the sudo state handoff.                                                    |
+| `b72b939` | Merged the ticket 15 privilege and binding port into the sync branch.                                                                                                                                                                                                                                      |
 
 ## Fork-Owned Invariants
 
