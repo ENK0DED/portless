@@ -4,8 +4,10 @@
  *
  * Intentionally omitted: run, <name> <cmd>, --name, and zero-arg mode
  * (foreground dev servers with no detached form), proxy start --foreground
- * (blocks), trust, clean, hosts sync, hosts clean, and service (may prompt for
- * sudo or need a TTY), plus mcp and --help (the server itself and human help).
+ * (blocks), bg logs --follow (blocks), trust, clean, hosts sync, hosts clean,
+ * and service (may prompt for sudo or need a TTY), tunnel and the sharing flags
+ * (public exposure is not typed into any tool), plus mcp and --help (the server
+ * itself and human help).
  */
 
 /** Commands in `portless --help` that deliberately have no MCP tool. */
@@ -18,37 +20,38 @@ export const OMITTED_COMMANDS: Record<string, string> = {
   "portless clean": "may prompt for sudo",
   "portless hosts sync": "may prompt for sudo",
   "portless hosts clean": "may prompt for sudo",
-  "portless bg start": "Pending fork mapping in ticket 22",
-  "portless bg status": "Pending fork mapping in ticket 22",
-  "portless bg list": "Pending fork mapping in ticket 22",
-  "portless bg logs": "Pending fork mapping in ticket 22",
-  "portless bg stop": "Pending fork mapping in ticket 22",
-  "portless bg restart": "Pending fork mapping in ticket 22",
-  "portless bg clean": "Pending fork mapping in ticket 22",
-  "portless url": "Pending fork mapping in ticket 22",
-  "portless tunnel map": "Pending fork mapping in ticket 22",
-  "portless list --json": "Pending fork mapping in ticket 22",
-  "portless ls": "Pending fork mapping in ticket 22",
-  "portless completion": "Pending fork mapping in ticket 22",
+  "portless bg clean": "deletes background app entries and their private logs; run it from a shell",
+  "portless url": "alias of get; use the get tool",
+  "portless ls": "alias of list; use the list tool",
+  "portless list --json": "covered by the json argument of the list tool",
+  "portless tunnel map": "public tunnel aliases are a sharing mode and are not exposed over MCP",
+  "portless completion": "prints a shell script for humans to source",
 };
 
-/** Explicit fork flags awaiting ticket 22. Tool behavior is unchanged. */
+/** Sharing flags on bg start. They are not typed; extraArgs can still carry them. */
+const SHARING_FLAGS = [
+  "--cloudflare",
+  "--tunnel",
+  "--tunnel-hostname",
+  "--tailscale",
+  "--tailscale-service",
+  "--tailscale-service-name",
+  "--funnel",
+  "--ngrok",
+  "--netbird",
+  "--netbird-password",
+  "--netbird-pin",
+  "--netbird-groups",
+];
+
+/** Flags in a tool's `--help` that have no typed argument. Keyed by tool name. */
 export const OMITTED_FLAGS: Record<string, Record<string, string>> = {
-  list: {
-    "--json": "Pending fork mapping in ticket 22",
-  },
-  get: {
-    "--json": "Pending fork mapping in ticket 22",
-    "--path": "Pending fork mapping in ticket 22",
-  },
-  alias_add: {
-    "--path": "Pending fork mapping in ticket 22",
-  },
   proxy_start: {
-    "--skip-trust": "Pending fork mapping in ticket 22",
-    "--suffix": "Pending fork mapping in ticket 22",
-    "--routes-cleanup-interval": "Pending fork mapping in ticket 22",
+    "--tld": "compatibility alias of --suffix; use the suffix argument",
   },
+  bg_start: Object.fromEntries(
+    SHARING_FLAGS.map((flag) => [flag, "sharing modes are not typed into MCP tools"])
+  ),
 };
 
 declare const __VERSION__: string;
@@ -140,6 +143,41 @@ function tool(
 }
 
 const NAME_PROPERTY = { type: "string", description: "App or alias name." };
+const JSON_PROPERTY = { type: "boolean", description: "Print machine-readable JSON." };
+const PATH_PROPERTY = {
+  type: "string",
+  description: "Route path prefix, for example /api. Starts with a slash.",
+};
+const BG_NAME_PROPERTY = {
+  type: "string",
+  description:
+    "Background app name. Optional when the working directory identifies exactly one background app.",
+};
+const BG_PATH_PROPERTY = {
+  type: "string",
+  description: "Resolve a path-scoped background route, for example /api.",
+};
+const WAIT_PROPERTIES = {
+  wait: {
+    type: "integer",
+    minimum: 1,
+    description: "Seconds to wait for readiness before returning (CLI default 30).",
+  },
+  noWait: {
+    type: "boolean",
+    description: "Return right after spawning without waiting for readiness.",
+  },
+  keep: {
+    type: "boolean",
+    description: "Keep a child that timed out waiting for readiness running.",
+  },
+};
+const READ_ONLY = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+};
 const PORT_PROPERTY = {
   type: "integer",
   minimum: 1,
@@ -152,8 +190,8 @@ export const TOOLS: ToolDef[] = [
   tool(
     "list",
     "List routes",
-    "List active routes with their URLs, ports, PIDs, and uptime.",
-    {},
+    "List active routes with their URLs, ports, PIDs, and uptime. Routes whose owner exited while the dev server still runs are marked orphaned; prune stops them. With json, each route has kind app, alias, or orphan.",
+    { json: JSON_PROPERTY },
     [],
     {
       readOnlyHint: true,
@@ -172,6 +210,8 @@ export const TOOLS: ToolDef[] = [
         type: "boolean",
         description: "Skip worktree prefix detection.",
       },
+      path: PATH_PROPERTY,
+      json: JSON_PROPERTY,
     },
     ["name"],
     {
@@ -188,6 +228,11 @@ export const TOOLS: ToolDef[] = [
     {
       name: NAME_PROPERTY,
       port: PORT_PROPERTY,
+      path: PATH_PROPERTY,
+      h2c: {
+        type: "boolean",
+        description: "Forward to an HTTP/2 cleartext (h2c or gRPC) upstream.",
+      },
       force: {
         type: "boolean",
         description:
@@ -232,16 +277,25 @@ export const TOOLS: ToolDef[] = [
   tool(
     "proxy_start",
     "Start proxy",
-    'Start the shared portless proxy as a background daemon. Without port, HTTPS uses 443; listener probes and enabled hosts sync determine whether sudo is needed. A failed sudo exits without changing ports; MCP cannot answer a sudo prompt, so pass unprivileged for a port below 1024 without sudo, or port (for example 1355). HTTPS may show an OS dialog to trust the local CA; pass extraArgs ["--skip-trust"] to skip it.',
+    "Start the shared portless proxy as a background daemon. Without port, HTTPS uses 443; listener probes and enabled hosts sync determine whether sudo is needed. A failed sudo exits without changing ports; MCP cannot answer a sudo prompt, so pass unprivileged for a port below 1024 without sudo, or port (for example 1355). HTTPS may show an OS dialog to trust the local CA; pass skipTrust to skip it.",
     {
       port: PORT_PROPERTY,
       noTls: { type: "boolean", description: "Serve plain HTTP instead of HTTPS." },
       lan: { type: "boolean", description: "Expose the proxy on the local network." },
-      tld: {
+      suffix: {
         type: "array",
         items: { type: "string" },
         minItems: 1,
-        description: "One or more TLDs to serve.",
+        description: "One or more route suffixes to serve, for example test or local.example.com.",
+      },
+      skipTrust: {
+        type: "boolean",
+        description: "Generate or reuse certificates without adding the CA to the trust store.",
+      },
+      routesCleanupInterval: {
+        type: "integer",
+        minimum: 0,
+        description: "Seconds between dead route sweeps (CLI default 300, 0 disables).",
       },
       wildcard: {
         type: "boolean",
@@ -290,7 +344,7 @@ export const TOOLS: ToolDef[] = [
   tool(
     "prune",
     "Prune servers",
-    "Kill orphaned dev servers left by crashed sessions.",
+    "Stop orphaned dev servers left by crashed sessions. When the route recorded the command's process group, the whole verified group is stopped; otherwise the process on the route port is. Removes the stale routes.",
     {
       force: {
         type: "boolean",
@@ -305,6 +359,108 @@ export const TOOLS: ToolDef[] = [
       openWorldHint: false,
     }
   ),
+  tool(
+    "bg_list",
+    "List background apps",
+    "List apps started with bg start, with their state.",
+    { json: JSON_PROPERTY },
+    [],
+    READ_ONLY
+  ),
+  tool(
+    "bg_status",
+    "Background app status",
+    "Show the status of one background app: state, PID, URL, and log locations.",
+    { name: BG_NAME_PROPERTY, path: BG_PATH_PROPERTY, json: JSON_PROPERTY },
+    [],
+    READ_ONLY
+  ),
+  tool(
+    "bg_logs",
+    "Background app logs",
+    "Print the last lines of a background app's logs. Streaming is not available.",
+    {
+      name: BG_NAME_PROPERTY,
+      path: BG_PATH_PROPERTY,
+      tail: {
+        type: "integer",
+        minimum: 0,
+        description: "Number of trailing lines (CLI default 100).",
+      },
+      all: { type: "boolean", description: "Print the whole selected log." },
+      errors: { type: "boolean", description: "Print the stderr log." },
+      lifecycle: { type: "boolean", description: "Print the portless lifecycle log." },
+    },
+    [],
+    READ_ONLY
+  ),
+  tool(
+    "bg_start",
+    "Start background app",
+    "Start a long-lived dev server in the background through portless, in the working directory. Without command, the project dev script runs. Public sharing flags are not typed into this tool. Waits up to 30 seconds for the route to become ready.",
+    {
+      command: {
+        type: "array",
+        items: { type: "string" },
+        minItems: 1,
+        description: 'Command and arguments to run, for example ["bun", "run", "dev"].',
+      },
+      name: { type: "string", description: "Explicit app name." },
+      path: PATH_PROPERTY,
+      appPort: { ...PORT_PROPERTY, description: "Fixed app port." },
+      h2c: { type: "boolean", description: "Forward to an HTTP/2 cleartext upstream." },
+      force: {
+        type: "boolean",
+        description: "Take over an existing route owned by portless.",
+      },
+      ...WAIT_PROPERTIES,
+      json: JSON_PROPERTY,
+    },
+    [],
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    }
+  ),
+  tool(
+    "bg_stop",
+    "Stop background app",
+    "Stop a background app. Sends SIGTERM and waits up to 12 seconds. With force, the app and the command it spawned get SIGKILL (the verified process group) and its route state is cleaned.",
+    {
+      name: BG_NAME_PROPERTY,
+      path: BG_PATH_PROPERTY,
+      force: { type: "boolean", description: "SIGKILL the app and its recorded process group." },
+      json: JSON_PROPERTY,
+    },
+    [],
+    {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    }
+  ),
+  tool(
+    "bg_restart",
+    "Restart background app",
+    "Stop a background app and start it again with its saved settings, including any sharing flags it was started with.",
+    {
+      name: BG_NAME_PROPERTY,
+      path: BG_PATH_PROPERTY,
+      force: { type: "boolean", description: "SIGKILL the app and its recorded process group." },
+      ...WAIT_PROPERTIES,
+      json: JSON_PROPERTY,
+    },
+    [],
+    {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false,
+    }
+  ),
   tool("version", "Print version", "Print the portless version.", {}, [], {
     readOnlyHint: true,
     destructiveHint: false,
@@ -316,8 +472,21 @@ export const TOOLS: ToolDef[] = [
 /** Profile name -> description and tool names. `all` has tools: "all". Aliases are not keys here. */
 export const PROFILES: Record<string, { description: string; tools: string[] | "all" }> = {
   core: {
-    description: "Everyday route lookup and static aliases.",
-    tools: ["list", "get", "alias_add", "alias_remove", "tools_profiles"],
+    description: "Route lookup, static aliases, and read-only background app status and logs.",
+    tools: [
+      "list",
+      "get",
+      "alias_add",
+      "alias_remove",
+      "bg_list",
+      "bg_status",
+      "bg_logs",
+      "tools_profiles",
+    ],
+  },
+  background: {
+    description: "Start, stop, and restart background apps.",
+    tools: ["bg_start", "bg_stop", "bg_restart"],
   },
   proxy: {
     description: "Start and stop the shared portless proxy.",
@@ -335,7 +504,8 @@ export const PROFILES: Record<string, { description: string; tools: string[] | "
 
 const PROFILE_ALIASES: Record<string, string> = { default: "core", full: "all" };
 
-const VALID_PROFILES = "core, proxy, diagnostics, all (aliases: default = core, full = all)";
+const VALID_PROFILES =
+  "core, background, proxy, diagnostics, all (aliases: default = core, full = all)";
 
 /** Parse a --tools value into canonical profile names (aliases resolved). */
 export function parseToolsFlag(value: string): string[] {
@@ -412,11 +582,37 @@ function readPort(
   return value;
 }
 
-function readStringArray(args: Record<string, unknown>, key: "extraArgs" | "tld"): string[] {
+/** An optional name or path value that must not be mistaken for a CLI flag. */
+function readOptionalWord(args: Record<string, unknown>, key: string): string | undefined {
+  const value = readString(args, key, false);
+  if (value === undefined) return undefined;
+  if (value.length === 0) fail(`${key} must not be empty`);
+  if (value.startsWith("-")) fail(`${key} must not start with "-"`);
+  return value;
+}
+
+function readInteger(
+  args: Record<string, unknown>,
+  key: string,
+  min: number,
+  max: number
+): number | undefined {
+  const value = args[key];
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < min || value > max) {
+    fail(`${key} must be an integer between ${min} and ${max}`);
+  }
+  return value;
+}
+
+function readStringArray(
+  args: Record<string, unknown>,
+  key: "extraArgs" | "suffix" | "command"
+): string[] {
   const value = args[key];
   if (value === undefined || value === null) return [];
-  if (!Array.isArray(value) || (key === "tld" && value.length === 0)) {
-    fail(key === "tld" ? "tld must not be empty" : "extraArgs must be an array");
+  if (!Array.isArray(value) || (key !== "extraArgs" && value.length === 0)) {
+    fail(key === "extraArgs" ? "extraArgs must be an array" : `${key} must not be empty`);
   }
   return value.map((item, index) => {
     if (typeof item !== "string") fail(`${key}[${index}] must be a string`);
@@ -442,6 +638,21 @@ function validateShared(args: Record<string, unknown>): string[] {
   return extraArgs;
 }
 
+/** The optional app name and path scope shared by the bg tools that target one app. */
+function pushBgTarget(argv: string[], args: Record<string, unknown>): void {
+  const name = readOptionalWord(args, "name");
+  if (name !== undefined) argv.push(name);
+  const path = readOptionalWord(args, "path");
+  if (path !== undefined) argv.push("--path", path);
+}
+
+function pushBgWait(argv: string[], args: Record<string, unknown>): void {
+  const wait = readInteger(args, "wait", 1, 2147483647);
+  if (wait !== undefined) argv.push("--wait", String(wait));
+  if (readBoolean(args, "noWait") === true) argv.push("--no-wait");
+  if (readBoolean(args, "keep") === true) argv.push("--keep");
+}
+
 /** Build the CLI argv (without node/script path, without cwd/timeoutMs) for a child-run tool. */
 export function buildArgv(toolName: string, args: Record<string, unknown>): string[] {
   const extraArgs = validateShared(args);
@@ -450,17 +661,24 @@ export function buildArgv(toolName: string, args: Record<string, unknown>): stri
   switch (toolName) {
     case "list":
       argv.push("list");
+      if (readBoolean(args, "json") === true) argv.push("--json");
       break;
     case "get": {
       const name = readRequiredName(args, "name");
       argv.push("get", name);
       if (readBoolean(args, "noWorktree") === true) argv.push("--no-worktree");
+      const path = readOptionalWord(args, "path");
+      if (path !== undefined) argv.push("--path", path);
+      if (readBoolean(args, "json") === true) argv.push("--json");
       break;
     }
     case "alias_add": {
       const name = readRequiredName(args, "name");
       const port = readPort(args, "port", true);
       argv.push("alias", name, String(port));
+      const path = readOptionalWord(args, "path");
+      if (path !== undefined) argv.push("--path", path);
+      if (readBoolean(args, "h2c") === true) argv.push("--h2c");
       if (readBoolean(args, "force") === true) argv.push("--force");
       break;
     }
@@ -482,9 +700,12 @@ export function buildArgv(toolName: string, args: Record<string, unknown>): stri
       if (port !== undefined) argv.push("-p", String(port));
       if (readBoolean(args, "noTls") === true) argv.push("--no-tls");
       if (readBoolean(args, "lan") === true) argv.push("--lan");
-      for (const tld of readStringArray(args, "tld")) argv.push("--tld", tld);
+      for (const suffix of readStringArray(args, "suffix")) argv.push("--suffix", suffix);
       if (readBoolean(args, "wildcard") === true) argv.push("--wildcard");
       if (readBoolean(args, "unprivileged") === true) argv.push("--unprivileged");
+      if (readBoolean(args, "skipTrust") === true) argv.push("--skip-trust");
+      const interval = readInteger(args, "routesCleanupInterval", 0, 2147483647);
+      if (interval !== undefined) argv.push("--routes-cleanup-interval", String(interval));
       break;
     }
     case "proxy_stop": {
@@ -500,6 +721,62 @@ export function buildArgv(toolName: string, args: Record<string, unknown>): stri
       argv.push("prune");
       if (readBoolean(args, "force") === true) argv.push("--force");
       break;
+    case "bg_list":
+      argv.push("bg", "list");
+      if (readBoolean(args, "json") === true) argv.push("--json");
+      break;
+    case "bg_status": {
+      argv.push("bg", "status");
+      pushBgTarget(argv, args);
+      if (readBoolean(args, "json") === true) argv.push("--json");
+      break;
+    }
+    case "bg_logs": {
+      if (extraArgs.includes("--follow")) {
+        fail("extraArgs must not include --follow because streaming logs would block the call");
+      }
+      argv.push("bg", "logs");
+      pushBgTarget(argv, args);
+      const tail = readInteger(args, "tail", 0, 2147483647);
+      if (tail !== undefined) argv.push("--tail", String(tail));
+      if (readBoolean(args, "all") === true) argv.push("--all");
+      if (readBoolean(args, "errors") === true) argv.push("--errors");
+      if (readBoolean(args, "lifecycle") === true) argv.push("--bg");
+      break;
+    }
+    case "bg_start": {
+      argv.push("bg", "start");
+      const name = readOptionalWord(args, "name");
+      if (name !== undefined) argv.push("--name", name);
+      const path = readOptionalWord(args, "path");
+      if (path !== undefined) argv.push("--path", path);
+      const appPort = readPort(args, "appPort", false);
+      if (appPort !== undefined) argv.push("--app-port", String(appPort));
+      if (readBoolean(args, "h2c") === true) argv.push("--h2c");
+      if (readBoolean(args, "force") === true) argv.push("--force");
+      pushBgWait(argv, args);
+      if (readBoolean(args, "json") === true) argv.push("--json");
+      // extraArgs must come before the command tail or they would run as part of the command.
+      argv.push(...extraArgs);
+      const command = readStringArray(args, "command");
+      if (command.length > 0) argv.push("--", ...command);
+      return argv;
+    }
+    case "bg_stop": {
+      argv.push("bg", "stop");
+      pushBgTarget(argv, args);
+      if (readBoolean(args, "force") === true) argv.push("--force");
+      if (readBoolean(args, "json") === true) argv.push("--json");
+      break;
+    }
+    case "bg_restart": {
+      argv.push("bg", "restart");
+      pushBgTarget(argv, args);
+      if (readBoolean(args, "force") === true) argv.push("--force");
+      pushBgWait(argv, args);
+      if (readBoolean(args, "json") === true) argv.push("--json");
+      break;
+    }
     case "version":
       argv.push("--version");
       break;
@@ -651,9 +928,11 @@ export function createServer(profiles: string[]): {
         const instructions = [
           `Portless MCP server. Active profiles: ${profiles.join(", ")}.`,
           lookup.length > 0 ? `Use ${lookup.join(", ")}.` : "",
-          "Start dev servers with `portless run <cmd>` in a shell; MCP does not run them.",
+          enabled.has("bg_start")
+            ? "Use the bg_start tool for long-lived servers; foreground dev servers still start with `portless run <cmd>` in a shell."
+            : "Start dev servers with `portless run <cmd>` in a shell; MCP does not run them.",
           enabled.has("tools_profiles")
-            ? "Call the tools_profiles tool to see other tool profiles."
+            ? "Call the tools_profiles tool to see other tool profiles, such as background for starting and stopping background apps."
             : "",
         ]
           .filter((part) => part.length > 0)
@@ -813,19 +1092,25 @@ export function printMcpHelp(): void {
       ),
       "",
       "Common tools:",
-      "  list            List active routes.",
+      "  list            List active routes (orphaned dev servers are marked).",
       "  get             Print an app URL.",
       "  alias_add       Register a static route.",
+      "  bg_list         List background apps (also bg_status and bg_logs).",
+      "  bg_start        Start a background app (background profile; also bg_stop, bg_restart).",
       "  tools_profiles  Show active and available profiles.",
       "",
-      "Pass --tools with a comma separated list of profiles. The default is core.",
+      "Pass --tools with a comma separated list of profiles. The default is core,",
+      "which is read-only for background apps. Add background to start, stop, and",
+      "restart them. Public sharing (tunnels, Tailscale, ngrok, NetBird) is not typed",
+      "into any tool; start shared apps from a shell.",
       "Aliases: default = core, full = all. Use the extraArgs argument on any tool",
       "to append CLI flags that are not typed into the tool schema.",
       "",
       "Environment:",
       "  PORTLESS_STATE_DIR  Directory for portless state.",
       "  PORTLESS_PORT       Default proxy port.",
-      "  PORTLESS_TLD        Default TLD or comma separated TLD list.",
+      "  PORTLESS_SUFFIX     Default suffix or comma separated suffix list.",
+      "  PORTLESS_TLD        Compatibility alias for PORTLESS_SUFFIX.",
       "",
       "Client config:",
       '  {"mcpServers":{"portless":{"command":"portless","args":["mcp"]}}}',

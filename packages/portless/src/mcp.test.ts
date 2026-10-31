@@ -79,10 +79,76 @@ describe("buildArgv", () => {
     ["alias_remove", { name: "db" }, ["alias", "--remove", "db"]],
     [
       "proxy_start",
-      { port: 1355, noTls: true, tld: ["test", "localhost"] },
-      ["proxy", "start", "-p", "1355", "--no-tls", "--tld", "test", "--tld", "localhost"],
+      { port: 1355, noTls: true, suffix: ["test", "localhost"] },
+      ["proxy", "start", "-p", "1355", "--no-tls", "--suffix", "test", "--suffix", "localhost"],
     ],
     ["proxy_start", { unprivileged: true }, ["proxy", "start", "--unprivileged"]],
+    [
+      "proxy_start",
+      { skipTrust: true, routesCleanupInterval: 0 },
+      ["proxy", "start", "--skip-trust", "--routes-cleanup-interval", "0"],
+    ],
+    ["list", { json: true }, ["list", "--json"]],
+    ["get", { name: "api", path: "/v1", json: true }, ["get", "api", "--path", "/v1", "--json"]],
+    [
+      "alias_add",
+      { name: "grpc", port: 50051, path: "/rpc", h2c: true },
+      ["alias", "grpc", "50051", "--path", "/rpc", "--h2c"],
+    ],
+    ["bg_list", { json: true }, ["bg", "list", "--json"]],
+    ["bg_status", {}, ["bg", "status"]],
+    [
+      "bg_status",
+      { name: "web", path: "/api", json: true },
+      ["bg", "status", "web", "--path", "/api", "--json"],
+    ],
+    [
+      "bg_logs",
+      { name: "web", tail: 20, errors: true },
+      ["bg", "logs", "web", "--tail", "20", "--errors"],
+    ],
+    ["bg_logs", { all: true, lifecycle: true }, ["bg", "logs", "--all", "--bg"]],
+    [
+      "bg_start",
+      {
+        name: "web",
+        path: "/api",
+        appPort: 4100,
+        h2c: true,
+        force: true,
+        wait: 60,
+        keep: true,
+        json: true,
+        command: ["bun", "run", "dev"],
+      },
+      [
+        "bg",
+        "start",
+        "--name",
+        "web",
+        "--path",
+        "/api",
+        "--app-port",
+        "4100",
+        "--h2c",
+        "--force",
+        "--wait",
+        "60",
+        "--keep",
+        "--json",
+        "--",
+        "bun",
+        "run",
+        "dev",
+      ],
+    ],
+    ["bg_start", { noWait: true }, ["bg", "start", "--no-wait"]],
+    ["bg_stop", { name: "web", force: true }, ["bg", "stop", "web", "--force"]],
+    [
+      "bg_restart",
+      { name: "web", force: true, noWait: true },
+      ["bg", "restart", "web", "--force", "--no-wait"],
+    ],
     ["version", {}, ["--version"]],
     ["list", { extraArgs: ["--x"], cwd: "/tmp", timeoutMs: 5 }, ["list", "--x"]],
     ["proxy_stop", { port: 1356 }, ["proxy", "stop", "-p", "1356"]],
@@ -96,6 +162,35 @@ describe("buildArgv", () => {
 
   it("rejects a flag-shaped name so it cannot become a CLI flag", () => {
     expect(() => buildArgv("alias_add", { name: "--remove", port: 5432 })).toThrow(
+      expect.objectContaining({ code: -32602 })
+    );
+  });
+
+  it("keeps bg_start extraArgs ahead of the command so they never reach the child", () => {
+    expect(
+      buildArgv("bg_start", { command: ["node", "server.js"], extraArgs: ["--cloudflare"] })
+    ).toEqual(["bg", "start", "--cloudflare", "--", "node", "server.js"]);
+  });
+
+  it("rejects a flag-shaped bg name or path so it cannot become a CLI flag", () => {
+    for (const tool of ["bg_status", "bg_stop", "bg_logs", "bg_restart"]) {
+      expect(() => buildArgv(tool, { name: "--all" })).toThrow(
+        expect.objectContaining({ code: -32602 })
+      );
+      expect(() => buildArgv(tool, { path: "--all" })).toThrow(
+        expect.objectContaining({ code: -32602 })
+      );
+    }
+    expect(() => buildArgv("bg_start", { name: "--force" })).toThrow(
+      expect.objectContaining({ code: -32602 })
+    );
+    expect(() => buildArgv("bg_start", { command: [] })).toThrow(
+      expect.objectContaining({ code: -32602 })
+    );
+  });
+
+  it("rejects --follow for bg logs with -32602 because streaming would block", () => {
+    expect(() => buildArgv("bg_logs", { extraArgs: ["--follow"] })).toThrow(
       expect.objectContaining({ code: -32602 })
     );
   });
@@ -122,8 +217,21 @@ describe("profiles", () => {
     const core = await names(["core"]);
     expect(core).toContain("get");
     expect(core).not.toContain("proxy_start");
+    expect(core).not.toContain("tunnel_map");
     expect(await names(["core", "proxy"])).toContain("proxy_start");
     expect(await names(["all"])).toHaveLength(TOOLS.length);
+  });
+
+  it("keeps read-only bg tools in core and mutating bg tools in the background profile", async () => {
+    const names = async (p: string[]) =>
+      (await call(p, "tools/list")).result.tools.map((t: { name: string }) => t.name);
+    const core = await names(["core"]);
+    expect(core).toEqual(expect.arrayContaining(["bg_list", "bg_status", "bg_logs"]));
+    for (const name of ["bg_start", "bg_stop", "bg_restart"]) expect(core).not.toContain(name);
+    expect(await names(["background"])).toEqual(["bg_start", "bg_stop", "bg_restart"]);
+    for (const tool of TOOLS.filter((t) => PROFILES.core.tools.includes(t.name))) {
+      if (tool.name.startsWith("bg_")) expect(tool.annotations.readOnlyHint).toBe(true);
+    }
   });
 
   it("returns an error result for a disabled tool", async () => {
@@ -131,6 +239,9 @@ describe("profiles", () => {
     expect(res.error).toBeUndefined();
     expect(res.result.isError).toBe(true);
     expect(res.result.content[0].text).toContain("not enabled");
+    const bg = await call(["core"], "tools/call", { name: "bg_stop", arguments: {} });
+    expect(bg.result.isError).toBe(true);
+    expect(bg.result.content[0].text).toContain("not enabled");
   });
 });
 
@@ -142,11 +253,11 @@ describe("tools/call validation", () => {
     });
     expect(res.result.isError).toBe(true);
     expect(res.result.content[0].text).toContain("alpha, zeta");
-    expect(res.result.content[0].text).toContain("Tool arguments: name, noWorktree");
+    expect(res.result.content[0].text).toContain("Tool arguments: name, noWorktree, path, json");
     expect(res.result.content[0].text).not.toMatch(/Unknown argument\(s\)[^.]*cwd/);
 
-    const none = await call(["core"], "tools/call", {
-      name: "list",
+    const none = await call(["core", "diagnostics"], "tools/call", {
+      name: "doctor",
       arguments: { bogus: 1 },
     });
     expect(none.result.isError).toBe(true);
@@ -289,6 +400,38 @@ describe("CLI coverage", () => {
         }
       }
     }
+  });
+});
+
+describe("bg subcommand coverage", () => {
+  it("types, omits, or rejects every flag each bg subcommand's --help lists", () => {
+    const bgTools = CHILD_TOOLS.filter((t) => commandOf(t)[0] === "bg");
+    expect(bgTools.map((t) => commandOf(t)[1])).toEqual([
+      "list",
+      "status",
+      "logs",
+      "start",
+      "stop",
+      "restart",
+    ]);
+    for (const tool of bgTools) {
+      const sub = commandOf(tool)[1];
+      const emitted = buildArgv(tool.name, sampleArgs(tool, false));
+      for (const line of cliHelp("bg", sub)) {
+        for (const flag of line.match(/(?<=^|\s)(--[a-z][a-z-]*)\b/g) ?? []) {
+          if (flag === "--help" || emitted.includes(flag)) continue;
+          if (OMITTED_FLAGS[tool.name]?.[flag]) continue;
+          expect(
+            () => buildArgv(tool.name, { ...sampleArgs(tool, true), extraArgs: [flag] }),
+            `"${flag}" is in "portless bg ${sub} --help" but the ${tool.name} tool does not handle it.`
+          ).toThrow();
+        }
+      }
+    }
+  });
+
+  it("leaves bg clean as a stated omission", () => {
+    expect(OMITTED_COMMANDS["portless bg clean"]).toBeTruthy();
   });
 });
 

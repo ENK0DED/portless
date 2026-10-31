@@ -651,6 +651,7 @@ portless trust                   # Add local CA to system trust store
 portless clean                   # Remove state, CA trust entry, and hosts block
 portless prune                   # Kill orphaned dev servers from crashed sessions
 portless completion <shell>      # Print shell completion script (bash, zsh, fish)
+portless mcp [--tools <profiles>] # Start a stdio MCP server for agents
 portless hosts sync              # Add routes to /etc/hosts (fixes Safari)
 portless hosts clean             # Remove portless entries from /etc/hosts
 
@@ -804,6 +805,28 @@ eval "$(portless completion zsh)"
 mkdir -p ~/.config/fish/completions
 portless completion fish > ~/.config/fish/completions/portless.fish
 ```
+
+## MCP server
+
+`portless mcp` starts a Model Context Protocol server over stdio, so MCP clients can look up routes, manage aliases, and watch background apps without a shell. Each tool call runs the matching portless command in the tool's `cwd`.
+
+```json
+{ "mcpServers": { "portless": { "command": "portless", "args": ["mcp"] } } }
+```
+
+Tools are grouped into profiles. Pass a comma separated list with `--tools`; the default is `core`.
+
+| Profile       | Tools                                                                                                                               |
+| ------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `core`        | `list`, `get`, `alias_add`, `alias_remove`, `bg_list`, `bg_status`, `bg_logs`, `tools_profiles` (all read-only for background apps) |
+| `background`  | `bg_start`, `bg_stop`, `bg_restart` (opt in: `portless mcp --tools core,background`)                                                |
+| `proxy`       | `proxy_start`, `proxy_stop`                                                                                                         |
+| `diagnostics` | `doctor`, `prune`, `version`                                                                                                        |
+| `all`         | Every tool. `default` aliases `core` and `full` aliases `all`.                                                                      |
+
+Tool arguments follow the CLI: `proxy_start` takes `suffix` (repeatable, like `--suffix`), `unprivileged`, `skipTrust`, and `routesCleanupInterval`; `list`, `get`, and the `bg` tools take `json`; `get`, `alias_add`, and the `bg` tools take `path`. `prune` stops the verified process group of an orphaned dev server, and `bg_stop` with `force` kills the recorded group. Every tool also accepts `cwd`, `extraArgs` (appended to the command), and `timeoutMs`.
+
+Left out on purpose: foreground dev servers (`run`), commands that may prompt for sudo or a TTY (`trust`, `clean`, `hosts`, `service`), `bg clean`, and every sharing mode (`--tunnel`, `--cloudflare`, `--tailscale`, `--funnel`, `--ngrok`, `--netbird`, and `tunnel map`). Start shared apps from a shell.
 
 ## Programmatic API
 
