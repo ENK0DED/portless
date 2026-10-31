@@ -315,7 +315,7 @@ flowchart TD
 2. **Run apps**: `portless <name> <command>` assigns a free port and registers with the proxy
 3. **Access via URL**: `https://<name>.localhost` routes through the proxy to your app
 
-Outside LAN mode, the proxy and its HTTP redirect listener bind only to the IPv4 and IPv6 loopback addresses, `127.0.0.1` and `::1`. They do not accept connections through LAN, VPN, or other network interfaces.
+By default, outside LAN mode, the proxy and its HTTP redirect listener bind only to the IPv4 and IPv6 loopback addresses, `127.0.0.1` and `::1`. They do not accept connections through LAN, VPN, or other network interfaces.
 
 When portless itself returns an error (404 for an unknown host, 421 for a misdirected request, 502 when the app is unreachable, 508 for a request loop), browsers get a branded HTML page. Any client whose `Accept` header does not include `text/html`, such as curl or `fetch`, gets a small JSON body instead, e.g. `{"error":"bad_gateway","upstream":"myapp.localhost","message":"..."}`. Responses from your own app are forwarded unchanged. Hostnames outside the portless TLDs, for example a site a DNS blocklist points at 127.0.0.1, get 421 Misdirected Request instead of the app list.
 
@@ -329,7 +329,7 @@ On first run, portless generates a local CA and adds it to your system trust sto
 
 ## Unprivileged mode
 
-Ports below 1024 normally need root, so portless elevates with `sudo` to bind 443 or 80. On a machine where that is not an option, such as a managed laptop, a CI runner, or an agent session with no terminal to type a password into, start the proxy with `--unprivileged`:
+Portless probes its listener addresses before elevating with `sudo` for bind permissions. It also elevates when automatic hosts sync is enabled and a configured suffix needs hosts entries. If sudo fails, startup exits without falling back to another port. On a machine where that is not an option, such as a managed laptop, a CI runner, or an agent session with no terminal to type a password into, start the proxy with `--unprivileged`:
 
 ```bash
 portless proxy start --unprivileged
@@ -344,9 +344,9 @@ sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80   # once per machine
 
 The mode promises no prompt of any kind, so it serves plain HTTP on port 80 by default: installing the generated CA into the trust store would be a prompt. `*.localhost` is a secure context either way, so `Secure` cookies and service workers work over HTTP. Pass `--https` to keep HTTPS on 443; the CA is generated but never installed by this mode, so browsers warn until you run `portless trust` once yourself.
 
-It never writes the hosts file either, since that needs root: automatic hosts sync is off in this mode, and `PORTLESS_SYNC_HOSTS=1` together with it is refused. `.localhost` names resolve in browsers without it. For Safari or a custom TLD, run `portless hosts sync` once yourself; a custom TLD says so when the proxy starts.
+It never writes the hosts file either, since that needs root: automatic hosts sync is off in this mode, and `PORTLESS_SYNC_HOSTS=1` together with it is refused. `.localhost` names resolve in browsers without it. For Safari or a custom TLD, run `sudo portless hosts sync` once yourself; a custom TLD says so when the proxy starts.
 
-The mode is remembered in the state directory, so auto-start reuses it, and `PORTLESS_UNPRIVILEGED=1` selects it without the flag. It never asks for `sudo`, which also means the no-TTY exit does not apply: a proxy can be auto-started from a script or an agent on a fresh machine. In LAN mode the flag only removes the sudo step, since LAN mode wants remote peers. Under `service install` the service still runs as root, so the flag does not remove a prompt there, but it keeps its other effects: plain HTTP on port 80 unless `--https` is given, hosts sync off, and loopback peers only.
+The mode is remembered in the state directory, so auto-start reuses it, and `PORTLESS_UNPRIVILEGED=1` selects it without the flag. Use `PORTLESS_UNPRIVILEGED=0` for a start to switch back. It never asks for `sudo`, which also means the no-TTY exit does not apply: a proxy can be auto-started from a script or an agent on a fresh machine. In LAN mode the flag only removes the sudo step, since LAN mode wants remote peers. Under `service install` the service still runs as root, so the flag does not remove a prompt there, but it keeps its other effects: plain HTTP on port 80 unless `--https` is given, hosts sync off, and loopback peers only unless LAN mode is enabled.
 
 On a Mac with the application firewall turned on, the first wildcard bind shows an "allow incoming connections" prompt for Node. No password, and the proxy still refuses non-loopback peers whatever you answer.
 
@@ -680,7 +680,7 @@ Run `portless doctor` first when routing, HTTPS, LAN access, or sharing does not
 portless doctor
 ```
 
-Doctor is read-only. It inspects the active state directory and sudo handoff, ordered suffix lists including dotted suffixes, loopback or LAN proxy bind mode, proxy and route liveness, generated or custom certificate state, every `cert.<suffix>` page, hosts sync, mDNS tooling, background apps, Cloudflare and ngrok binaries, and Tailscale and NetBird availability. It prints suggested commands but never starts, stops, trusts, syncs, prunes, cleans, or modifies portless state.
+Doctor is read-only. It inspects the active state directory and sudo handoff, ordered suffix lists including dotted suffixes, loopback, guarded unprivileged, or LAN proxy bind mode, proxy and route liveness, generated or custom certificate state, every `cert.<suffix>` page, hosts sync, mDNS tooling, background apps, Cloudflare and ngrok binaries, and Tailscale and NetBird availability. It prints suggested commands but never starts, stops, trusts, syncs, prunes, cleans, or modifies portless state.
 
 ### Options
 
