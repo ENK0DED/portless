@@ -3,10 +3,9 @@
 Replace port numbers with stable, named .localhost URLs for local development. For humans and agents.
 
 <p>
-  <a href="https://vercel.com/labs#labs-products"><img alt="Vercel Labs Product" src="https://img.shields.io/badge/LABS-PRODUCT-0a0a0a.svg?style=for-the-badge&amp;logo=Vercel&amp;labelColor=000000" height="28"></a>
-  <a href="https://www.npmjs.com/package/@enk0ded/portless"><img alt="npm version: portless" src="https://img.shields.io/npm/v/@enk0ded/portless.svg?style=for-the-badge&amp;labelColor=000000" height="28"></a>
+  <a href="https://www.npmjs.com/package/@enk0ded/portless"><img alt="npm version: @enk0ded/portless" src="https://img.shields.io/npm/v/@enk0ded/portless.svg?style=for-the-badge&amp;labelColor=000000" height="28"></a>
   <a href="https://github.com/ENK0DED/portless/blob/main/LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/github/license/ENK0DED/portless.svg?style=for-the-badge&amp;labelColor=000000" height="28"></a>
-  <a href="https://www.npmjs.com/package/@enk0ded/portless"><img alt="npm downloads per month: portless" src="https://img.shields.io/npm/dm/@enk0ded/portless.svg?style=for-the-badge&amp;labelColor=000000&amp;label=npm%20downloads" height="28"></a>
+  <a href="https://www.npmjs.com/package/@enk0ded/portless"><img alt="npm downloads per month: @enk0ded/portless" src="https://img.shields.io/npm/dm/@enk0ded/portless.svg?style=for-the-badge&amp;labelColor=000000&amp;label=npm%20downloads" height="28"></a>
 </p>
 
 ```diff
