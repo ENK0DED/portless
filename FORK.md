@@ -214,10 +214,10 @@ Current fork-owned commits and what they protect:
 - Turbo task references must use `@enk0ded/portless#build`
 - `packages/portless/README.md` is a gitignored publish artifact generated from the root `README.md` by `packages/portless/package.json` `prepublishOnly`; do not edit or track it as source documentation
 
-After every upstream sync, search for upstream package install strings outside this fork-maintenance ledger and the fork-sync skill itself:
+After every upstream sync, search for upstream package install strings, npm links, npm badges and the Geistdocs GitHub owner outside this fork-maintenance ledger and the fork-sync skill itself. The last alternative also catches install commands inside JSON fixtures such as `apps/docs/tests/fixtures/docs-baseline.json`:
 
 ```bash
-rg --glob '!FORK.md' --glob '!skills/portless-fork-sync/SKILL.md' 'npm install -g [p]ortless|npm install -D [p]ortless|npm view [p]ortless|"name": "[p]ortless"|github.com/vercel-labs/[p]ortless|node_modules/[p]ortless'
+rg --glob '!FORK.md' --glob '!skills/portless-fork-sync/SKILL.md' 'npm install -g [p]ortless|npm install -D [p]ortless|npm view [p]ortless|"name": "[p]ortless"|github.com/vercel-labs/[p]ortless|node_modules/[p]ortless|npmjs\.com/package/[p]ortless\b|npm/(v|dm)/[p]ortless|owner: "[v]ercel-labs"|install -g [p]ortless'
 ```
 
 ### Version Mapping
@@ -246,8 +246,8 @@ This fork uses Bun for repository development.
 - Keep `engines.bun` aligned with the required Bun version
 - Keep root `workspaces` in `package.json`
 - Keep `bun.lock`
-- Do not keep `pnpm-lock.yaml` or `pnpm-workspace.yaml`
-- CI, release workflows, Windows debug scripts, README, and `skills/portless/SKILL.md` must use `bun install` and `bun run ...`
+- Do not keep `pnpm-lock.yaml` or `pnpm-workspace.yaml`. When upstream changes them, re-express the change for Bun: patches go in root `package.json` `patchedDependencies` (`patches/` holds the patch files), and `minimumReleaseAge` goes in the root `bunfig.toml` `[install]` table in seconds (upstream's pnpm value is in minutes), with `minimumReleaseAgeExcludes` for exact-pin exceptions. Bun skips dependency lifecycle scripts unless listed in `trustedDependencies`, so upstream's `allowBuilds: false` entries need no equivalent
+- CI, release workflows, Windows debug scripts, README, `skills/portless/SKILL.md`, and the docs-site READMEs under `apps/docs` must use `bun install` and `bun run ...`. CI runs `bun run --cwd apps/docs test:routes` in the Bun job
 - The pre-commit hook uses `bunx lint-staged`
 - `.prettierignore` ignores `bun.lock`
 - `.gitignore` and ESLint ignore rules should not reference `.pnpm-store`
@@ -375,7 +375,10 @@ Fork-specific docs live in more than one place and should be kept consistent:
 - `FORK.md`: fork invariants, version mapping, and sync checklist
 - `skills/portless/SKILL.md`: agent-facing usage guide for this package
 - `skills/oauth/SKILL.md`: OAuth guidance should use suffix terminology
-- `apps/docs/src/app/*`: docs site content should use `@enk0ded/portless` and suffix terminology
+- `apps/docs/content/docs/*.mdx`: docs site content should use `@enk0ded/portless` and suffix terminology
+- `apps/docs/src/lib/geistdocs/config.tsx`: Geistdocs identity must stay `owner: "ENK0DED"`, the `@enk0ded/portless` npm link and a non-`labs` navbar brand
+- `apps/docs/tests/fixtures/docs-baseline.json`: frozen fork content hashes, regenerated from fork pages, never from upstream's fixture; see `apps/docs/tests/README.md`
+- `bunfig.toml` and root `package.json` `patchedDependencies`: Bun equivalents of upstream's `pnpm-workspace.yaml` `minimumReleaseAge` and `patchedDependencies`
 - `apps/docs/src/app/api/docs-chat/route.ts`: docs chat system prompt should identify the ENK0DED repo and `@enk0ded/portless`
 - `skills/portless-fork-sync/SKILL.md`: local agentic process for repeating upstream syncs
 
@@ -556,12 +559,12 @@ Upstream intake has two entry points because PR triage becomes stale continuousl
 
 1. Run `bun run check:upstream-drift` first. This is a manual command for the start of a pass, never a CI drift gate. The checker is added by the next ticket, ticket 32; if this checkout does not have the command yet, record it as pending and do not restore the retired inline shell pipeline.
 2. Run `git status --short --branch` and start from a clean worktree at the current fork tip. Create a backup branch before changing it.
-3. Fetch `origin` and `upstream`. If the default SSH agent cannot authenticate, find a reachable agent socket and retry the fetch with that socket. If no reachable credentials exist, stop for the maintainer under the capability rule below and hand over the exact fetch command and missing access.
+3. Fetch `origin` and `upstream`. Prefer HTTPS with GitHub CLI credentials, which needs no SSH agent. If SSH is required, note that live agent sockets are not only under `/tmp` (for example `~/.ssh/agent/`), and signing may wait for a device approval the agent cannot give, so treat a hanging SSH operation as a capability stop rather than retrying. If no reachable credentials exist, stop for the maintainer under the capability rule below and hand over the exact fetch command and missing access.
    ```bash
-   find /tmp -type s \( -name 'agent.*' -o -name '*ssh*' \) 2>/dev/null
-   SSH_AUTH_SOCK=/tmp/path/to/agent ssh-add -l
-   SSH_AUTH_SOCK=/tmp/path/to/agent git fetch --all --prune
+   git -c credential.helper='!gh auth git-credential' fetch https://github.com/vercel-labs/portless.git '+refs/heads/*:refs/remotes/upstream/*'
+   git -c credential.helper='!gh auth git-credential' fetch https://github.com/ENK0DED/portless.git '+refs/heads/*:refs/remotes/origin/*'
    ```
+   Do not force-fetch upstream tags into the local tag namespace: upstream's `v0.10.2` differs from the fork's.
 4. Choose **sweep** or **sync**. A sync performs the sweep before merging anything.
 
 ### Sweep path
@@ -578,7 +581,7 @@ After the sweep has handed back all required judgment decisions, continue in thi
 1. Compare `git log --oneline --decorate upstream/main..HEAD` and `git log --oneline --decorate HEAD..upstream/main` before merging.
 2. Merge `upstream/main` with `git merge upstream/main --no-edit` into the sync branch.
 3. Resolve conflicts by keeping fork code in regions covered by a `FORK.md` invariant unless upstream is demonstrably better on the merits. Take upstream where the fork has no implementation.
-4. Remove upstream pnpm workspace files if they return. Run `bun install` to refresh `bun.lock`.
+4. Remove upstream pnpm workspace files if they return, re-expressing any `patchedDependencies` or `minimumReleaseAge` change under the Package Manager invariant. Run `bun install` to refresh `bun.lock`.
 5. Run the package-identity search in the Package Identity invariant and fix every hit outside intentional upstream PR references or compatibility tests. Also run the package-manager command search and conflict-marker search:
    ```bash
    rg '[p]npm install|[p]npm build|[p]npm test|[p]npm lint|[p]npm type-check|[p]npm format|[p]npm dev|[p]npm run dev:app'
@@ -588,7 +591,7 @@ After the sweep has handed back all required judgment decisions, continue in thi
 7. Review `git log --oneline upstream/main..HEAD` and update the fork-only ledger for behavior-protecting fork commits. The ledger-maintenance commit itself may be picked up by the next sweep.
 8. Run focused tests for every fork invariant touched by the merge, then run the full verification gate below.
 9. Prepare the sync branch and its release notes. Do not push `main` directly. If a sync PR is opened, merging that PR to `main` remains a maintainer action under the consequence rule. When a branch push is authorized but SSH remains unavailable, use `git push https://github.com/ENK0DED/portless.git <branch>`.
-10. End every sync with a fork release. Apply the Version Mapping formula, `fork patch = ((upstream patch + 1) * 1000) + fork iteration`, to select the next version and update the matching release material. Preparing the release is AFK; dispatching `release.yml` for the real `@enk0ded/portless` publish is HITL by consequence, so the agent stops before publishing.
+10. End every sync with a fork release. Apply the Version Mapping formula, `fork patch = ((upstream patch + 1) * 1000) + fork iteration`, to select the next version and update the matching release material. Preparing the release is AFK; dispatching `release.yml` for the real `@enk0ded/portless` publish is HITL by consequence, so the agent stops before publishing. The release material includes the docs changelog page `apps/docs/content/docs/changelog.mdx`: after adding its entry, build the docs and run `bun run --cwd apps/docs update:baseline changelog` so the frozen hashes and headings in `apps/docs/tests/fixtures/docs-baseline.json` match, then run `bun run --cwd apps/docs test:routes`.
 
 ### AFK and HITL boundaries
 
@@ -610,7 +613,7 @@ The procedure must run from the repository alone. It never requires a past wayfi
 
 ### Conflict hotspots and completion gate
 
-Expect recurring conflicts in `package.json`, `packages/portless/package.json`, `bun.lock`, `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `README.md`, `skills/portless/SKILL.md`, `packages/portless/src/cli.ts`, `packages/portless/src/cli.test.ts`, `packages/portless/src/cli-utils.test.ts`, `CHANGELOG.md`, and `apps/docs/src/app/changelog/page.mdx`. When behavior changes commands, flags, config, or human-facing usage, update the corresponding user and agent surfaces together.
+Expect recurring conflicts in `package.json`, `packages/portless/package.json`, `bun.lock`, `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `README.md`, `skills/portless/SKILL.md`, `packages/portless/src/cli.ts`, `packages/portless/src/cli.test.ts`, `packages/portless/src/cli-utils.test.ts`, `CHANGELOG.md`, `apps/docs/content/docs/changelog.mdx`, and `apps/docs/tests/fixtures/docs-baseline.json`. When behavior changes commands, flags, config, or human-facing usage, update the corresponding user and agent surfaces together.
 
 Before finishing a sync, confirm the fork package identity, the Version Mapping formula, the absence of unscoped upstream install commands, the absence of conflict markers, the live open-PR set, the verification outcomes, and the maintainer handoffs still outstanding.
 
@@ -625,6 +628,7 @@ bun run lint
 bun run type-check
 bun run build
 bun run test
+bun run --cwd apps/docs test:routes
 bun run test:fork-ledger
 bun run check:fork-ledger
 ```
@@ -640,8 +644,10 @@ bun run test packages/portless/src/cli-utils.test.ts
 bun run test packages/portless/src/utils.test.ts
 bun run test packages/portless/src/proxy.test.ts
 bun run test packages/portless/src/service.test.ts
-rg --glob '!FORK.md' --glob '!skills/portless-fork-sync/SKILL.md' 'npm install -g [p]ortless|npm install -D [p]ortless|npm view [p]ortless|"name": "[p]ortless"|github.com/vercel-labs/[p]ortless|node_modules/[p]ortless'
-rg 'PORTLESS_TLD' README.md skills/portless/SKILL.md apps/docs/src/app
+rg --glob '!FORK.md' --glob '!skills/portless-fork-sync/SKILL.md' 'npm install -g [p]ortless|npm install -D [p]ortless|npm view [p]ortless|"name": "[p]ortless"|github.com/vercel-labs/[p]ortless|node_modules/[p]ortless|npmjs\.com/package/[p]ortless\b|npm/(v|dm)/[p]ortless|owner: "[v]ercel-labs"|install -g [p]ortless'
+rg 'PORTLESS_TLD' README.md skills/portless/SKILL.md apps/docs/content/docs
 ```
 
 The final `PORTLESS_TLD` search is expected to find only compatibility-alias language.
+
+The package-identity search is expected to find only the CI step that adds the `upstream` remote and the sample ledger rows in `scripts/check-upstream-drift.test.ts`. Any hit in `README.md`, `skills/`, `apps/docs`, or `packages/` is an identity regression.

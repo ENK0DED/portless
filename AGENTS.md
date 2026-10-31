@@ -46,7 +46,8 @@ To prepare a release:
 3. Write the changelog entry in `CHANGELOG.md`, wrapped in `<!-- release:start -->` and `<!-- release:end -->` markers
 4. Remove the `<!-- release:start -->` and `<!-- release:end -->` markers from the previous release entry (only the latest release should have markers)
 5. Add a matching entry to `apps/docs/content/docs/changelog.mdx`
-6. Open a PR and merge to `main`
+6. Build the docs, then run `bun run --cwd apps/docs update:baseline changelog` to refresh that page's hashes and headings in `apps/docs/tests/fixtures/docs-baseline.json`
+7. Open a PR and merge to `main`
 
 CI compares the version in `packages/portless/package.json` to what's on npm. If it differs, it builds, publishes, and creates the GitHub release automatically. The release body is extracted from the content between the markers.
 
