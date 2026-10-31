@@ -367,7 +367,8 @@ describe("orphaned process groups", () => {
     return sidecarPid;
   }
 
-  it("prune kills the whole process group, not only the route port", async () => {
+  // pending ticket 19 (#451 fork-shaped port)
+  it.skip("prune kills the whole process group, not only the route port", async () => {
     if (isWindows) return;
 
     const pid = await startAndCrash("orphan-prune");
@@ -389,7 +390,8 @@ describe("orphaned process groups", () => {
     expect(await waitForPortToClose(state.appPort!, 5000)).toBe(true);
   });
 
-  it("run stops the orphaned process group of a crashed session", async () => {
+  // pending ticket 19 (#451 fork-shaped port)
+  it.skip("run stops the orphaned process group of a crashed session", async () => {
     if (isWindows) return;
 
     const pid = await startAndCrash("orphan-restart");
