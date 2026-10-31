@@ -194,6 +194,8 @@ Current fork-owned commits and what they protect:
 | `cce06b1` | Removed declined upstream artifacts after the merge: the technical-writer skill and its AGENTS.md line, the tracked `.claude` symlink, and the global Vitest timeout config.                                                                                                                               |
 | `7dbd4b1` | Listed fork-only commands and flags as temporary MCP omissions so the merged coverage test passes until the fork MCP mappings land.                                                                                                                                                                        |
 | `dba7902` | Temporarily skipped upstream's two #451 orphan-group e2e cases until the fork-shaped lifecycle port lands.                                                                                                                                                                                                 |
+| `7ab592c` | Recorded the advisor batch, upstream merge, declines, and placeholder commits in the fork-only ledger.                                                                                                                                                                                                     |
+| `1de1aa5` | Routed managed Cloudflare and ngrok tunnels directly to the app port with Host rewritten, consolidated providers on upstream's tunnel runner, added `--cloudflare` aliases, PID binary checks, and multiplex-aware manual aliases.                                                                         |
 
 ## Fork-Owned Invariants
 
