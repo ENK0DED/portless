@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import type { TunnelProviderName } from "./types.js";
-import { isWindows, resolveWindowsCommandInvocation } from "./cli-utils.js";
+import { guardWindowsOrphans, isWindows, resolveWindowsCommandInvocation } from "./cli-utils.js";
 import { ensureNgrokAvailable, startNgrok, type NgrokChildProcess } from "./ngrok.js";
 
 const CLOUDFLARED_BINARY = "cloudflared";
@@ -40,6 +40,13 @@ export interface TunnelProvider {
 }
 
 function defaultSpawner(command: string, args: string[]): TunnelChildProcess {
+  const spawnedAt = Date.now();
+  const child = spawnTunnelProcess(command, args);
+  guardWindowsOrphans(child, spawnedAt);
+  return child;
+}
+
+function spawnTunnelProcess(command: string, args: string[]): TunnelChildProcess {
   if (isWindows) {
     const invocation = resolveWindowsCommandInvocation(
       command,
