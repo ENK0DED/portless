@@ -12,11 +12,13 @@ import { createHttpRedirectServer, createProxyServer } from "./proxy.js";
 import type { RouteProtocol, TunnelAlias, TunnelProviderName } from "./types.js";
 import {
   fixOwnership,
+  formatUptime,
   formatUrl,
   isErrnoException,
   normalizePathPrefix,
   parseHostname,
   parseHostnames,
+  parsePort,
 } from "./utils.js";
 import { getUrl } from "./api.js";
 import {
@@ -1363,6 +1365,7 @@ function listRoutes(
         upstream_protocol: route.protocol ?? "http1",
         pid: route.pid,
         kind: route.pid === 0 ? "alias" : "app",
+        ...(typeof route.registeredAt === "number" ? { registered_at: route.registeredAt } : {}),
         ...(route.tailscaleUrl
           ? { tailscale_url: formatSharedUrl(route.tailscaleUrl, pathPrefix) }
           : {}),
@@ -1401,10 +1404,11 @@ function listRoutes(
     const pathPrefix = normalizePathPrefix(route.pathPrefix);
     const url = formatUrl(route.hostname, proxyPort, tls, pathPrefix);
     const label = route.pid === 0 ? "(alias)" : `(pid ${route.pid})`;
+    const uptime = route.pid === 0 ? null : formatUptime(route.registeredAt, Date.now());
     const targetPath = pathPrefix === "/" ? "" : pathPrefix;
     const target = `localhost:${route.port}${targetPath}${route.protocol === "h2c" ? " (h2c)" : ""}`;
     console.log(
-      `  ${colors.cyan(url)}  ${colors.gray("->")}  ${colors.white(target)}  ${colors.gray(label)}`
+      `  ${colors.cyan(url)}  ${colors.gray("->")}  ${colors.white(target)}  ${colors.gray(label)}${uptime ? ` ${colors.gray(`up ${uptime}`)}` : ""}`
     );
     if (route.tailscaleUrl) {
       const tsLabel = route.tailscaleFunnel ? "funnel" : "tailscale";
@@ -2449,8 +2453,8 @@ function parseAppPort(value: string | undefined): number {
     console.error(colors.red("Error: --app-port requires a port number."));
     process.exit(1);
   }
-  const port = parseInt(value, 10);
-  if (isNaN(port) || port < 1 || port > 65535) {
+  const port = parsePort(value);
+  if (port === null) {
     console.error(colors.red(`Error: Invalid app port "${value}". Must be 1-65535.`));
     process.exit(1);
   }
@@ -2461,8 +2465,8 @@ function parseAppPort(value: string | undefined): number {
 function appPortFromEnv(): number | undefined {
   const envVal = process.env.PORTLESS_APP_PORT;
   if (!envVal) return undefined;
-  const port = parseInt(envVal, 10);
-  if (isNaN(port) || port < 1 || port > 65535) {
+  const port = parsePort(envVal);
+  if (port === null) {
     console.error(colors.red(`Error: Invalid PORTLESS_APP_PORT="${envVal}". Must be 1-65535.`));
     process.exit(1);
   }
@@ -3475,7 +3479,7 @@ ${colors.bold("Usage:")}
   ${colors.cyan("portless alias <name> <port>")}     Register a static route (e.g. for Docker)
   ${colors.cyan("portless alias --remove <name>")}   Remove a static route
   ${colors.cyan("portless tunnel map <route> <host>")} Manage exact public tunnel aliases
-  ${colors.cyan("portless list")}                    Show active routes
+  ${colors.cyan("portless list")}                    Show active routes and uptime
   ${colors.cyan("portless list --json")}             Show active routes as JSON
   ${colors.cyan("portless ls")} / ${colors.cyan("portless status")}   Aliases for portless list
   ${colors.cyan("portless doctor")}                  Check local portless health
@@ -3546,6 +3550,8 @@ ${colors.bold("How it works:")}
      --host or --ip flags injected automatically; safe bun run, npm run, pnpm run, or yarn run
      scripts resolving directly to those server commands receive the same injection
   6. The proxy listens only on 127.0.0.1 and ::1 unless LAN mode is enabled
+  7. Errors from portless itself are HTML for browsers and JSON
+     {"error","upstream","message"} for other clients; hosts outside your suffixes get 421
 
 ${colors.bold("Background apps:")}
   Use portless bg start for long-lived local servers that should keep running
@@ -4224,6 +4230,7 @@ ${colors.bold("JSON fields:")}
   kind                   "app", "alias", or "orphan"
   orphaned               true on orphan entries: the owner exited but its dev server
                          still runs; "portless prune" stops it
+  registered_at          Epoch milliseconds when the route was registered (absent on routes from older versions)
 `);
       process.exit(0);
     } else {
@@ -4556,8 +4563,8 @@ ${colors.bold("Examples:")}
 
   const hostnames = buildHostnames(aliasName, tlds);
   const hostname = hostnames[0]!;
-  const port = parseInt(aliasPort, 10);
-  if (isNaN(port) || port < 1 || port > 65535) {
+  const port = parsePort(aliasPort);
+  if (port === null) {
     console.error(colors.red(`Error: Invalid port "${aliasPort}". Must be 1-65535.`));
     process.exit(1);
   }
@@ -4742,10 +4749,13 @@ async function handleProxy(args: string[]): Promise<void> {
     if (portIdx !== -1) {
       const portValue = args[portIdx + 1];
       if (portValue && !portValue.startsWith("-")) {
-        const parsed = parseInt(portValue, 10);
-        if (!isNaN(parsed) && parsed >= 1 && parsed <= 65535) {
-          explicitPort = parsed;
+        const parsed = parsePort(portValue);
+        if (parsed === null) {
+          console.error(colors.red(`Error: Invalid port number: ${portValue}`));
+          console.error(colors.blue("Port must be between 1 and 65535."));
+          process.exit(1);
         }
+        explicitPort = parsed;
       }
     }
 
@@ -4851,12 +4861,13 @@ ${colors.bold("LAN mode (--lan):")}
       console.error(colors.cyan("  portless proxy start -p 8080"));
       process.exit(1);
     }
-    proxyPort = parseInt(portValue, 10);
-    if (isNaN(proxyPort) || proxyPort < 1 || proxyPort > 65535) {
+    const parsedPort = parsePort(portValue);
+    if (parsedPort === null) {
       console.error(colors.red(`Error: Invalid port number: ${portValue}`));
       console.error(colors.blue("Port must be between 1 and 65535."));
       process.exit(1);
     }
+    proxyPort = parsedPort;
     hasExplicitPort = true;
   }
 

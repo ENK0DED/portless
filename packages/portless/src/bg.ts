@@ -35,7 +35,7 @@ import { cleanupRouteSharing } from "./route-cleanup.js";
 import { RouteStore, type RouteMapping } from "./routes.js";
 import { TunnelAliasStore } from "./tunnel-aliases.js";
 import type { RouteProtocol, TunnelProviderName } from "./types.js";
-import { fixOwnership, normalizePathPrefix } from "./utils.js";
+import { fixOwnership, normalizePathPrefix, parsePort } from "./utils.js";
 
 export const DEFAULT_BG_WAIT_SECONDS = 30;
 
@@ -351,8 +351,8 @@ function parseRunIntent(runArgs: string[], cwd: string): ParsedRunIntent {
     } else if (token === "--force") {
       force = true;
     } else if (token === "--app-port") {
-      const value = Number(runArgs[++i]);
-      if (!Number.isInteger(value) || value < 1 || value > 65535) {
+      const value = parsePort(runArgs[++i] ?? "");
+      if (value === null) {
         throw new Error("--app-port requires a valid port number");
       }
       appPort = value;

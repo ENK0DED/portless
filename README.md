@@ -219,7 +219,7 @@ portless docs.myapp next dev
 # -> https://docs.myapp.localhost
 ```
 
-By default, only explicitly registered subdomains are routed (strict mode). Use `--wildcard` when starting the proxy to allow any subdomain of a registered route to fall back to that app (e.g. `tenant1.myapp.localhost` routes to the `myapp` app without extra registration). Wildcard routing is local proxy behavior only; mDNS LAN mode cannot resolve wildcard subdomains on other devices. To change wildcard mode for a running proxy, stop it and start it again with the desired mode.
+By default, only explicitly registered subdomains are routed (strict mode). Use `--wildcard` when starting the proxy to allow any subdomain of a registered route to fall back to that app (e.g. `tenant1.myapp.localhost` routes to the `myapp` app without extra registration). Wildcard routing is local proxy behavior only; mDNS LAN mode cannot resolve wildcard subdomains on other devices. When several registered hostnames could answer a wildcard request, the longest (most specific) parent hostname wins, then the longest path prefix within it, so `admin.api.acme.localhost` reaches `api.acme.localhost` rather than `acme.localhost` whichever was registered first. To change wildcard mode for a running proxy, stop it and start it again with the desired mode.
 
 ## Git Worktrees
 
@@ -325,7 +325,9 @@ flowchart TD
 
 By default, outside LAN mode, the proxy and its HTTP redirect listener bind only to the IPv4 and IPv6 loopback addresses, `127.0.0.1` and `::1`. They do not accept connections through LAN, VPN, or other network interfaces.
 
-When portless itself returns an error (404 for an unknown host, 421 for a misdirected request, 502 when the app is unreachable, 508 for a request loop), browsers get a branded HTML page. Any client whose `Accept` header does not include `text/html`, such as curl or `fetch`, gets a small JSON body instead, e.g. `{"error":"bad_gateway","upstream":"myapp.localhost","message":"..."}`. Responses from your own app are forwarded unchanged. Hostnames outside the portless TLDs, for example a site a DNS blocklist points at 127.0.0.1, get 421 Misdirected Request instead of the app list.
+When portless itself returns an error (404 for an unknown host, 421 for a misdirected request, 502 when the app is unreachable, 508 for a request loop), browsers get a branded HTML page. Any client whose `Accept` header does not include `text/html`, such as curl or `fetch`, gets a small JSON body instead: `{"error":"bad_gateway","upstream":"myapp.localhost","message":"..."}`, where `error` is `not_found`, `misdirected_request`, `bad_gateway`, or `loop_detected` and `message` carries the hint (the target port and `portless list` for a 502, the `portless <name> your-command` registration command for a 404). Both representations send `Vary: Accept`. Responses from your own app are forwarded unchanged.
+
+A hostname outside every configured suffix, for example a site a DNS blocklist points at 127.0.0.1, gets 421 Misdirected Request with no app list, so a misdirected client cannot read your route names. A public tunnel or Tailscale hostname whose path matches no route gets a plain 404 without the app list as well. Under a configured suffix, an unknown name gets the 404 page listing active apps with their uptime; with more than five apps the page adds a hostname filter and a "Newest first" toggle.
 
 ## HTTP/2 + HTTPS
 
@@ -642,8 +644,8 @@ portless bg clean [name]         # Remove dead background entries
 portless get <name>              # Print URL for a service
 portless get <name> --json       # Print service info as JSON
 portless url <name>              # Alias for portless get
-portless list                    # Show active routes
-portless list --json             # Show active routes as JSON
+portless list                    # Show active routes and their uptime
+portless list --json             # Show active routes as JSON (includes registered_at)
 portless ls                      # Alias for portless list
 portless status                  # Alias for portless list
 portless doctor                  # Run read-only local diagnostics

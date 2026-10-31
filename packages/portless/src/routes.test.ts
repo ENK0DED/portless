@@ -304,7 +304,19 @@ describe("RouteStore", () => {
         hostname: "myapp.localhost",
         port: 4001,
         pid: process.pid,
+        registeredAt: expect.any(Number),
       });
+    });
+
+    it("records when a route registered, for sole-owner and multiplex members", () => {
+      const before = Date.now();
+      store.addRoute("solo.localhost", 4001, process.pid);
+      store.addRoute("multi.localhost", 4002, process.pid, false, { label: "a" });
+      const after = Date.now();
+      for (const route of store.loadRoutes()) {
+        expect(route.registeredAt).toBeGreaterThanOrEqual(before);
+        expect(route.registeredAt).toBeLessThanOrEqual(after);
+      }
     });
 
     it("replaces existing route with same hostname", () => {
