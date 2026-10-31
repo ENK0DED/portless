@@ -673,6 +673,52 @@ describe("CLI", () => {
       ]);
     });
 
+    it("includes registered_at in JSON only for routes that recorded it", () => {
+      const registeredAt = Date.now() - 5 * 60_000;
+      fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
+      fs.writeFileSync(
+        path.join(tmpDir, "routes.json"),
+        JSON.stringify([
+          { hostname: "new.localhost", port: 4100, pid: process.pid, registeredAt },
+          { hostname: "old.localhost", port: 4101, pid: process.pid },
+        ])
+      );
+
+      const { status, stdout } = run(["list", "--json"], {
+        env: { PORTLESS_STATE_DIR: tmpDir },
+      });
+
+      expect(status).toBe(0);
+      const parsed = JSON.parse(stdout);
+      expect(parsed[0].registered_at).toBe(registeredAt);
+      expect("registered_at" in parsed[1]).toBe(false);
+    });
+
+    it("shows uptime for apps in the human-readable list but not for aliases", () => {
+      fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
+      fs.writeFileSync(
+        path.join(tmpDir, "routes.json"),
+        JSON.stringify([
+          {
+            hostname: "myapp.localhost",
+            port: 4100,
+            pid: process.pid,
+            registeredAt: Date.now() - 5 * 60_000,
+          },
+          { hostname: "redis.localhost", port: 6379, pid: 0, registeredAt: Date.now() - 60_000 },
+          { hostname: "legacy.localhost", port: 4102, pid: process.pid },
+        ])
+      );
+
+      const { status, stdout } = run(["list"], { env: { PORTLESS_STATE_DIR: tmpDir } });
+
+      expect(status).toBe(0);
+      const lines = stdout.split("\n");
+      expect(lines.find((l) => l.includes("myapp.localhost"))).toMatch(/up 5m$/);
+      expect(lines.find((l) => l.includes("redis.localhost"))).not.toContain("up ");
+      expect(lines.find((l) => l.includes("legacy.localhost"))).not.toContain("up ");
+    });
+
     it.each(["ls", "status"])("outputs JSON through the %s alias", (cmd) => {
       fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
       fs.writeFileSync(
@@ -811,6 +857,7 @@ describe("CLI", () => {
       expect(status).toBe(0);
       expect(stdout).toContain("--json");
       expect(stdout).toContain("target_port");
+      expect(stdout).toContain("registered_at");
     });
   });
 
@@ -1005,6 +1052,19 @@ describe("CLI", () => {
         tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-cli-bg-"));
         proxyPort = await getFreePort();
       });
+
+      it.each(["0x50", "3e3", "80abc", "0", "65536"])(
+        "bg start rejects the lenient --app-port value %j",
+        (value) => {
+          const { status, stderr } = run(
+            ["bg", "start", "--app-port", value, "--", ...longRunningCommand()],
+            { env: bgEnv() }
+          );
+          expect(status).not.toBe(0);
+          expect(stderr).toContain("--app-port requires a valid port number");
+          expect(readBgRegistry(tmpDir)).toEqual([]);
+        }
+      );
 
       afterEach(() => {
         for (const entry of readBgRegistry(tmpDir)) {
@@ -1988,6 +2048,35 @@ describe("CLI", () => {
       expect(stdout.trim()).toBe("bypassed");
     });
 
+    it.each(["80abc", "0x50", "3e3", "0", "65536"])(
+      "proxy stop -p rejects the lenient port %j instead of stopping another proxy",
+      (port) => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-stop-badport-"));
+        try {
+          const { status, stderr } = run(["proxy", "stop", "-p", port], {
+            env: { PORTLESS_STATE_DIR: tmpDir },
+          });
+          expect(status).toBe(1);
+          expect(stderr).toContain("Invalid port number");
+        } finally {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+      }
+    );
+
+    it.each(["80abc", "0x50", "3e3"])("proxy start -p rejects the lenient port %j", (port) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-start-badport-"));
+      try {
+        const { status, stderr } = run(["proxy", "start", "-p", port], {
+          env: { PORTLESS_STATE_DIR: tmpDir },
+        });
+        expect(status).toBe(1);
+        expect(stderr).toContain("Invalid port number");
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
     it("does not bypass proxy commands when PORTLESS=0 is set", async () => {
       // 'proxy stop' should still be handled as a proxy command, not bypassed
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-bypass-proxy-"));
@@ -2211,6 +2300,25 @@ describe("CLI", () => {
       expect(stderr).toContain("Invalid app port");
     });
 
+    it.each(["0x50", "3e3", "80abc", "-1", "0", "65536", ""])(
+      "rejects the lenient --app-port value %j",
+      (value) => {
+        const { status, stderr } = run(["run", "--app-port", value, "echo", "ok"], {
+          env: { PORTLESS: "0" },
+        });
+        expect(status).toBe(1);
+        expect(stderr).toMatch(/Invalid app port|requires a port number/);
+      }
+    );
+
+    it.each(["0x50", "3e3", "80abc"])("rejects the lenient PORTLESS_APP_PORT value %j", (value) => {
+      const { status, stderr } = run(["run", "echo", "ok"], {
+        env: { PORTLESS: "0", PORTLESS_APP_PORT: value },
+      });
+      expect(status).toBe(1);
+      expect(stderr).toContain("Invalid PORTLESS_APP_PORT");
+    });
+
     it("rejects browser-blocked --app-port values", () => {
       const { status, stderr } = run(["run", "--app-port", "4045", "echo", "ok"], {
         env: { PORTLESS: "0" },
@@ -2334,6 +2442,12 @@ describe("CLI", () => {
       expect(stderr).toContain("Invalid port");
     });
 
+    it.each(["80abc", "0x50", "3e3", "0", "65536"])("exits 1 for the lenient port %j", (port) => {
+      const { status, stderr } = run(["alias", "mydb", port]);
+      expect(status).toBe(1);
+      expect(stderr).toContain("Invalid port");
+    });
+
     it("exits 1 when --remove has no name", () => {
       const { status, stderr } = run(["alias", "--remove"]);
       expect(status).toBe(1);
@@ -2355,6 +2469,7 @@ describe("CLI", () => {
             port: 50051,
             pid: 0,
             protocol: "h2c",
+            registeredAt: expect.any(Number),
           },
         ]);
       } finally {
@@ -2377,6 +2492,7 @@ describe("CLI", () => {
             port: 4100,
             pid: 0,
             pathPrefix: "/v1",
+            registeredAt: expect.any(Number),
           },
         ]);
       } finally {
