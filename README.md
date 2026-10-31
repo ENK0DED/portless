@@ -853,6 +853,10 @@ portless hosts clean   # Clean up later
 
 Auto-syncs `/etc/hosts` for route hostnames by default (`.localhost`, custom suffixes, LAN `.local`). Set `PORTLESS_SYNC_HOSTS=0` to disable.
 
+`portless hosts sync` reconciles the managed block with the current routes, so stale entries are removed and, with no routes, a leftover block is cleared. A missing hosts file is created containing only the portless block. If the hosts file exists but cannot be read, portless refuses to rewrite it rather than risk losing your own entries. Edits are made in place, so the file's permissions and any symlink are kept.
+
+When a command registers a route, it asks the running proxy to write the entry immediately through an authenticated, loopback-only request, and falls back to waiting for the proxy's route watcher with an older proxy. The request uses a random token the proxy keeps in its state directory while it runs, and the proxy does nothing when automatic hosts sync is off or the proxy runs with `--unprivileged`.
+
 If a route hostname will not resolve, the command that registered it warns instead of failing silently and points you to `portless hosts sync`.
 
 ## Proxying Between Portless Apps
