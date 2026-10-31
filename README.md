@@ -196,8 +196,16 @@ With a portless config file, you can simplify to:
 Then run `portless` or `portless run` to go through the proxy.
 
 When you press Ctrl+C, portless forwards the interrupt and waits for the command's process tree to
-exit. Press Ctrl+C again to forward another interrupt. Any remaining descendants are terminated
-after a short grace period.
+exit. Press Ctrl+C again to forward another interrupt. Any remaining descendants are sent SIGTERM
+after 5 seconds and SIGKILL after 10 seconds. On Windows, the process tree is ended with
+`taskkill /T`, and a small watcher process ends it if portless itself is force-killed.
+
+If portless is killed without running its cleanup (SIGKILL, a crash), the command it started can keep
+running. portless records that command's process group and start time on the route. The next
+`portless run`, or `portless prune`, stops the group, and only while its leader still has the recorded
+start time, so a reused process ID is never targeted. The proxy's background sweep never kills
+anything: it keeps such a route on file as orphaned, and `portless list` and the dashboard show it
+until you run or prune. Process groups do not exist on Windows, so this recovery is Unix only.
 
 ## Subdomains
 
@@ -568,6 +576,8 @@ portless bg logs web --tail 100
 portless bg stop web
 ```
 
+`bg stop` sends SIGTERM and waits up to 12 seconds, so `portless run` can finish its own graceful shutdown (it sends SIGKILL after 10 seconds). `bg stop --force` sends SIGKILL to the app and also to the command it started, when that process group is still the one recorded on the route.
+
 Background app management currently supports macOS and Linux. Windows support needs a separate process-group implementation.
 
 `bg start` waits up to 30 seconds for the route to become ready by default. Use `--wait <seconds>` to customize the timeout, `--no-wait` to return immediately after spawning, or `--keep` to leave a timed-out child running for manual inspection. A timed-out child is stopped by default so stale routes are not left behind accidentally.
@@ -720,7 +730,7 @@ bg start --wait [seconds]        Wait for background readiness (default: 30)
 bg start --no-wait               Return after spawning a background app
 bg start --keep                  Keep a timed-out background app running
 bg logs --tail <lines>           Print the last N background log lines
-bg stop --force                  Force-stop the exact registered background app
+bg stop --force                  Force-stop the registered background app and its command
 --force                          Kill the existing process and take over its route
 --name <name>                    Use <name> as the app name
 ```
