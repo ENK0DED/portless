@@ -2,6 +2,13 @@
 
 Replace port numbers with stable, named .localhost URLs for local development. For humans and agents.
 
+<p>
+  <a href="https://vercel.com/labs#labs-products"><img alt="Vercel Labs Product" src="https://img.shields.io/badge/LABS-PRODUCT-0a0a0a.svg?style=for-the-badge&amp;logo=Vercel&amp;labelColor=000000" height="28"></a>
+  <a href="https://www.npmjs.com/package/@enk0ded/portless"><img alt="npm version: portless" src="https://img.shields.io/npm/v/@enk0ded/portless.svg?style=for-the-badge&amp;labelColor=000000" height="28"></a>
+  <a href="https://github.com/ENK0DED/portless/blob/main/LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/github/license/ENK0DED/portless.svg?style=for-the-badge&amp;labelColor=000000" height="28"></a>
+  <a href="https://www.npmjs.com/package/@enk0ded/portless"><img alt="npm downloads per month: portless" src="https://img.shields.io/npm/dm/@enk0ded/portless.svg?style=for-the-badge&amp;labelColor=000000&amp;label=npm%20downloads" height="28"></a>
+</p>
+
 ```diff
 - "dev": "next dev"                  # http://localhost:3000
 + "dev": "portless run next dev"     # https://myapp.localhost
@@ -162,6 +169,8 @@ Turbo runs each package's `dev` script, which invokes portless. Portless reads t
 
 `bun dev` at the root works through turbo as usual. People without portless can run `bun run dev:app` directly.
 
+When `portless` runs from a workspace root, it uses the existing Turbo integration to preserve task ordering when either `turbo.json` or `turbo.jsonc` is readable. Set `"turbo": false` in the root portless configuration to use direct spawning instead.
+
 ## Use in package.json
 
 You can still use portless in `package.json` scripts:
@@ -185,6 +194,10 @@ With a portless config file, you can simplify to:
 ```
 
 Then run `portless` or `portless run` to go through the proxy.
+
+When you press Ctrl+C, portless forwards the interrupt and waits for the command's process tree to
+exit. Press Ctrl+C again to forward another interrupt. Any remaining descendants are terminated
+after a short grace period.
 
 ## Subdomains
 
@@ -304,6 +317,8 @@ flowchart TD
 
 Outside LAN mode, the proxy and its HTTP redirect listener bind only to the IPv4 and IPv6 loopback addresses, `127.0.0.1` and `::1`. They do not accept connections through LAN, VPN, or other network interfaces.
 
+When portless itself returns an error (404 for an unknown host, 421 for a misdirected request, 502 when the app is unreachable, 508 for a request loop), browsers get a branded HTML page. Any client whose `Accept` header does not include `text/html`, such as curl or `fetch`, gets a small JSON body instead, e.g. `{"error":"bad_gateway","upstream":"myapp.localhost","message":"..."}`. Responses from your own app are forwarded unchanged. Hostnames outside the portless TLDs, for example a site a DNS blocklist points at 127.0.0.1, get 421 Misdirected Request instead of the app list.
+
 ## HTTP/2 + HTTPS
 
 HTTPS with HTTP/2 is enabled by default. Browsers limit HTTP/1.1 to 6 connections per host, which bottlenecks dev servers that serve many unbundled files (Vite, Nuxt, etc.). HTTP/2 multiplexes all requests over a single connection.
@@ -311,6 +326,29 @@ HTTPS with HTTP/2 is enabled by default. Browsers limit HTTP/1.1 to 6 connection
 Portless also supports modern browser HMR WebSockets over HTTP/2 using RFC 8441 Extended CONNECT, including negotiated WebSocket subprotocols such as Vite's `vite-hmr`, so Next.js Turbopack, Vite, Nuxt, and similar dev servers can keep hot reloading while HTTPS/HTTP/2 is enabled.
 
 On first run, portless generates a local CA and adds it to your system trust store. The generated CA, server certificate, and per-host certificates live under `~/.portless` by default and are reused across proxy restarts and machine reboots. They are regenerated only when removed or cleaned. No browser warnings. No manual setup.
+
+## Unprivileged mode
+
+Ports below 1024 normally need root, so portless elevates with `sudo` to bind 443 or 80. On a machine where that is not an option, such as a managed laptop, a CI runner, or an agent session with no terminal to type a password into, start the proxy with `--unprivileged`:
+
+```bash
+portless proxy start --unprivileged
+# -> http://myapp.localhost, no sudo prompt, nothing installed
+```
+
+macOS lets a non-root process bind a port below 1024 only on the wildcard address, so the proxy binds `0.0.0.0` and `::` instead of the loopback addresses and then refuses every connection whose peer is not loopback itself, at accept time and again per request and per upgrade. The result is the same loopback-only proxy, obtained without root. Windows has no privileged-port rule, so the flag only changes the bind address there. Linux moves the boundary with a sysctl; portless checks it and stops with the exact command when the port is still out of reach, rather than falling back to another port:
+
+```bash
+sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80   # once per machine
+```
+
+The mode promises no prompt of any kind, so it serves plain HTTP on port 80 by default: installing the generated CA into the trust store would be a prompt. `*.localhost` is a secure context either way, so `Secure` cookies and service workers work over HTTP. Pass `--https` to keep HTTPS on 443; the CA is generated but never installed by this mode, so browsers warn until you run `portless trust` once yourself.
+
+It never writes the hosts file either, since that needs root: automatic hosts sync is off in this mode, and `PORTLESS_SYNC_HOSTS=1` together with it is refused. `.localhost` names resolve in browsers without it. For Safari or a custom TLD, run `portless hosts sync` once yourself; a custom TLD says so when the proxy starts.
+
+The mode is remembered in the state directory, so auto-start reuses it, and `PORTLESS_UNPRIVILEGED=1` selects it without the flag. It never asks for `sudo`, which also means the no-TTY exit does not apply: a proxy can be auto-started from a script or an agent on a fresh machine. In LAN mode the flag only removes the sudo step, since LAN mode wants remote peers. Under `service install` the service still runs as root, so the flag does not remove a prompt there, but it keeps its other effects: plain HTTP on port 80 unless `--https` is given, hosts sync off, and loopback peers only.
+
+On a Mac with the application firewall turned on, the first wildcard bind shows an "allow incoming connections" prompt for Node. No password, and the proxy still refuses non-loopback peers whatever you answer.
 
 ```bash
 # Use your own certs (e.g., from mkcert)
@@ -795,7 +833,7 @@ macOS/Linux may prompt for `sudo`. Custom certificate paths passed with `--cert`
 If Safari can't find your `.localhost` URL:
 
 ```bash
-portless hosts sync    # Add current routes to /etc/hosts
+portless hosts sync    # Reconcile current routes with /etc/hosts
 portless hosts clean   # Clean up later
 ```
 

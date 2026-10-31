@@ -124,6 +124,7 @@ function findGitRoot(startDir: string): string | null {
       encoding: "utf-8",
       timeout: 5000,
       stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
     }).trim();
     if (toplevel) return toplevel;
   } catch {
@@ -252,6 +253,7 @@ function detectWorktreeViaCli(cwd: string): WorktreePrefix | null | undefined {
       encoding: "utf-8",
       timeout: 5000,
       stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
     });
 
     // Count worktrees — each block starts with "worktree "
@@ -273,6 +275,7 @@ function detectWorktreeViaCli(cwd: string): WorktreePrefix | null | undefined {
         encoding: "utf-8",
         timeout: 5000,
         stdio: ["ignore", "pipe", "ignore"],
+        windowsHide: true,
       }).trim()
     );
 
@@ -283,6 +286,7 @@ function detectWorktreeViaCli(cwd: string): WorktreePrefix | null | undefined {
         encoding: "utf-8",
         timeout: 5000,
         stdio: ["ignore", "pipe", "ignore"],
+        windowsHide: true,
       }).trim()
     );
 
@@ -293,6 +297,7 @@ function detectWorktreeViaCli(cwd: string): WorktreePrefix | null | undefined {
       encoding: "utf-8",
       timeout: 5000,
       stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
     }).trim();
 
     const prefix = branchToPrefix(branch);

@@ -92,12 +92,16 @@ export function buildNodeOptions(baseDir: string = USER_STATE_DIR): string {
   return existing ? `${requireFlag} ${existing}` : requireFlag;
 }
 
-/** Check whether turbo.json exists at the given workspace root. */
+/** Check whether a readable turbo.json or turbo.jsonc exists at the given workspace root. */
 export function hasTurboConfig(wsRoot: string): boolean {
-  try {
-    fs.accessSync(path.join(wsRoot, "turbo.json"), fs.constants.R_OK);
-    return true;
-  } catch {
-    return false;
+  for (const configName of ["turbo.json", "turbo.jsonc"]) {
+    try {
+      fs.accessSync(path.join(wsRoot, configName), fs.constants.R_OK);
+      return true;
+    } catch {
+      // Try the next supported Turbo configuration filename.
+    }
   }
+
+  return false;
 }

@@ -2,7 +2,12 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { RouteInfo, RouteProtocol, TunnelProviderName } from "./types.js";
-import { fixOwnership, isErrnoException, normalizePathPrefix } from "./utils.js";
+import {
+  fixOwnership,
+  isErrnoException,
+  normalizePathPrefix,
+  isProcessAlive as isPidAlive,
+} from "./utils.js";
 
 /** How long (ms) before a lock directory is considered stale and forcibly removed. */
 const STALE_LOCK_THRESHOLD_MS = 10_000;
@@ -33,6 +38,10 @@ export interface RouteMapping extends RouteInfo {
   pid: number;
   /** Distinguishing label when several routes multiplex one hostname. */
   label?: string;
+  /** Process group of the command portless spawned for this route. */
+  childPgid?: number;
+  /** Start time of the process group leader, as reported by `ps`. */
+  childStartTime?: string;
   tailscaleUrl?: string;
   tailscaleHttpsPort?: number;
   tailscaleFunnel?: boolean;
@@ -47,9 +56,13 @@ export interface RouteMapping extends RouteInfo {
   tunnelPid?: number;
   netbirdUrl?: string;
   netbirdPid?: number;
+  cloudflareUrl?: string;
+  cloudflarePid?: number;
 }
 
 type RouteMetadataPatch = {
+  childPgid?: number | null;
+  childStartTime?: string | null;
   tailscaleUrl?: string | null;
   tailscaleHttpsPort?: number | null;
   tailscaleFunnel?: boolean | null;
@@ -64,6 +77,8 @@ type RouteMetadataPatch = {
   tunnelPid?: number | null;
   netbirdUrl?: string | null;
   netbirdPid?: number | null;
+  cloudflareUrl?: string | null;
+  cloudflarePid?: number | null;
 };
 
 interface AddRouteOptions {
@@ -273,12 +288,7 @@ export class RouteStore {
   // ---------------------------------------------------------------------------
 
   private isProcessAlive(pid: number): boolean {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      return false;
-    }
+    return pid === 0 || isPidAlive(pid);
   }
 
   private loadAndMigrateRoutes(strict = false): RouteMapping[] {
@@ -624,6 +634,14 @@ export class RouteStore {
           routeMatchesKey(r, hostname, pathPrefix) && (label === undefined || r.label === label)
       );
       if (!route) return;
+      if ("childPgid" in fields) {
+        if (fields.childPgid === null) delete route.childPgid;
+        else if (fields.childPgid !== undefined) route.childPgid = fields.childPgid;
+      }
+      if ("childStartTime" in fields) {
+        if (fields.childStartTime === null) delete route.childStartTime;
+        else if (fields.childStartTime !== undefined) route.childStartTime = fields.childStartTime;
+      }
       if ("tailscaleUrl" in fields) {
         if (fields.tailscaleUrl === null) delete route.tailscaleUrl;
         else if (fields.tailscaleUrl !== undefined) route.tailscaleUrl = fields.tailscaleUrl;
@@ -685,6 +703,14 @@ export class RouteStore {
       if ("netbirdPid" in fields) {
         if (fields.netbirdPid === null) delete route.netbirdPid;
         else if (fields.netbirdPid !== undefined) route.netbirdPid = fields.netbirdPid;
+      }
+      if ("cloudflareUrl" in fields) {
+        if (fields.cloudflareUrl === null) delete route.cloudflareUrl;
+        else if (fields.cloudflareUrl !== undefined) route.cloudflareUrl = fields.cloudflareUrl;
+      }
+      if ("cloudflarePid" in fields) {
+        if (fields.cloudflarePid === null) delete route.cloudflarePid;
+        else if (fields.cloudflarePid !== undefined) route.cloudflarePid = fields.cloudflarePid;
       }
       this.saveRoutes(routes);
     } finally {

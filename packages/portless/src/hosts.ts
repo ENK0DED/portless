@@ -13,13 +13,13 @@ const MARKER_END = "# portless-end";
 
 /**
  * Read the current /etc/hosts file content.
- * Returns empty string if the file cannot be read.
+ * Returns null if the file cannot be read, including when it does not exist.
  */
-function readHostsFile(): string {
+function readHostsFile(): string | null {
   try {
     return fs.readFileSync(HOSTS_PATH, "utf-8");
   } catch {
-    return "";
+    return null;
   }
 }
 
@@ -137,6 +137,7 @@ export function blockMatchesHostnames(content: string, hostnames: string[]): boo
 export function syncHostsFile(hostnames: string[]): boolean {
   const uniqueHostnames = deduplicateHostnames(hostnames);
   const content = readHostsFile();
+  if (content === null) return false;
   if (blockMatchesHostnames(content, uniqueHostnames)) return true;
 
   try {
@@ -152,7 +153,8 @@ export function syncHostsFile(hostnames: string[]): boolean {
     return false;
   }
 
-  return blockMatchesHostnames(readHostsFile(), uniqueHostnames);
+  const verification = readHostsFile();
+  return verification !== null && blockMatchesHostnames(verification, uniqueHostnames);
 }
 
 /**
@@ -160,8 +162,9 @@ export function syncHostsFile(hostnames: string[]): boolean {
  * Returns true on success, false on failure.
  */
 export function cleanHostsFile(): boolean {
+  const content = readHostsFile();
+  if (content === null) return false;
   try {
-    const content = readHostsFile();
     if (!content.includes(MARKER_START)) return true;
     fs.writeFileSync(HOSTS_PATH, removeBlock(content));
     return true;
@@ -172,9 +175,12 @@ export function cleanHostsFile(): boolean {
 
 /**
  * Return the current portless-managed hostnames from /etc/hosts.
+ * A read failure returns an empty array for best-effort callers; it does not
+ * prove that the hosts file is empty or was read successfully.
  */
 export function getManagedHostnames(): string[] {
   const content = readHostsFile();
+  if (content === null) return [];
   return extractManagedBlock(content).flatMap((line) => {
     const [, ...aliases] = line.split("#", 1)[0].trim().split(/\s+/);
     return aliases;
@@ -182,17 +188,17 @@ export function getManagedHostnames(): string[] {
 }
 
 /**
- * Check whether a hostname resolves to 127.0.0.1 via the system DNS resolver.
- * Returns true if resolution works, false otherwise.
+ * Check whether the system DNS resolver selects an address where the local
+ * proxy listens.
  */
 export function checkHostResolution(hostname: string): Promise<boolean> {
   return new Promise((resolve) => {
-    dns.lookup(hostname, { family: 4 }, (err, address) => {
+    dns.lookup(hostname, (err, address) => {
       if (err) {
         resolve(false);
         return;
       }
-      resolve(address === "127.0.0.1");
+      resolve(address === "127.0.0.1" || address === "::1");
     });
   });
 }

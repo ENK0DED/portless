@@ -15,7 +15,7 @@ import {
   SUFFIX_ENV,
 } from "./cli-utils.js";
 import { isMdnsSupported } from "./mdns.js";
-import { fixOwnership, resolveUserHome } from "./utils.js";
+import { fixOwnership, parsePort, resolveUserHome } from "./utils.js";
 
 const DEFAULT_SERVICE_PORT = getProtocolPort(true);
 const SERVICE_LABEL = "sh.portless.proxy";
@@ -85,6 +85,7 @@ export type ServiceInstallConfig = {
   tlds: string[];
   tldsExplicit: boolean;
   useWildcard: boolean;
+  unprivileged: boolean;
   extraEnv: Record<string, string>;
 };
 
@@ -104,6 +105,7 @@ const DEFAULT_SERVICE_CONFIG: ServiceInstallConfig = {
   tlds: [DEFAULT_TLD],
   tldsExplicit: false,
   useWildcard: false,
+  unprivileged: false,
   extraEnv: {},
 };
 
@@ -202,8 +204,8 @@ function parseBooleanEnv(value: string | undefined): boolean | null {
 }
 
 function parsePortValue(value: string, source: string): number {
-  const port = parseInt(value, 10);
-  if (isNaN(port) || port < 1 || port > 65535) {
+  const port = parsePort(value);
+  if (port === null) {
     throw new Error(`${source} must be a number between 1 and 65535.`);
   }
   return port;
@@ -279,6 +281,7 @@ function parseServiceInstallConfig(
   }
 
   const envHttps = parseBooleanEnv(env.PORTLESS_HTTPS);
+  let httpsExplicit = envHttps !== null;
   if (envHttps !== null) {
     config.useHttps = envHttps;
   }
@@ -306,6 +309,11 @@ function parseServiceInstallConfig(
     config.useWildcard = envWildcard;
   }
 
+  const envUnprivileged = parseBooleanEnv(env.PORTLESS_UNPRIVILEGED);
+  if (envUnprivileged !== null) {
+    config.unprivileged = envUnprivileged;
+  }
+
   if (env.PORTLESS_PORT) {
     config.proxyPort = parsePortValue(env.PORTLESS_PORT, "PORTLESS_PORT");
   } else {
@@ -325,9 +333,11 @@ function parseServiceInstallConfig(
         break;
       case "--https":
         config.useHttps = true;
+        httpsExplicit = true;
         break;
       case "--no-tls":
         config.useHttps = false;
+        httpsExplicit = true;
         break;
       case "--lan":
         config.lanMode = true;
@@ -356,14 +366,19 @@ function parseServiceInstallConfig(
       case "--wildcard":
         config.useWildcard = true;
         break;
+      case "--unprivileged":
+        config.unprivileged = true;
+        break;
       case "--cert":
         config.customCertPath = getFlagValue(tokens, i, token);
         config.useHttps = true;
+        httpsExplicit = true;
         i += 1;
         break;
       case "--key":
         config.customKeyPath = getFlagValue(tokens, i, token);
         config.useHttps = true;
+        httpsExplicit = true;
         i += 1;
         break;
       case "--state-dir":
@@ -386,6 +401,12 @@ function parseServiceInstallConfig(
     (!config.customCertPath && config.customKeyPath)
   ) {
     throw new Error("--cert and --key must be used together.");
+  }
+
+  // Match proxy start: unprivileged mode serves plain HTTP on 80 unless
+  // HTTPS was asked for.
+  if (config.unprivileged && !httpsExplicit) {
+    config.useHttps = false;
   }
 
   if (!env.PORTLESS_PORT && !tokens.includes("--port") && !tokens.includes("-p")) {
@@ -438,6 +459,7 @@ function buildProxyCommand(entryScript: string, serviceConfig: ServiceInstallCon
     tlds: serviceConfig.tlds,
     tldsExplicit: serviceConfig.tldsExplicit,
     useWildcard: serviceConfig.useWildcard,
+    unprivileged: serviceConfig.unprivileged,
     foreground: true,
     includePort: true,
     proxyPort: serviceConfig.proxyPort,
@@ -453,6 +475,7 @@ function buildServiceEnv(ctx: ServiceContext): Record<string, string> {
     PORTLESS_HTTPS: ctx.config.useHttps ? "1" : "0",
     PORTLESS_LAN: ctx.config.lanMode ? "1" : "0",
     PORTLESS_WILDCARD: ctx.config.useWildcard ? "1" : "0",
+    PORTLESS_UNPRIVILEGED: ctx.config.unprivileged ? "1" : "0",
     ...ctx.config.extraEnv,
   };
 
@@ -1233,6 +1256,7 @@ async function printServiceStatus(entryScript: string, runner: CommandRunner): P
     console.log(`  LAN IP: ${config.lanIp}`);
   }
   console.log(`  Wildcard: ${config.useWildcard ? "yes" : "no"}`);
+  console.log(`  Unprivileged: ${config.unprivileged ? "yes" : "no"}`);
   console.log(`  State directory: ${config.stateDir}`);
   if (status.details) {
     console.log(`  Service entry: ${status.details}`);
@@ -1259,6 +1283,7 @@ ${colors.bold("Install options:")}
   --suffix <suffix>                Use a custom suffix, repeatable
   --tld <tld>                      Compatibility alias for --suffix
   --wildcard                       Allow subdomain fallback
+  --unprivileged                   Bind the wildcard address, loopback peers only, no elevation
   --cert <path>                    Use a custom TLS certificate
   --key <path>                     Use a custom TLS private key
   --state-dir <path>               Use a custom service state directory

@@ -155,6 +155,7 @@ import {
 import type { ManifestEntry } from "./turbo.js";
 import { formatViteAllowedHosts } from "./vite.js";
 import { buildServiceUninstallSudoArgs, handleService, tryUninstallService } from "./service.js";
+import { runMcp } from "./mcp.js";
 import { handleBg, pruneBgEntriesForState, stopBgEntriesForState } from "./bg.js";
 import { cleanupRouteSharing } from "./route-cleanup.js";
 import { PORTLESS_BG_ID_ENV, PORTLESS_BG_READY_PATH_ENV, writeBgReadyFile } from "./bg-ready.js";
@@ -701,16 +702,24 @@ function startProxyServer(
   tlsOptions?: { cert: Buffer; key: Buffer },
   lanIp?: string | null,
   strict?: boolean,
-  lanMode = false,
-  customCert = false,
-  routesCleanupIntervalSeconds = DEFAULT_ROUTES_CLEANUP_INTERVAL_SECONDS
+  {
+    lanMode = false,
+    customCert = false,
+    unprivileged = false,
+    routesCleanupIntervalSeconds = DEFAULT_ROUTES_CLEANUP_INTERVAL_SECONDS,
+  }: {
+    lanMode?: boolean;
+    customCert?: boolean;
+    unprivileged?: boolean;
+    routesCleanupIntervalSeconds?: number;
+  } = {}
 ): void {
   store.ensureDir();
 
   const isTls = !!tlsOptions;
   const mdnsSupport = isMdnsSupported();
   let activeLanIp = lanIp && mdnsSupport.supported ? lanIp : null;
-  const bindTargets = getProxyBindTargets(lanMode);
+  const bindTargets = getProxyBindTargets(lanMode, unprivileged);
   const primaryBindTarget = bindTargets[0]!;
   const lanIpPinned = !!process.env.PORTLESS_LAN_IP;
   let lanMonitor: ReturnType<typeof startLanIpMonitor> | null = null;
@@ -5060,9 +5069,7 @@ ${colors.bold("LAN mode (--lan):")}
       tlsOptions,
       lanIp,
       desiredWildcard ? false : undefined,
-      lanMode,
-      !!(customCertPath && customKeyPath),
-      routesCleanupIntervalSeconds
+      { lanMode, customCert: !!(customCertPath && customKeyPath), routesCleanupIntervalSeconds }
     );
     return;
   }
@@ -6025,6 +6032,10 @@ async function main() {
   }
 
   const args = process.argv.slice(2);
+  if (args[0] === "mcp") {
+    await runMcp(args.slice(1));
+    return;
+  }
 
   // Block one-off npx / pnpm dlx downloads. Running "sudo npx" is unsafe
   // because it performs package resolution and downloads as root. When

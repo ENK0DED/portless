@@ -18,6 +18,8 @@ const PORTLESS_STATE_FILES = [
   "proxy.tlds",
   "proxy.lan",
   "proxy.wildcard",
+  "proxy.hosts-sync-token",
+  "proxy.hosts-sync-token.tmp",
   "ca.trusted",
   "ca.trust-refresh-pending",
   "ca-key.pem",
@@ -27,6 +29,7 @@ const PORTLESS_STATE_FILES = [
   "server.csr",
   "server-ext.cnf",
   "ca.srl",
+  "cloudflared.yml",
 ] as const;
 
 const HOST_CERTS_DIR = "host-certs";

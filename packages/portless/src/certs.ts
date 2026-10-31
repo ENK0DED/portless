@@ -59,6 +59,8 @@ const SERVER_KEY_FILE = "server-key.pem";
 const SERVER_CERT_FILE = "server.pem";
 const CA_TRUST_MARKER = "ca.trusted";
 const CA_TRUST_REFRESH_PENDING = "ca.trust-refresh-pending";
+/** Directory within state dir where per-hostname certs are cached. */
+const HOST_CERTS_DIR = "host-certs";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -205,6 +207,19 @@ function isCertSansComplete(certPath: string): boolean {
 }
 
 /**
+ * Check whether a certificate has a wildcard SAN directly under a bare TLD
+ * (such as "*.localhost"). Apple platforms reject such certificates outright.
+ */
+function hasTldWildcardSan(certPath: string): boolean {
+  try {
+    const cert = new crypto.X509Certificate(fs.readFileSync(certPath));
+    return /DNS:\*\.[^.,\s]+(,|$)/.test(cert.subjectAltName ?? "");
+  } catch {
+    return true;
+  }
+}
+
+/**
  * Check whether a certificate uses a strong signature algorithm.
  * Reject SHA-1 signatures to avoid OpenSSL "ca md too weak" failures.
  *
@@ -226,6 +241,33 @@ function isCertSignatureStrong(certPath: string): boolean {
 }
 
 /**
+ * Check whether a certificate lists the same X.509v3 extension more than once.
+ * RFC 5280 requires extensions to be unique, and macOS's Security framework
+ * rejects every chain through a CA that violates this ("Unknown critical cert
+ * extension") regardless of trust settings.
+ *
+ * Earlier portless releases could emit such a CA when the ambient openssl.cnf
+ * set `x509_extensions = v3_ca` for `req` (see #429). An existing CA that trips
+ * this check is regenerated so affected users recover on upgrade.
+ *
+ * Parses the `openssl x509 -text` output: inside the `X509v3 extensions:`
+ * block each extension name sits on its own line at a fixed indent, optionally
+ * followed by `critical`, while values are indented one level deeper.
+ */
+function hasDuplicateExtensions(certPath: string): boolean {
+  try {
+    const text = openssl(["x509", "-in", certPath, "-noout", "-text"]);
+    const block = text.split(/^\s*X509v3 extensions:\s*$/m)[1];
+    if (!block) return false;
+    const body = block.split(/^\s*Signature Algorithm:/m)[0];
+    const names = [...body.matchAll(/^ {12}(\S.*?):(?: critical)?\s*$/gm)].map((m) => m[1]);
+    return new Set(names).size !== names.length;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Run openssl and return stdout. Throws on non-zero exit.
  */
 function openssl(args: string[], options?: { input?: string }): string {
@@ -236,6 +278,7 @@ function openssl(args: string[], options?: { input?: string }): string {
       timeout: OPENSSL_TIMEOUT_MS,
       input: options?.input,
       stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
       ...(extraEnv && Object.keys(extraEnv).length > 0
         ? { env: { ...process.env, ...extraEnv } }
         : {}),
@@ -244,6 +287,33 @@ function openssl(args: string[], options?: { input?: string }): string {
     const message = err instanceof Error ? err.message : String(err);
     throw new Error(`openssl failed: ${message}\n\n${opensslErrorMessage()}`, { cause: err });
   }
+}
+
+const NOT_BEFORE_SKEW_MS = 5 * 60 * 1000;
+
+let notBeforeSupported: boolean | undefined;
+
+/** Whether `openssl x509 -req` accepts `-not_before` for the given `openssl version` output. */
+export function opensslSupportsNotBefore(version: string): boolean {
+  const match = /^OpenSSL (\d+)\.(\d+)/.exec(version.trim());
+  if (!match) return false;
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  return major > 3 || (major === 3 && minor >= 4);
+}
+
+/** `-not_before` args that backdate a signed cert, or none if unsupported. */
+function backdatedNotBeforeArgs(): string[] {
+  if (notBeforeSupported === undefined) {
+    try {
+      notBeforeSupported = opensslSupportsNotBefore(openssl(["version"]));
+    } catch {
+      notBeforeSupported = false;
+    }
+  }
+  if (!notBeforeSupported) return [];
+  const start = new Date(Date.now() - NOT_BEFORE_SKEW_MS).toISOString();
+  return ["-not_before", start.replace(/[-:T]/g, "").slice(0, 14) + "Z"];
 }
 
 const execFileAsync = promisify(execFileCb);
@@ -259,6 +329,7 @@ async function opensslAsync(args: string[]): Promise<string> {
     const { stdout } = await execFileAsync("openssl", args, {
       encoding: "utf-8",
       timeout: OPENSSL_TIMEOUT_MS,
+      windowsHide: true,
       ...(extraEnv && Object.keys(extraEnv).length > 0
         ? { env: { ...process.env, ...extraEnv } }
         : {}),
@@ -268,6 +339,18 @@ async function opensslAsync(args: string[]): Promise<string> {
     const message = err instanceof Error ? err.message : String(err);
     throw new Error(`openssl failed: ${message}\n\n${opensslErrorMessage()}`, { cause: err });
   }
+}
+
+/** Async version of backdatedNotBeforeArgs. */
+async function backdatedNotBeforeArgsAsync(): Promise<string[]> {
+  if (notBeforeSupported === undefined) {
+    try {
+      notBeforeSupported = opensslSupportsNotBefore(await opensslAsync(["version"]));
+    } catch {
+      notBeforeSupported = false;
+    }
+  }
+  return backdatedNotBeforeArgs();
 }
 
 // ---------------------------------------------------------------------------
@@ -281,35 +364,76 @@ async function opensslAsync(args: string[]): Promise<string> {
 function generateCA(stateDir: string): { certPath: string; keyPath: string } {
   const keyPath = path.join(stateDir, CA_KEY_FILE);
   const certPath = path.join(stateDir, CA_CERT_FILE);
+  const reqConfigPath = path.join(stateDir, `ca-req-${process.pid}-${crypto.randomUUID()}.cnf`);
 
   // Generate EC private key
   openssl(["ecparam", "-genkey", "-name", "prime256v1", "-noout", "-out", keyPath]);
 
-  // Generate self-signed CA certificate
-  openssl([
-    "req",
-    "-new",
-    "-x509",
-    "-sha256",
-    "-key",
-    keyPath,
-    "-out",
-    certPath,
-    "-days",
-    CA_VALIDITY_DAYS.toString(),
-    "-subj",
-    `/CN=${CA_COMMON_NAME}`,
-    "-addext",
-    "basicConstraints=critical,CA:TRUE",
-    "-addext",
-    "keyUsage=critical,keyCertSign,cRLSign",
-  ]);
+  // Generate self-signed CA certificate.
+  //
+  // `-config` is passed explicitly (a minimal config with no
+  // `x509_extensions` default) instead of relying on the environment's
+  // ambient openssl.cnf. Some openssl builds ship the stock upstream
+  // template, which sets `x509_extensions = v3_ca` under `[ req ]`; combined
+  // with `-addext basicConstraints=...` below that produces a certificate
+  // with the Basic Constraints extension listed twice. That's invalid per
+  // RFC 5280 (extensions must be unique) and macOS's Security framework
+  // rejects the whole chain with "Unknown critical cert extension",
+  // regardless of trust settings, so every *.localhost site looks
+  // untrusted even after `portless trust` succeeds.
+  //
+  // The subject lives in the config rather than in `-subj`: LibreSSL (the
+  // openssl shipped with macOS) refuses a `prompt = no` request whose
+  // distinguished_name section is empty, even when `-subj` is given.
+  fs.writeFileSync(
+    reqConfigPath,
+    [
+      "[req]",
+      "distinguished_name = req_distinguished_name",
+      "prompt = no",
+      "[req_distinguished_name]",
+      `CN = ${CA_COMMON_NAME}`,
+      "",
+    ].join("\n")
+  );
+  try {
+    openssl([
+      "req",
+      "-new",
+      "-x509",
+      "-sha256",
+      "-key",
+      keyPath,
+      "-out",
+      certPath,
+      ...backdatedNotBeforeArgs(),
+      "-days",
+      CA_VALIDITY_DAYS.toString(),
+      "-config",
+      reqConfigPath,
+      "-addext",
+      "basicConstraints=critical,CA:TRUE",
+      "-addext",
+      "keyUsage=critical,keyCertSign,cRLSign",
+      "-addext",
+      "subjectKeyIdentifier=hash",
+      "-addext",
+      "authorityKeyIdentifier=keyid:always",
+    ]);
+  } finally {
+    fs.rmSync(reqConfigPath, { force: true });
+  }
 
   fs.chmodSync(keyPath, 0o600);
   fs.chmodSync(certPath, 0o644);
   fixOwnership(keyPath, certPath);
 
   clearTrustMarker(stateDir);
+
+  // Per-hostname certificates issued by the previous CA no longer chain to
+  // this one, and the SNI callback serves cached certs from disk without
+  // checking their issuer, so drop them to be re-issued on demand.
+  fs.rmSync(path.join(stateDir, HOST_CERTS_DIR), { recursive: true, force: true });
 
   return { certPath, keyPath };
 }
@@ -376,6 +500,7 @@ function generateServerCert(stateDir: string): { certPath: string; keyPath: stri
     srlPath,
     "-out",
     serverCertPath,
+    ...backdatedNotBeforeArgs(),
     "-days",
     SERVER_VALIDITY_DAYS.toString(),
     "-extfile",
@@ -423,7 +548,8 @@ export function ensureCerts(stateDir: string): {
     !fileExists(caCertPath) ||
     !fileExists(caKeyPath) ||
     !isCertValid(caCertPath) ||
-    !isCertSignatureStrong(caCertPath);
+    !isCertSignatureStrong(caCertPath) ||
+    hasDuplicateExtensions(caCertPath);
 
   if (caMissing) {
     generateCA(stateDir);
@@ -646,9 +772,6 @@ function isCATrustedLinux(
 // Per-hostname certificate generation (SNI)
 // ---------------------------------------------------------------------------
 
-/** Directory within state dir where per-hostname certs are cached. */
-const HOST_CERTS_DIR = "host-certs";
-
 /**
  * Longest suffix appended to a sanitized host when composing a cert cache
  * filename (`-key.pem` and `-ext.cnf` are both 8 bytes). The sanitized base
@@ -726,12 +849,9 @@ async function generateHostCertAsync(
   // Generate CSR
   await opensslAsync(["req", "-new", "-key", keyPath, "-out", csrPath, "-subj", `/CN=${cn}`]);
 
-  // Build SAN list: include the exact hostname plus a wildcard at the same level
-  // e.g., for "chat.json-render2.localhost" -> also add "*.json-render2.localhost"
   const sans = [`DNS:${hostname}`];
   const parts = hostname.split(".");
-  if (parts.length >= 2) {
-    // Add a wildcard for sibling subdomains at the same level
+  if (parts.length >= 3) {
     sans.push(`DNS:*.${parts.slice(1).join(".")}`);
   }
 
@@ -769,6 +889,7 @@ async function generateHostCertAsync(
     srlPath,
     "-out",
     certPath,
+    ...(await backdatedNotBeforeArgsAsync()),
     "-days",
     SERVER_VALIDITY_DAYS.toString(),
     "-extfile",
@@ -832,8 +953,14 @@ export function createSNICallback(
     // For .localhost: RFC 2606 §2 designates it as a reserved TLD, so
     // "*.localhost" sits at the public-suffix boundary and TLS specs do
     // not permit wildcard certificates at that level.
-    if (servername === "localhost" && configuredTlds.includes("localhost")) {
+    if (servername === "localhost") {
       cb(null, defaultCtx);
+      return;
+    }
+
+    const name = servername.toLowerCase();
+    if (!/^[a-z0-9.-]+$/.test(name) || !configuredTlds.some((tld) => name.endsWith(`.${tld}`))) {
+      cb(new Error(`Refusing certificate for ${servername}: not under a configured TLD`));
       return;
     }
 
@@ -854,7 +981,8 @@ export function createSNICallback(
       fileExists(certPath) &&
       fileExists(keyPath) &&
       isCertValid(certPath) &&
-      isCertSignatureStrong(certPath)
+      isCertSignatureStrong(certPath) &&
+      !hasTldWildcardSan(certPath)
     ) {
       try {
         const hostCert = fs.readFileSync(certPath);
@@ -1023,6 +1151,8 @@ export function trustCA(stateDir: string): TrustCAResult {
             "-d",
             "-r",
             "trustRoot",
+            "-p",
+            "ssl",
             "-k",
             "/Library/Keychains/System.keychain",
             caCertPath,
@@ -1033,7 +1163,7 @@ export function trustCA(stateDir: string): TrustCAResult {
         const keychain = loginKeychainPath();
         execFileSync(
           "security",
-          ["add-trusted-cert", "-r", "trustRoot", "-k", keychain, caCertPath],
+          ["add-trusted-cert", "-r", "trustRoot", "-p", "ssl", "-k", keychain, caCertPath],
           { stdio: "pipe", timeout: MACOS_SECURITY_AUTH_TIMEOUT_MS }
         );
       }
