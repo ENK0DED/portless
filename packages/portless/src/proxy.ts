@@ -677,6 +677,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     tld = "localhost",
     tlds = [tld],
     strict = true,
+    loopbackOnly = false,
     onError = (msg: string) => console.error(msg),
     tls,
     internalPages = true,
@@ -688,6 +689,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
   const tldSuffixes = configuredTlds
     .map((configuredTld) => `.${configuredTld}`)
     .sort((a, b) => b.length - a.length);
+  const refusesPeer = (address: string | undefined) => loopbackOnly && !isLoopbackPeer(address);
   const h2cSessions: H2cSessionCache = new Map();
 
   // Reserved internal hostnames. Intercepted before route dispatch so a user
@@ -942,6 +944,11 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     headers: http2.IncomingHttpHeaders
   ): void => {
     stream.on("error", () => stream.destroy());
+    if (refusesPeer(stream.session?.socket.remoteAddress)) {
+      stream.respond({ ":status": 403 });
+      stream.end();
+      return;
+    }
     // The response is deferred until the backend's 101 arrives so its
     // negotiated subprotocol and extensions can be relayed. RFC 8441 clients
     // wait for the 2xx before sending frames, so nothing is lost by waiting.
@@ -1056,6 +1063,11 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
   };
 
   const handleRequest = (req: http.IncomingMessage, res: http.ServerResponse, isReplay = false) => {
+    if (refusesPeer(req.socket.remoteAddress)) {
+      res.writeHead(403, { [PORTLESS_HEADER]: "1" });
+      res.end("Forbidden");
+      return;
+    }
     const reqTls = isEncrypted(req);
     res.setHeader(PORTLESS_HEADER, "1");
     res.setHeader(PORTLESS_LISTENER_PORT_HEADER, getListenerPort(req, proxyPort));
@@ -1337,6 +1349,10 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
   };
 
   const handleUpgrade = (req: http.IncomingMessage, socket: net.Socket, head: Buffer) => {
+    if (refusesPeer(socket.remoteAddress)) {
+      socket.destroy();
+      return;
+    }
     socket.on("error", () => socket.destroy());
 
     const hops = parseInt(req.headers[PORTLESS_HOPS_HEADER] as string, 10) || 0;
@@ -1606,6 +1622,10 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     // Wrap both in a net.Server that peeks at the first byte to decide
     // whether the connection is TLS (0x16 = ClientHello) or plain HTTP.
     const wrapper = net.createServer((socket) => {
+      if (refusesPeer(socket.remoteAddress)) {
+        socket.destroy();
+        return;
+      }
       // Absorb connection errors (ECONNRESET, EPIPE, etc.) from abrupt
       // client disconnects (tab close, page reload, HMR) so they don't
       // bubble up as uncaught exceptions and crash the proxy (#111).
@@ -1649,15 +1669,15 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     upstreamAgent.destroy();
   });
 
-  return httpServer;
+  return loopbackOnly ? guardLoopbackOnly(httpServer) : httpServer;
 }
 
 /**
  * Create a minimal HTTP server that 302-redirects every request to HTTPS.
  * Meant to run on port 80 alongside an HTTPS proxy on port 443.
  */
-export function createHttpRedirectServer(httpsPort: number): http.Server {
-  return http.createServer((req, res) => {
+export function createHttpRedirectServer(httpsPort: number, loopbackOnly = false): net.Server {
+  const server = http.createServer((req, res) => {
     const authority = req.headers.host || "localhost";
     const host = authority.split(":")[0];
     const target = classifyRequestTarget(req.url || "/", req.method, authority, false);
@@ -1670,6 +1690,37 @@ export function createHttpRedirectServer(httpsPort: number): http.Server {
     res.writeHead(302, { Location: location, [PORTLESS_HEADER]: "1" });
     res.end();
   });
+  return loopbackOnly ? guardLoopbackOnly(server) : server;
+}
+
+/**
+ * Wrap `inner` in the server that actually listens, so a connection from a
+ * non-loopback peer is closed before the HTTP parser reads a byte. The inner
+ * server only ever receives sockets that passed the check.
+ */
+function guardLoopbackOnly(inner: http.Server): net.Server {
+  // Sockets handed over with emit("connection") are not in the inner
+  // server's connection list, so its close() cannot end their keep-alive
+  // idle time and the wrapper's close() would wait for them. Track them here.
+  const sockets = new Set<net.Socket>();
+  const wrapper = net.createServer((socket) => {
+    if (!isLoopbackPeer(socket.remoteAddress)) {
+      socket.destroy();
+      return;
+    }
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+    inner.emit("connection", socket);
+  });
+  const origClose = wrapper.close.bind(wrapper);
+  wrapper.close = function (cb?: (err?: Error) => void) {
+    inner.close();
+    for (const socket of sockets) {
+      socket.destroy();
+    }
+    return origClose(cb);
+  } as typeof wrapper.close;
+  return wrapper;
 }
 
 export const HOSTS_SYNC_PATH = "/.portless/hosts-sync";

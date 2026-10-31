@@ -204,13 +204,13 @@ Background mode is not a public sharing feature. It keeps the same loopback-firs
 
 ## How It Works
 
-1. `portless proxy start` starts an HTTPS reverse proxy on port 443 as a background daemon. Auto-elevates with sudo on macOS/Linux; falls back to port 1355 if sudo is unavailable. Use `--no-tls` for plain HTTP on port 80. Configurable with `-p` / `--port` or the `PORTLESS_PORT` env var. The proxy also auto-starts when you run an app.
+1. `portless proxy start` starts an HTTPS reverse proxy on port 443 as a background daemon. Probes the listeners first and elevates only for bind permissions or enabled hosts sync with a suffix that needs hosts entries. A failed sudo exits without changing the port. Use `--no-tls` for plain HTTP on port 80. Configurable with `-p` / `--port` or the `PORTLESS_PORT` env var. The proxy also auto-starts when you run an app.
 2. `portless <name> <cmd>` assigns a random port in the 4000 to 4999 range that is free on `127.0.0.1` via the `PORT` env var and registers the app with the proxy
 3. The browser hits `https://<name>.localhost`; the proxy forwards to the app's assigned port
 
-Outside LAN mode, the proxy and its HTTP redirect listener bind only to the IPv4 and IPv6 loopback addresses, `127.0.0.1` and `::1`. They do not accept connections through LAN, VPN, or other network interfaces.
+By default, outside LAN mode, the proxy and its HTTP redirect listener bind only to the IPv4 and IPv6 loopback addresses, `127.0.0.1` and `::1`. They do not accept connections through LAN, VPN, or other network interfaces.
 
-With `--unprivileged` (or `PORTLESS_UNPRIVILEGED=1`) the proxy takes a port below 1024 without `sudo`: it binds the wildcard addresses, which macOS allows for non-root processes, and refuses every non-loopback peer itself. It serves plain HTTP on port 80 unless `--https` is given, because installing the CA would be a prompt; with `--https` the CA is generated but not installed, so run `portless trust` once yourself. It never writes the hosts file: automatic hosts sync is off, `PORTLESS_SYNC_HOSTS=1` together with it is refused, and Safari or a custom TLD need `portless hosts sync` run once by you. Linux needs `net.ipv4.ip_unprivileged_port_start` to cover the port; portless checks and prints the sysctl command instead of falling back to another port. The mode is remembered for auto-start and never triggers a sudo prompt, so it suits scripts, agents and managed machines.
+With `--unprivileged` (or `PORTLESS_UNPRIVILEGED=1`) the proxy takes a port below 1024 without `sudo`: it binds the wildcard addresses, which macOS allows for non-root processes, and refuses every non-loopback peer itself. It serves plain HTTP on port 80 unless `--https` is given, because installing the CA would be a prompt; with `--https` the CA is generated but not installed, so run `portless trust` once yourself. It never writes the hosts file: automatic hosts sync is off, `PORTLESS_SYNC_HOSTS=1` together with it is refused, and Safari or a custom TLD need `sudo portless hosts sync` run once by you. Linux needs `net.ipv4.ip_unprivileged_port_start` to cover the port; portless checks and prints the sysctl command instead of falling back to another port. The mode is remembered for auto-start; use `PORTLESS_UNPRIVILEGED=0` for a start to switch back. LAN mode takes precedence over the loopback peer guard and permits remote peers. Unprivileged mode never triggers a sudo prompt, so it suits scripts, agents and managed machines.
 
 When portless itself returns an error (404 for an unknown host, 421 for a misdirected request, 502 when the app is unreachable, 508 for a request loop), the body depends on the `Accept` header. Browsers (`text/html`) get an HTML page. curl, `fetch`, and other clients get JSON such as `{"error":"bad_gateway","upstream":"myapp.localhost","message":"..."}`, with `error` set to `not_found`, `misdirected_request`, `bad_gateway`, or `loop_detected`. Parse that JSON instead of scraping HTML. Responses from the app itself are forwarded unchanged. Hostnames outside the portless TLDs, for example a site a DNS blocklist points at 127.0.0.1, get 421 Misdirected Request instead of the app list.
 
@@ -615,7 +615,7 @@ For workspace package overrides, package `package.json` `"portless"` values take
 
 ### Run diagnostics first
 
-Run `portless doctor` before changing state. It is read-only and checks the resolved state directory and sudo handoff, ordered and dotted suffixes, local or LAN proxy bind mode, route and background-app liveness, generated or custom certificates, `cert.<suffix>` pages, hosts sync, mDNS tooling, tunnel provider binaries, Tailscale, and NetBird. Follow its printed hints only after reviewing the reported state.
+Run `portless doctor` before changing state. It is read-only and checks the resolved state directory and sudo handoff, ordered and dotted suffixes, local, guarded unprivileged, or LAN proxy bind mode, route and background-app liveness, generated or custom certificates, `cert.<suffix>` pages, hosts sync, mDNS tooling, tunnel provider binaries, Tailscale, and NetBird. Follow its printed hints only after reviewing the reported state.
 
 ### Proxy not running
 
@@ -652,7 +652,7 @@ For other frameworks that don't read `PORT`, pass the assigned values with place
 
 ### Permission errors
 
-The default ports (80 for HTTP, 443 for HTTPS) require `sudo` on macOS and Linux. Portless auto-elevates with sudo when needed. If sudo is unavailable, it falls back to port 1355 (no sudo needed). On Windows, no elevation is required.
+Portless probes the default ports (80 for HTTP, 443 for HTTPS) and auto-elevates only when binding needs permission or enabled hosts sync needs root for a configured suffix. A failed sudo exits without changing the port. On Windows, no elevation is required.
 
 ```bash
 portless proxy start --https           # Auto-elevates with sudo for port 443

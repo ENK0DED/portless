@@ -53,6 +53,7 @@ function healthySnapshot(): DoctorSnapshot {
       pidAlive: true,
       portPid: 42,
       lanMode: false,
+      unprivileged: false,
       lanIp: null,
       configuredBindTargets: ["127.0.0.1", "::1"],
     },
@@ -116,6 +117,17 @@ function healthySnapshot(): DoctorSnapshot {
 }
 
 describe("evaluateDoctor", () => {
+  it("recognizes guarded wildcard binds in unprivileged mode", () => {
+    const snapshot = healthySnapshot();
+    snapshot.proxy.unprivileged = true;
+    snapshot.proxy.configuredBindTargets = ["0.0.0.0", "::"];
+    const report = evaluateDoctor(snapshot);
+    expect(
+      report.findings.some((finding) => finding.message.includes("loopback-only peer guard"))
+    ).toBe(true);
+    expect(report.findings.some((finding) => finding.status === "fail")).toBe(false);
+  });
+
   it("recognizes healthy ordered suffixes, dotted certificate pages, loopback bind, hosts, and background state", () => {
     const report = evaluateDoctor(healthySnapshot());
 

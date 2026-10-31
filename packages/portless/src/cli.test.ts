@@ -2583,6 +2583,40 @@ describe("CLI", () => {
     });
   });
 
+  describe("persisted unprivileged marker", () => {
+    let tmpDir: string;
+
+    beforeEach(() => {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-cli-unpriv-marker-"));
+    });
+
+    afterEach(() => {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it.each([
+      ["keeps unprivileged mode from the marker after a stop", undefined, true],
+      ["PORTLESS_UNPRIVILEGED=0 overrides the marker", "0", false],
+    ])("%s", async (_name, envValue, expected) => {
+      const proxyPort = await getFreePort();
+      const env = {
+        PORTLESS_STATE_DIR: tmpDir,
+        PORTLESS_PORT: proxyPort.toString(),
+        PORTLESS_HTTPS: "0",
+        PORTLESS_UNPRIVILEGED: envValue,
+      };
+      fs.writeFileSync(path.join(tmpDir, "proxy.unprivileged"), "1");
+
+      try {
+        const start = run(["proxy", "start"], { env });
+        expect(start.status).toBe(0);
+        expect(fs.existsSync(path.join(tmpDir, "proxy.unprivileged"))).toBe(expected);
+      } finally {
+        run(["proxy", "stop", "-p", proxyPort.toString()], { env });
+      }
+    });
+  });
+
   describe("persisted LAN marker", () => {
     let tmpDir: string;
 
@@ -3540,9 +3574,10 @@ describe("CLI", () => {
       }
     }, 10_000);
 
-    it.skipIf(process.platform === "win32" || (process.getuid?.() ?? 0) === 0)(
-      "passes --skip-trust through sudo re-exec",
-      () => {
+    it.skipIf(process.platform === "win32" || (process.getuid?.() ?? 0) === 0).each([true, false])(
+      "passes --skip-trust through sudo re-exec (explicit port: %s)",
+      async (explicitPort) => {
+        const port = await getFreePort();
         const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-sudo-shim-"));
         const capturePath = path.join(shimDir, "sudo-args.txt");
         try {
@@ -3553,24 +3588,74 @@ describe("CLI", () => {
           );
           fs.chmodSync(sudoPath, 0o755);
 
-          const start = run(["proxy", "start", "--port", "1", "--https", "--skip-trust"], {
-            env: {
-              PATH: prependPath(shimDir),
-              PORTLESS_STATE_DIR: tmpDir,
-              PORTLESS_TEST_CAPTURE_FILE: capturePath,
-            },
-          });
+          const start = run(
+            [
+              "proxy",
+              "start",
+              ...(explicitPort ? ["--port", String(port)] : []),
+              "--https",
+              "--skip-trust",
+            ],
+            {
+              env: {
+                PATH: prependPath(shimDir),
+                PORTLESS_STATE_DIR: tmpDir,
+                PORTLESS_TEST_CAPTURE_FILE: capturePath,
+                PORTLESS_SYNC_HOSTS: "1",
+                PORTLESS_SUFFIX: "test",
+                PORTLESS_PORT: String(port),
+              },
+            }
+          );
 
           expect(start.status).toBe(1);
           const sudoArgs = fs.readFileSync(capturePath, "utf-8").trim().split("\n");
           expect(sudoArgs).toContain(`PORTLESS_STATE_DIR=${tmpDir}`);
           expect(sudoArgs).toContain("--skip-trust");
+          expect(start.stderr).toContain("sudo failed");
+          expect(start.stdout).not.toContain("Falling back");
+          expect(fs.existsSync(path.join(tmpDir, "proxy.port"))).toBe(false);
         } finally {
           fs.rmSync(shimDir, { recursive: true, force: true });
         }
       }
     );
 
+    it("starts unprivileged with hosts warnings and persists its guarded wildcard bind", async () => {
+      const start = run(["proxy", "start", "--unprivileged", "--suffix", "test"], {
+        env: proxyEnv(),
+      });
+      expect(start.status).toBe(0);
+      expect(start.stderr).toContain("sudo portless hosts sync");
+      expect(fs.existsSync(path.join(tmpDir, "proxy.unprivileged"))).toBe(true);
+      expect(fs.readFileSync(path.join(tmpDir, "proxy.log"), "utf-8")).toContain(
+        `listening on 0.0.0.0:${testPort}`
+      );
+      await waitForHttpHeader(testPort, "X-Portless", "1");
+      const mismatch = run(["proxy", "start"], {
+        env: { ...proxyEnv(), PORTLESS_UNPRIVILEGED: "0" },
+      });
+      expect(mismatch.status).toBe(1);
+      expect(mismatch.stderr).toContain("unprivileged mode differs");
+    });
+
+    it("refuses forced hosts sync in unprivileged mode", () => {
+      const start = run(["proxy", "start", "--unprivileged"], {
+        env: { ...proxyEnv(), PORTLESS_SYNC_HOSTS: "1" },
+      });
+      expect(start.status).toBe(1);
+      expect(start.stderr).toContain("cannot be combined");
+      expect(fs.existsSync(path.join(tmpDir, "proxy.port"))).toBe(false);
+    });
+
+    it("defaults unprivileged mode to HTTP without an HTTPS choice", () => {
+      const start = run(["proxy", "start", "--unprivileged"], {
+        env: { ...proxyEnv(), PORTLESS_HTTPS: undefined },
+      });
+      expect(start.status).toBe(0);
+      expect(start.stdout).toContain("HTTP proxy started");
+      expect(fs.existsSync(path.join(tmpDir, "proxy.tls"))).toBe(false);
+    });
     it("persists wildcard mode while the proxy runs and clears it on stop", () => {
       const start = run(["proxy", "start", "--wildcard"], { env: proxyEnv() });
       expect(start.status).toBe(0);

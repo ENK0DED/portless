@@ -14,6 +14,7 @@ import {
   isProxyRunning,
   LEGACY_SYSTEM_STATE_DIR,
   readCustomCertMarker,
+  readUnprivilegedMarker,
   readInternalPagesDisabledMarker,
   resolveStateDir,
   resolveWindowsCommandInvocation,
@@ -84,6 +85,7 @@ export interface DoctorSnapshot {
     pid?: number;
     pidAlive?: boolean;
     portPid?: number | null;
+    unprivileged: boolean;
     lanMode: boolean;
     lanIp: string | null;
     configuredBindTargets: string[];
@@ -588,8 +590,12 @@ export async function collectDoctorSnapshot(
       ...(pid !== undefined ? { pid, pidAlive: dependencies.isProcessAlive(pid) } : {}),
       portPid: portListening ? dependencies.findPidOnPort(proxyPort) : null,
       lanMode: state.lanMode,
+      unprivileged: readUnprivilegedMarker(state.dir),
       lanIp: state.lanIp,
-      configuredBindTargets: getProxyBindTargets(state.lanMode).map((target) => target.host),
+      configuredBindTargets: getProxyBindTargets(
+        state.lanMode,
+        readUnprivilegedMarker(state.dir)
+      ).map((target) => target.host),
     },
     suffixes: persistedSuffixDiagnostics(state.dir, state.tlds),
     certificates: {
@@ -758,6 +764,11 @@ export function evaluateDoctor(snapshot: DoctorSnapshot): DoctorReport {
         `mDNS tooling is unavailable${snapshot.mdns.reason ? `: ${snapshot.mdns.reason}` : "."}`
       );
     }
+  } else if (
+    snapshot.proxy.unprivileged &&
+    hasExactBindTargets(snapshot.proxy.configuredBindTargets, ["0.0.0.0", "::"])
+  ) {
+    add("ok", "Unprivileged mode binds wildcard addresses with a loopback-only peer guard.");
   } else if (hasExactBindTargets(snapshot.proxy.configuredBindTargets, ["127.0.0.1", "::1"])) {
     add("ok", "Configured local mode binds only to 127.0.0.1 and ::1.");
   } else {

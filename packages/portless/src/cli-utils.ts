@@ -229,6 +229,64 @@ export function getProxyBindTargets(lanMode: boolean, unprivileged = false): Pro
     : [{ host: IPV4_LOOPBACK_PROXY_HOST }, { host: IPV6_LOOPBACK_PROXY_HOST, ipv6Only: true }];
 }
 
+/**
+ * Check whether this process may bind `port` on every target without root.
+ * Resolves false only when a bind fails with EACCES (or EPERM), so callers can
+ * elevate for that case alone. Any other outcome, such as EADDRINUSE, resolves
+ * true and is left for the real listen to report.
+ */
+export async function canBindProxyPort(
+  port: number,
+  targets: readonly ProxyBindTarget[]
+): Promise<boolean> {
+  for (const target of targets) {
+    const code = await new Promise<string | null>((resolve) => {
+      const probe = net.createServer();
+      probe.once("error", (err: NodeJS.ErrnoException) => resolve(err.code ?? "UNKNOWN"));
+      probe.listen({ port, host: target.host, ipv6Only: target.ipv6Only, exclusive: true }, () =>
+        probe.close(() => resolve(null))
+      );
+    });
+    if (code === "EACCES" || code === "EPERM") return false;
+  }
+  return true;
+}
+
+/**
+ * Whether this process can bind `port` without root on `platform`. macOS
+ * allows any port on the wildcard address since Mojave. Linux moves the
+ * boundary with `net.ipv4.ip_unprivileged_port_start`. Windows has none.
+ */
+export function canBindWithoutRoot(
+  port: number,
+  platform: NodeJS.Platform = process.platform,
+  readUnprivilegedPortStart: () => string = () =>
+    fs.readFileSync("/proc/sys/net/ipv4/ip_unprivileged_port_start", "utf-8")
+): { ok: true } | { ok: false; reason: string } {
+  if (port >= PRIVILEGED_PORT_THRESHOLD || platform === "darwin" || platform === "win32") {
+    return { ok: true };
+  }
+  if (platform !== "linux") {
+    return {
+      ok: false,
+      reason: `Binding port ${port} without root is not supported on ${platform}.`,
+    };
+  }
+  let start: number;
+  try {
+    start = parseInt(readUnprivilegedPortStart().trim(), 10);
+  } catch {
+    return { ok: false, reason: "Could not read net.ipv4.ip_unprivileged_port_start." };
+  }
+  if (!Number.isNaN(start) && port >= start) {
+    return { ok: true };
+  }
+  return {
+    ok: false,
+    reason: `Port ${port} is below net.ipv4.ip_unprivileged_port_start (${Number.isNaN(start) ? "unreadable" : start}).`,
+  };
+}
+
 /** Start a proxy listener on the selected interface and port. */
 export function listenOnProxyInterface(
   server: net.Server,
@@ -447,6 +505,32 @@ export function readTlsMarker(dir: string): boolean {
 /** Write or remove the TLS marker in the state directory. */
 export function writeTlsMarker(dir: string, enabled: boolean): void {
   const markerPath = path.join(dir, TLS_MARKER_FILE);
+  if (enabled) {
+    fs.writeFileSync(markerPath, "1", { mode: 0o644 });
+  } else {
+    try {
+      fs.unlinkSync(markerPath);
+    } catch {
+      // Marker may already be absent; non-fatal
+    }
+  }
+}
+
+/** Name of the marker file that remembers unprivileged mode across proxy restarts. */
+const UNPRIVILEGED_MARKER_FILE = "proxy.unprivileged";
+
+/** Read the unprivileged-mode marker from a state directory. */
+export function readUnprivilegedMarker(dir: string): boolean {
+  try {
+    return fs.existsSync(path.join(dir, UNPRIVILEGED_MARKER_FILE));
+  } catch {
+    return false;
+  }
+}
+
+/** Write or remove the unprivileged-mode marker in the state directory. */
+export function writeUnprivilegedMarker(dir: string, enabled: boolean): void {
+  const markerPath = path.join(dir, UNPRIVILEGED_MARKER_FILE);
   if (enabled) {
     fs.writeFileSync(markerPath, "1", { mode: 0o644 });
   } else {
@@ -859,6 +943,7 @@ export function readPersistedProxyState(): {
   tlds: string[];
   lanMode: boolean;
   useWildcard: boolean;
+  unprivileged: boolean;
 } | null {
   const dir = process.env.PORTLESS_STATE_DIR || USER_STATE_DIR;
   const port = readPortFromDir(dir);
@@ -867,7 +952,15 @@ export function readPersistedProxyState(): {
     const tlds = readTldsFromDir(dir);
     const tld = tlds[0] ?? DEFAULT_TLD;
     const useWildcard = readWildcardMarker(dir);
-    return { port, tls, tld, tlds, lanMode: hasLanMarker(dir), useWildcard };
+    return {
+      port,
+      tls,
+      tld,
+      tlds,
+      lanMode: hasLanMarker(dir),
+      unprivileged: readUnprivilegedMarker(dir),
+      useWildcard,
+    };
   }
 
   return null;

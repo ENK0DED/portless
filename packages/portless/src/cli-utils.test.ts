@@ -2149,6 +2149,7 @@ describe("readPersistedProxyState", () => {
       tlds: ["local"],
       lanMode: true,
       useWildcard: true,
+      unprivileged: false,
     });
   });
 });

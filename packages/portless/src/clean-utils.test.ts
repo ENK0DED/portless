@@ -46,6 +46,7 @@ describe("removePortlessStateFiles", () => {
     fs.writeFileSync(path.join(tmpDir, "proxy.custom-cert"), "1");
     fs.writeFileSync(path.join(tmpDir, "proxy.internal-pages-disabled"), "1");
     fs.writeFileSync(path.join(tmpDir, "proxy.wildcard"), "1");
+    fs.writeFileSync(path.join(tmpDir, "proxy.unprivileged"), "1");
     fs.mkdirSync(path.join(tmpDir, "host-certs"));
     fs.writeFileSync(path.join(tmpDir, "host-certs", "x.pem"), "x");
     fs.mkdirSync(path.join(tmpDir, "bg", "logs"), { recursive: true });
@@ -61,6 +62,7 @@ describe("removePortlessStateFiles", () => {
     expect(fs.existsSync(path.join(tmpDir, "proxy.internal-pages-disabled"))).toBe(false);
     expect(fs.existsSync(path.join(tmpDir, "ca.pem"))).toBe(false);
     expect(fs.existsSync(path.join(tmpDir, "proxy.wildcard"))).toBe(false);
+    expect(fs.existsSync(path.join(tmpDir, "proxy.unprivileged"))).toBe(false);
     expect(fs.existsSync(path.join(tmpDir, "ca.trusted"))).toBe(false);
     expect(fs.existsSync(path.join(tmpDir, "ca.trust-refresh-pending"))).toBe(false);
     expect(fs.existsSync(path.join(tmpDir, "host-certs"))).toBe(false);

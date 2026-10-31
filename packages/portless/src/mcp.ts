@@ -232,7 +232,7 @@ export const TOOLS: ToolDef[] = [
   tool(
     "proxy_start",
     "Start proxy",
-    'Start the shared portless proxy as a background daemon. Without port, HTTPS uses 443 which may need sudo; MCP cannot answer a sudo prompt, so pass unprivileged for a port below 1024 without sudo, or port (for example 1355). HTTPS may show an OS dialog to trust the local CA; pass extraArgs ["--skip-trust"] to skip it.',
+    'Start the shared portless proxy as a background daemon. Without port, HTTPS uses 443; listener probes and enabled hosts sync determine whether sudo is needed. A failed sudo exits without changing ports; MCP cannot answer a sudo prompt, so pass unprivileged for a port below 1024 without sudo, or port (for example 1355). HTTPS may show an OS dialog to trust the local CA; pass extraArgs ["--skip-trust"] to skip it.',
     {
       port: PORT_PROPERTY,
       noTls: { type: "boolean", description: "Serve plain HTTP instead of HTTPS." },
