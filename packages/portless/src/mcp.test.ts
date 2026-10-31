@@ -6,6 +6,8 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   TOOLS,
+  OMITTED_COMMANDS,
+  OMITTED_FLAGS,
   PROFILES,
   buildArgv,
   parseToolsFlag,
@@ -218,18 +220,6 @@ describe("toToolResult", () => {
   });
 });
 
-/** Commands in `portless --help` that deliberately have no MCP tool. */
-const OMITTED_COMMANDS: Record<string, string> = {
-  portless: "zero-arg and named mode run foreground dev servers",
-  "portless run": "runs a foreground dev server",
-  "portless mcp": "the MCP server itself",
-  "portless service install": "may prompt for sudo",
-  "portless trust": "may prompt for sudo",
-  "portless clean": "may prompt for sudo",
-  "portless hosts sync": "may prompt for sudo",
-  "portless hosts clean": "may prompt for sudo",
-};
-
 /** Leading command words and flags of a help line or argv, e.g. "alias --remove". */
 function commandWords(tokens: string[]): string[] {
   const words: string[] = [];
@@ -290,6 +280,7 @@ describe("CLI coverage", () => {
         const emitted = buildArgv(owner.name, sampleArgs(owner, false));
         for (const flag of line.match(/(?<=^|\s)(-p|--[a-z][a-z-]*)\b/g) ?? []) {
           if (flag === "--help" || emitted.includes(flag)) continue;
+          if (OMITTED_FLAGS[owner.name]?.[flag]) continue;
           expect(
             () => buildArgv(owner.name, { ...sampleArgs(owner, true), extraArgs: [flag] }),
             `"${flag}" is in "portless ${page} --help" but the ${owner.name} tool does not handle it. Type it in mcp.ts or reject it.`

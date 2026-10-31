@@ -8,6 +8,49 @@
  * sudo or need a TTY), plus mcp and --help (the server itself and human help).
  */
 
+/** Commands in `portless --help` that deliberately have no MCP tool. */
+export const OMITTED_COMMANDS: Record<string, string> = {
+  portless: "zero-arg and named mode run foreground dev servers",
+  "portless run": "runs a foreground dev server",
+  "portless mcp": "the MCP server itself",
+  "portless service install": "may prompt for sudo",
+  "portless trust": "may prompt for sudo",
+  "portless clean": "may prompt for sudo",
+  "portless hosts sync": "may prompt for sudo",
+  "portless hosts clean": "may prompt for sudo",
+  "portless bg start": "Pending fork mapping in ticket 22",
+  "portless bg status": "Pending fork mapping in ticket 22",
+  "portless bg list": "Pending fork mapping in ticket 22",
+  "portless bg logs": "Pending fork mapping in ticket 22",
+  "portless bg stop": "Pending fork mapping in ticket 22",
+  "portless bg restart": "Pending fork mapping in ticket 22",
+  "portless bg clean": "Pending fork mapping in ticket 22",
+  "portless url": "Pending fork mapping in ticket 22",
+  "portless tunnel map": "Pending fork mapping in ticket 22",
+  "portless list --json": "Pending fork mapping in ticket 22",
+  "portless ls": "Pending fork mapping in ticket 22",
+  "portless completion": "Pending fork mapping in ticket 22",
+};
+
+/** Explicit fork flags awaiting ticket 22. Tool behavior is unchanged. */
+export const OMITTED_FLAGS: Record<string, Record<string, string>> = {
+  list: {
+    "--json": "Pending fork mapping in ticket 22",
+  },
+  get: {
+    "--json": "Pending fork mapping in ticket 22",
+    "--path": "Pending fork mapping in ticket 22",
+  },
+  alias_add: {
+    "--path": "Pending fork mapping in ticket 22",
+  },
+  proxy_start: {
+    "--skip-trust": "Pending fork mapping in ticket 22",
+    "--suffix": "Pending fork mapping in ticket 22",
+    "--routes-cleanup-interval": "Pending fork mapping in ticket 22",
+  },
+};
+
 declare const __VERSION__: string;
 
 import { spawn } from "node:child_process";
