@@ -294,6 +294,7 @@ const PAGE_STYLES = `
     justify-content: flex-end;
   }
   .app-extras:empty, .app-actions:empty { display: none; }
+  .app-item[hidden] { display: none; }
   /* Second line: status badge on the left, Copy URL button on the right. */
   .app-actions { justify-content: space-between; }
   .app-extras .badge, .app-actions .badge, .app-copy { pointer-events: auto; }
@@ -326,6 +327,43 @@ const PAGE_STYLES = `
   .app-copy svg { width: 13px; height: 13px; }
   .app-copy.copied { color: var(--ok); border-color: var(--ok); }
 
+  /* Filter bar (404 page, shown above the route threshold) ------------------ */
+  .filter { display: flex; gap: 8px; margin-bottom: 10px; }
+  .filter[hidden] { display: none; }
+  .filter input {
+    flex: 1;
+    min-width: 0;
+    font: inherit;
+    font-size: 14px;
+    color: var(--fg);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+  }
+  .filter input::placeholder { color: var(--text-3); }
+  .filter button {
+    font: inherit;
+    font-size: 14px;
+    color: var(--text-2);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .filter button[aria-pressed="true"] {
+    color: var(--accent);
+    background: var(--surface);
+    border-color: var(--accent);
+  }
+  .filter input:focus-visible,
+  .filter button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+
   /* Badges ------------------------------------------------------------------ */
   .badge {
     display: inline-flex;
@@ -339,6 +377,7 @@ const PAGE_STYLES = `
     padding: 0 9px;
     border-radius: 999px;
     letter-spacing: 0.02em;
+    font-variant-numeric: tabular-nums;
     white-space: nowrap;
     text-decoration: none;
     cursor: pointer;
@@ -679,6 +718,56 @@ document.addEventListener('click',function(e){
   if(item){var link=item.querySelector('.app-link');if(link)link.click();}
 });`;
 
+/** Route count above which the 404 page offers a hostname filter. */
+export const APP_FILTER_THRESHOLD = 5;
+
+// Revealed by APP_FILTER_SCRIPT; stays hidden when scripting is unavailable.
+export const APP_FILTER_CONTROLS =
+  '<div class="filter" hidden><input type="search" placeholder="Filter apps" autocomplete="off" aria-label="Filter apps by hostname"><button type="button" aria-pressed="false">Newest first</button></div>';
+export const APP_FILTER_NO_MATCH = '<p class="empty" role="status" hidden>No apps match.</p>';
+
+/**
+ * Static inline script for the 404 page filter bar. It matches the shared app
+ * row markup (`.app-list > .app-item` with an `.app-name`), filters by
+ * hostname, and sorts newest first by each row's `data-registered-at`. It
+ * interpolates no request or route data. Include it after APP_SCRIPT.
+ */
+export const APP_FILTER_SCRIPT = `
+(function(){
+  var bar=document.querySelector('.filter');
+  var list=document.querySelector('.app-list');
+  if(!bar||!list)return;
+  var input=bar.querySelector('input');
+  var sort=bar.querySelector('button');
+  var none=document.querySelector('.empty[role=status]');
+  var rows=Array.prototype.slice.call(list.children);
+  rows.forEach(function(row,i){row.setAttribute('data-index',String(i));});
+  function num(row,name){return Number(row.getAttribute(name))||0;}
+  function apply(){
+    var query=input.value.trim().toLowerCase();
+    var newest=sort.getAttribute('aria-pressed')==='true';
+    var shown=0;
+    rows.forEach(function(row){
+      var name=row.querySelector('.app-name');
+      var hit=!!name&&name.textContent.toLowerCase().indexOf(query)!==-1;
+      row.hidden=!hit;
+      if(hit)shown++;
+    });
+    rows.slice().sort(function(a,b){
+      if(newest){var d=num(b,'data-registered-at')-num(a,'data-registered-at');if(d)return d;}
+      return num(a,'data-index')-num(b,'data-index');
+    }).forEach(function(row){list.appendChild(row);});
+    if(none)none.hidden=shown>0;
+  }
+  input.addEventListener('input',apply);
+  sort.addEventListener('click',function(){
+    sort.setAttribute('aria-pressed',String(sort.getAttribute('aria-pressed')!=='true'));
+    apply();
+  });
+  apply();
+  bar.hidden=false;
+})();`;
+
 export interface AppRowBadge {
   /** ok | warn | danger | accent | muted | idle */
   variant: string;
@@ -705,6 +794,8 @@ export interface AppRowOptions {
   badges?: AppRowBadge[];
   /** When set, renders a "Copy URL" button (requires APP_SCRIPT on the page). */
   copyUrl?: string;
+  /** Epoch milliseconds the app registered; emitted as `data-registered-at` for sorting. */
+  registeredAt?: number;
 }
 
 function renderBadge(b: AppRowBadge): string {
@@ -733,7 +824,11 @@ export function appRow(o: AppRowOptions): string {
 
   // Top line: name + other badges + arrow. Second line (inside the same entry):
   // the status badge and the Copy URL button.
-  return `<li class="app-item">
+  const registered =
+    typeof o.registeredAt === "number" && Number.isFinite(o.registeredAt)
+      ? ` data-registered-at="${Math.trunc(o.registeredAt)}"`
+      : "";
+  return `<li class="app-item"${registered}>
   <div class="app-main">
     <a class="app-link" href="${escapeHtml(o.href)}"${target}><span class="app-name">${escapeHtml(o.name)}</span>${sub}</a>
     <span class="app-extras">${badgesHtml}</span>

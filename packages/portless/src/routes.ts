@@ -462,6 +462,7 @@ export class RouteStore {
       hostname,
       port,
       pid,
+      registeredAt: Date.now(),
       ...(pathPrefix !== "/" ? { pathPrefix } : {}),
       ...(protocol && protocol !== "http1" ? { protocol } : {}),
       ...(label !== undefined ? { label } : {}),

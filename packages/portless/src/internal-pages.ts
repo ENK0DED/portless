@@ -1,5 +1,5 @@
 import type { RouteInfo } from "./types.js";
-import { escapeHtml, formatUrl, normalizePathPrefix } from "./utils.js";
+import { escapeHtml, formatUptime, formatUrl, normalizePathPrefix } from "./utils.js";
 import {
   APP_SCRIPT,
   ARROW_SVG,
@@ -122,9 +122,24 @@ export interface DashboardData {
  */
 export function renderRouteRow(
   route: RouteInfo,
-  opts: { url: string; copyUrl?: string; status?: "active" | "inactive"; newTab?: boolean }
+  opts: {
+    url: string;
+    copyUrl?: string;
+    status?: "active" | "inactive";
+    newTab?: boolean;
+    /** Clock used for the uptime badge; defaults to the current time. */
+    now?: number;
+  }
 ): string {
   const badges: AppRowBadge[] = [];
+  const uptime = route.pid === 0 ? null : formatUptime(route.registeredAt, opts.now ?? Date.now());
+  if (uptime) {
+    badges.push({
+      variant: "muted",
+      label: `up ${uptime}`,
+      title: "Time since this app registered with portless",
+    });
+  }
   if (route.label) {
     badges.push({
       variant: "muted",
@@ -156,6 +171,7 @@ export function renderRouteRow(
     newTab: opts.newTab,
     status: opts.status,
     badges,
+    ...(route.registeredAt !== undefined ? { registeredAt: route.registeredAt } : {}),
     ...(opts.copyUrl ? { copyUrl: opts.copyUrl } : {}),
   });
 }
