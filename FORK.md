@@ -449,7 +449,7 @@ The ten PRs that closed since the 2026-06-18 pass were all closed unmerged: #321
 - HTTP/2 Extended CONNECT WebSockets reject internal hosts, h2c routes, missing routes, and looped requests; they forward a single negotiated subprotocol such as `vite-hmr` and validate backend `Sec-WebSocket-Accept` before forwarding payload.
 - Path routing uses strict segment boundaries and forwards full paths unchanged.
 - Tailscale Serve, Funnel, and Service traffic routes only through exact persisted route hostnames. Unrelated `.ts.net` hosts and arbitrary public Host passthrough remain rejected.
-- Public tunnel traffic routes only through exact managed aliases. Arbitrary public Host passthrough remains rejected.
+- Managed Cloudflare and ngrok tunnels target only the selected app port on loopback, with Host rewritten to the route hostname; public traffic bypasses the proxy. A path-prefixed route exposes the whole app and prints a notice. External tunnels may use exact manual aliases through the proxy. Arbitrary public Host passthrough remains rejected.
 
 ### Retained Source And Coverage Notes
 

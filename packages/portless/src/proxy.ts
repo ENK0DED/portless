@@ -545,7 +545,8 @@ function findRoute(
   tunnelAliases: TunnelAlias[],
   host: string,
   requestPath: string,
-  strict?: boolean
+  strict?: boolean,
+  selectedLabel?: string
 ): RouteInfo | undefined {
   const authority = normalizeAuthority(host);
   const hostname = authorityHostname(authority);
@@ -559,10 +560,15 @@ function findRoute(
   if (alias) {
     const targetPathPrefix = normalizePathPrefix(alias.targetPathPrefix);
     if (matchesPathPrefix(requestPath, targetPathPrefix)) {
-      return routes.find(
+      const targets = routes.filter(
         (route) =>
           route.hostname === alias.targetHostname &&
-          normalizePathPrefix(route.pathPrefix) === targetPathPrefix
+          normalizePathPrefix(route.pathPrefix) === targetPathPrefix &&
+          (!alias.routeOwnerPid || route.pid === alias.routeOwnerPid)
+      );
+      return (
+        targets.find((route) => selectedLabel && route.label === selectedLabel) ??
+        defaultMember(targets)
       );
     }
   }
@@ -909,7 +915,14 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
         (selected ? members.find((member) => member.label === selected) : undefined) ??
         defaultMember(members);
     } else {
-      route = findRoute(routes, tunnelAliases, authority, matchPath, strict);
+      route = findRoute(
+        routes,
+        tunnelAliases,
+        authority,
+        matchPath,
+        strict,
+        parseCookieHeader(cookieHeaderValue(headers.cookie))[SELECTION_COOKIE]
+      );
     }
 
     if (!route) return { ...base, rejectReason: "missing-route" };
@@ -1137,7 +1150,14 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       route = resolveMultiplex(req, res, members, host, requestPath, reqTls);
       if (!route) return; // a picker page or selection redirect was served
     } else {
-      route = findRoute(routes, tunnelAliases, rawHost, requestPath, strict);
+      route = findRoute(
+        routes,
+        tunnelAliases,
+        rawHost,
+        requestPath,
+        strict,
+        readSelectionCookie(req)
+      );
     }
 
     if (!route) {
@@ -1370,7 +1390,14 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
         (selected ? members.find((m) => m.label === selected) : undefined) ??
         defaultMember(members);
     } else {
-      route = findRoute(routes, tunnelAliases, rawHost, requestPath, strict);
+      route = findRoute(
+        routes,
+        tunnelAliases,
+        rawHost,
+        requestPath,
+        strict,
+        readSelectionCookie(req)
+      );
     }
 
     if (!route) {

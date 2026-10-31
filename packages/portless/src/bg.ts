@@ -88,6 +88,7 @@ const RUN_VALUE_FLAGS = new Set([
 ]);
 
 const RUN_BOOLEAN_FLAGS = new Set([
+  "--cloudflare",
   "--force",
   "--h2c",
   "--tailscale",
@@ -135,6 +136,7 @@ ${colors.bold("Run options forwarded to portless run:")}
   --app-port <number>           Use a fixed app port
   --h2c                         Forward to an HTTP/2 cleartext upstream
   --path <prefix>               Scope route to a path prefix
+  --cloudflare                 Alias of --tunnel cloudflare
   --tunnel <provider>           Share publicly via a managed tunnel
   --tunnel-hostname <hostname>  Request a stable tunnel hostname
   --tailscale                   Share on Tailscale
@@ -292,7 +294,17 @@ function parseRunIntent(runArgs: string[], cwd: string): ParsedRunIntent {
   let appPort: number | undefined;
   let protocol: RouteProtocol | undefined;
   let pathPrefix = "/";
-  let tunnel: BgManagedTunnelOptions | undefined;
+  const envProvider =
+    process.env.PORTLESS_TUNNEL ??
+    (["1", "true"].includes(process.env.PORTLESS_CLOUDFLARE ?? "") ? "cloudflare" : undefined);
+  let tunnel: BgManagedTunnelOptions | undefined = envProvider
+    ? {
+        provider: parseTunnelProviderForIntent(envProvider),
+        ...(process.env.PORTLESS_TUNNEL_HOSTNAME
+          ? { hostname: process.env.PORTLESS_TUNNEL_HOSTNAME }
+          : {}),
+      }
+    : undefined;
   const sharing: BgStartIntent["sharing"] = {
     tailscale: false,
     tailscaleService: false,
@@ -329,6 +341,8 @@ function parseRunIntent(runArgs: string[], cwd: string): ParsedRunIntent {
       protocol = "h2c";
     } else if (token === "--path") {
       pathPrefix = normalizePathPrefix(runArgs[++i]);
+    } else if (token === "--cloudflare") {
+      tunnel = { provider: "cloudflare" };
     } else if (token === "--tunnel") {
       tunnel = { ...(tunnel ?? {}), provider: parseTunnelProviderForIntent(runArgs[++i]) };
     } else if (token === "--tunnel-hostname") {

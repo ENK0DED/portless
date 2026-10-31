@@ -1665,10 +1665,6 @@ async function runApp(
     console.log(chalk.gray("-- Proxy is running"));
   }
 
-  const tunnelAliasStore = new TunnelAliasStore(stateDir, {
-    onWarning: (msg) => console.warn(colors.yellow(msg)),
-  });
-
   // Compute hostname after auto-start so tld reflects the running proxy
   // (e.g. --lan changes tld from "localhost" to "local")
   const hostnames = buildHostnames(name, tlds);
@@ -1758,7 +1754,6 @@ async function runApp(
   let ngrokProcess: Awaited<ReturnType<typeof startNgrok>> | undefined;
   let tunnelUrl: string | undefined;
   let managedTunnel: TunnelInstance | undefined;
-  let managedTunnelExternalHostname: string | undefined;
   let stoppingNetbird = false;
   let netbirdRouteReady = false;
   let netbirdExitHandled = false;
@@ -1861,13 +1856,6 @@ async function runApp(
       );
     } catch {
       // Best-effort cleanup; non-fatal
-    }
-    if (managedTunnelExternalHostname) {
-      try {
-        tunnelAliasStore.removeManagedAlias(managedTunnelExternalHostname, process.pid);
-      } catch {
-        // Best-effort cleanup; non-fatal
-      }
     }
   };
 
@@ -2090,27 +2078,22 @@ async function runApp(
   if (requestedTunnel) {
     try {
       const provider = getTunnelProvider(requestedTunnel.provider);
-      managedTunnel = await provider.start(proxyPort, {
+      managedTunnel = await provider.start(port, {
+        hostHeader: hostname,
+        configPath: path.join(stateDir, "cloudflared.yml"),
         hostname: requestedTunnel.hostname,
         onExit: handleTunnelExit,
       });
       tunnelUrl = managedTunnel.url;
-      managedTunnelExternalHostname = managedTunnel.hostname;
-      tunnelAliasStore.setAlias({
-        externalHostname: managedTunnel.hostname,
-        targetHostname: hostname,
-        targetPathPrefix: routePathPrefix,
-        managed: true,
-        provider: managedTunnel.provider,
-        url: managedTunnel.url,
-        tunnelPid: managedTunnel.pid,
-        routeOwnerPid: process.pid,
-      });
+      if (routePathPrefix !== "/")
+        console.log(
+          colors.yellow(
+            "  Notice: the tunnel exposes the whole app, including paths outside the route prefix."
+          )
+        );
       const label = managedTunnel.provider === "cloudflare" ? "Cloudflare Tunnel" : "ngrok tunnel";
       console.log(chalk.green(`  ${label} -> ${formatSharedUrl(tunnelUrl, routePathPrefix)}`));
-      console.log(
-        chalk.gray("  (accessible from the public internet through an exact tunnel alias)\n")
-      );
+      console.log(chalk.gray("  (accessible from the public internet directly at the app)\n"));
 
       try {
         store.updateRoute(
@@ -2141,13 +2124,6 @@ async function runApp(
       stopNetbirdExpose(netbirdProcess);
       stopNgrokProcess(ngrokProcess?.child);
       stopTunnelProcess(managedTunnel?.child);
-      if (managedTunnelExternalHostname) {
-        try {
-          tunnelAliasStore.removeManagedAlias(managedTunnelExternalHostname, process.pid);
-        } catch {
-          // Best-effort cleanup; non-fatal
-        }
-      }
       try {
         unregisterTailscale({
           tailscaleHttpsPort,
@@ -2278,7 +2254,14 @@ async function runApp(
       ...(tailscaleUrl ? { PORTLESS_TAILSCALE_URL: tailscaleUrl } : {}),
       ...(tailscaleServiceUrl ? { PORTLESS_TAILSCALE_SERVICE_URL: tailscaleServiceUrl } : {}),
       ...(ngrokUrl ? { PORTLESS_NGROK_URL: ngrokUrl } : {}),
-      ...(tunnelUrl ? { PORTLESS_TUNNEL_URL: tunnelUrl } : {}),
+      ...(tunnelUrl
+        ? {
+            PORTLESS_TUNNEL_URL: tunnelUrl,
+            ...(managedTunnel?.provider === "cloudflare"
+              ? { PORTLESS_CLOUDFLARE_URL: tunnelUrl }
+              : {}),
+          }
+        : {}),
       ...(netbirdUrl ? { PORTLESS_NETBIRD_URL: netbirdUrl } : {}),
       ...caEnv,
     },
@@ -2289,13 +2272,6 @@ async function runApp(
       stopNetbirdExpose(netbirdProcess);
       stopNgrokProcess(ngrokProcess?.child);
       stopTunnelProcess(managedTunnel?.child);
-      if (managedTunnelExternalHostname) {
-        try {
-          tunnelAliasStore.removeManagedAlias(managedTunnelExternalHostname, process.pid);
-        } catch {
-          // Best-effort cleanup; non-fatal
-        }
-      }
       try {
         unregisterTailscale({
           tailscaleHttpsPort,
@@ -2405,9 +2381,14 @@ function parseTunnelHostname(value: string | undefined, source: string): string 
 }
 
 function tunnelFromEnv(): ManagedTunnelOptions | undefined {
-  if (process.env.PORTLESS_TUNNEL === undefined) return undefined;
+  if (process.env.PORTLESS_TUNNEL === undefined && !isEnabledEnv(process.env.PORTLESS_CLOUDFLARE))
+    return undefined;
   return {
-    provider: parseTunnelProvider(process.env.PORTLESS_TUNNEL, "PORTLESS_TUNNEL"),
+    provider: parseTunnelProvider(
+      process.env.PORTLESS_TUNNEL ??
+        (isEnabledEnv(process.env.PORTLESS_CLOUDFLARE) ? "cloudflare" : undefined),
+      "PORTLESS_TUNNEL"
+    ),
     ...(process.env.PORTLESS_TUNNEL_HOSTNAME !== undefined
       ? {
           hostname: parseTunnelHostname(
@@ -2607,6 +2588,7 @@ ${colors.bold("Options:")}
   --app-port <number>    Use a fixed app port; browser-blocked ports are rejected
   --h2c                  Forward this route to an HTTP/2 cleartext upstream
   --path <prefix>        Scope the route to a path prefix, e.g. /api
+  --cloudflare                 Alias of --tunnel cloudflare
   --tunnel <provider>    Share publicly via a managed tunnel: cloudflare or ngrok
   --tunnel-hostname <h>  Request a provider-specific stable tunnel hostname
   --tailscale            Share the app on your Tailscale network (tailnet)
@@ -2664,6 +2646,8 @@ ${colors.bold("Examples:")}
     } else if (args[i] === "--path") {
       i++;
       pathPrefix = parsePathPrefix(args[i], "--path");
+    } else if (args[i] === "--cloudflare") {
+      tunnel = { provider: "cloudflare" };
     } else if (args[i] === "--tunnel") {
       i++;
       tunnel = { ...(tunnel ?? {}), provider: parseTunnelProvider(args[i], "--tunnel") };
@@ -2671,7 +2655,12 @@ ${colors.bold("Examples:")}
       i++;
       tunnel = {
         provider:
-          tunnel?.provider ?? parseTunnelProvider(process.env.PORTLESS_TUNNEL, "PORTLESS_TUNNEL"),
+          tunnel?.provider ??
+          parseTunnelProvider(
+            process.env.PORTLESS_TUNNEL ??
+              (isEnabledEnv(process.env.PORTLESS_CLOUDFLARE) ? "cloudflare" : undefined),
+            "PORTLESS_TUNNEL"
+          ),
         hostname: parseTunnelHostname(args[i], "--tunnel-hostname"),
       };
     } else if (args[i] === "--name") {
@@ -2695,7 +2684,7 @@ ${colors.bold("Examples:")}
         console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
         console.error(
           colors.blue(
-            "Known flags: --name, --force, --app-port, --h2c, --path, --tunnel, --tunnel-hostname, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups, --help"
+            "Known flags: --name, --force, --app-port, --h2c, --path, --cloudflare, --tunnel, --tunnel-hostname, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups, --help"
           )
         );
         process.exit(1);
@@ -2745,6 +2734,8 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
     } else if (args[i] === "--path") {
       i++;
       pathPrefix = parsePathPrefix(args[i], "--path");
+    } else if (args[i] === "--cloudflare") {
+      tunnel = { provider: "cloudflare" };
     } else if (args[i] === "--tunnel") {
       i++;
       tunnel = { ...(tunnel ?? {}), provider: parseTunnelProvider(args[i], "--tunnel") };
@@ -2752,7 +2743,12 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
       i++;
       tunnel = {
         provider:
-          tunnel?.provider ?? parseTunnelProvider(process.env.PORTLESS_TUNNEL, "PORTLESS_TUNNEL"),
+          tunnel?.provider ??
+          parseTunnelProvider(
+            process.env.PORTLESS_TUNNEL ??
+              (isEnabledEnv(process.env.PORTLESS_CLOUDFLARE) ? "cloudflare" : undefined),
+            "PORTLESS_TUNNEL"
+          ),
         hostname: parseTunnelHostname(args[i], "--tunnel-hostname"),
       };
     } else if (args[i] === "--wildcard") {
@@ -2768,7 +2764,7 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
         console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
         console.error(
           colors.blue(
-            "Known flags: --force, --app-port, --h2c, --path, --tunnel, --tunnel-hostname, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups"
+            "Known flags: --force, --app-port, --h2c, --path, --cloudflare, --tunnel, --tunnel-hostname, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups"
           )
         );
         process.exit(1);
@@ -2797,6 +2793,8 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
     } else if (args[i] === "--path") {
       i++;
       pathPrefix = parsePathPrefix(args[i], "--path");
+    } else if (args[i] === "--cloudflare") {
+      tunnel = { provider: "cloudflare" };
     } else if (args[i] === "--tunnel") {
       i++;
       tunnel = { ...(tunnel ?? {}), provider: parseTunnelProvider(args[i], "--tunnel") };
@@ -2804,7 +2802,12 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
       i++;
       tunnel = {
         provider:
-          tunnel?.provider ?? parseTunnelProvider(process.env.PORTLESS_TUNNEL, "PORTLESS_TUNNEL"),
+          tunnel?.provider ??
+          parseTunnelProvider(
+            process.env.PORTLESS_TUNNEL ??
+              (isEnabledEnv(process.env.PORTLESS_CLOUDFLARE) ? "cloudflare" : undefined),
+            "PORTLESS_TUNNEL"
+          ),
         hostname: parseTunnelHostname(args[i], "--tunnel-hostname"),
       };
     } else if (args[i] === "--wildcard") {
@@ -2820,7 +2823,7 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
         console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
         console.error(
           colors.blue(
-            "Known flags: --force, --app-port, --h2c, --path, --tunnel, --tunnel-hostname, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups"
+            "Known flags: --force, --app-port, --h2c, --path, --cloudflare, --tunnel, --tunnel-hostname, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups"
           )
         );
         process.exit(1);
@@ -2904,6 +2907,7 @@ const GLOBAL_COMPLETION_FLAGS: CompletionFlag[] = [
   { name: "--multiplex", description: "Share the hostname with other apps (app picker)" },
   { name: "--label", description: "Label for this multiplexed app", value: "label" },
   { name: "--path", description: "Scope route to a path prefix", value: "prefix" },
+  { name: "--cloudflare", description: "Alias of --tunnel cloudflare" },
   { name: "--tunnel", description: "Share publicly via tunnel provider", value: "provider" },
   { name: "--tunnel-hostname", description: "Request stable tunnel hostname", value: "hostname" },
   { name: "--tailscale", description: "Share on Tailscale" },
@@ -2932,6 +2936,7 @@ const RUN_COMPLETION_FLAGS = GLOBAL_COMPLETION_FLAGS.filter((flag) =>
     "--multiplex",
     "--label",
     "--path",
+    "--cloudflare",
     "--tunnel",
     "--tunnel-hostname",
     "--tailscale",
@@ -2954,6 +2959,7 @@ const APP_COMPLETION_FLAGS = GLOBAL_COMPLETION_FLAGS.filter((flag) =>
     "--multiplex",
     "--label",
     "--path",
+    "--cloudflare",
     "--tunnel",
     "--tunnel-hostname",
     "--tailscale",
@@ -3481,7 +3487,8 @@ ${colors.bold("Tailscale sharing:")}
 
 ${colors.bold("Public tunnel sharing:")}
   Use --tunnel cloudflare or --tunnel ngrok to expose your dev server to
-  the public internet through the portless proxy with an exact tunnel alias.
+  the public internet directly at the app, with the route hostname as Host.
+  A path-prefixed route still exposes the whole app. --cloudflare aliases --tunnel cloudflare.
   Use portless tunnel map when you already have an external tunnel hostname.
   Requires cloudflared or ngrok to be installed.
   ${colors.cyan("portless myapp --tunnel cloudflare next dev")}
@@ -3543,6 +3550,7 @@ ${colors.bold("Options:")}
   --multiplex                   Share this hostname with other apps (shows an app picker)
   --label <label>               Label for this multiplexed app (default: directory name)
   --path <prefix>               Scope this route to a path prefix, e.g. /api
+  --cloudflare                 Alias of --tunnel cloudflare
   --tunnel <provider>           Share publicly via a managed tunnel: cloudflare or ngrok
   --tunnel-hostname <hostname>  Request a provider-specific stable tunnel hostname
   --tailscale                   Share the app on your Tailscale network (tailnet)
@@ -3571,6 +3579,7 @@ ${colors.bold("Environment variables:")}
   PORTLESS_LABEL=<label>        Label for this multiplexed app (same as --label)
   PORTLESS_DASHBOARD=0          Disable the dashboard at portless.<suffix>
   PORTLESS_PATH=<prefix>        Scope app routes to a path prefix
+  PORTLESS_CLOUDFLARE=1         Alias of PORTLESS_TUNNEL=cloudflare
   PORTLESS_TUNNEL=<provider>    Share publicly via a managed tunnel provider
   PORTLESS_TUNNEL_HOSTNAME=<h>  Request a provider-specific stable tunnel hostname
   PORTLESS_HTTPS=0              Disable HTTPS (same as --no-tls)
@@ -3604,6 +3613,7 @@ ${colors.bold("Child process environment:")}
   PORT                          Ephemeral port the child should listen on
   HOST                          Usually 127.0.0.1 (omitted for Expo in LAN mode)
   PORTLESS_URL                  Public URL of the app (e.g. https://myapp.localhost)
+  PORTLESS_CLOUDFLARE_URL       Public URL from a managed Cloudflare tunnel
   PORTLESS_TUNNEL_URL           Public URL from a managed tunnel provider
   PORTLESS_LAN                  Set to 1 when proxy is in LAN mode
   PORTLESS_TAILSCALE_URL        Tailscale URL of the app (when --tailscale is active)
@@ -6137,6 +6147,7 @@ async function main() {
   } else if (typeof pathResult === "string") {
     process.env.PORTLESS_PATH = parsePathPrefix(pathResult, "--path");
   }
+  if (stripGlobalFlag("--cloudflare", false)) process.env.PORTLESS_TUNNEL = "cloudflare";
   const tunnelResult = stripGlobalFlag("--tunnel", true);
   if (tunnelResult === false) {
     console.error(colors.red("Error: --tunnel requires a tunnel provider."));

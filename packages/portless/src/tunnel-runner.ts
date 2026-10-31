@@ -1,5 +1,10 @@
 import { spawn, spawnSync } from "node:child_process";
-import { isWindows, resolveWindowsCommandInvocation, guardWindowsOrphans } from "./cli-utils.js";
+import {
+  isWindows,
+  resolveWindowsCommandInvocation,
+  guardWindowsOrphans,
+  getProcessCommand,
+} from "./cli-utils.js";
 
 const NGROK_BINARY = "ngrok";
 const NGROK_START_TIMEOUT_MS = 30_000;
@@ -27,7 +32,8 @@ interface TunnelCommandResult {
 export type TunnelCommandRunner = (args: string[]) => TunnelCommandResult;
 
 export interface StartNgrokOptions {
-  hostHeader?: string;
+  hostHeader?: string | false;
+  domain?: string;
   onExit?: (code: number | null, signal: NodeJS.Signals | null) => void;
   spawner?: TunnelSpawner;
   timeoutMs?: number;
@@ -52,7 +58,7 @@ export interface TunnelProvider {
 function defaultSpawner(binary: string, args: string[]): TunnelChildProcess {
   const spawnedAt = Date.now();
   const invocation = isWindows
-    ? resolveWindowsCommandInvocation(binary, args, process.env.PATH ?? "")
+    ? resolveWindowsCommandInvocation(binary, args, process.env.PATH ?? process.env.Path ?? "")
     : null;
   const child = spawn(invocation?.command ?? binary, invocation?.args ?? args, {
     ...(invocation?.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
@@ -64,7 +70,11 @@ function defaultSpawner(binary: string, args: string[]): TunnelChildProcess {
 }
 
 function defaultRunner(binary: string, args: string[]): TunnelCommandResult {
-  const result = spawnSync(binary, args, {
+  const invocation = isWindows
+    ? resolveWindowsCommandInvocation(binary, args, process.env.PATH ?? process.env.Path ?? "")
+    : null;
+  const result = spawnSync(invocation?.command ?? binary, invocation?.args ?? args, {
+    ...(invocation?.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
     encoding: "utf-8",
     killSignal: "SIGKILL",
     timeout: NGROK_COMMAND_TIMEOUT_MS,
@@ -158,20 +168,25 @@ export function extractNgrokUrl(output: string): string | null {
   return null;
 }
 
-export function buildNgrokArgs(localPort: number, hostHeader = "rewrite"): string[] {
+export function buildNgrokArgs(
+  localPort: number,
+  hostHeader: string | false = "rewrite",
+  domain?: string
+): string[] {
   return [
     "http",
     "--log=stdout",
     "--log-format=logfmt",
-    `--host-header=${hostHeader}`,
+    ...(hostHeader === false ? [] : [`--host-header=${hostHeader}`]),
+    ...(domain ? [`--domain=${domain}`] : []),
     `http://127.0.0.1:${localPort}`,
   ];
 }
 
-const ngrok: TunnelProvider = {
+export const ngrok: TunnelProvider = {
   binary: NGROK_BINARY,
   versionArgs: ["version"],
-  buildArgs: (localPort, options) => buildNgrokArgs(localPort, options.hostHeader),
+  buildArgs: (localPort, options) => buildNgrokArgs(localPort, options.hostHeader, options.domain),
   extractUrl: extractNgrokUrl,
   formatOutputError,
   notFound:
@@ -269,7 +284,24 @@ export function stopNgrokProcess(child: TunnelChildProcess | undefined): void {
 }
 
 export function stopTunnelPid(pid: number | undefined): void {
-  if (!pid) return;
+  if (!pid || !Number.isInteger(pid) || pid <= 1) return;
+  let binary = getProcessCommand(pid);
+  if (isWindows) {
+    const result = spawnSync("tasklist.exe", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], {
+      encoding: "utf-8",
+      timeout: NGROK_COMMAND_TIMEOUT_MS,
+      windowsHide: true,
+    });
+    binary =
+      result.status === 0
+        ? (result.stdout
+            ?.trimStart()
+            .match(/^"([^"\r\n]+)",/)?.[1]
+            ?.toLowerCase()
+            .replace(/\.exe$/, "") ?? null)
+        : null;
+  }
+  if (binary !== "ngrok" && binary !== "cloudflared") return;
   try {
     process.kill(pid, "SIGTERM");
   } catch {

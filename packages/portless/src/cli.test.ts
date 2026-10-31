@@ -5,7 +5,7 @@ import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildRestartStartArgs, parseBgStartArgs, stopEntry } from "./bg.js";
+import { buildRestartStartArgs, parseBgStartArgs, stopEntry, runArgsFromIntent } from "./bg.js";
 import { getBgLogPaths } from "./bg-logs.js";
 import { BgStore, type BgProcessEntry, type BgStartIntent } from "./bg-store.js";
 import { ensureCerts } from "./certs.js";
@@ -125,6 +125,7 @@ function prependPath(dir: string): string {
 }
 
 interface TestBgEntry {
+  intent?: BgStartIntent;
   id: string;
   label: string;
   cwd?: string;
@@ -292,8 +293,10 @@ function writeCloudflaredShim(dir: string, url = "https://abc.trycloudflare.com"
   fs.writeFileSync(
     scriptPath,
     [
-      "if (process.argv.includes('version')) { console.log('cloudflared version test'); process.exit(0); }",
+      "if (process.argv.includes('version') || process.argv.includes('--version')) { console.log('cloudflared version test'); process.exit(0); }",
+      "if (process.env.PORTLESS_TEST_TUNNEL_ARGS) require('node:fs').writeFileSync(process.env.PORTLESS_TEST_TUNNEL_ARGS, JSON.stringify(process.argv.slice(2)));",
       `console.log(${JSON.stringify(url)});`,
+      "console.log('Registered tunnel connection');",
       "setInterval(() => {}, 1000);",
       "process.on('SIGTERM', () => process.exit(0));",
     ].join("\n") + "\n"
@@ -1151,7 +1154,7 @@ describe("CLI", () => {
         });
       });
 
-      it("passes managed tunnel flags through and records PORTLESS_TUNNEL_URL in child logs", async () => {
+      it("saves the Cloudflare alias as a managed tunnel intent and records its public URL", async () => {
         const appPort = await getFreePort();
         writeCloudflaredShim(tmpDir, "https://bg-test.trycloudflare.com");
         const { status } = run(
@@ -1160,8 +1163,7 @@ describe("CLI", () => {
             "start",
             "--name",
             "tunnel",
-            "--tunnel",
-            "cloudflare",
+            "--cloudflare",
             "--app-port",
             String(appPort),
             process.execPath,
@@ -1176,6 +1178,10 @@ describe("CLI", () => {
 
         expect(status).toBe(0);
         expect(entry.url).toContain("tunnel.localhost");
+        expect(entry.intent?.tunnel).toEqual({ provider: "cloudflare" });
+        expect(runArgsFromIntent(entry.intent!, false)).toEqual(
+          expect.arrayContaining(["--tunnel", "cloudflare"])
+        );
         await expect(
           waitForFileIncludes(logs.stdout, "https://bg-test.trycloudflare.com")
         ).resolves.toBe(true);
@@ -1936,7 +1942,7 @@ describe("CLI", () => {
         expect(isPidAlive(live.pid)).toBe(true);
       });
 
-      it("managed tunnel aliases are removed for stopped bg entries", async () => {
+      it("managed tunnels need no persisted aliases and clear route metadata on bg stop", async () => {
         const appPort = await getFreePort();
         writeCloudflaredShim(tmpDir, "https://stop-bg.trycloudflare.com");
         expect(
@@ -1955,14 +1961,12 @@ describe("CLI", () => {
             { env: bgEnv({ PATH: prependPath(tmpDir) }) }
           ).status
         ).toBe(0);
-        expect(fs.existsSync(path.join(tmpDir, "tunnel-aliases.json"))).toBe(true);
+        expect(fs.existsSync(path.join(tmpDir, "tunnel-aliases.json"))).toBe(false);
 
         expect(run(["bg", "stop", "tunnel-stop", "--force"], { env: bgEnv() }).status).toBe(0);
 
-        const aliases = JSON.parse(
-          fs.readFileSync(path.join(tmpDir, "tunnel-aliases.json"), "utf-8")
-        ) as unknown[];
-        expect(aliases).toEqual([]);
+        expect(fs.existsSync(path.join(tmpDir, "tunnel-aliases.json"))).toBe(false);
+        expect(new RouteStore(tmpDir).loadRoutes()).toEqual([]);
       });
     });
   });
@@ -4661,6 +4665,82 @@ describe("CLI", () => {
       expect(stderr).toContain("cloudflared CLI not found");
     });
 
+    it.each([
+      ["--cloudflare", "myapp", "echo", "hello"],
+      ["run", "--cloudflare", "echo", "hello"],
+      ["myapp", "--cloudflare", "echo", "hello"],
+    ])("accepts the Cloudflare alias: %j", (...args) => {
+      const result = run(args, { env: { PATH: "/tmp/portless-no-cloudflared-path" } });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("cloudflared CLI not found");
+    });
+    it("accepts PORTLESS_CLOUDFLARE=1", () => {
+      expect(
+        run(["myapp", "echo", "hello"], {
+          env: { PORTLESS_CLOUDFLARE: "1", PATH: "/tmp/portless-no-cloudflared-path" },
+        }).stderr
+      ).toContain("cloudflared CLI not found");
+    });
+    it("targets the HTTP app directly in default TLS mode without an HTTPS redirect loop", async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-tls-tunnel-"));
+      const proxyPort = await getFreePort();
+      const appPort = await getFreePort();
+      const argsPath = path.join(tmpDir, "tunnel-args.json");
+      const resultPath = path.join(tmpDir, "origin-response.json");
+      const env = {
+        PORTLESS_STATE_DIR: tmpDir,
+        PORTLESS_PORT: String(proxyPort),
+        PORTLESS_TEST_TUNNEL_ARGS: argsPath,
+        PATH: prependPath(tmpDir),
+      };
+      try {
+        writeCloudflaredShim(tmpDir);
+        const start = run(["proxy", "start", "--skip-trust"], { env });
+        expect(start.status, start.stdout + start.stderr).toBe(0);
+        expect(fs.existsSync(path.join(tmpDir, "proxy.tls"))).toBe(true);
+        const script = path.join(tmpDir, "origin.cjs");
+        fs.writeFileSync(
+          script,
+          `
+const http = require("node:http");
+const fs = require("node:fs");
+const args = JSON.parse(fs.readFileSync(${JSON.stringify(argsPath)}, "utf8"));
+const url = args[args.indexOf("--url") + 1];
+const host = args[args.indexOf("--http-host-header") + 1];
+const server = http.createServer((req, res) => { res.end("app:" + req.headers.host); });
+server.listen(Number(process.env.PORT), "127.0.0.1", () => {
+  http.get(url, { headers: { Host: host, "X-Forwarded-Proto": "https" } }, res => {
+    let body = "";
+    res.on("data", chunk => body += chunk);
+    res.on("end", () => { fs.writeFileSync(${JSON.stringify(resultPath)}, JSON.stringify({ status: res.statusCode, location: res.headers.location, body })); server.close(); });
+  }).on("error", () => process.exit(1));
+});
+`
+        );
+        const result = run(
+          [
+            "myapp",
+            "--tunnel",
+            "cloudflare",
+            "--app-port",
+            String(appPort),
+            process.execPath,
+            script,
+          ],
+          { env }
+        );
+        expect(result.status, result.stdout + result.stderr).toBe(0);
+        expect(JSON.parse(fs.readFileSync(resultPath, "utf8"))).toMatchObject({
+          status: 200,
+          body: "app:myapp.localhost",
+        });
+        expect(fs.existsSync(path.join(tmpDir, "tunnel-aliases.json"))).toBe(false);
+      } finally {
+        run(["proxy", "stop"], { env });
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
     it("sets PORTLESS_TUNNEL_URL for managed tunnel child commands", async () => {
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-cli-managed-tunnel-"));
       const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-cloudflared-bin-"));
@@ -4689,6 +4769,7 @@ describe("CLI", () => {
             `fs.writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify({`,
             "  PORTLESS_URL: process.env.PORTLESS_URL,",
             "  PORTLESS_TUNNEL_URL: process.env.PORTLESS_TUNNEL_URL,",
+            "  PORTLESS_CLOUDFLARE_URL: process.env.PORTLESS_CLOUDFLARE_URL,",
             "  __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: process.env.__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS,",
             "}));",
           ].join("\n") + "\n"
@@ -4711,6 +4792,7 @@ describe("CLI", () => {
           {
             env: {
               PATH: prependPath(binDir),
+              PORTLESS_TEST_TUNNEL_ARGS: path.join(tmpDir, "tunnel-args.json"),
               PORTLESS_STATE_DIR: tmpDir,
               PORTLESS_HTTPS: "0",
             },
@@ -4719,11 +4801,21 @@ describe("CLI", () => {
 
         expect({ status, stdout, stderr }).toMatchObject({ status: 0 });
         expect(stdout).toContain("Cloudflare Tunnel -> https://abc.trycloudflare.com/api");
+        expect(stdout).toContain("tunnel exposes the whole app");
+        expect(JSON.parse(fs.readFileSync(path.join(tmpDir, "tunnel-args.json"), "utf-8"))).toEqual(
+          expect.arrayContaining([
+            "http://127.0.0.1:4567",
+            "--http-host-header",
+            expect.stringContaining("myapp.localhost"),
+          ])
+        );
+        expect(fs.existsSync(path.join(tmpDir, "tunnel-aliases.json"))).toBe(false);
         expect(JSON.parse(fs.readFileSync(capturePath, "utf-8"))).toMatchObject({
           PORTLESS_URL: expect.stringMatching(
             new RegExp(`^http://(?:[^.]+\\.)?myapp\\.localhost:${proxyPort}/api$`)
           ),
           PORTLESS_TUNNEL_URL: "https://abc.trycloudflare.com",
+          PORTLESS_CLOUDFLARE_URL: "https://abc.trycloudflare.com",
           __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: expect.stringContaining("abc.trycloudflare.com"),
         });
       } finally {

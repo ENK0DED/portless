@@ -3,6 +3,14 @@ import { parseBgStartArgs, runArgsFromIntent } from "./bg.js";
 import type { BgStartIntent } from "./bg-store.js";
 
 describe("bg start parser", () => {
+  it("forwards the Cloudflare alias as a run flag", () => {
+    expect(parseBgStartArgs(["--cloudflare", "--", "bun", "dev"]).runArgs).toEqual([
+      "--cloudflare",
+      "--",
+      "bun",
+      "dev",
+    ]);
+  });
   it("parses bg start with every current run flag", () => {
     const parsed = parseBgStartArgs([
       "--name",

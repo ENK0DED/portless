@@ -398,14 +398,16 @@ Set `PORTLESS_NGROK=1` to enable ngrok by default when portless runs an app. `po
 
 ### Public tunnel aliases
 
-Use managed tunnels when public internet traffic should enter through the portless proxy:
+Use managed tunnels to send public internet traffic directly to the selected app:
 
 ```bash
 portless myapp --tunnel cloudflare next dev
 portless myapp --tunnel ngrok next dev
 ```
 
-Managed tunnels are public. Portless keeps child apps bound to `127.0.0.1`, starts the tunnel to the local proxy, and registers an exact tunnel alias for the generated public hostname. Unknown public `Host` headers remain rejected. Do not create wildcard tunnel aliases.
+Managed tunnels are public. Portless keeps the child app bound to `127.0.0.1` and targets its app port directly, rewriting Host to the route hostname. Public requests bypass the portless proxy. A path-prefixed route still exposes the whole app, including paths outside the prefix; portless prints a notice when starting it. Manual aliases remain exact proxy routes; unknown public Host headers are rejected.
+
+`--cloudflare` and `PORTLESS_CLOUDFLARE=1` are aliases of `--tunnel cloudflare`. Cloudflare children receive both `PORTLESS_TUNNEL_URL` and `PORTLESS_CLOUDFLARE_URL`. Cloudflare startup waits for a registered connection and uses an empty config in the portless state directory.
 
 Use manual aliases when another tunnel tool already owns the external hostname:
 
@@ -416,7 +418,7 @@ portless tunnel list
 portless tunnel unmap abc.trycloudflare.com
 ```
 
-`--tunnel cloudflare` uses Cloudflare Quick Tunnels through `cloudflared`. `--tunnel ngrok` requires the `ngrok` CLI and authentication. Child commands receive `PORTLESS_TUNNEL_URL` when managed tunnel startup succeeds.
+`--tunnel cloudflare` uses Cloudflare Quick Tunnels through `cloudflared`. `--tunnel ngrok` requires the `ngrok` CLI and authentication. Child commands receive `PORTLESS_TUNNEL_URL` when managed tunnel startup succeeds. Cloudflare also sets `PORTLESS_CLOUDFLARE_URL`.
 
 ### NetBird sharing
 
@@ -521,7 +523,7 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 | `portless <name> --h2c <cmd>`                    | Forward this route to an HTTP/2 cleartext upstream             |
 | `portless <name> --path /api <cmd>`              | Scope this route to a path prefix                              |
 | `portless <name> --tunnel cloudflare <cmd>`      | Share publicly via a managed Cloudflare Quick Tunnel           |
-| `portless <name> --tunnel ngrok <cmd>`           | Share publicly via a managed ngrok tunnel through portless     |
+| `portless <name> --tunnel ngrok <cmd>`           | Share publicly via a managed ngrok tunnel directly to the app  |
 | `portless <name> --tailscale <cmd>`              | Share the app on your Tailscale network (tailnet)              |
 | `portless <name> --tailscale-service <cmd>`      | Share the app as a stable Tailscale Service                    |
 | `portless <name> --funnel <cmd>`                 | Share the app publicly via Tailscale Funnel                    |

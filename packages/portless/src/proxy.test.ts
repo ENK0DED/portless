@@ -264,6 +264,58 @@ describe("createProxyServer", () => {
       expect(res.body).toBe("via alias");
     });
 
+    it("honors multiplex cookies through a manual alias and chooses a stable default", async () => {
+      const a = trackServer(http.createServer((_req, res) => res.end("alpha")));
+      const b = trackServer(http.createServer((_req, res) => res.end("beta")));
+      await listen(a);
+      await listen(b);
+      const aAddr = a.address();
+      const bAddr = b.address();
+      if (!aAddr || typeof aAddr === "string" || !bAddr || typeof bAddr === "string")
+        throw new Error("no addr");
+      const routes: RouteInfo[] = [
+        { hostname: "shared.localhost", port: bAddr.port, label: "beta", pid: 2 },
+        { hostname: "shared.localhost", port: aAddr.port, label: "alpha", pid: 1 },
+      ];
+      const aliases: TunnelAlias[] = [
+        { externalHostname: "public.example.com", targetHostname: "shared.localhost" },
+      ];
+      const server = trackServer(
+        createProxyServer({
+          getRoutes: () => routes,
+          getTunnelAliases: () => aliases,
+          proxyPort: TEST_PROXY_PORT,
+        })
+      );
+      await listen(server);
+      expect((await request(server, { host: "public.example.com" })).body).toBe("alpha");
+      expect(
+        (
+          await request(server, {
+            host: "public.example.com",
+            headers: { cookie: "portless_app=beta" },
+          })
+        ).body
+      ).toBe("beta");
+      expect(
+        (
+          await request(server, {
+            host: "public.example.com",
+            headers: { cookie: "portless_app=stale" },
+          })
+        ).body
+      ).toBe("alpha");
+      aliases[0].routeOwnerPid = 2;
+      expect(
+        (
+          await request(server, {
+            host: "public.example.com",
+            headers: { cookie: "portless_app=alpha" },
+          })
+        ).body
+      ).toBe("beta");
+    });
+
     it("uses the tunnel alias provider as the only alias source for repeated requests", async () => {
       const backend = trackServer(http.createServer((_req, res) => res.end("via provider")));
       await listen(backend);

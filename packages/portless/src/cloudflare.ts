@@ -18,7 +18,7 @@ export function extractCloudflareUrl(output: string) {
   return url && /Registered tunnel connection|Connection \S+ registered/.test(output) ? url : null;
 }
 
-const cloudflare = (host = "", config = ""): TunnelProvider => ({
+export const cloudflare = (host = "", config = ""): TunnelProvider => ({
   binary: "cloudflared",
   versionArgs: ["--version"],
   buildArgs: (port) => buildCloudflareArgs(port, host, config),
@@ -42,6 +42,6 @@ export async function startCloudflare(
   port: number,
   options: StartNgrokOptions & { configPath: string }
 ) {
-  writeFileSync(options.configPath, "{}");
-  return startTunnel(cloudflare(options.hostHeader, options.configPath), port, options);
+  writeFileSync(options.configPath, "{}", { mode: 0o600 });
+  return startTunnel(cloudflare(options.hostHeader || "", options.configPath), port, options);
 }

@@ -510,7 +510,7 @@ Requires the ngrok CLI to be installed and authenticated. If ngrok reports an au
 
 ## Public tunnel aliases
 
-Use managed tunnels when a public HTTPS URL should route through the portless proxy instead of directly to a child app:
+Use managed tunnels to expose a public HTTPS URL directly to a child app:
 
 ```bash
 portless myapp --tunnel cloudflare next dev
@@ -521,7 +521,9 @@ portless myapp --tunnel ngrok next dev
 # -> https://abc123.ngrok.app
 ```
 
-Managed tunnel requests are public internet traffic. Portless keeps the child app bound to `127.0.0.1`, starts the tunnel to the local proxy, and registers an exact tunnel alias for the generated public hostname. Unknown public `Host` headers are rejected; portless does not route arbitrary tunnel hostnames to the only running app.
+Managed tunnels are public. Portless keeps the child app bound to `127.0.0.1` and targets its app port directly, rewriting Host to the route hostname. Public requests bypass the portless proxy. A path-prefixed route still exposes the whole app, including paths outside the prefix; portless prints a notice when starting it. Manual aliases remain exact proxy routes; unknown public Host headers are rejected.
+
+`--cloudflare` and `PORTLESS_CLOUDFLARE=1` are aliases of `--tunnel cloudflare`. Cloudflare children receive both `PORTLESS_TUNNEL_URL` and `PORTLESS_CLOUDFLARE_URL`. Cloudflare startup waits for a registered connection and uses an empty config in the portless state directory.
 
 Use manual tunnel aliases when another tool already provides the public hostname:
 
