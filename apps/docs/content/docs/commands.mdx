@@ -349,6 +349,8 @@ portless trust
 
 Adds the portless certificate authority to your system trust store. Required once for HTTPS with auto-generated certs. Use `portless proxy start --skip-trust` to generate or reuse certs without adding the CA to the trust store.
 
+On Linux it also trusts the CA in your Chrome/Chromium NSS database when one exists (needs NSS `certutil`), and it does nothing when every store it writes already has the CA, so scripts can run it every time. See [HTTPS](/https).
+
 ## Clean up
 
 ```bash

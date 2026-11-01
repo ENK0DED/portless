@@ -301,6 +301,12 @@ portless trust                                      # Add CA to trust store late
 
 On Linux, `portless trust` supports Debian/Ubuntu, Arch, Fedora/RHEL/CentOS, and openSUSE (via `update-ca-certificates` or `update-ca-trust`). NixOS and unrecognized Linux distributions receive manual setup guidance instead of being written to an unsupported trust layout. On Windows, it uses `certutil` to add the CA to the system trust store. In WSL, portless also installs the CA into the Windows CurrentUser Root store so Windows browsers trust WSL-served portless HTTPS URLs. Linux containers on a WSL2 host use only the Linux trust store.
 
+On Linux, portless also trusts the CA in the invoking user's existing Chrome/Chromium NSS database (also under `sudo`): `~/.pki/nssdb` if present, otherwise `~/.local/share/pki/nssdb` (Chromium M146+). This needs NSS `certutil`: install `libnss3-tools` on Debian/Ubuntu, `nss-tools` on Fedora/RHEL, `nss` on Arch, or `mozilla-nss-tools` on openSUSE, then run `portless trust` and restart the browser. No NSS database is created; if neither path exists, open Chrome once and rerun `portless trust`. In WSL the NSS database is updated as well, whichever of the Linux and Windows stores succeeded. `portless clean` removes the CA from the active NSS database too.
+
+If NSS registration fails (including when `certutil` is missing), the system trust that succeeded is kept and `portless trust` exits successfully with a browser-trust warning. Chrome may still reject the certificate until you install the NSS tools and rerun `portless trust`. `portless doctor` reports incomplete trust until the NSS entry verifies. If NSS removal fails during `portless clean`, the CA certificate and key are kept for a retry.
+
+`portless trust` does nothing when every store it writes already has the CA (both the Linux and Windows stores on WSL, plus the NSS database on Linux when one exists), so setup scripts can run it every time without a prompt. It checks the stores themselves rather than the trust marker, so it still repairs a CA that was removed.
+
 To trust the CA on another device (a phone over LAN mode, a second machine, or a browser with its own store), open `https://cert.localhost` (`cert.<suffix>`) in that browser. It serves the **public** CA only (`/portless-ca.pem`, with its SHA-256 fingerprint) plus per-OS install steps; the private key is never exposed. On the host machine, `portless trust` already does this.
 
 ### Dashboard
