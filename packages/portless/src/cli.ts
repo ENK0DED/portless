@@ -84,6 +84,7 @@ import {
   BLOCKED_PORTS,
   DEFAULT_TLD,
   FALLBACK_PROXY_PORT,
+  getProxyStatus,
   INTERNAL_LAN_IP_ENV,
   INTERNAL_LAN_IP_FLAG,
   PRIVILEGED_PORT_THRESHOLD,
@@ -3311,9 +3312,11 @@ _portless_completions() {
       ;;
     proxy)
       if [[ $COMP_CWORD -eq 2 ]]; then
-        COMPREPLY=( $(compgen -W "start stop --help -h" -- "$cur") )
+        COMPREPLY=( $(compgen -W "start stop status --help -h" -- "$cur") )
       elif [[ "$subcmd" == "start" ]]; then
         COMPREPLY=( $(compgen -W "${completionFlagWords(PROXY_START_COMPLETION_FLAGS)}" -- "$cur") )
+      elif [[ "$subcmd" == "status" ]]; then
+        COMPREPLY=( $(compgen -W "--json --help -h" -- "$cur") )
       else
         COMPREPLY=( $(compgen -W "--help -h" -- "$cur") )
       fi
@@ -3402,7 +3405,9 @@ _portless() {
           ;;
         proxy)
           if (( CURRENT == 3 )); then
-            _values 'proxy command' start stop
+            _values 'proxy command' start stop status
+          elif [[ $words[3] == status ]]; then
+            _arguments '--json[Print JSON]' '--help[Show help]' '-h[Show help]'
           else
             _arguments ${PROXY_START_COMPLETION_FLAGS.map(zshFlag).join(" ")}
           fi
@@ -3467,8 +3472,9 @@ complete -c portless -n "__fish_seen_subcommand_from doctor" -l help -s h -d "Sh
 complete -c portless -n "__fish_seen_subcommand_from clean" -l help -s h -d "Show help"
 complete -c portless -n "__fish_seen_subcommand_from prune" -l force -d "Send SIGKILL"
 complete -c portless -n "__fish_seen_subcommand_from prune" -l help -s h -d "Show help"
-complete -c portless -n "__fish_seen_subcommand_from proxy; and __fish_is_nth_token 2" -a "start stop"
+complete -c portless -n "__fish_seen_subcommand_from proxy; and __fish_is_nth_token 2" -a "start stop status"
 ${fishFlagLines(PROXY_START_COMPLETION_FLAGS, "__fish_seen_subcommand_from proxy")}
+complete -c portless -n "__fish_seen_subcommand_from proxy; and __fish_seen_subcommand_from status" -l json -d "Print JSON"
 complete -c portless -n "__fish_seen_subcommand_from bg; and __fish_is_nth_token 2" -a "start stop restart status list logs clean"
 ${fishFlagLines(BG_START_COMPLETION_FLAGS, "__fish_seen_subcommand_from bg")}
 complete -c portless -n "__fish_seen_subcommand_from bg" -l tail -d "Number of log lines" -r
@@ -3530,6 +3536,7 @@ ${colors.bold("Usage:")}
   ${colors.cyan("portless <name> <cmd>")}            Run with an explicit app name
   ${colors.cyan("portless proxy start")}             Start the proxy (HTTPS on port 443, daemon); rarely needed since it auto-starts on first run
   ${colors.cyan("portless proxy stop")}              Stop the proxy
+  ${colors.cyan("portless proxy status [--json]")}   Show whether the proxy is running and its settings
   ${colors.cyan("portless service install")}         Start proxy automatically when the OS starts
   ${colors.cyan("portless bg start")}                Start an app in the background
   ${colors.cyan("portless bg status [name]")}        Show background app status
@@ -4826,7 +4833,77 @@ function resolveRoutesCleanupIntervalSeconds(args: string[]): number {
   return seconds;
 }
 
+/** `portless proxy status [--json]`: report the proxy without starting, stopping, or elevating anything. */
+async function handleProxyStatus(args: string[]): Promise<void> {
+  const rest = args.slice(2);
+  if (hasHelpFlag(rest)) {
+    console.log(`
+${colors.bold("portless proxy status")} - Show whether the proxy is running and how it is configured.
+
+Read-only: it never starts, stops, or elevates the proxy. This is not
+${colors.cyan("portless status")}, which is an alias of ${colors.cyan("portless list")} and shows routes.
+
+${colors.bold("Usage:")}
+  ${colors.cyan("portless proxy status")}           Human-readable summary
+  ${colors.cyan("portless proxy status --json")}    One line of JSON for scripts and launchers
+
+${colors.bold("JSON fields:")}
+  running        true when a portless proxy answers on its port
+  pid            Proxy process id, or null when unreadable
+  port           Proxy port
+  tls            true when the proxy serves HTTPS
+  tlds           Suffixes the proxy serves, e.g. ["localhost"]
+  lan            true in LAN mode
+  unprivileged   true when started with --unprivileged
+  stateDir       State directory (holds ca.pem when HTTPS is on)
+  wildcard       true when unregistered subdomains fall back to the parent (fork field)
+  lanIp          LAN IP recorded for LAN mode, or null (fork field)
+
+Every field is always present. While the proxy is not running, everything
+except running and stateDir is null. The command exits 0 either way; read
+running.
+
+${colors.bold("Options:")}
+  --json                 Print JSON instead of text
+  --help, -h             Show this help
+`);
+    process.exit(0);
+  }
+
+  const unknown = rest.find((arg) => arg !== "--json");
+  if (unknown !== undefined) {
+    console.error(colors.red(`Error: Unknown argument "${unknown}".`));
+    console.error(colors.cyan("  portless proxy status --help"));
+    process.exit(1);
+  }
+
+  const status = await getProxyStatus();
+  if (rest.includes("--json")) {
+    console.log(JSON.stringify(status));
+    return;
+  }
+
+  console.log(colors.bold("portless proxy"));
+  console.log(`  Running: ${status.running ? "yes" : "no"}`);
+  if (status.running) {
+    if (status.pid !== null) console.log(`  PID: ${status.pid}`);
+    console.log(`  Port: ${status.port}`);
+    console.log(`  HTTPS: ${status.tls ? "yes" : "no"}`);
+    console.log(`  Suffixes: ${formatTldList(status.tlds ?? [])}`);
+    console.log(`  LAN mode: ${status.lan ? "yes" : "no"}`);
+    if (status.lanIp !== null) console.log(`  LAN IP: ${status.lanIp}`);
+    console.log(`  Unprivileged: ${status.unprivileged ? "yes" : "no"}`);
+    console.log(`  Wildcard: ${status.wildcard ? "yes" : "no"}`);
+  }
+  console.log(`  State directory: ${status.stateDir}`);
+}
+
 async function handleProxy(args: string[]): Promise<void> {
+  if (args[1] === "status") {
+    await handleProxyStatus(args);
+    return;
+  }
+
   if (args[1] === "stop") {
     if (hasHelpFlag(args.slice(2))) {
       console.log(`
@@ -4904,6 +4981,8 @@ ${colors.bold("Usage:")}
   ${colors.cyan("portless proxy start --unprivileged")} Bind without sudo; HTTP by default, hosts sync off
   ${colors.cyan("portless proxy start --wildcard")}     Allow unregistered subdomains to fall back to parent (local only)
   ${colors.cyan("portless proxy start --routes-cleanup-interval 60")}  Sweep dead routes every 60s (default 300, 0 disables)
+  ${colors.cyan("portless proxy status")}               Show whether the proxy is running and its settings
+  ${colors.cyan("portless proxy status --json")}        The same as one line of JSON, for scripts
   ${colors.cyan("portless proxy stop")}                 Stop the proxy
   ${colors.cyan("portless proxy stop -p 1355")}         Stop the proxy on a specific port
 

@@ -31,6 +31,7 @@ import {
   getProtocolPort,
   getProcessStartTime,
   getProxyBindTargets,
+  getProxyStatus,
   getRiskyTldReason,
   hasLanMarker,
   hasConfiguredTldEnv,
@@ -48,6 +49,7 @@ import {
   readCustomCertMarker,
   readInternalPagesDisabledMarker,
   readPersistedProxyState,
+  readPidFromDir,
   readTldFromDir,
   readTldsFromDir,
   readWildcardMarker,
@@ -67,6 +69,7 @@ import {
   writeTldFile,
   writeTldsFile,
   writeTlsMarker,
+  writeUnprivilegedMarker,
   writeWildcardMarker,
   hasHelpFlag,
 } from "./cli-utils.js";
@@ -3047,5 +3050,160 @@ describe("caRegeneratedRestartHint", () => {
     expect(caRegeneratedRestartHint(1355, false)[1]).toBe(
       "Restart it: portless proxy stop -p 1355 && portless proxy start -p 1355"
     );
+  });
+});
+
+describe("getProxyStatus", () => {
+  let tmpDir: string;
+  let server: http.Server | undefined;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-status-test-"));
+    vi.stubEnv("PORTLESS_STATE_DIR", tmpDir);
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    if (server) await new Promise<void>((resolve) => server!.close(() => resolve()));
+    server = undefined;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  /** Listen like a portless proxy: answer every request with the X-Portless header. */
+  async function listenAsProxy(): Promise<number> {
+    server = http.createServer((_req, res) => {
+      res.setHeader("X-Portless", "1");
+      res.end();
+    });
+    await new Promise<void>((resolve) => server!.listen(0, "127.0.0.1", resolve));
+    return (server.address() as net.AddressInfo).port;
+  }
+
+  it("reports a stopped proxy with null settings and the state directory", async () => {
+    fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
+    writeTlsMarker(tmpDir, true);
+    writeWildcardMarker(tmpDir, true);
+
+    await expect(getProxyStatus()).resolves.toEqual({
+      running: false,
+      pid: null,
+      port: null,
+      tls: null,
+      tlds: null,
+      lan: null,
+      unprivileged: null,
+      stateDir: tmpDir,
+      wildcard: null,
+      lanIp: null,
+    });
+  });
+
+  it("does not take another service on the proxy port for a proxy", async () => {
+    const other = http.createServer((_req, res) => res.end());
+    await new Promise<void>((resolve) => other.listen(0, "127.0.0.1", resolve));
+    try {
+      fs.writeFileSync(
+        path.join(tmpDir, "proxy.port"),
+        String((other.address() as net.AddressInfo).port)
+      );
+      await expect(getProxyStatus()).resolves.toMatchObject({ running: false, port: null });
+    } finally {
+      await new Promise<void>((resolve) => other.close(() => resolve()));
+    }
+  });
+
+  it("reports the running proxy's pid, port, and settings", async () => {
+    const port = await listenAsProxy();
+    fs.writeFileSync(path.join(tmpDir, "proxy.port"), String(port));
+    fs.writeFileSync(path.join(tmpDir, "proxy.pid"), String(process.pid));
+    writeTlsMarker(tmpDir, true);
+    writeTldsFile(tmpDir, ["localhost", "test"]);
+    writeUnprivilegedMarker(tmpDir, true);
+    writeWildcardMarker(tmpDir, true);
+
+    await expect(getProxyStatus()).resolves.toEqual({
+      running: true,
+      pid: process.pid,
+      port,
+      tls: true,
+      tlds: ["localhost", "test"],
+      lan: false,
+      unprivileged: true,
+      stateDir: tmpDir,
+      wildcard: true,
+      lanIp: null,
+    });
+  });
+
+  it("reports LAN mode and the LAN IP from the LAN marker", async () => {
+    const port = await listenAsProxy();
+    fs.writeFileSync(path.join(tmpDir, "proxy.port"), String(port));
+    writeTldFile(tmpDir, "local");
+    writeLanMarker(tmpDir, "192.168.1.42");
+
+    await expect(getProxyStatus()).resolves.toMatchObject({
+      running: true,
+      lan: true,
+      lanIp: "192.168.1.42",
+      tlds: ["local"],
+      unprivileged: false,
+      wildcard: false,
+    });
+  });
+
+  it("reports LAN mode without an IP when the marker is empty", async () => {
+    const port = await listenAsProxy();
+    fs.writeFileSync(path.join(tmpDir, "proxy.port"), String(port));
+    fs.writeFileSync(path.join(tmpDir, "proxy.lan"), "");
+
+    await expect(getProxyStatus()).resolves.toMatchObject({
+      running: true,
+      lan: true,
+      lanIp: null,
+    });
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["unreadable", "not a pid"],
+    ["stale", "999999"],
+  ])("reports no pid when the pid file is %s", async (_name, content) => {
+    const port = await listenAsProxy();
+    fs.writeFileSync(path.join(tmpDir, "proxy.port"), String(port));
+    if (content !== undefined) fs.writeFileSync(path.join(tmpDir, "proxy.pid"), content);
+
+    await expect(getProxyStatus()).resolves.toMatchObject({ running: true, pid: null });
+  });
+
+  it("writes nothing to the state directory", async () => {
+    const port = await listenAsProxy();
+    fs.writeFileSync(path.join(tmpDir, "proxy.port"), String(port));
+    const before = fs.readdirSync(tmpDir).sort();
+
+    await getProxyStatus();
+
+    expect(fs.readdirSync(tmpDir).sort()).toEqual(before);
+  });
+});
+
+describe("readPidFromDir", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-pid-test-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("reads the pid file", () => {
+    fs.writeFileSync(path.join(tmpDir, "proxy.pid"), "1841\n");
+    expect(readPidFromDir(tmpDir)).toBe(1841);
+  });
+
+  it.each([undefined, "", "abc", "0", "-5"])("is null for %j", (content) => {
+    if (content !== undefined) fs.writeFileSync(path.join(tmpDir, "proxy.pid"), content);
+    expect(readPidFromDir(tmpDir)).toBeNull();
   });
 });

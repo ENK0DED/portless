@@ -152,6 +152,8 @@ describe("buildArgv", () => {
     ["version", {}, ["--version"]],
     ["list", { extraArgs: ["--x"], cwd: "/tmp", timeoutMs: 5 }, ["list", "--x"]],
     ["proxy_stop", { port: 1356 }, ["proxy", "stop", "-p", "1356"]],
+    ["proxy_status", {}, ["proxy", "status"]],
+    ["proxy_status", { json: true }, ["proxy", "status", "--json"]],
     ["prune", { force: true }, ["prune", "--force"]],
   ] as const)(
     "builds %s argv without cwd or timeoutMs and appends extraArgs last",
@@ -220,6 +222,16 @@ describe("profiles", () => {
     expect(core).not.toContain("tunnel_map");
     expect(await names(["core", "proxy"])).toContain("proxy_start");
     expect(await names(["all"])).toHaveLength(TOOLS.length);
+  });
+
+  it("offers the read-only proxy_status tool in core and in the proxy profile", async () => {
+    const names = async (p: string[]) =>
+      (await call(p, "tools/list")).result.tools.map((t: { name: string }) => t.name);
+    expect(await names(["core"])).toContain("proxy_status");
+    expect(await names(["proxy"])).toContain("proxy_status");
+    const tool = TOOLS.find((t) => t.name === "proxy_status")!;
+    expect(tool.annotations.readOnlyHint).toBe(true);
+    expect(tool.annotations.destructiveHint).toBe(false);
   });
 
   it("keeps read-only bg tools in core and mutating bg tools in the background profile", async () => {
