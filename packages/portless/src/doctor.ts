@@ -27,7 +27,7 @@ import { ensureNetbirdReady } from "./netbird.js";
 import { RouteStore, type RouteMapping } from "./routes.js";
 import { ensureTailscaleReady } from "./tailscale.js";
 import type { TunnelProviderName } from "./types.js";
-import { resolveUserHome } from "./utils.js";
+import { isProcessAlive, resolveUserHome } from "./utils.js";
 
 export type DoctorStatus = "ok" | "warn" | "fail" | "info";
 
@@ -165,16 +165,6 @@ export interface CollectDoctorOptions {
   dependencies?: Partial<DoctorDependencies>;
 }
 
-function processIsAlive(pid: number): boolean {
-  if (pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
 export function resolveDoctorCommandInvocation(
   command: DoctorToolName,
   args: string[],
@@ -286,7 +276,7 @@ const DEFAULT_DEPENDENCIES: DoctorDependencies = {
   isProxyRunning,
   isPortListening,
   findPidOnPort,
-  isProcessAlive: processIsAlive,
+  isProcessAlive,
   managedHostnames: getManagedHostnames,
   resolvesHostname: checkHostResolution,
   isCATrusted,

@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { TunnelAlias } from "./types.js";
 import { DIR_MODE, FILE_MODE, isRetryableLockError } from "./routes.js";
-import { fixOwnership, isErrnoException, normalizePathPrefix } from "./utils.js";
+import { fixOwnership, isErrnoException, isProcessAlive, normalizePathPrefix } from "./utils.js";
 
 const STALE_LOCK_THRESHOLD_MS = 10_000;
 const LOCK_TIMEOUT_MS = 5_000;
@@ -171,15 +171,6 @@ export class TunnelAliasStore {
     fixOwnership(this.aliasesPath);
   }
 
-  private isProcessAlive(pid: number): boolean {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
   loadAliases(): TunnelAlias[] {
     return this.readAliases(false);
   }
@@ -282,7 +273,7 @@ export class TunnelAliasStore {
         if (
           !alias.managed ||
           alias.routeOwnerPid === undefined ||
-          this.isProcessAlive(alias.routeOwnerPid)
+          isProcessAlive(alias.routeOwnerPid)
         ) {
           alive.push(alias);
         } else {

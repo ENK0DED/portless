@@ -3,12 +3,7 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { RouteInfo, RouteProtocol, TunnelProviderName } from "./types.js";
 import { isRecordedProcessGroupAlive } from "./process-group.js";
-import {
-  fixOwnership,
-  isErrnoException,
-  normalizePathPrefix,
-  isProcessAlive as isPidAlive,
-} from "./utils.js";
+import { fixOwnership, isErrnoException, isProcessAlive, normalizePathPrefix } from "./utils.js";
 
 /** How long (ms) before a lock directory is considered stale and forcibly removed. */
 const STALE_LOCK_THRESHOLD_MS = 10_000;
@@ -201,7 +196,10 @@ export class RouteConflictError extends Error {
     hostname: string,
     existingPid: number,
     pathPrefix = "/",
-    options: { conflict?: "sole-owner" | "multiplex-host" | "same-label"; label?: string } = {}
+    options: {
+      conflict?: "sole-owner" | "multiplex-host" | "same-label" | "static-alias";
+      label?: string;
+    } = {}
   ) {
     const target = routeLabel(hostname, pathPrefix);
     let detail: string;
@@ -210,6 +208,11 @@ export class RouteConflictError extends Error {
         detail =
           `"${target}" is already shared by other apps (multiplex mode). ` +
           `Register this app with --multiplex too, or use --force to take over.`;
+        break;
+      case "static-alias":
+        detail =
+          `"${target}" is a static alias. Use --force to replace it; ` +
+          `re-add the alias with "portless alias" afterwards.`;
         break;
       case "same-label":
         detail =
@@ -319,7 +322,7 @@ export class RouteStore {
   // ---------------------------------------------------------------------------
 
   private isProcessAlive(pid: number): boolean {
-    return pid === 0 || isPidAlive(pid);
+    return pid === 0 || isProcessAlive(pid);
   }
 
   /**
@@ -592,7 +595,12 @@ export class RouteStore {
           if (!force) {
             const blocker = group[0];
             throw new RouteConflictError(hostname, blocker.pid, pathPrefix, {
-              conflict: blocker.label !== undefined ? "multiplex-host" : "sole-owner",
+              conflict:
+                blocker.pid === 0
+                  ? "static-alias"
+                  : blocker.label !== undefined
+                    ? "multiplex-host"
+                    : "sole-owner",
             });
           }
           group.forEach(killLive);
@@ -608,7 +616,7 @@ export class RouteStore {
         if (soleOwner) {
           if (!force) {
             throw new RouteConflictError(hostname, soleOwner.pid, pathPrefix, {
-              conflict: "sole-owner",
+              conflict: soleOwner.pid === 0 ? "static-alias" : "sole-owner",
             });
           }
           killLive(soleOwner);

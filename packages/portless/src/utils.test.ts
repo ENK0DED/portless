@@ -5,6 +5,7 @@ import {
   formatUptime,
   formatUrl,
   isErrnoException,
+  isProcessAlive,
   matchesPathPrefix,
   normalizePathPrefix,
   parseHostname,
@@ -483,5 +484,38 @@ describe("parsePort", () => {
     ]) {
       expect(parsePort(value)).toBeNull();
     }
+  });
+});
+
+describe("isProcessAlive", () => {
+  function mockKill(code: string | undefined): void {
+    vi.spyOn(process, "kill").mockImplementation(() => {
+      if (code === undefined) return true;
+      throw Object.assign(new Error(code), { code });
+    });
+  }
+
+  it("is true when the signal check succeeds", () => {
+    mockKill(undefined);
+    expect(isProcessAlive(4242)).toBe(true);
+  });
+
+  it("is true for a process the caller cannot signal (EPERM)", () => {
+    mockKill("EPERM");
+    expect(isProcessAlive(4242)).toBe(true);
+  });
+
+  it("is false for a missing process (ESRCH)", () => {
+    mockKill("ESRCH");
+    expect(isProcessAlive(4242)).toBe(false);
+  });
+
+  it("never probes non-positive or non-integer pids", () => {
+    const kill = vi.spyOn(process, "kill").mockReturnValue(true);
+    expect(isProcessAlive(0)).toBe(false);
+    expect(isProcessAlive(-1)).toBe(false);
+    expect(isProcessAlive(1.5)).toBe(false);
+    expect(isProcessAlive(Number.NaN)).toBe(false);
+    expect(kill).not.toHaveBeenCalled();
   });
 });

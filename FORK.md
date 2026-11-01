@@ -518,6 +518,10 @@ Retained coverage anchors:
 - #352 Tailscale hostname coverage: exact `tailscaleUrl` and `tailscaleServiceUrl` routing, path-aware and port-normalized authority selection, and rejection of unrelated `.ts.net` hosts.
 - #212, #240, and #264 UI coverage: shared page shell in `packages/portless/src/pages.ts`, reserved host interception in `proxy.ts`, reserved-name registration rejection, read-only dashboard behavior, public CA-only certificate page, and non-invasive multiplex app picker.
 
+Retained security finding notes:
+
+- Unbounded on-demand certificate minting (advisor finding, narrowed rather than closed). Upstream #497 (adopted in the 0.15.13000 sync) makes the SNI callback refuse names that contain characters outside `a-z0-9.-` or that do not end in `.<configured suffix>`, before it touches the cache or runs openssl, which closes the SAN-injection vector and bounds minting to the configured suffix list. It does not bound the `cache` and `pending` maps, and it does not require a registered route, so any `*.<suffix>` name still mints and caches a host certificate. The finding stays open for cache bounds and a registered-route gate.
+
 ### Full Open Upstream PR State on 2026-08-14
 
 Rechecked against upstream on 2026-08-14: GitHub reported 52 open PRs, and every open PR is listed below with a final fork state. Every open PR is implemented, implemented differently, or won't implement.

@@ -25,6 +25,7 @@ import {
   discoverState,
   findFreePort,
   getDefaultPort,
+  caRegeneratedRestartHint,
   getDefaultTld,
   getDefaultTlds,
   getProtocolPort,
@@ -2961,5 +2962,26 @@ describe.skipIf(process.platform === "win32")("killOrphanedProcessGroup", () => 
       await new Promise((r) => setTimeout(r, 20));
     }
     expect(isAlive(orphanPid)).toBe(false);
+  });
+});
+
+describe("caRegeneratedRestartHint", () => {
+  afterEach(() => {
+    delete process.env.PORTLESS_PORT;
+  });
+
+  it("omits the port flag on the protocol default port", () => {
+    delete process.env.PORTLESS_PORT;
+    expect(caRegeneratedRestartHint(443, true)).toEqual([
+      "The running proxy still serves certificates from the previous CA.",
+      "Restart it: portless proxy stop && portless proxy start",
+    ]);
+  });
+
+  it("repeats a non-default port on both commands", () => {
+    delete process.env.PORTLESS_PORT;
+    expect(caRegeneratedRestartHint(1355, false)[1]).toBe(
+      "Restart it: portless proxy stop -p 1355 && portless proxy start -p 1355"
+    );
   });
 });

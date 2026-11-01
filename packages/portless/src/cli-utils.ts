@@ -470,6 +470,19 @@ export function getDefaultPort(tls?: boolean): number {
   return tls === undefined ? FALLBACK_PROXY_PORT : getProtocolPort(tls);
 }
 
+/**
+ * Lines telling the user to restart a running proxy after the CA was
+ * regenerated: the proxy keeps the previous CA and the TLS contexts it already
+ * built in memory, so it presents the old chain until it restarts.
+ */
+export function caRegeneratedRestartHint(port: number, tls: boolean): [string, string] {
+  const portFlag = port !== getDefaultPort(tls) ? ` -p ${port}` : "";
+  return [
+    "The running proxy still serves certificates from the previous CA.",
+    `Restart it: portless proxy stop${portFlag} && portless proxy start${portFlag}`,
+  ];
+}
+
 // ---------------------------------------------------------------------------
 // State directory resolution
 // ---------------------------------------------------------------------------

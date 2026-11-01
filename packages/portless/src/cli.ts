@@ -90,6 +90,7 @@ import {
   findPidsOnPort,
   getConfiguredTldEnv,
   getDefaultPort,
+  caRegeneratedRestartHint,
   getDefaultTlds,
   getProxyBindTargets,
   hasConfiguredTldEnv,
@@ -3616,7 +3617,8 @@ ${colors.bold("HTTP/2 + HTTPS (default):")}
   On first use, portless generates a local CA and adds it to your
   system trust store. Generated certs are stored in the state directory
   and reused across restarts. In WSL, the CA is also added to the Windows
-  user trust store for Windows browsers. On NixOS and unrecognized Linux
+  user trust store for Windows browsers. Linux containers on a WSL2 host use
+  only the Linux trust store. On NixOS and unrecognized Linux
   distributions, portless prints manual CA setup guidance instead of using
   an unsupported trust-store layout. No browser warnings.
   Use --skip-trust to skip adding the CA to the trust store.
@@ -3839,13 +3841,20 @@ function printVersion(): void {
 }
 
 async function handleTrust(): Promise<void> {
-  const { dir } = await discoverState();
+  const { dir, port, tls } = await discoverState();
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
   const { caGenerated } = ensureCerts(dir);
   if (caGenerated) {
     console.log(colors.gray("Generated local CA certificate."));
+    // A running proxy keeps the previous CA and the TLS contexts it already
+    // built in memory, so it presents the old chain until it restarts.
+    if (await isProxyRunning(port, tls)) {
+      const [notice, restart] = caRegeneratedRestartHint(port, tls);
+      console.log(colors.yellow(notice));
+      console.log(colors.blue(restart));
+    }
   }
   const result = trustCA(dir);
   if (result.trusted) {
