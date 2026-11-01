@@ -245,6 +245,49 @@ function killProcessGroup(pid: number): void {
   }
 }
 
+const sleepMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Pids of proxy daemons started with `--foreground --port <port>`, found by command line. */
+function findProxyDaemonPids(port: number): number[] {
+  const result = spawnSync("pgrep", ["-f", `proxy start --foreground --port ${port}( |$)`], {
+    encoding: "utf-8",
+  });
+  if (result.status !== 0) return [];
+  return result.stdout
+    .split("\n")
+    .map((line) => parseInt(line.trim(), 10))
+    .filter((pid) => Number.isInteger(pid) && pid > 0 && pid !== process.pid);
+}
+
+function signalPid(pid: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    try {
+      process.kill(pid, signal);
+    } catch {
+      // Process may already have exited.
+    }
+  }
+}
+
+/** SIGTERM the pids, wait for them to exit, then SIGKILL whatever is left. */
+async function terminateAndWait(pids: Iterable<number>, timeoutMs = 5000): Promise<void> {
+  const targets = [...pids];
+  for (const pid of targets) signalPid(pid, "SIGTERM");
+  const deadline = Date.now() + timeoutMs;
+  while (targets.some(isPidAlive) && Date.now() < deadline) {
+    await sleepMs(25);
+  }
+  for (const pid of targets) {
+    if (isPidAlive(pid)) signalPid(pid, "SIGKILL");
+  }
+  const killDeadline = Date.now() + 2000;
+  while (targets.some(isPidAlive) && Date.now() < killDeadline) {
+    await sleepMs(25);
+  }
+}
+
 /**
  * Stop everything a bg test left behind and remove its state directory.
  *
@@ -254,42 +297,48 @@ function killProcessGroup(pid: number): void {
  * process recreate the directory. Wait for every recorded process to exit
  * (escalating to SIGKILL) before the directory goes away, then remove it again
  * if anything recreated it.
+ *
+ * The proxy daemon is started detached by the `portless run` process that
+ * `bg start` spawns, so it is in neither the bg registry nor, while it is still
+ * booting, in `proxy.pid`. The bg wrappers are therefore stopped first (so
+ * nothing can start a new daemon), and the daemon is then found by its
+ * `--port` argument as well as by `proxy.pid`. It is stopped before the
+ * directory is removed so it cannot outlive its state.
  */
-async function tearDownBgState(stateDir: string, stopProxy: () => void): Promise<void> {
-  const pids = new Set<number>();
+async function tearDownBgState(
+  stateDir: string,
+  stopProxy: () => void,
+  proxyPort: number
+): Promise<void> {
+  const wrapperPids = new Set<number>();
   for (const entry of readBgRegistry(stateDir)) {
-    if (Number.isInteger(entry.pid) && entry.pid > 0) pids.add(entry.pid);
+    if (Number.isInteger(entry.pid) && entry.pid > 0) wrapperPids.add(entry.pid);
   }
-  try {
-    const daemonPid = parseInt(fs.readFileSync(path.join(stateDir, "proxy.pid"), "utf-8"), 10);
-    if (Number.isInteger(daemonPid) && daemonPid > 0) pids.add(daemonPid);
-  } catch {
-    // No proxy daemon was started for this state directory.
-  }
+  await terminateAndWait(wrapperPids);
 
-  for (const pid of pids) killProcessGroup(pid);
-  stopProxy();
-
-  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-  const deadline = Date.now() + 5000;
-  while ([...pids].some(isPidAlive) && Date.now() < deadline) {
-    await sleep(25);
-  }
-  for (const pid of pids) {
-    if (!isPidAlive(pid)) continue;
+  // A daemon may have been spawned just before its wrapper exited and may still
+  // be booting. Wait until the set of matching daemons stops changing.
+  const daemonPids = new Set<number>();
+  let stableRounds = 0;
+  const settleDeadline = Date.now() + 2000;
+  while (stableRounds < 3 && Date.now() < settleDeadline) {
+    const before = daemonPids.size;
+    for (const pid of findProxyDaemonPids(proxyPort)) daemonPids.add(pid);
     try {
-      process.kill(-pid, "SIGKILL");
+      const pidFromFile = parseInt(fs.readFileSync(path.join(stateDir, "proxy.pid"), "utf-8"), 10);
+      if (Number.isInteger(pidFromFile) && pidFromFile > 0) daemonPids.add(pidFromFile);
     } catch {
-      try {
-        process.kill(pid, "SIGKILL");
-      } catch {
-        // Exited between the check and the signal.
-      }
+      // No proxy.pid yet.
     }
+    stableRounds = daemonPids.size === before ? stableRounds + 1 : 0;
+    await sleepMs(50);
   }
+
+  stopProxy();
+  await terminateAndWait(daemonPids);
 
   fs.rmSync(stateDir, { recursive: true, force: true });
-  await sleep(50);
+  await sleepMs(50);
   fs.rmSync(stateDir, { recursive: true, force: true });
 }
 
@@ -1178,7 +1227,7 @@ describe("CLI", () => {
       );
 
       afterEach(async () => {
-        await tearDownBgState(tmpDir, () => run(["proxy", "stop"], { env: bgEnv() }));
+        await tearDownBgState(tmpDir, () => run(["proxy", "stop"], { env: bgEnv() }), proxyPort);
       });
 
       it("starts a background process and records the ready route", async () => {
