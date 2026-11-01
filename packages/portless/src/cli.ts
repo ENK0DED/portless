@@ -3487,6 +3487,7 @@ ${colors.bold("Usage:")}
   ${colors.cyan("portless clean")}                   Remove portless state, trust entry, and hosts block
   ${colors.cyan("portless prune")}                   Kill orphaned dev servers from crashed sessions
   ${colors.cyan("portless completion <shell>")}      Print shell completion script
+  ${colors.cyan("portless mcp")}                     Start a stdio MCP server for agents
   ${colors.cyan("portless hosts sync")}              Add routes to ${HOSTS_DISPLAY} (fixes Safari)
   ${colors.cyan("portless hosts clean")}             Remove portless entries from ${HOSTS_DISPLAY}
 

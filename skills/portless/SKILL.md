@@ -537,6 +537,7 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 | `portless --name <name> <cmd>`                   | Force `<name>` as app name (bypasses subcommand dispatch)      |
 | `portless <name> KEY=value <cmd>`                | Pass `KEY` only to the child command                           |
 | `portless <name> -- <cmd> [args...]`             | Stop flag parsing; everything after `--` is passed to child    |
+| `portless mcp [--tools <profiles>]`              | Start a stdio MCP server for agents                            |
 | `portless --help` / `-h`                         | Show help                                                      |
 | `portless run --help`                            | Show help for a subcommand (also: alias, hosts, doctor, clean) |
 | `portless --version` / `-v`                      | Show version                                                   |
@@ -552,6 +553,17 @@ portless completion fish > ~/.config/fish/completions/portless.fish
 ```
 
 Generate completions from the installed portless binary so agents and humans get the flags supported by that version.
+
+### MCP server
+
+`portless mcp [--tools <profiles>]` starts a stdio MCP server. Each tool runs the matching CLI command in the tool's `cwd`; every tool also accepts `extraArgs` and `timeoutMs`.
+
+- `core` (default): `list`, `get`, `alias_add`, `alias_remove`, read-only `bg_list`, `bg_status`, `bg_logs`, and `tools_profiles`.
+- `background` (opt in): `bg_start`, `bg_stop`, `bg_restart`. Use `--tools core,background`.
+- `proxy`: `proxy_start` (`suffix`, `unprivileged`, `skipTrust`, `routesCleanupInterval`, `wildcard`, `lan`, `noTls`, `port`), `proxy_stop`.
+- `diagnostics`: `doctor`, `prune`, `version`. `all` enables everything.
+
+`list`, `get`, and the `bg` tools take `json`; `get`, `alias_add`, and the `bg` tools take `path`. `list --json` marks routes whose owner died but whose dev server still runs as `kind: "orphan"`; `prune` stops them. Not exposed: foreground `run`, `trust`, `clean`, `hosts`, `service`, `bg clean`, `bg logs --follow`, and every sharing mode (tunnels, Tailscale, ngrok, NetBird). Start shared apps from a shell.
 
 ## Programmatic API
 
