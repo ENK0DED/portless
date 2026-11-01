@@ -286,7 +286,7 @@ export const TOOLS: ToolDef[] = [
   tool(
     "proxy_start",
     "Start proxy",
-    "Start the shared portless proxy as a background daemon. Backend pooling permits 16 simultaneous dials per app and 64 idle sockets; connects have a 10-second deadline, established streams have no proxy timeout, and shutdown rejects queued requests with 503. Without port, HTTPS uses 443; listener probes and enabled hosts sync determine whether sudo is needed. A failed sudo exits without changing ports; MCP cannot answer a sudo prompt, so pass unprivileged for a port below 1024 without sudo, or port (for example 1355). HTTPS may show an OS dialog to trust the local CA; pass skipTrust to skip it.",
+    "Start the shared portless proxy as a background daemon. Backend pooling permits 16 simultaneous dials per app and 64 idle sockets; connects have a 10-second deadline, established streams have no proxy timeout, and shutdown rejects queued requests with 503. Without port, HTTPS uses 443; listener probes and enabled hosts sync determine whether sudo is needed. A failed sudo exits without changing ports; MCP cannot answer a sudo prompt, so pass unprivileged for a port below 1024 without sudo, or port (for example 1355). HTTPS may show an OS dialog to trust the local CA; pass skipTrust to skip it. A state directory tracks one proxy: starting on another port fails while a live proxy is tracked, so stop it first.",
     {
       port: PORT_PROPERTY,
       noTls: { type: "boolean", description: "Serve plain HTTP instead of HTTPS." },
@@ -327,7 +327,7 @@ export const TOOLS: ToolDef[] = [
   tool(
     "proxy_stop",
     "Stop proxy",
-    "Stop the shared portless proxy. Pass port when the proxy runs on a non-default port.",
+    "Stop the shared portless proxy. Pass port when the proxy runs on a non-default port; a proxy on another port than the tracked one is stopped without clearing the tracked proxy's state.",
     { port: PORT_PROPERTY },
     [],
     {

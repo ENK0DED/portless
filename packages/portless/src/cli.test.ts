@@ -15,7 +15,7 @@ import {
 } from "./bg.js";
 import { getBgLogPaths } from "./bg-logs.js";
 import { BgStore, type BgProcessEntry, type BgStartIntent } from "./bg-store.js";
-import { triggerHostsSync } from "./cli-utils.js";
+import { isProxyRunning, triggerHostsSync } from "./cli-utils.js";
 import { ensureCerts } from "./certs.js";
 import { getProcessStartTime } from "./process-group.js";
 import { RouteStore } from "./routes.js";
@@ -108,6 +108,15 @@ function runGit(cwd: string, args: string[]): void {
   });
   if (result.status !== 0) {
     throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
+  }
+}
+
+/** Poll until no portless proxy answers on the port (SIGTERM is asynchronous). */
+async function waitForProxyGone(port: number, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (await isProxyRunning(port)) {
+    if (Date.now() > deadline) throw new Error(`Proxy on port ${port} is still running`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
   }
 }
 
@@ -3962,6 +3971,75 @@ describe("CLI", () => {
       const stop = run(["proxy", "stop"], { env: proxyEnv() });
       expect(stop.status).toBe(0);
       expect(stop.stdout).toContain("Proxy stopped");
+    });
+
+    it("refuses to start a second proxy on another port in the same state dir", async () => {
+      const start1 = run(["proxy", "start"], { env: proxyEnv() });
+      expect(start1.status).toBe(0);
+
+      const otherPort = await getFreePort();
+      const start2 = run(["proxy", "start", "-p", String(otherPort)], { env: proxyEnv() });
+      expect(start2.status).toBe(1);
+      expect(start2.stderr).toContain(`A proxy is already running on port ${testPort}`);
+      expect(start2.stderr).toContain(`portless proxy stop -p ${testPort}`);
+      expect(start2.stderr).toContain("PORTLESS_STATE_DIR");
+
+      // The first proxy stays tracked and nothing listens on the other port.
+      expect(fs.readFileSync(path.join(tmpDir, "proxy.port"), "utf-8").trim()).toBe(
+        String(testPort)
+      );
+      expect(await isProxyRunning(otherPort)).toBe(false);
+    });
+
+    it("stops an untracked proxy without touching the tracked one's state", async () => {
+      const start1 = run(["proxy", "start"], { env: proxyEnv() });
+      expect(start1.status).toBe(0);
+
+      // Older versions let a second start take over the state dir: proxy.pid
+      // and proxy.port name the new proxy and the first one runs untracked.
+      const otherDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-lifecycle-other-"));
+      const otherPort = await getFreePort();
+      const otherEnv = {
+        ...proxyEnv(),
+        PORTLESS_PORT: String(otherPort),
+        PORTLESS_STATE_DIR: otherDir,
+      };
+      try {
+        const start2 = run(["proxy", "start"], { env: otherEnv });
+        expect(start2.status).toBe(0);
+        const otherPid = fs.readFileSync(path.join(otherDir, "proxy.pid"), "utf-8").trim();
+        fs.writeFileSync(path.join(tmpDir, "proxy.pid"), otherPid);
+        fs.writeFileSync(path.join(tmpDir, "proxy.port"), String(otherPort));
+
+        const stop = run(["proxy", "stop", "-p", String(testPort)], { env: proxyEnv() });
+        expect(stop.status).toBe(0);
+        expect(stop.stdout).toContain(`tracks the proxy on port ${otherPort}`);
+        expect(stop.stdout).toContain("Proxy stopped");
+
+        await waitForProxyGone(testPort);
+        await waitForHttpHeader(otherPort, "X-Portless", "1");
+        // The stopped proxy's exit cleanup left the state of the tracked one alone.
+        expect(fs.readFileSync(path.join(tmpDir, "proxy.pid"), "utf-8").trim()).toBe(otherPid);
+        expect(fs.readFileSync(path.join(tmpDir, "proxy.port"), "utf-8").trim()).toBe(
+          String(otherPort)
+        );
+      } finally {
+        run(["proxy", "stop"], { env: otherEnv });
+        fs.rmSync(otherDir, { recursive: true, force: true });
+      }
+    });
+
+    it("clears a dead proxy's state when stopping another port", async () => {
+      const deadPort = await getFreePort();
+      const deadPid = spawnSync(process.execPath, ["-e", ""]).pid;
+      fs.writeFileSync(path.join(tmpDir, "proxy.pid"), String(deadPid));
+      fs.writeFileSync(path.join(tmpDir, "proxy.port"), String(deadPort));
+
+      const stop = run(["proxy", "stop", "-p", String(testPort)], { env: proxyEnv() });
+      expect(stop.status).toBe(0);
+      expect(stop.stdout).toContain("no longer running");
+      expect(fs.existsSync(path.join(tmpDir, "proxy.pid"))).toBe(false);
+      expect(fs.existsSync(path.join(tmpDir, "proxy.port"))).toBe(false);
     });
 
     describe.skipIf(process.platform === "win32")("app port strategy", () => {
