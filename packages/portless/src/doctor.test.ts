@@ -128,6 +128,42 @@ describe("evaluateDoctor", () => {
     expect(report.findings.some((finding) => finding.status === "fail")).toBe(false);
   });
 
+  it("reports whether the installed service's pinned Node binary exists", () => {
+    const missing = healthySnapshot();
+    missing.service = {
+      nodePath: "/home/dev/.nvm/versions/node/v24.0.0/bin/node",
+      nodeExists: false,
+    };
+    const report = evaluateDoctor(missing);
+    expect(report.findings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          status: "warn",
+          message: expect.stringContaining(
+            "pins a Node binary that no longer exists: /home/dev/.nvm/versions/node/v24.0.0/bin/node"
+          ),
+          hint: expect.stringContaining("portless service install"),
+        }),
+      ])
+    );
+    expect(report.exitCode).toBe(0);
+
+    const present = healthySnapshot();
+    present.service = { nodePath: "/usr/bin/node", nodeExists: true };
+    expect(evaluateDoctor(present).findings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          status: "ok",
+          message: "Installed service Node binary exists: /usr/bin/node.",
+        }),
+      ])
+    );
+
+    expect(evaluateDoctor(healthySnapshot()).findings.some((f) => /service/i.test(f.message))).toBe(
+      false
+    );
+  });
+
   it("recognizes healthy ordered suffixes, dotted certificate pages, loopback bind, hosts, and background state", () => {
     const report = evaluateDoctor(healthySnapshot());
 
@@ -527,6 +563,44 @@ describe("collectDoctorSnapshot", () => {
       if (previousHttps === undefined) delete process.env.PORTLESS_HTTPS;
       else process.env.PORTLESS_HTTPS = previousHttps;
     }
+  });
+
+  it("records the installed service's pinned Node binary when one is installed", async () => {
+    const stateDir = makeTempDir();
+    const base = {
+      version: "0.15.6000",
+      state: {
+        dir: stateDir,
+        port: 1355,
+        tls: false,
+        tld: "localhost",
+        tlds: ["localhost"],
+        lanMode: false,
+        lanIp: null,
+      },
+    };
+    const dependencies = {
+      isProxyRunning: async () => false,
+      isPortListening: async () => false,
+      managedHostnames: () => [],
+      mdnsSupport: () => ({ supported: false }),
+      probeTool: () => ({ status: "unavailable" as const }),
+    };
+
+    const installed = await collectDoctorSnapshot({
+      ...base,
+      dependencies: {
+        ...dependencies,
+        installedServiceNode: () => ({ path: "/gone/node", exists: false }),
+      },
+    });
+    expect(installed.service).toEqual({ nodePath: "/gone/node", nodeExists: false });
+
+    const none = await collectDoctorSnapshot({
+      ...base,
+      dependencies: { ...dependencies, installedServiceNode: () => undefined },
+    });
+    expect(none.service).toBeUndefined();
   });
 
   it("reads multi-suffix, certificate, route, hosts, and background state without changing files", async () => {
