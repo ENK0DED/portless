@@ -1,11 +1,11 @@
 import type { Metadata, Viewport } from "next";
 import type { GeistdocsNavLink } from "@vercel/geistdocs/config";
-import { Footer } from "@vercel/geistdocs/footer";
 import { GeistSans } from "geist/font/sans";
 import { GeistMono } from "geist/font/mono";
 import { cookies } from "next/headers";
 import { DocsChat } from "@/components/docs-chat";
 import { DocsProvider } from "@/components/geistdocs-provider";
+import { SiteFooter } from "@/components/site-footer";
 import { SiteNavbar } from "@/components/site-navbar";
 import { config } from "@/lib/geistdocs/config";
 import "./globals.css";
@@ -79,7 +79,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
         <DocsProvider>
           <SiteNavbar logo={config.logo} nav={config.nav as GeistdocsNavLink[]} />
           {children}
-          <Footer />
+          <SiteFooter logo={config.logo} nav={config.nav as GeistdocsNavLink[]} />
           <DocsChat defaultOpen={chatOpen} defaultWidth={chatWidth} />
         </DocsProvider>
       </body>
