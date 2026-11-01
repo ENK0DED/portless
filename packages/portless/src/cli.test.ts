@@ -2229,6 +2229,57 @@ describe("CLI", () => {
       expect(stdout.trim()).toBe("bypassed");
     });
 
+    it.each(["--help", "-h"])("proxy stop %s prints help and does not stop anything", (flag) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-stop-help-"));
+      try {
+        const { status, stdout, stderr } = run(["proxy", "stop", flag], {
+          env: { PORTLESS_STATE_DIR: tmpDir, PORTLESS_PORT: "19099" },
+        });
+        expect(status).toBe(0);
+        expect(stdout).toContain("portless proxy stop");
+        expect(stdout).not.toContain("not running");
+        expect(stderr).not.toContain("not running");
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it.each([
+      [["--frce"], "Unknown argument"],
+      [["now"], "Unknown argument"],
+      [["-p", "1355", "--force"], "Unknown argument"],
+      [["-p"], "requires a port number"],
+      [["--port", "--force"], "requires a port number"],
+    ])("proxy stop rejects %j instead of stopping the proxy", (extra, message) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-stop-strict-"));
+      try {
+        const { status, stdout, stderr } = run(["proxy", "stop", ...extra], {
+          env: { PORTLESS_STATE_DIR: tmpDir, PORTLESS_PORT: "19099" },
+        });
+        expect(status).toBe(1);
+        expect(stderr).toContain(message);
+        expect(stdout).not.toContain("stopped");
+        expect(stderr).not.toContain("not running");
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it("proxy stop still accepts --port and -p", () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-stop-port-"));
+      try {
+        for (const flag of ["--port", "-p"]) {
+          const { status, stdout, stderr } = run(["proxy", "stop", flag, "19098"], {
+            env: { PORTLESS_STATE_DIR: tmpDir },
+          });
+          expect(status).toBe(0);
+          expect(`${stdout}${stderr}`).toContain("not running");
+        }
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
     it.each(["80abc", "0x50", "3e3", "0", "65536"])(
       "proxy stop -p rejects the lenient port %j instead of stopping another proxy",
       (port) => {
@@ -2603,6 +2654,17 @@ describe("CLI", () => {
       const { status, stdout } = run(["alias", "-h"]);
       expect(status).toBe(0);
       expect(stdout).toContain("portless alias");
+    });
+
+    it.each([
+      ["add mode", ["alias", "mydb", "5432", "--help"]],
+      ["add mode after flags", ["alias", "mydb", "5432", "--force", "-h"]],
+      ["remove mode", ["alias", "--remove", "mydb", "--help"]],
+    ])("prints help for a trailing help flag in %s", (_label, argv) => {
+      const { status, stdout, stderr } = run(argv);
+      expect(status).toBe(0);
+      expect(stdout).toContain("portless alias");
+      expect(stderr).not.toContain("Unknown flag");
     });
 
     it("exits 1 with usage when no args given", () => {
@@ -3350,6 +3412,13 @@ describe("CLI", () => {
       expect(stdout).toContain("--no-worktree");
       expect(stdout).toContain("--json");
       expect(stdout).toContain("--path");
+    });
+
+    it.each([["get"], ["url"]])("prints help for a trailing help flag on %s", (command) => {
+      const { status, stdout, stderr } = run([command, "myapp", "--help"]);
+      expect(status).toBe(0);
+      expect(stdout).toContain("portless get");
+      expect(stderr).not.toContain("Unknown flag");
     });
 
     it("prints help with -h", () => {
@@ -5223,6 +5292,81 @@ server.listen(Number(process.env.PORT), "127.0.0.1", () => {
         await new Promise<void>((resolve) => server.close(() => resolve()));
         fs.rmSync(tmpDir, { recursive: true, force: true });
         fs.rmSync(binDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("Vite allowed hosts by installed Vite version", () => {
+    it.each([
+      ["7.3.7", "tunnel.trycloudflare.com", true],
+      ["8.0.16", "tunnel.trycloudflare.com", true],
+      ["8.1.0", ".test,tunnel.trycloudflare.com", false],
+    ])("serializes for Vite %s", async (viteVersion, expected, expectNotice) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-cli-vite-hosts-"));
+      const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-cloudflared-bin-"));
+      const appDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-cli-vite-app-"));
+      const server = http.createServer((_req, res) => {
+        res.setHeader("X-Portless", "1");
+        res.end("ok");
+      });
+      try {
+        const proxyPort = await new Promise<number>((resolve) => {
+          server.listen(0, "127.0.0.1", () => {
+            const addr = server.address();
+            if (addr && typeof addr !== "string") resolve(addr.port);
+          });
+        });
+        fs.writeFileSync(path.join(tmpDir, "proxy.port"), proxyPort.toString());
+        fs.writeFileSync(path.join(tmpDir, "proxy.tlds"), "localhost\ntest\n");
+        writeCloudflaredShim(binDir, "https://tunnel.trycloudflare.com");
+
+        const viteDir = path.join(appDir, "node_modules", "vite");
+        fs.mkdirSync(viteDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(viteDir, "package.json"),
+          JSON.stringify({ name: "vite", version: viteVersion })
+        );
+
+        const capturePath = path.join(tmpDir, "capture.json");
+        const scriptPath = path.join(tmpDir, "capture-env.js");
+        fs.writeFileSync(
+          scriptPath,
+          [
+            'const fs = require("node:fs");',
+            `fs.writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify(process.env.__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS));`,
+          ].join("\n") + "\n"
+        );
+
+        const { status, stdout, stderr } = run(
+          [
+            "run",
+            "--name",
+            "myapp",
+            "--app-port",
+            "4568",
+            "--tunnel",
+            "cloudflare",
+            process.execPath,
+            scriptPath,
+          ],
+          {
+            cwd: appDir,
+            env: {
+              PATH: prependPath(binDir),
+              PORTLESS_STATE_DIR: tmpDir,
+              PORTLESS_HTTPS: "0",
+            },
+          }
+        );
+
+        expect({ status, stdout, stderr }).toMatchObject({ status: 0 });
+        expect(JSON.parse(fs.readFileSync(capturePath, "utf-8"))).toBe(expected);
+        expect(stdout.includes("reads one additional allowed host")).toBe(expectNotice);
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+        fs.rmSync(binDir, { recursive: true, force: true });
+        fs.rmSync(appDir, { recursive: true, force: true });
       }
     });
   });

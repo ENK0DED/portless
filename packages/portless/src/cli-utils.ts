@@ -2072,6 +2072,14 @@ const FRAMEWORKS_NEEDING_PORT: Record<string, FrameworkSpec> = {
     serverSubcommands: ["dev"],
     defaultIsServer: false,
   },
+  // `vinext dev` proxies to Vite (`--host`) and ignores PORT. `vinext start`
+  // honors PORT but binds 0.0.0.0 unless given `--hostname`.
+  vinext: {
+    strictPort: false,
+    serverSubcommands: ["dev", "start"],
+    nonServerSubcommands: ["init", "build", "check", "lint"],
+    defaultIsServer: false,
+  },
 };
 
 type PackageRunnerSpec = {
@@ -2319,15 +2327,25 @@ export function injectFrameworkFlags(commandArgs: string[], port: number): strin
 
   if (!frameworkArgs || !invokesFrameworkServer(frameworkArgs, framework)) return [];
 
+  // `vinext start` has its own parser (`-p`, `-H`, `--hostname`), while
+  // `vinext dev` hands everything to Vite (`--host`, and it rejects the short
+  // flags as retired).
+  const vinextStart =
+    basename === "vinext" && frameworkPositionals(frameworkArgs, framework)?.[0] === "start";
+
   const flags: string[] = [];
-  if (!hasCliOption(frameworkArgs, "--port")) {
+  if (
+    !hasCliOption(frameworkArgs, "--port") &&
+    !(vinextStart && hasCliOption(frameworkArgs, "-p"))
+  ) {
     flags.push("--port", port.toString());
     if (framework.strictPort) flags.push("--strictPort");
   }
 
-  const hostFlag = framework.hostFlag ?? "--host";
+  const hostFlag = vinextStart ? "--hostname" : (framework.hostFlag ?? "--host");
   const hasHostChoice =
     hasCliOption(frameworkArgs, hostFlag) ||
+    (vinextStart && hasCliOption(frameworkArgs, "-H")) ||
     (basename === "expo" &&
       ["--localhost", "--lan", "--tunnel"].some((option) => hasCliOption(frameworkArgs, option)));
   if (!hasHostChoice) {
@@ -2391,6 +2409,15 @@ function isUnsafeToAppendArgs(command: string): boolean {
     atWordStart = ch === " " || ch === "\t";
   }
   return false;
+}
+
+/**
+ * True when `--help` or `-h` appears anywhere in `args`. Commands that reject
+ * unknown flags use this first so a trailing help flag prints help instead of
+ * an error, and commands with side effects (`proxy stop`) never run on a probe.
+ */
+export function hasHelpFlag(args: readonly string[]): boolean {
+  return args.some((arg) => arg === "--help" || arg === "-h");
 }
 
 function hasCliOption(args: string[], option: string): boolean {
