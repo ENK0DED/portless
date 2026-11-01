@@ -200,7 +200,7 @@ Background app management currently supports macOS and Linux. Do not use it on W
 
 `bg stop` sends SIGTERM and waits up to 12 seconds (portless escalates to SIGKILL after 10 seconds on its own). `bg stop --force` sends SIGKILL to the app and to the command it started.
 
-If portless itself is killed without cleanup, the command it started can keep running. portless records that command's process group and start time on the route, and the next `portless run` or `portless prune` stops it (Unix only). The proxy sweep never kills: it keeps the route, and `portless list` and the dashboard show it as orphaned (`kind: "orphan"` in `list --json`). Run `portless prune` to stop it.
+If portless itself is killed without cleanup, the command it started can keep running. portless records that command's process group and start time on the route, and the next `portless run` or `portless prune` stops it (Unix only). The proxy sweep never kills: it keeps the route, and `portless list` and the dashboard show it as orphaned (`kind: "orphan"` in `list --json`). The proxy stops serving an orphaned route within about a second of its owner dying (the hostname answers 404) and writes nothing to do so. Run `portless prune` to stop the dev server.
 
 `bg start` waits up to 30 seconds for route readiness by default. Use `--wait <seconds>` for a longer known startup, `--no-wait` only when fire-and-forget behavior is acceptable, and `--keep` only when a timed-out process should be left running for inspection. Logs are private files under `PORTLESS_STATE_DIR/bg/logs`; use `portless bg logs` instead of scraping paths directly.
 

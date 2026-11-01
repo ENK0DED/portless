@@ -233,6 +233,21 @@ export class RouteConflictError extends Error {
 }
 
 /**
+ * Whether the process that owns a route still exists. Pid `0` marks a reserved
+ * or static route with no owner, which is always live. Other users' processes
+ * (EPERM) count as alive, so a route owned by another account is never judged
+ * dead by a daemon that cannot signal it. Read-only: it sends signal 0 only.
+ */
+export function isRouteOwnerAlive(route: Pick<RouteMapping, "pid">): boolean {
+  return route.pid === 0 || isProcessAlive(route.pid);
+}
+
+/** True when any route's owner has died since the routes were loaded. */
+export function hasDeadRouteOwner(routes: readonly Pick<RouteMapping, "pid">[]): boolean {
+  return routes.some((route) => !isRouteOwnerAlive(route));
+}
+
+/**
  * Manages route mappings stored as a JSON file on disk.
  * Supports file locking and stale-route cleanup.
  */
@@ -322,7 +337,7 @@ export class RouteStore {
   // ---------------------------------------------------------------------------
 
   private isProcessAlive(pid: number): boolean {
-    return pid === 0 || isProcessAlive(pid);
+    return isRouteOwnerAlive({ pid });
   }
 
   /**
@@ -538,7 +553,7 @@ export class RouteStore {
 
   /** True if a route entry currently has an owning process (or is reserved). */
   private routeIsPresent(route: RouteMapping): boolean {
-    return route.pid === 0 || this.isProcessAlive(route.pid);
+    return isRouteOwnerAlive(route);
   }
 
   /**

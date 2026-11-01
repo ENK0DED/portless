@@ -32,7 +32,13 @@ import {
   removeHostsSyncToken,
   writeHostsSyncToken,
 } from "./hosts-sync-auth.js";
-import { FILE_MODE, RouteConflictError, RouteStore, type RouteMapping } from "./routes.js";
+import {
+  FILE_MODE,
+  RouteConflictError,
+  RouteStore,
+  hasDeadRouteOwner,
+  type RouteMapping,
+} from "./routes.js";
 import { TunnelAliasStore, normalizeTunnelHostname } from "./tunnel-aliases.js";
 import {
   ensureTunnelProviderAvailable,
@@ -203,6 +209,13 @@ const DEBOUNCE_MS = 100;
 
 /** Polling interval (ms) when fs.watch is unavailable. */
 const POLL_INTERVAL_MS = 3000;
+
+/**
+ * Interval (ms) at which the proxy daemon checks whether the owner of any
+ * served route has died, so a killed owner stops being served within about a
+ * second even though the routes file did not change.
+ */
+const OWNER_CHECK_INTERVAL_MS = 1000;
 
 /** Default interval (seconds) for the proxy's background stale-route sweep. */
 const DEFAULT_ROUTES_CLEANUP_INTERVAL_SECONDS = 300;
@@ -839,6 +852,7 @@ function startProxyServer(
   let watcher: fs.FSWatcher | null = null;
   let pollingInterval: ReturnType<typeof setInterval> | null = null;
   let routesCleanupInterval: ReturnType<typeof setInterval> | null = null;
+  let ownerCheckInterval: ReturnType<typeof setInterval> | null = null;
 
   const autoSyncHosts = !unprivileged && shouldAutoSyncHosts(process.env.PORTLESS_SYNC_HOSTS);
   const hostsSyncToken = generateHostsSyncToken();
@@ -964,6 +978,16 @@ function startProxyServer(
       reloadTunnelAliases();
     }, POLL_INTERVAL_MS);
   }
+
+  // A SIGKILLed owner never touches the routes file, so no watcher event fires
+  // and the cache would keep serving its route. Probe each cached owner with
+  // signal 0 and reload the in-memory routes when one has died. This writes
+  // nothing and kills nothing, so the sweep below stays the only writer and the
+  // never-kill rule holds. loadRoutes drops the dead owner from the routable
+  // set, and loadOrphanedRoutes moves it to the dashboard's orphan list.
+  ownerCheckInterval = setInterval(() => {
+    if (hasDeadRouteOwner(cachedRoutes)) reloadRoutes();
+  }, OWNER_CHECK_INTERVAL_MS).unref();
 
   if (routesCleanupIntervalSeconds > 0) {
     routesCleanupInterval = setInterval(() => {
@@ -1168,6 +1192,7 @@ function startProxyServer(
     if (debounceTimer) clearTimeout(debounceTimer);
     if (pollingInterval) clearInterval(pollingInterval);
     if (routesCleanupInterval) clearInterval(routesCleanupInterval);
+    if (ownerCheckInterval) clearInterval(ownerCheckInterval);
     if (lanMonitor) lanMonitor.stop();
     if (watcher) {
       watcher.close();
@@ -4076,7 +4101,8 @@ recorded the command's process group and start time, the whole group is stopped
 (only while its leader still has that start time); otherwise the process on the
 route port is stopped. portless run does the same for orphans before it starts.
 The proxy never kills orphans: it keeps their routes, and portless list shows
-them as orphaned until you run or prune.
+them as orphaned until you run or prune. It stops serving an orphaned route
+within about a second of its owner dying (404) and writes nothing to do so.
 
 ${colors.bold("Usage:")}
   ${colors.cyan("portless prune")}

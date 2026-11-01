@@ -206,7 +206,9 @@ running. portless records that command's process group and start time on the rou
 `portless run`, or `portless prune`, stops the group, and only while its leader still has the recorded
 start time, so a reused process ID is never targeted. The proxy's background sweep never kills
 anything: it keeps such a route on file as orphaned, and `portless list` and the dashboard show it
-until you run or prune. Process groups do not exist on Windows, so this recovery is Unix only.
+until you run or prune. The proxy does not serve an orphaned route: it checks route owners about
+once a second and answers 404 for the hostname as soon as the owner is gone, without writing the
+routes file. Process groups do not exist on Windows, so this recovery is Unix only.
 
 ## Subdomains
 

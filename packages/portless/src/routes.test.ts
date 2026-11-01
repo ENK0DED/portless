@@ -4,7 +4,14 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { pathToFileURL } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
-import { FILE_MODE, RouteStore, RouteConflictError, isRetryableLockError } from "./routes.js";
+import {
+  FILE_MODE,
+  RouteStore,
+  RouteConflictError,
+  hasDeadRouteOwner,
+  isRetryableLockError,
+  isRouteOwnerAlive,
+} from "./routes.js";
 import { getProcessStartTime } from "./process-group.js";
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -1129,5 +1136,54 @@ describe.skipIf(process.platform === "win32")("orphaned routes", () => {
       expect(store.pruneStaleRoutes({ keepOrphaned: true })).toHaveLength(1);
       expect(raw()).toEqual([]);
     });
+  });
+});
+
+describe("isRouteOwnerAlive", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function mockKill(code: string | undefined) {
+    return vi.spyOn(process, "kill").mockImplementation(() => {
+      if (code === undefined) return true;
+      throw Object.assign(new Error(code), { code });
+    });
+  }
+
+  it("treats pid 0 as a live reserved route without signaling anything", () => {
+    const kill = mockKill("ESRCH");
+    expect(isRouteOwnerAlive({ pid: 0 })).toBe(true);
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it("is true for a live owner and false for a dead one", () => {
+    mockKill(undefined);
+    expect(isRouteOwnerAlive({ pid: 4242 })).toBe(true);
+    vi.restoreAllMocks();
+    mockKill("ESRCH");
+    expect(isRouteOwnerAlive({ pid: 4242 })).toBe(false);
+  });
+
+  it("keeps a route owned by another user's process (EPERM) live", () => {
+    mockKill("EPERM");
+    expect(isRouteOwnerAlive({ pid: 4242 })).toBe(true);
+    expect(hasDeadRouteOwner([{ pid: 4242 }, { pid: 0 }])).toBe(false);
+  });
+
+  it("only sends signal 0, so the check never kills", () => {
+    const kill = mockKill(undefined);
+    hasDeadRouteOwner([{ pid: 11 }, { pid: 12 }]);
+    expect(kill.mock.calls.every((call) => call[1] === 0)).toBe(true);
+  });
+
+  it("reports a dead owner among live ones", () => {
+    vi.spyOn(process, "kill").mockImplementation((pid) => {
+      if (pid === 13) throw Object.assign(new Error("ESRCH"), { code: "ESRCH" });
+      return true;
+    });
+    expect(hasDeadRouteOwner([{ pid: 11 }, { pid: 13 }])).toBe(true);
+    expect(hasDeadRouteOwner([{ pid: 11 }, { pid: 12 }])).toBe(false);
+    expect(hasDeadRouteOwner([])).toBe(false);
   });
 });
