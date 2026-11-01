@@ -15,6 +15,7 @@ import {
   untrustCA,
   untrustCALinux,
 } from "./certs.js";
+import { resolveOpensslBinary, SERVICE_OPENSSL_ENV } from "./openssl-path.js";
 
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
@@ -114,6 +115,71 @@ describe("opensslSupportsNotBefore", () => {
     expect(opensslSupportsNotBefore("OpenSSL 3.4.0 22 Oct 2024")).toBe(true);
     expect(opensslSupportsNotBefore("OpenSSL 3.3.2 3 Sep 2024")).toBe(false);
     expect(opensslSupportsNotBefore("LibreSSL 3.3.6")).toBe(false);
+  });
+});
+
+describe.skipIf(process.platform === "win32")("service-pinned openssl", () => {
+  let tmpDir: string;
+  let originalPath: string | undefined;
+
+  /** A shell wrapper that records each call in `log`, then runs the real openssl. */
+  function writeRecordingOpenssl(dir: string, log: string): string {
+    fs.mkdirSync(dir, { recursive: true });
+    const script = path.join(dir, "openssl");
+    fs.writeFileSync(
+      script,
+      `#!/bin/sh\necho "$0" >> "${log}"\nexec "${resolveOpensslBinary()}" "$@"\n`,
+      { mode: 0o755 }
+    );
+    return script;
+  }
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-pin-test-"));
+    fs.mkdirSync(path.join(tmpDir, "state"));
+    originalPath = process.env.PATH;
+  });
+
+  afterEach(() => {
+    delete process.env[SERVICE_OPENSSL_ENV];
+    process.env.PATH = originalPath;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("runs the pinned binary and ignores a planted openssl earlier on PATH", () => {
+    const pinnedLog = path.join(tmpDir, "pinned.log");
+    const plantedLog = path.join(tmpDir, "planted.log");
+    const pinned = writeRecordingOpenssl(path.join(tmpDir, "pinned"), pinnedLog);
+    writeRecordingOpenssl(path.join(tmpDir, "planted"), plantedLog);
+    process.env[SERVICE_OPENSSL_ENV] = pinned;
+    process.env.PATH = `${path.join(tmpDir, "planted")}${path.delimiter}${originalPath ?? ""}`;
+
+    ensureCerts(path.join(tmpDir, "state"));
+
+    expect(fs.existsSync(pinnedLog)).toBe(true);
+    expect(fs.existsSync(plantedLog)).toBe(false);
+  });
+
+  it("keeps the PATH lookup when no pin is set (interactive runs)", () => {
+    const plantedLog = path.join(tmpDir, "planted.log");
+    writeRecordingOpenssl(path.join(tmpDir, "planted"), plantedLog);
+    process.env.PATH = `${path.join(tmpDir, "planted")}${path.delimiter}${originalPath ?? ""}`;
+
+    ensureCerts(path.join(tmpDir, "state"));
+
+    expect(fs.existsSync(plantedLog)).toBe(true);
+  });
+
+  it("fails with a re-install hint when the pinned binary is gone", () => {
+    process.env[SERVICE_OPENSSL_ENV] = path.join(tmpDir, "missing", "openssl");
+    expect(() => ensureCerts(path.join(tmpDir, "state"))).toThrow(
+      /pins openssl to .*service install/s
+    );
+  });
+
+  it("rejects a relative pin instead of searching PATH", () => {
+    process.env[SERVICE_OPENSSL_ENV] = "openssl";
+    expect(() => ensureCerts(path.join(tmpDir, "state"))).toThrow(/must be an absolute path/);
   });
 });
 
