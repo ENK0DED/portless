@@ -12,13 +12,17 @@ const MARKER_START = "# portless-start";
 const MARKER_END = "# portless-end";
 
 /**
- * Read the current /etc/hosts file content.
- * Returns null if the file cannot be read, including when it does not exist.
+ * Read the current hosts file content. A file that does not exist reads as an
+ * empty string, so the first sync creates it holding only portless's block.
+ * Returns null when the file exists but cannot be read (a lock, an I/O error, a
+ * permissions problem) so callers refuse to rewrite it from empty content,
+ * which would destroy every hand-written entry.
  */
-function readHostsFile(): string | null {
+function readHostsFile(hostsPath: string): string | null {
   try {
-    return fs.readFileSync(HOSTS_PATH, "utf-8");
-  } catch {
+    return fs.readFileSync(hostsPath, "utf-8");
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return "";
     return null;
   }
 }
@@ -133,10 +137,14 @@ export function blockMatchesHostnames(content: string, hostnames: string[]): boo
 /**
  * Rewrite the managed block to include exactly these hostnames. Requires root
  * access. Returns whether the desired block is present after the operation.
+ *
+ * Writes are in place, not a temp file plus rename: a rename would replace the
+ * file with a new inode and drop its mode, owner, ACLs and any symlink. The
+ * optional path lets tests use a real file instead of the system hosts file.
  */
-export function syncHostsFile(hostnames: string[]): boolean {
+export function syncHostsFile(hostnames: string[], hostsPath = HOSTS_PATH): boolean {
   const uniqueHostnames = deduplicateHostnames(hostnames);
-  const content = readHostsFile();
+  const content = readHostsFile(hostsPath);
   if (content === null) return false;
   if (blockMatchesHostnames(content, uniqueHostnames)) return true;
 
@@ -144,16 +152,18 @@ export function syncHostsFile(hostnames: string[]): boolean {
     const cleaned = removeBlock(content);
 
     if (uniqueHostnames.length === 0) {
-      fs.writeFileSync(HOSTS_PATH, cleaned);
+      fs.writeFileSync(hostsPath, cleaned);
     } else {
       const block = buildBlock(uniqueHostnames);
-      fs.writeFileSync(HOSTS_PATH, cleaned.trimEnd() + "\n\n" + block + "\n");
+      // A missing or empty file holds only the block, with no leading blank line.
+      const prefix = cleaned.trim() === "" ? "" : cleaned.trimEnd() + "\n\n";
+      fs.writeFileSync(hostsPath, prefix + block + "\n");
     }
   } catch {
     return false;
   }
 
-  const verification = readHostsFile();
+  const verification = readHostsFile(hostsPath);
   return verification !== null && blockMatchesHostnames(verification, uniqueHostnames);
 }
 
@@ -161,12 +171,12 @@ export function syncHostsFile(hostnames: string[]): boolean {
  * Remove the portless-managed block from /etc/hosts.
  * Returns true on success, false on failure.
  */
-export function cleanHostsFile(): boolean {
-  const content = readHostsFile();
+export function cleanHostsFile(hostsPath = HOSTS_PATH): boolean {
+  const content = readHostsFile(hostsPath);
   if (content === null) return false;
   try {
     if (!content.includes(MARKER_START)) return true;
-    fs.writeFileSync(HOSTS_PATH, removeBlock(content));
+    fs.writeFileSync(hostsPath, removeBlock(content));
     return true;
   } catch {
     return false;
@@ -178,8 +188,8 @@ export function cleanHostsFile(): boolean {
  * A read failure returns an empty array for best-effort callers; it does not
  * prove that the hosts file is empty or was read successfully.
  */
-export function getManagedHostnames(): string[] {
-  const content = readHostsFile();
+export function getManagedHostnames(hostsPath = HOSTS_PATH): string[] {
+  const content = readHostsFile(hostsPath);
   if (content === null) return [];
   return extractManagedBlock(content).flatMap((line) => {
     const [, ...aliases] = line.split("#", 1)[0].trim().split(/\s+/);

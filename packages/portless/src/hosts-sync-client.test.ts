@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as http from "node:http";
+import * as http2 from "node:http2";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -98,6 +99,55 @@ describe("hosts-sync internal client", () => {
 
     expect(await triggerHostsSync(running.port, encrypted, dir)).toBe(result);
     expect(running.calls()).toBe(1);
+  });
+
+  it("serves the authenticated endpoint and proof over HTTP/2", async () => {
+    const dir = createDir();
+    const token = "a".repeat(64);
+    const running = await start(dir, { clientToken: token, encrypted: true });
+    const session = http2.connect(`https://127.0.0.1:${running.port}`, {
+      rejectUnauthorized: false,
+    });
+    try {
+      const request = (headers: http2.OutgoingHttpHeaders) =>
+        new Promise<http2.IncomingHttpHeaders>((resolve, reject) => {
+          const req = session.request(headers);
+          req.on("response", (responseHeaders) => {
+            req.resume();
+            req.on("end", () => resolve(responseHeaders));
+          });
+          req.on("error", reject);
+          req.end();
+        });
+
+      const challenge = "c".repeat(64);
+      const probe = await request({
+        ":method": "HEAD",
+        ":path": "/",
+        ":authority": `127.0.0.1:${running.port}`,
+        [HOSTS_SYNC_AUTH_CHALLENGE_HEADER]: challenge,
+      });
+      expect(probe[HOSTS_SYNC_AUTH_PROOF_HEADER]).toBe(createHostsSyncProof(token, challenge));
+
+      const denied = await request({
+        ":method": "POST",
+        ":path": "/.portless/hosts-sync",
+        ":authority": `127.0.0.1:${running.port}`,
+      });
+      expect(denied[":status"]).toBe(401);
+      expect(running.calls()).toBe(0);
+
+      const acted = await request({
+        ":method": "POST",
+        ":path": "/.portless/hosts-sync",
+        ":authority": `127.0.0.1:${running.port}`,
+        "x-portless-hosts-sync-token": token,
+      });
+      expect(acted[":status"]).toBe(204);
+      expect(running.calls()).toBe(1);
+    } finally {
+      session.close();
+    }
   });
 
   it.each([

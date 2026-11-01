@@ -690,7 +690,7 @@ portless hosts clean   # Remove entries later
 
 Auto-syncs `/etc/hosts` for route hostnames by default. Set `PORTLESS_SYNC_HOSTS=0` to disable. If a route hostname will not resolve, the command that registered it warns and points you to `portless hosts sync`.
 
-Manual sync reconciles portless-managed entries with current routes and removes stale entries when there are no routes. It requires a successful initial hosts-file read before writing and verifies each write. A read or verification failure follows the normal sync error path.
+Manual sync reconciles portless-managed entries with current routes and removes stale entries, including a leftover block when there are no routes. A missing hosts file is created holding only the portless block; a file that exists but cannot be read is never rewritten. Writes are in place, so permissions and symlinks are kept. A registering command asks the running proxy to sync through an authenticated loopback request (a token in the state directory), falling back to waiting for an older proxy's route watcher; the request is a no-op with `PORTLESS_SYNC_HOSTS=0` or `--unprivileged`. It requires a successful initial hosts-file read before writing and verifies each write. A read or verification failure follows the normal sync error path.
 
 If a route hostname will not resolve, the command that registered it warns instead of failing silently and points you to `portless hosts sync`.
 

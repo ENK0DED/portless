@@ -14,6 +14,7 @@ import {
 } from "./bg.js";
 import { getBgLogPaths } from "./bg-logs.js";
 import { BgStore, type BgProcessEntry, type BgStartIntent } from "./bg-store.js";
+import { triggerHostsSync } from "./cli-utils.js";
 import { ensureCerts } from "./certs.js";
 import { getProcessStartTime } from "./process-group.js";
 import { RouteStore } from "./routes.js";
@@ -3916,6 +3917,25 @@ describe("CLI", () => {
       const stop = run(["proxy", "stop"], { env: proxyEnv() });
       expect(stop.status).toBe(0);
       expect(fs.existsSync(path.join(tmpDir, "proxy.wildcard"))).toBe(false);
+    });
+
+    it("publishes the hosts-sync token while the proxy runs and removes it on stop", async () => {
+      const tokenPath = path.join(tmpDir, "proxy.hosts-sync-token");
+      const start = run(["proxy", "start"], { env: proxyEnv() });
+      expect(start.status, start.stdout + start.stderr).toBe(0);
+      expect(fs.existsSync(tokenPath)).toBe(true);
+      expect(fs.readFileSync(tokenPath, "utf-8").trim()).toMatch(/^[a-f0-9]{64}$/);
+      if (process.platform !== "win32") {
+        expect(fs.statSync(tokenPath).mode & 0o077).toBe(0);
+      }
+
+      // The authenticated handshake succeeds; the daemon declines because the
+      // test environment disables hosts sync, so nothing touches a hosts file.
+      expect(await triggerHostsSync(testPort, false, tmpDir)).toBe("disabled");
+
+      const stop = run(["proxy", "stop"], { env: proxyEnv() });
+      expect(stop.status).toBe(0);
+      expect(fs.existsSync(tokenPath)).toBe(false);
     });
 
     it("persists custom certificate mode while the proxy runs and clears it on stop", () => {

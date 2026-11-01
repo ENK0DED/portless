@@ -57,6 +57,7 @@ import {
   resolveWindowsExecutable,
   resolveStateDir,
   syncHostsWithWarning,
+  triggerHostsSync,
   validateTld,
   writeLanMarker,
   writeCustomCertMarker,
@@ -2160,93 +2161,204 @@ describe("readPersistedProxyState", () => {
 
 describe("reportHostsSync", () => {
   const warnings: string[] = [];
+  const onWarn = (m: string) => warnings.push(m);
+  const acted = async (): Promise<"acted"> => "acted";
+  const mute = async (): Promise<"mute"> => "mute";
+  const absent = async (): Promise<"absent"> => "absent";
+  const disabled = async (): Promise<"disabled"> => "disabled";
+  const savedSyncHosts = process.env.PORTLESS_SYNC_HOSTS;
 
   beforeEach(() => {
     warnings.length = 0;
+    delete process.env.PORTLESS_SYNC_HOSTS;
   });
 
-  it("checks each unique hostname after the managed block is ready", async () => {
-    const checked: string[] = [];
-    let reads = 0;
+  afterEach(() => {
+    if (savedSyncHosts === undefined) delete process.env.PORTLESS_SYNC_HOSTS;
+    else process.env.PORTLESS_SYNC_HOSTS = savedSyncHosts;
+  });
 
+  it("says nothing when the hostname already resolves", async () => {
+    await reportHostsSync(["a.localhost"], 1, false, false, onWarn, acted, async () => true);
+    expect(warnings).toEqual([]);
+  });
+
+  it("does not warn when the system resolver selects IPv6 loopback", async () => {
+    await reportHostsSync(["::1"], 1, false, false, onWarn, acted);
+    expect(warnings).toEqual([]);
+  });
+
+  it("warns when the system resolver selects non-loopback IPv6", async () => {
+    await reportHostsSync(["2001:db8::1"], 1, false, false, onWarn, acted);
+    expect(warnings).toEqual(["2001:db8::1 will not resolve. Run: portless hosts sync"]);
+  });
+
+  it("warns naming only the hostnames that do not resolve", async () => {
+    await reportHostsSync(
+      ["good.test", "bad.test"],
+      1,
+      false,
+      false,
+      onWarn,
+      acted,
+      async (hostname) => hostname === "good.test",
+      50
+    );
+    expect(warnings).toEqual(["bad.test will not resolve. Run: portless hosts sync"]);
+  });
+
+  it("checks each unique hostname once", async () => {
+    const checked: string[] = [];
     await reportHostsSync(
       ["good.test", "bad.test", "bad.test"],
+      1,
       false,
-      (message) => warnings.push(message),
+      false,
+      onWarn,
+      acted,
       async (hostname) => {
-        expect(reads).toBeGreaterThan(1);
         checked.push(hostname);
         return hostname === "good.test";
-      },
-      () => (++reads >= 2 ? ["good.test", "bad.test"] : []),
-      500
+      }
     );
-
     expect(checked).toEqual(["good.test", "bad.test"]);
     expect(warnings).toEqual(["bad.test will not resolve. Run: portless hosts sync"]);
   });
 
-  it("polls the managed block up to the bounded ceiling before warning", async () => {
-    let reads = 0;
-    const started = Date.now();
+  it("passes the proxy port and TLS mode to the trigger", async () => {
+    const calls: Array<[number, boolean]> = [];
+    await reportHostsSync(
+      ["a.test"],
+      1355,
+      true,
+      false,
+      onWarn,
+      async (port, tls) => {
+        calls.push([port, tls]);
+        return "acted";
+      },
+      async () => true
+    );
+    expect(calls).toEqual([[1355, true]]);
+  });
 
+  it("gives an older daemon its watcher window", async () => {
+    let reads = 0;
+    await reportHostsSync(
+      ["a.test"],
+      1,
+      false,
+      false,
+      onWarn,
+      mute,
+      async () => true,
+      2000,
+      () => (++reads >= 3 ? ["a.test"] : [])
+    );
+    expect(reads).toBeGreaterThan(1);
+    expect(warnings).toEqual([]);
+  });
+
+  it("checks the resolver only after the managed block is published", async () => {
+    let reads = 0;
+    await reportHostsSync(
+      ["a.test"],
+      1,
+      false,
+      false,
+      onWarn,
+      mute,
+      async () => {
+        expect(reads).toBeGreaterThan(1);
+        return true;
+      },
+      500,
+      () => (++reads >= 2 ? ["a.test"] : [])
+    );
+    expect(warnings).toEqual([]);
+  });
+
+  it("warns at the ceiling when an older daemon never syncs", async () => {
+    const started = Date.now();
+    await reportHostsSync(
+      ["a.test"],
+      1,
+      false,
+      false,
+      onWarn,
+      mute,
+      async () => false,
+      150,
+      () => []
+    );
+    expect(Date.now() - started).toBeGreaterThanOrEqual(150);
+    expect(warnings).toHaveLength(1);
+  });
+
+  it("does not wait when no producer exists", async () => {
+    const started = Date.now();
+    await reportHostsSync(["a.test"], 1, false, false, onWarn, absent, async () => false, 3000);
+    expect(Date.now() - started).toBeLessThan(200);
+    expect(warnings).toHaveLength(1);
+  });
+
+  it("does not wait when the daemon has hosts sync disabled", async () => {
+    const started = Date.now();
+    await reportHostsSync(["a.test"], 1, false, false, onWarn, disabled, async () => false, 3000);
+    expect(Date.now() - started).toBeLessThan(200);
+    expect(warnings).toHaveLength(1);
+  });
+
+  it("neither asks nor waits when PORTLESS_SYNC_HOSTS disables syncing here", async () => {
+    process.env.PORTLESS_SYNC_HOSTS = "0";
+    let triggered = false;
+    let slept = false;
     await reportHostsSync(
       ["missing.test"],
+      1,
       false,
-      (message) => warnings.push(message),
-      async () => false,
-      () => {
-        reads += 1;
-        return [];
-      },
-      40
-    );
-
-    expect(reads).toBeGreaterThan(1);
-    expect(Date.now() - started).toBeGreaterThanOrEqual(40);
-    expect(warnings).toEqual(["missing.test will not resolve. Run: portless hosts sync"]);
-  });
-
-  it("skips .local hostnames only while LAN mode is active", async () => {
-    let checked = 0;
-    await reportHostsSync(
-      ["device.local", "custom.test"],
-      true,
-      (message) => warnings.push(message),
+      false,
+      onWarn,
       async () => {
-        checked += 1;
-        return false;
+        triggered = true;
+        return "mute";
       },
-      () => ["custom.test"]
+      async () => false,
+      3500,
+      () => [],
+      async () => {
+        slept = true;
+      }
     );
-
-    expect(checked).toBe(1);
-    expect(warnings).toEqual(["custom.test will not resolve. Run: portless hosts sync"]);
-  });
-
-  it("checks immediately when hosts sync is disabled", async () => {
-    const previous = process.env.PORTLESS_SYNC_HOSTS;
-    process.env.PORTLESS_SYNC_HOSTS = "0";
-    let slept = false;
-    try {
-      await reportHostsSync(
-        ["missing.test"],
-        false,
-        (message) => warnings.push(message),
-        async () => false,
-        () => [],
-        3500,
-        async () => {
-          slept = true;
-        }
-      );
-    } finally {
-      if (previous === undefined) delete process.env.PORTLESS_SYNC_HOSTS;
-      else process.env.PORTLESS_SYNC_HOSTS = previous;
-    }
-
+    expect(triggered).toBe(false);
     expect(slept).toBe(false);
     expect(warnings).toEqual(["missing.test will not resolve. Run: portless hosts sync"]);
+  });
+
+  it("checks custom .local names outside LAN mode", async () => {
+    let asked = 0;
+    await reportHostsSync(["app.local"], 1, false, false, onWarn, acted, async () => {
+      asked += 1;
+      return false;
+    });
+    expect(asked).toBe(1);
+    expect(warnings).toHaveLength(1);
+  });
+
+  it("skips .local names in active LAN mode", async () => {
+    let triggered = false;
+    await reportHostsSync(["app.local"], 1, false, true, onWarn, async () => {
+      triggered = true;
+      return "acted";
+    });
+    expect(triggered).toBe(false);
+    expect(warnings).toEqual([]);
+  });
+});
+
+describe("triggerHostsSync", () => {
+  it("reports absent when nothing is listening", async () => {
+    expect(await triggerHostsSync(19899)).toBe("absent");
   });
 });
 
