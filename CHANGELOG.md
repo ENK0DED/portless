@@ -10,6 +10,7 @@
 
 ### Security
 
+- **Windows tunnels stop with portless**: Stopping a managed Cloudflare or ngrok tunnel on Windows now ends the whole process tree. When the provider binary resolves to a `.cmd` shim, the old stop path ended only the `cmd.exe` wrapper, so the tunnel process kept running and its public URL stayed reachable after portless exited. Found by the Windows CI matrix on the sync PR.
 - **Pinned openssl for the installed service**: `service install` now resolves and checks `openssl` once and pins its absolute path in the launchd plist, systemd unit and Windows script through an internal `PORTLESS_SERVICE_OPENSSL` variable. Certificate generation in a pinned service never falls back to `PATH`, and the install warns when the pinned path sits in a location a normal user can write. This closes the route by which a user-influenced `PATH` could pick the binary a root or SYSTEM service runs. The pinned path is unverified on a real Windows host, so the Windows matrix in CI is the only check so far.
 
 ### New Features

@@ -770,7 +770,9 @@ describe("CLI", () => {
       } finally {
         fs.rmSync(stateDir, { recursive: true, force: true });
       }
-    });
+      // doctor probes the installed service and the sharing tools, which are
+      // slow to spawn on Windows CI.
+    }, 30_000);
 
     it("rejects unknown arguments", () => {
       const { status, stderr } = run(["doctor", "--fix"]);

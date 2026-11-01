@@ -4,6 +4,7 @@ import {
   resolveWindowsCommandInvocation,
   guardWindowsOrphans,
   getProcessCommand,
+  killTree,
 } from "./cli-utils.js";
 
 const NGROK_BINARY = "ngrok";
@@ -247,11 +248,7 @@ export function startTunnel(
     };
 
     const timer = setTimeout(() => {
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        // non-fatal
-      }
+      terminateTunnelChild(child);
       settle(() => reject(new Error(provider.timeout)));
     }, timeoutMs);
 
@@ -274,13 +271,27 @@ export function startTunnel(
   });
 }
 
-export function stopNgrokProcess(child: TunnelChildProcess | undefined): void {
-  if (!child) return;
+/**
+ * Stop a tunnel child started by this process. On Windows a provider binary
+ * that resolves to a .cmd shim runs under cmd.exe, and child.kill() would end
+ * only that wrapper and leave the tunnel itself running and public, so the
+ * whole tree is killed there.
+ */
+function terminateTunnelChild(child: TunnelChildProcess): void {
   try {
+    if (isWindows && child.pid) {
+      killTree(child as unknown as Parameters<typeof killTree>[0]);
+      return;
+    }
     child.kill("SIGTERM");
   } catch {
     // Best-effort cleanup.
   }
+}
+
+export function stopNgrokProcess(child: TunnelChildProcess | undefined): void {
+  if (!child) return;
+  terminateTunnelChild(child);
 }
 
 export function stopTunnelPid(pid: number | undefined): void {
