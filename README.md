@@ -300,7 +300,7 @@ In LAN mode, an explicit suffix list is preserved and `.local` is appended when 
 
 Suffix values are lowercased and validated as DNS names: each label may contain lowercase letters, digits, and hyphens, must start and end with a letter or digit, and must be 63 characters or less. The full suffix and generated hostname must be 253 characters or less. Leading dots, trailing dots, and consecutive dots are rejected.
 
-Auto-elevated proxy starts pass the resolved `PORTLESS_STATE_DIR` and proxy flags such as `--skip-trust` through `sudo`, so a root-owned proxy uses the same per-user state, suffix settings, and trust choice as the command that started it. Set `PORTLESS_STATE_DIR` explicitly before running portless if you want a separate proxy state directory.
+Auto-elevated proxy starts pass the resolved `PORTLESS_STATE_DIR` and proxy flags such as `--skip-trust` through `sudo`, so a root-owned proxy uses the same per-user state, suffix settings, and trust choice as the command that started it. Set `PORTLESS_STATE_DIR` explicitly before running portless if you want a separate proxy state directory. A state directory without a port file counts as having no proxy: portless does not fall back to probing the default port, so a fresh isolated directory never reaches another proxy running on this machine.
 
 The proxy auto-syncs `/etc/hosts` for route hostnames, so `.test`, `.server01.acme.com`, and other configured suffixes resolve on your machine.
 
@@ -439,7 +439,7 @@ portless service uninstall
 
 The service uses portless defaults unless install options or `PORTLESS_*` environment variables are provided: HTTPS on port 443 with `.localhost` names. `service install` accepts the proxy options you would use with `proxy start`, including `--port`, `--no-tls`, `--lan`, `--ip`, `--suffix`, `--tld`, `--wildcard`, `--cert`, and `--key`. Use `--state-dir <path>` or `PORTLESS_STATE_DIR=<path>` to choose where service state and logs are written.
 
-The chosen service configuration is written into launchd, systemd, or Task Scheduler and reused after reboot. Custom service suffix lists are persisted as `PORTLESS_SUFFIX`; `--suffix` and `--tld` may repeat. `portless service status` reports the installed port, HTTPS mode, configured suffixes, LAN mode, wildcard mode, and state directory. macOS and Linux install a root-owned service so port 443 can bind at boot. Windows installs a Task Scheduler startup task that runs as SYSTEM. Installation and removal may require administrator privileges. `portless clean` automatically removes the service.
+The chosen service configuration is written into launchd, systemd, or Task Scheduler and reused after reboot. Custom service suffix lists are persisted as `PORTLESS_SUFFIX`; `--suffix` and `--tld` may repeat. `portless service status` reports the installed port, HTTPS mode, configured suffixes, LAN mode, wildcard mode, state directory, and the Node binary the service pins, flagging it when that binary no longer exists (re-run `portless service install` to repair). macOS and Linux install a root-owned service so port 443 can bind at boot. Windows installs a Task Scheduler startup task that runs as SYSTEM. Installation and removal may require administrator privileges. `portless clean` automatically removes the service.
 
 ## LAN mode
 
@@ -719,7 +719,7 @@ Run `portless doctor` first when routing, HTTPS, LAN access, or sharing does not
 portless doctor
 ```
 
-Doctor is read-only. It inspects the active state directory and sudo handoff, ordered suffix lists including dotted suffixes, loopback, guarded unprivileged, or LAN proxy bind mode, proxy and route liveness, generated or custom certificate state, every `cert.<suffix>` page, hosts sync, mDNS tooling, background apps, Cloudflare and ngrok binaries, and Tailscale and NetBird availability. It prints suggested commands but never starts, stops, trusts, syncs, prunes, cleans, or modifies portless state.
+Doctor is read-only. It inspects the active state directory and sudo handoff, ordered suffix lists including dotted suffixes, loopback, guarded unprivileged, or LAN proxy bind mode, proxy and route liveness, generated or custom certificate state, every `cert.<suffix>` page, hosts sync, mDNS tooling, background apps, the Node binary pinned by an installed startup service, Cloudflare and ngrok binaries, and Tailscale and NetBird availability. It prints suggested commands but never starts, stops, trusts, syncs, prunes, cleans, or modifies portless state.
 
 ### Options
 
@@ -973,6 +973,7 @@ See [FORK.md](./FORK.md) for the full list of fork-owned invariants and the upst
 ## Requirements
 
 - Node.js 24+
+- Bun 1.4.4+, only when you run portless under Bun. Earlier Bun versions ignore SNI callbacks, so every hostname receives the default `localhost` certificate. Portless adds no runtime check for this.
 - macOS, Linux, or Windows
 - Tailscale CLI (optional, for `--tailscale` and `--funnel`)
 - ngrok CLI (optional, for `--ngrok`)

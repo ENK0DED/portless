@@ -327,7 +327,7 @@ Path-scoped routes report their prefix in `path_prefix`, and h2c routes report `
 portless doctor
 ```
 
-Runs read-only diagnostics across the local portless installation. Doctor checks Node.js, the resolved state directory and sudo handoff, ordered suffix lists including dotted suffixes, loopback or LAN proxy bind mode, proxy and route liveness, generated or custom certificate state, each `cert.<suffix>` page, hosts sync, mDNS tooling, background apps, Cloudflare and ngrok binaries, and Tailscale and NetBird availability.
+Runs read-only diagnostics across the local portless installation. Doctor checks Node.js, the resolved state directory and sudo handoff, ordered suffix lists including dotted suffixes, loopback or LAN proxy bind mode, proxy and route liveness, generated or custom certificate state, each `cert.<suffix>` page, hosts sync, mDNS tooling, background apps, the Node binary pinned by an installed startup service, Cloudflare and ngrok binaries, and Tailscale and NetBird availability.
 
 Doctor prints suggested commands when it finds a problem. It never starts, stops, trusts, syncs, prunes, cleans, or modifies portless state.
 
@@ -501,7 +501,7 @@ portless service uninstall
 
 Installs the proxy as an OS startup service. The default is HTTPS on port 443 with `.localhost` names, but `service install` accepts proxy options including `--port`, `--no-tls`, `--lan`, `--ip`, `--suffix`, `--tld`, `--wildcard`, `--cert`, and `--key`. Use `--state-dir <path>` or `PORTLESS_STATE_DIR=<path>` to choose where service state and logs are written.
 
-The chosen service configuration is written into launchd, systemd, or Task Scheduler and reused after reboot. Custom service suffix lists are persisted as `PORTLESS_SUFFIX`; `--suffix` and `--tld` may repeat. `portless service status` reports the installed port, HTTPS mode, configured suffixes, LAN mode, wildcard mode, and state directory. macOS and Linux use a root-owned service so port 443 can bind at boot. Windows uses a Task Scheduler startup task that runs as SYSTEM. Installation and removal may require administrator privileges. `portless clean` automatically removes the service.
+The chosen service configuration is written into launchd, systemd, or Task Scheduler and reused after reboot. Custom service suffix lists are persisted as `PORTLESS_SUFFIX`; `--suffix` and `--tld` may repeat. `portless service status` reports the installed port, HTTPS mode, configured suffixes, LAN mode, wildcard mode, state directory, and the Node binary the service pins, flagging it when that binary no longer exists (re-run `portless service install` to repair). macOS and Linux use a root-owned service so port 443 can bind at boot. Windows uses a Task Scheduler startup task that runs as SYSTEM. Installation and removal may require administrator privileges. `portless clean` automatically removes the service.
 
 ### LAN mode
 
