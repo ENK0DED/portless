@@ -3653,6 +3653,16 @@ ${colors.bold("HTTP/2 + HTTPS (default):")}
   only the Linux trust store. On NixOS and unrecognized Linux
   distributions, portless prints manual CA setup guidance instead of using
   an unsupported trust-store layout. No browser warnings.
+  On Linux the CA also goes into the invoking user's existing Chrome/Chromium
+  NSS database (~/.pki/nssdb if present, else ~/.local/share/pki/nssdb), even
+  under sudo. This needs NSS certutil (Debian/Ubuntu: libnss3-tools). No
+  database is created: if neither exists, open Chrome once and rerun
+  portless trust. If NSS registration fails, system trust still succeeds with
+  a warning and Chrome may stay untrusted; install the tools and rerun
+  portless trust. Restart the browser afterwards. portless clean removes the
+  NSS entry too.
+  portless trust does nothing when every store it writes already has the CA
+  (both stores on WSL, plus NSS), so setup scripts can run it every time.
   Use --skip-trust to skip adding the CA to the trust store.
   Disable with --no-tls.
 
@@ -3888,12 +3898,26 @@ async function handleTrust(): Promise<void> {
       console.log(colors.blue(restart));
     }
   }
+  // Adding a CA that every store already holds asks for authorization again
+  // (a Keychain dialog on macOS, sudo on Linux), so scripts that run `trust`
+  // to be sure would prompt on every run. Ask the OS, not the marker: `trust`
+  // also repairs trust after the CA was removed from a store. On WSL both the
+  // Linux and the Windows store must have it, plus the NSS database on Linux.
+  if (isCATrusted(dir, { useMarker: false, everyStore: true })) {
+    console.log(colors.green("Local CA is already in the system trust store."));
+    return;
+  }
   const result = trustCA(dir);
   if (result.trusted) {
     console.log(colors.green("Local CA added to system trust store."));
-    console.log(colors.gray("Browsers will now trust portless HTTPS certificates."));
     if (result.warning) {
       console.warn(colors.yellow(result.warning));
+    } else {
+      console.log(
+        colors.gray(
+          "Browsers will now trust portless HTTPS certificates. Restart your browser to pick up the change."
+        )
+      );
     }
     return;
   }

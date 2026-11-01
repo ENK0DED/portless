@@ -824,9 +824,13 @@ export function evaluateDoctor(snapshot: DoctorSnapshot): DoctorReport {
     }
     if (snapshot.certificates.ca) {
       if (snapshot.certificates.trusted) {
-        add("ok", "Generated CA is trusted by the OS trust store.");
+        add("ok", "Generated CA is trusted by the required trust stores.");
       } else {
-        add("warn", "Generated CA is not trusted by the OS trust store.", "Run: portless trust");
+        add(
+          "warn",
+          "Generated CA is not trusted by all required trust stores.",
+          "Run: portless trust"
+        );
       }
     }
   } else if (snapshot.proxy.tls) {

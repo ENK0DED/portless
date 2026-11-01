@@ -22,6 +22,20 @@ vi.mock("node:fs", async (importOriginal) => {
   return { ...actual, readFileSync: vi.fn(actual.readFileSync) };
 });
 
+// Trust code looks for the invoking user's Chrome/Chromium NSS database under
+// their home directory. Point HOME at an empty directory so no test can read or
+// modify the real one.
+let isolatedHome: string;
+beforeEach(() => {
+  isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), "portless-certs-home-"));
+  vi.stubEnv("HOME", isolatedHome);
+  vi.stubEnv("SUDO_USER", "");
+});
+afterEach(() => {
+  vi.unstubAllEnvs();
+  fs.rmSync(isolatedHome, { recursive: true, force: true });
+});
+
 /**
  * Return the signature algorithm string for a PEM cert file using openssl.
  * X509Certificate.signatureAlgorithm was only added in Node.js 24.9.0 and
