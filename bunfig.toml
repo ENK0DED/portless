@@ -1,0 +1,6 @@
+[install]
+# Refuse package versions published less than 48 hours ago (seconds). Matches
+# the pnpm minimumReleaseAge of 2880 minutes that upstream uses.
+minimumReleaseAge = 172800
+# Upstream excludes this pinned docs dependency from the age gate.
+minimumReleaseAgeExcludes = ["@vercel/agent-readability"]

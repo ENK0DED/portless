@@ -5,7 +5,7 @@ import { request } from "node:http";
 import { test } from "node:test";
 
 const base = process.env.DOCS_TEST_URL;
-if (!base) throw new Error("Run pnpm --filter @portless/docs test:routes after building the docs.");
+if (!base) throw new Error("Run bun run --cwd apps/docs test:routes after building the docs.");
 const noindex = process.env.DOCS_EXPECT_NOINDEX === "1";
 const { pages } = JSON.parse(
   await readFile(new URL("fixtures/docs-baseline.json", import.meta.url), "utf8")

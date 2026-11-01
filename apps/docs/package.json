@@ -12,7 +12,8 @@
     "type-check": "fumadocs-mdx && tsc --noEmit",
     "start": "next start",
     "test": "vitest run src/lib",
-    "test:routes": "node scripts/test-routes.mjs"
+    "test:routes": "node scripts/test-routes.mjs",
+    "update:baseline": "node scripts/update-baseline.mjs"
   },
   "dependencies": {
     "@ai-sdk/react": "^3.0.96",

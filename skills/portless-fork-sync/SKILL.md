@@ -32,17 +32,18 @@ Expect recurring conflicts in:
 - `packages/portless/src/cli.test.ts`
 - `packages/portless/src/cli-utils.test.ts`
 - `CHANGELOG.md`
-- `apps/docs/src/app/changelog/page.mdx`
+- `apps/docs/content/docs/changelog.mdx`
+- `apps/docs/tests/fixtures/docs-baseline.json`
 
 ## Agent Hints
 
-- If SSH authentication fails, look for a reachable agent socket before handing off for missing capability:
+- Prefer HTTPS with GitHub CLI credentials; it needs no SSH agent:
 
   ```bash
-  find /tmp -type s \( -name 'agent.*' -o -name '*ssh*' \) 2>/dev/null
-  SSH_AUTH_SOCK=/tmp/path/to/agent ssh-add -l
-  SSH_AUTH_SOCK=/tmp/path/to/agent git fetch --all --prune
+  git -c credential.helper='!gh auth git-credential' fetch https://github.com/vercel-labs/portless.git '+refs/heads/*:refs/remotes/upstream/*'
   ```
+
+  Live SSH agent sockets are not only under `/tmp` (check `~/.ssh/agent/`), and signing may wait for a device approval the agent cannot give. Treat a hanging SSH operation as missing capability and hand off rather than retrying. Do not force-fetch upstream tags into the local tag namespace.
 
 - When a branch push is authorized but SSH remains unavailable, use the HTTPS fork remote:
 

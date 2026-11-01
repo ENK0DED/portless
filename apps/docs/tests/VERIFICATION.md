@@ -1,5 +1,7 @@
 # Migration verification
 
+This file records the upstream migration's original verification (September 17, 2026). It is kept as history. Commands below are the Bun equivalents used in this fork; the frozen baseline has since been regenerated from fork content (see `README.md` in this directory).
+
 Verified locally on September 17, 2026, on `feat/portless-geistdocs`, based on `05d8a9a791052ae9322c24ebeafc27f596ceb4d8`. This records pre-publication validation; no production deployment was performed.
 
 ## Final checks
@@ -7,12 +9,12 @@ Verified locally on September 17, 2026, on `feat/portless-geistdocs`, based on `
 All commands ran from the repository root and exited 0:
 
 ```sh
-VERCEL_ENV=preview pnpm --filter @portless/docs build
-VERCEL_ENV=preview DOCS_EXPECT_NOINDEX=1 pnpm --filter @portless/docs test:routes
-VERCEL_ENV=production pnpm --filter @portless/docs build
-VERCEL_ENV=production DOCS_EXPECT_NOINDEX=0 pnpm --filter @portless/docs test:routes
-pnpm --filter @portless/docs test
-pnpm --filter @portless/docs type-check
+VERCEL_ENV=preview bun run --cwd apps/docs build
+VERCEL_ENV=preview DOCS_EXPECT_NOINDEX=1 bun run --cwd apps/docs test:routes
+VERCEL_ENV=production bun run --cwd apps/docs build
+VERCEL_ENV=production DOCS_EXPECT_NOINDEX=0 bun run --cwd apps/docs test:routes
+bun run --cwd apps/docs test
+bun run --cwd apps/docs type-check
 git diff --check
 ```
 
