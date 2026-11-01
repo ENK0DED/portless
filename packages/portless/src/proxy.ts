@@ -84,6 +84,7 @@ function routeSignature(routes: RouteInfo[]): string {
           r.tailscaleUrl,
           r.tailscaleServiceUrl,
           r.tailscaleFunnel ? "f" : "",
+          r.tailscaleHttp ? "h" : "",
           r.ngrokUrl,
           r.tunnelUrl,
           r.netbirdUrl,

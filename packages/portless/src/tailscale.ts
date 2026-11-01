@@ -11,6 +11,12 @@ const TAILSCALE_COMMAND_TIMEOUT_MS = 30_000;
  */
 const PREFERRED_SERVE_PORTS = [443, 8443, 8444, 8445, 8446, 8447, 8448, 8449, 8450];
 
+/**
+ * Port allocation sequence for plain-HTTP tailnet forwards, mirroring
+ * PREFERRED_SERVE_PORTS: first app gets 80, subsequent apps get 8080+.
+ */
+const PREFERRED_HTTP_SERVE_PORTS = [80, 8080, 8081, 8082, 8083, 8084, 8085, 8086, 8087];
+
 /** Tailscale Funnel only supports these three ports. */
 const FUNNEL_PORTS = [443, 8443, 10000];
 
@@ -30,21 +36,33 @@ interface TailscaleStatusJson {
     DNSName?: string;
     HostName?: string;
     ID?: string;
+    TailscaleIPs?: string[];
   };
   CurrentTailnet?: {
     MagicDNSSuffix?: string;
+    MagicDNSEnabled?: boolean;
   };
 }
 
+/** Whether a share is registered over TLS or as a plain-HTTP forward inside the tailnet. */
+export type ServeScheme = "http" | "https";
+
 export interface TailscaleReadyResult {
-  dnsName: string;
+  /** Host other tailnet nodes address this node by: a MagicDNS name or a tailnet IP. */
+  host: string;
+  /** MagicDNS name of the node. Absent when plain HTTP falls back to the tailnet IP. */
+  dnsName?: string;
   baseUrl: string;
-  tailnetDnsSuffix: string;
+  /** MagicDNS suffix of the tailnet. Absent when plain HTTP falls back to the tailnet IP. */
+  tailnetDnsSuffix?: string;
 }
 
 export interface EnsureTailscaleReadyOptions {
   requireFunnel?: boolean;
   requireHttps?: boolean;
+  /** Tailscale Services need MagicDNS too; only changes the MagicDNS-off advice. */
+  requireService?: boolean;
+  scheme?: ServeScheme;
   runner?: TailscaleCommandRunner;
 }
 
@@ -137,6 +155,23 @@ function statusToTailnetDnsSuffix(status: TailscaleStatusJson, dnsName: string):
   );
 }
 
+/**
+ * The node's own tailnet address, used when MagicDNS is off and the node's DNS
+ * name does not resolve for other nodes. IPv4 is preferred; IPv6 is bracketed
+ * so it can sit in a URL authority.
+ */
+function statusToTailnetIp(status: TailscaleStatusJson): string {
+  const ips = (status.Self?.TailscaleIPs ?? []).filter(
+    (ip): ip is string => typeof ip === "string" && ip.length > 0
+  );
+  const ipv4 = ips.find((ip) => ip.includes("."));
+  if (ipv4) return ipv4;
+  if (ips.length > 0) return `[${ips[0]}]`;
+  throw new Error(
+    "Could not determine this node's Tailscale IP from `tailscale status --json`. Is Tailscale connected?"
+  );
+}
+
 function isFunnelCapability(value: string): boolean {
   const normalized = value.toLowerCase();
   return normalized === "funnel" || normalized.endsWith("/funnel");
@@ -175,6 +210,17 @@ function throwHttpsNotEnabled(): never {
   );
 }
 
+function throwMagicDnsDisabled(suggestHttp: boolean): never {
+  const alternative = suggestHttp
+    ? "Use --tailscale-http to share over plain HTTP inside the tailnet instead."
+    : "Enable MagicDNS in Tailscale DNS settings, then run portless again.";
+  throw new Error(
+    "MagicDNS is disabled on your tailnet, so Tailscale cannot issue an HTTPS certificate " +
+      "for this node and every request would fail the TLS handshake. " +
+      alternative
+  );
+}
+
 function throwFunnelNotEnabled(status: TailscaleStatusJson): never {
   const nodeId = status.Self?.ID;
   const enableUrl =
@@ -190,17 +236,49 @@ function throwFunnelNotEnabled(status: TailscaleStatusJson): never {
 
 /**
  * Verify that the Tailscale CLI is installed and the node is connected.
- * Returns the node's DNS name and base URL.
+ * Returns the host other tailnet nodes address this node by, and the base URL.
+ *
+ * HTTPS sharing needs MagicDNS for the certificate, so it fails fast when the
+ * tailnet reports MagicDNS as off. Plain HTTP needs neither MagicDNS nor
+ * certificates: it uses the MagicDNS name when the tailnet has one and the
+ * node's tailnet IP otherwise.
  */
 export function ensureTailscaleReady(
   options: EnsureTailscaleReadyOptions = {}
 ): TailscaleReadyResult {
   const runner = options.runner ?? defaultRunner;
+  const scheme = options.scheme ?? "https";
   runOrThrow(["version"], "check tailscale version", runner);
   const statusResult = runOrThrow(["status", "--json"], "read tailscale status", runner);
   const status = parseStatusJson(statusResult.stdout);
+
+  if (scheme === "http") {
+    // Only an explicit true proves other nodes can resolve the name. Older
+    // tailscaled omits the flag, and the IP always works.
+    if (status.CurrentTailnet?.MagicDNSEnabled === true) {
+      try {
+        const dnsName = statusToDnsName(status);
+        return {
+          host: dnsName,
+          dnsName,
+          baseUrl: `http://${dnsName}`,
+          tailnetDnsSuffix: statusToTailnetDnsSuffix(status, dnsName),
+        };
+      } catch {
+        // Fall through to the tailnet IP.
+      }
+    }
+    const ip = statusToTailnetIp(status);
+    return { host: ip, baseUrl: `http://${ip}` };
+  }
+
   const dnsName = statusToDnsName(status);
   const tailnetDnsSuffix = statusToTailnetDnsSuffix(status, dnsName);
+  // An absent flag (older tailscaled) is ignored; only an explicit false means
+  // the certificate cannot be issued.
+  if (status.CurrentTailnet?.MagicDNSEnabled === false) {
+    throwMagicDnsDisabled(!options.requireFunnel && !options.requireService);
+  }
   if (options.requireHttps && !hasHttpsCapability(status)) {
     throwHttpsNotEnabled();
   }
@@ -208,6 +286,7 @@ export function ensureTailscaleReady(
     throwFunnelNotEnabled(status);
   }
   return {
+    host: dnsName,
     dnsName,
     baseUrl: `https://${dnsName}`,
     tailnetDnsSuffix,
@@ -266,15 +345,21 @@ export function getUsedServePorts(runner: TailscaleCommandRunner = defaultRunner
 }
 
 /**
- * Pick the next available HTTPS port from the preferred sequence.
- * Returns the first port not in `usedPorts`. Funnel mode is restricted
+ * Pick the next available serve port from the preferred sequence for the
+ * scheme. Returns the first port not in `usedPorts`. Funnel mode is restricted
  * to 443, 8443, and 10000; serve mode extends beyond its preferred list.
  */
 export function findAvailableServePort(
   usedPorts: Set<number>,
-  mode: TailscaleMode = "serve"
+  mode: TailscaleMode = "serve",
+  scheme: ServeScheme = "https"
 ): number {
-  const pool = mode === "funnel" ? FUNNEL_PORTS : PREFERRED_SERVE_PORTS;
+  const pool =
+    mode === "funnel"
+      ? FUNNEL_PORTS
+      : scheme === "http"
+        ? PREFERRED_HTTP_SERVE_PORTS
+        : PREFERRED_SERVE_PORTS;
   for (const port of pool) {
     if (!usedPorts.has(port)) return port;
   }
@@ -284,7 +369,7 @@ export function findAvailableServePort(
         "Stop an existing funnel to free a port."
     );
   }
-  let port = PREFERRED_SERVE_PORTS[PREFERRED_SERVE_PORTS.length - 1] + 1;
+  let port = pool[pool.length - 1] + 1;
   while (usedPorts.has(port)) port++;
   return port;
 }
@@ -320,6 +405,7 @@ function formatFunnelNotEnabledError(stderr: string, stdout: string): string {
 export type TailscaleMode = "serve" | "funnel";
 
 export interface RegisterServeOptions {
+  scheme?: ServeScheme;
   runner?: TailscaleCommandRunner;
 }
 
@@ -334,14 +420,31 @@ const CONFLICT_MESSAGES: Record<TailscaleMode, string> = {
   funnel: "Tailscale Funnel supports ports 443, 8443, and 10000.",
 };
 
+/**
+ * CLI flag and target scheme for a serve registration.
+ *
+ * Plain HTTP is registered as a raw TCP forward rather than with `--http`: a
+ * `--http` serve is keyed by the node's MagicDNS name, so a request addressed
+ * to the tailnet IP would be answered with a 404 by tailscaled before it
+ * reached the app. A TCP forward does no host matching. The target stays on
+ * `127.0.0.1`, like every other share.
+ */
+function serveTransport(scheme: ServeScheme): { flag: string; targetScheme: string } {
+  return scheme === "http"
+    ? { flag: "tcp", targetScheme: "tcp" }
+    : { flag: "https", targetScheme: "http" };
+}
+
 function register(
   mode: TailscaleMode,
   localPort: number,
   httpsPort: number,
+  scheme: ServeScheme,
   runner: TailscaleCommandRunner
 ): void {
-  const target = `http://127.0.0.1:${localPort}`;
-  const result = runner([mode, "--bg", "--yes", `--https=${httpsPort}`, target]);
+  const { flag, targetScheme } = serveTransport(scheme);
+  const target = `${targetScheme}://127.0.0.1:${localPort}`;
+  const result = runner([mode, "--bg", "--yes", `--${flag}=${httpsPort}`, target]);
   if (result.error) {
     const errno = result.error as NodeJS.ErrnoException;
     if (errno.code === "ENOENT") {
@@ -365,7 +468,7 @@ function register(
     }
     if (isConflictError(result.stderr, result.stdout)) {
       throw new Error(
-        `Tailscale ${mode === "funnel" ? "Funnel " : ""}HTTPS port ${httpsPort} is already in use. ` +
+        `Tailscale ${mode === "funnel" ? "Funnel " : ""}${scheme.toUpperCase()} port ${httpsPort} is already in use. ` +
           CONFLICT_MESSAGES[mode]
       );
     }
@@ -379,10 +482,11 @@ function register(
 function unregister(
   mode: TailscaleMode,
   httpsPort: number,
-  options?: { ignoreMissing?: boolean; runner?: TailscaleCommandRunner }
+  options?: { scheme?: ServeScheme; ignoreMissing?: boolean; runner?: TailscaleCommandRunner }
 ): void {
   const runner = options?.runner ?? defaultRunner;
-  const result = runner([mode, "--yes", `--https=${httpsPort}`, "off"]);
+  const { flag } = serveTransport(options?.scheme ?? "https");
+  const result = runner([mode, "--yes", `--${flag}=${httpsPort}`, "off"]);
   if (result.error) {
     const errno = result.error as NodeJS.ErrnoException;
     if (errno.code === "ENOENT") return;
@@ -408,7 +512,13 @@ export function registerServe(
   httpsPort: number,
   options?: RegisterServeOptions
 ): void {
-  register("serve", localPort, httpsPort, options?.runner ?? defaultRunner);
+  register(
+    "serve",
+    localPort,
+    httpsPort,
+    options?.scheme ?? "https",
+    options?.runner ?? defaultRunner
+  );
 }
 
 export function registerFunnel(
@@ -416,12 +526,12 @@ export function registerFunnel(
   httpsPort: number,
   options?: RegisterServeOptions
 ): void {
-  register("funnel", localPort, httpsPort, options?.runner ?? defaultRunner);
+  register("funnel", localPort, httpsPort, "https", options?.runner ?? defaultRunner);
 }
 
 export function unregisterServe(
   httpsPort: number,
-  options?: { ignoreMissing?: boolean; runner?: TailscaleCommandRunner }
+  options?: { scheme?: ServeScheme; ignoreMissing?: boolean; runner?: TailscaleCommandRunner }
 ): void {
   unregister("serve", httpsPort, options);
 }
@@ -532,6 +642,7 @@ export function unregisterTailscale(
   route: {
     tailscaleHttpsPort?: number;
     tailscaleFunnel?: boolean;
+    tailscaleHttp?: boolean;
     tailscaleServiceName?: string;
   },
   options?: { runner?: TailscaleCommandRunner }
@@ -545,16 +656,23 @@ export function unregisterTailscale(
   }
   if (!route.tailscaleHttpsPort) return;
   const mode: TailscaleMode = route.tailscaleFunnel ? "funnel" : "serve";
-  unregister(mode, route.tailscaleHttpsPort, { ignoreMissing: true, runner: options?.runner });
+  // Funnel has no plain-HTTP mode, so a stray flag cannot change its cleanup.
+  const scheme: ServeScheme = mode === "serve" && route.tailscaleHttp ? "http" : "https";
+  unregister(mode, route.tailscaleHttpsPort, {
+    scheme,
+    ignoreMissing: true,
+    runner: options?.runner,
+  });
 }
 
 // ---------------------------------------------------------------------------
 // URL formatting
 // ---------------------------------------------------------------------------
 
-/** Build a display URL, omitting the port for 443 (default HTTPS). */
+/** Build a display URL, omitting the port when it is the scheme's default (443 or 80). */
 export function formatTailscaleUrl(baseUrl: string, httpsPort: number): string {
   const trimmed = baseUrl.endsWith("/") ? baseUrl.slice(0, -1) : baseUrl;
-  if (httpsPort === 443) return trimmed;
+  const defaultPort = trimmed.startsWith("http://") ? 80 : 443;
+  if (httpsPort === defaultPort) return trimmed;
   return `${trimmed}:${httpsPort}`;
 }

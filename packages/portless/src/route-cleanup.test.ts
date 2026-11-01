@@ -37,6 +37,23 @@ describe("cleanupRouteSharing", () => {
     expect(actions.removeManagedAlias).toHaveBeenCalledWith("public.example.com", 12345);
   });
 
+  it("passes the plain-HTTP flag through to Tailscale cleanup", () => {
+    const actions = {
+      unregisterTailscale: vi.fn(),
+      stopNgrok: vi.fn(),
+      stopTunnelPid: vi.fn(),
+      stopNetbird: vi.fn(),
+      removeManagedAlias: vi.fn(),
+    };
+    const target = route({ tailscaleHttpsPort: 80, tailscaleHttp: true });
+
+    cleanupRouteSharing(target, { actions });
+
+    expect(actions.unregisterTailscale).toHaveBeenCalledWith(
+      expect.objectContaining({ tailscaleHttpsPort: 80, tailscaleHttp: true })
+    );
+  });
+
   it("does not stop managed tunnel processes when stopTunnels is false", () => {
     const actions = {
       unregisterTailscale: vi.fn(),

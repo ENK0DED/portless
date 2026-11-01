@@ -99,6 +99,10 @@ Supported placeholders are `{PORT}`, `{HOST}`, and `{PORTLESS_URL}`. Portless re
       <td>Use an explicit Tailscale Service name. Also configurable via `PORTLESS_TAILSCALE_SERVICE_NAME`.</td>
     </tr>
     <tr>
+      <td>`--tailscale-http`</td>
+      <td>Share on the tailnet over plain HTTP, for tailnets without MagicDNS. Also configurable via `PORTLESS_TAILSCALE_HTTP=1`.</td>
+    </tr>
+    <tr>
       <td>`--funnel`</td>
       <td>Share the app publicly via Tailscale Funnel.</td>
     </tr>
@@ -135,13 +139,14 @@ Supported placeholders are `{PORT}`, `{HOST}`, and `{PORTLESS_URL}`. Portless re
 
 ```bash
 portless myapp --tailscale next dev
+portless myapp --tailscale-http next dev
 portless myapp --tailscale-service next dev
 portless myapp --funnel next dev
 portless myapp --ngrok next dev
 portless myapp --netbird --netbird-groups team next dev
 ```
 
-Tailscale sharing requires the Tailscale CLI to be connected with MagicDNS and HTTPS certificates enabled on the active tailnet. Funnel also requires Funnel to be enabled for the tailnet and node.
+Tailscale sharing requires the Tailscale CLI to be connected with MagicDNS and HTTPS certificates enabled on the active tailnet. Funnel also requires Funnel to be enabled for the tailnet and node. When the tailnet reports MagicDNS as off, portless exits before starting the child process. On such tailnets use `--tailscale-http`, which forwards a plain TCP port (80, then 8080, 8081, etc.) to the app, addressed by the node's tailnet IP, with no certificate. It cannot be combined with `--funnel` or `--tailscale-service`, and browsers treat its URL as an insecure context.
 
 ### Tailscale Service mode
 

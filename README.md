@@ -507,13 +507,27 @@ portless myapp --funnel next dev
 # -> https://devbox.yourteam.ts.net    (public)
 ```
 
+### Tailnets without MagicDNS
+
+HTTPS sharing needs a certificate for the node's MagicDNS name, so `--tailscale`, `--tailscale-service`, and `--funnel` need MagicDNS. When the tailnet reports MagicDNS as off, portless exits before starting the child process instead of printing an `https://` URL that fails the TLS handshake. Some tailnets cannot enable MagicDNS, for example because it breaks split-horizon DNS. Use `--tailscale-http` there:
+
+```bash
+portless myapp --tailscale-http next dev
+# -> https://myapp.localhost           (local)
+# -> http://100.101.102.103            (tailnet)
+```
+
+This forwards a raw TCP port on the node straight to the app, addressed by the node's tailnet IP (or its MagicDNS name when the tailnet has one), so no certificate is involved. WireGuard encrypts all tailnet traffic, so the plain-HTTP hop exists only inside the tunnel. Browsers still treat a plain-HTTP tailnet URL as an insecure context: APIs that need a secure context (service workers, camera and microphone, `crypto.subtle`) are unavailable, and cookies marked `Secure` are not set. Apps get port 80 first, then 8080, 8081, and so on. Because the forward is raw TCP, the app does not receive the `Tailscale-User-*` and `X-Forwarded-*` headers that an HTTPS serve adds.
+
+`--tailscale-http` cannot be combined with `--funnel` (Funnel has no plain-HTTP mode) or `--tailscale-service` (Services are HTTPS only). Set `PORTLESS_TAILSCALE_HTTP=1` to enable it for every app. It is cleaned up like any other tailnet share, including by `portless clean` and `portless prune` after a crash.
+
 Tailscale HTTPS certificates must be enabled before `--tailscale`, `--tailscale-service`, or `--funnel` can register HTTPS URLs. Funnel must also be enabled for the tailnet and node before `--funnel` can register the public URL. If either setting is missing, portless exits before starting the child process.
 
 Set `PORTLESS_TAILSCALE=1` in your shell profile or `.env` to share every app by default. `portless list` shows both local and tailnet URLs. Tailscale serve registrations are cleaned up automatically when the app exits.
 
 The proxy routes exact requests for each persisted Serve, Funnel, or Service hostname to its registered app. It does not accept unrelated public Host values or wildcard-match other `.ts.net` names.
 
-Requires the Tailscale CLI to be installed and connected (`tailscale up`), with MagicDNS and Tailscale HTTPS certificates enabled on the active tailnet.
+Requires the Tailscale CLI to be installed and connected (`tailscale up`). `--tailscale`, `--tailscale-service`, and `--funnel` also need MagicDNS and Tailscale HTTPS certificates enabled on the active tailnet; `--tailscale-http` needs neither.
 
 ## ngrok sharing
 
@@ -747,6 +761,7 @@ Doctor is read-only. It inspects the active state directory and sudo handoff, or
 --tunnel <provider>              Share publicly via a managed tunnel: cloudflare or ngrok
 --tunnel-hostname <hostname>     Request a provider-specific stable tunnel hostname
 --tailscale                      Share the app on your Tailscale network (tailnet)
+--tailscale-http                 Share on the tailnet over plain HTTP (no MagicDNS needed)
 --tailscale-service              Share the app as a stable Tailscale Service
 --tailscale-service-name <name>  Use an explicit Tailscale Service name
 --funnel                         Share the app publicly via Tailscale Funnel
@@ -788,6 +803,7 @@ PORTLESS_ROUTES_CLEANUP_INTERVAL=<s>
 PORTLESS_SYNC_HOSTS=0            Disable auto-sync of /etc/hosts (on by default)
 PORTLESS_WORKTREE_FLAT=1         Join worktree and app names into one DNS label
 PORTLESS_TAILSCALE=1             Share apps on your Tailscale network (same as --tailscale)
+PORTLESS_TAILSCALE_HTTP=1        Share on the tailnet over plain HTTP (same as --tailscale-http)
 PORTLESS_TAILSCALE_SERVICE=1     Share apps as Tailscale Services
 PORTLESS_TAILSCALE_SERVICE_NAME=<name>
                                   Use an explicit Tailscale Service name
@@ -852,7 +868,7 @@ Tools are grouped into profiles. Pass a comma separated list with `--tools`; the
 
 Tool arguments follow the CLI: `proxy_start` takes `suffix` (repeatable, like `--suffix`), `unprivileged`, `skipTrust`, and `routesCleanupInterval`; `list`, `get`, and the `bg` tools take `json`; `get`, `alias_add`, and the `bg` tools take `path`. `prune` stops the verified process group of an orphaned dev server, and `bg_stop` with `force` kills the recorded group. Every tool also accepts `cwd`, `extraArgs` (appended to the command), and `timeoutMs`.
 
-Left out on purpose: foreground dev servers (`run`), commands that may prompt for sudo or a TTY (`trust`, `clean`, `hosts`, `service`), `bg clean`, and every sharing mode (`--tunnel`, `--cloudflare`, `--tailscale`, `--funnel`, `--ngrok`, `--netbird`, and `tunnel map`). Start shared apps from a shell.
+Left out on purpose: foreground dev servers (`run`), commands that may prompt for sudo or a TTY (`trust`, `clean`, `hosts`, `service`), `bg clean`, and every sharing mode (`--tunnel`, `--cloudflare`, `--tailscale`, `--tailscale-http`, `--funnel`, `--ngrok`, `--netbird`, and `tunnel map`). Start shared apps from a shell.
 
 ## Programmatic API
 
@@ -974,6 +990,6 @@ See [FORK.md](./FORK.md) for the full list of fork-owned invariants and the upst
 
 - Node.js 24+
 - macOS, Linux, or Windows
-- Tailscale CLI (optional, for `--tailscale` and `--funnel`)
+- Tailscale CLI (optional, for `--tailscale`, `--tailscale-http`, and `--funnel`)
 - ngrok CLI (optional, for `--ngrok`)
 - NetBird CLI (optional, for `--netbird`)

@@ -5403,6 +5403,46 @@ describe("CLI", () => {
       }
     });
 
+    it("rejects combining --tailscale-http with --funnel", () => {
+      const { status, stderr } = run(["--tailscale-http", "--funnel", "myapp", "echo", "ok"]);
+      expect(status).toBe(1);
+      expect(stderr).toContain("--tailscale-http cannot be combined with --funnel");
+    });
+
+    it("rejects combining --tailscale-http with --tailscale-service", () => {
+      const { status, stderr } = run([
+        "--tailscale-http",
+        "--tailscale-service",
+        "myapp",
+        "echo",
+        "ok",
+      ]);
+      expect(status).toBe(1);
+      expect(stderr).toContain("--tailscale-http cannot be combined with --tailscale-service");
+    });
+
+    it("accepts --tailscale-http in the run subcommand and checks Tailscale first", () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-cli-ts-http-run-"));
+      try {
+        fs.writeFileSync(path.join(tmpDir, "package.json"), JSON.stringify({ name: "test-app" }));
+        const { status, stderr } = run(["run", "--tailscale-http", "echo", "hello"], {
+          cwd: tmpDir,
+          env: { PATH: "/tmp/portless-no-ts-path" },
+        });
+        expect(status).toBe(1);
+        expect(stderr).toContain("Tailscale CLI not found");
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it("shows --tailscale-http and PORTLESS_TAILSCALE_HTTP in help", () => {
+      const { status, stdout } = run(["--help"]);
+      expect(status).toBe(0);
+      expect(stdout).toContain("--tailscale-http");
+      expect(stdout).toContain("PORTLESS_TAILSCALE_HTTP");
+    });
+
     it("rejects combining --tailscale-service with --funnel", () => {
       const { status, stderr } = run(["--tailscale-service", "--funnel", "myapp", "echo", "ok"]);
       expect(status).toBe(1);

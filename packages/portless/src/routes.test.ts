@@ -740,6 +740,22 @@ describe("RouteStore", () => {
       expect(routes[0].tailscaleFunnel).toBe(true);
     });
 
+    it("persists and clears the plain-HTTP flag via updateRoute", () => {
+      store.addRoute("api.localhost", 4456, process.pid);
+      store.updateRoute("api.localhost", {
+        tailscaleUrl: "http://100.101.102.103:8080",
+        tailscaleHttpsPort: 8080,
+        tailscaleHttp: true,
+      });
+      let routes = store.loadRoutes();
+      expect(routes[0].tailscaleHttp).toBe(true);
+      expect(routes[0].tailscaleFunnel).toBeUndefined();
+
+      store.updateRoute("api.localhost", { tailscaleHttp: null });
+      routes = store.loadRoutes();
+      expect(routes[0].tailscaleHttp).toBeUndefined();
+    });
+
     it("persists and clears Tailscale Service metadata via updateRoute", () => {
       store.addRoute("api.localhost", 4456, process.pid);
       store.updateRoute("api.localhost", {

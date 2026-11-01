@@ -71,6 +71,8 @@ function exposureTitle(kind: string): string {
       return "Public on the internet via Tailscale Funnel";
     case "Tailscale":
       return "Shared on your Tailscale network (tailnet)";
+    case "Tailscale (HTTP)":
+      return "Shared on your Tailscale network (tailnet) over plain HTTP";
     case "Tailscale Service":
       return "Shared as a stable Tailscale Service";
     case "ngrok":
@@ -85,7 +87,12 @@ function exposureTitle(kind: string): string {
 function routeExposures(route: RouteInfo): Exposure[] {
   const out: Exposure[] = [];
   if (route.tailscaleFunnel) out.push({ kind: "Funnel", url: route.tailscaleUrl });
-  else if (route.tailscaleUrl) out.push({ kind: "Tailscale", url: route.tailscaleUrl });
+  else if (route.tailscaleUrl) {
+    out.push({
+      kind: route.tailscaleHttp ? "Tailscale (HTTP)" : "Tailscale",
+      url: route.tailscaleUrl,
+    });
+  }
   if (route.tailscaleServiceUrl)
     out.push({ kind: "Tailscale Service", url: route.tailscaleServiceUrl });
   if (route.ngrokUrl) out.push({ kind: "ngrok", url: route.ngrokUrl });

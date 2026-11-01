@@ -35,6 +35,8 @@ export interface BgStartIntent {
   tunnel?: BgManagedTunnelOptions;
   sharing: {
     tailscale: boolean;
+    /** Plain-HTTP tailnet share. Absent in entries written before this flag existed. */
+    tailscaleHttp?: boolean;
     tailscaleService: boolean;
     tailscaleServiceName?: string;
     funnel: boolean;
@@ -103,6 +105,7 @@ function isValidSharing(value: unknown): value is BgStartIntent["sharing"] {
     typeof sharing.funnel === "boolean" &&
     typeof sharing.ngrok === "boolean" &&
     typeof sharing.netbird === "boolean" &&
+    (sharing.tailscaleHttp === undefined || typeof sharing.tailscaleHttp === "boolean") &&
     (sharing.tailscaleServiceName === undefined ||
       typeof sharing.tailscaleServiceName === "string") &&
     (sharing.netbirdPassword === undefined || typeof sharing.netbirdPassword === "string") &&

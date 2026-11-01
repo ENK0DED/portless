@@ -25,6 +25,8 @@ export interface RouteInfo {
   tailscaleUrl?: string;
   tailscaleServiceUrl?: string;
   tailscaleFunnel?: boolean;
+  /** True when the Tailscale share is a plain-HTTP forward (`--tailscale-http`). */
+  tailscaleHttp?: boolean;
   ngrokUrl?: string;
   tunnelUrl?: string;
   tunnelProvider?: TunnelProviderName;
