@@ -68,6 +68,7 @@ import {
   writeTldsFile,
   writeTlsMarker,
   writeWildcardMarker,
+  hasHelpFlag,
 } from "./cli-utils.js";
 import { PORTLESS_HEADER, PORTLESS_LISTENER_PORT_HEADER } from "./proxy.js";
 
@@ -1271,6 +1272,56 @@ describe("injectFrameworkFlags", () => {
       "127.0.0.1",
     ]);
   });
+
+  it("injects --port and --host for vinext dev, which delegates to Vite", () => {
+    const args = ["vinext", "dev"];
+    injectFrameworkFlags(args, 4567);
+    expect(args).toEqual(["vinext", "dev", "--port", "4567", "--host", "127.0.0.1"]);
+  });
+
+  it("injects --port and --hostname for vinext start so it does not bind 0.0.0.0", () => {
+    const args = ["vinext", "start"];
+    injectFrameworkFlags(args, 4567);
+    expect(args).toEqual(["vinext", "start", "--port", "4567", "--hostname", "127.0.0.1"]);
+  });
+
+  it("injects through package runners for vinext start", () => {
+    const args = ["bunx", "vinext", "start"];
+    injectFrameworkFlags(args, 4567);
+    expect(args).toEqual(["bunx", "vinext", "start", "--port", "4567", "--hostname", "127.0.0.1"]);
+  });
+
+  it.each([
+    [
+      ["vinext", "start", "-H", "0.0.0.0"],
+      ["vinext", "start", "-H", "0.0.0.0", "--port", "4567"],
+    ],
+    [
+      ["vinext", "start", "--hostname=::1"],
+      ["vinext", "start", "--hostname=::1", "--port", "4567"],
+    ],
+    [
+      ["vinext", "start", "-p", "3000"],
+      ["vinext", "start", "-p", "3000", "--hostname", "127.0.0.1"],
+    ],
+    [
+      ["vinext", "dev", "--host", "0.0.0.0"],
+      ["vinext", "dev", "--host", "0.0.0.0", "--port", "4567"],
+    ],
+  ])("respects explicit vinext flags in %j", (input, expected) => {
+    const args = [...input];
+    injectFrameworkFlags(args, 4567);
+    expect(args).toEqual(expected);
+  });
+
+  it.each(["init", "build", "check", "lint", "typegen"])(
+    "does not inject flags for vinext %s",
+    (subcommand) => {
+      const args = ["vinext", subcommand];
+      injectFrameworkFlags(args, 4567);
+      expect(args).toEqual(["vinext", subcommand]);
+    }
+  );
 
   it("injects flags for Laravel artisan serve", () => {
     const args = ["php", "artisan", "serve"];
@@ -2658,6 +2709,19 @@ describe("syncHostsWithWarning", () => {
     );
     expect(latched).toBe(true);
     expect(warnings).toBe(1);
+  });
+});
+
+describe("hasHelpFlag", () => {
+  it("finds --help and -h anywhere in the arguments", () => {
+    expect(hasHelpFlag(["--help"])).toBe(true);
+    expect(hasHelpFlag(["myapp", "5432", "-h"])).toBe(true);
+    expect(hasHelpFlag(["--remove", "myapp", "--help"])).toBe(true);
+  });
+
+  it("ignores everything else", () => {
+    expect(hasHelpFlag([])).toBe(false);
+    expect(hasHelpFlag(["myapp", "--json", "--helpful"])).toBe(false);
   });
 });
 

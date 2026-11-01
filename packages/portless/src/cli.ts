@@ -97,6 +97,7 @@ import {
   hasPlaceholders,
   injectPackageScriptFrameworkFlags,
   injectFrameworkFlags,
+  hasHelpFlag,
   isHttpsEnvDisabled,
   isPortListening,
   isWildcardEnvEnabled,
@@ -2408,7 +2409,10 @@ async function runApp(
       PORT: port.toString(),
       ...(hostBind ? { HOST: hostBind } : {}),
       PORTLESS_URL: finalUrl,
-      __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: formatViteAllowedHosts(tlds, viteRouteMetadata),
+      __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: formatViteAllowedHosts(tlds, viteRouteMetadata, {
+        packageDir: scriptContext?.packageDir ?? process.cwd(),
+        onNotice: (message) => console.log(chalk.gray(message)),
+      }),
       // Note: EXPO_PACKAGER_PROXY_URL is not used — expo-dev-client removed
       // baked-in pinging, making this env var ineffective. Expo handles its
       // own LAN discovery natively.
@@ -3583,8 +3587,8 @@ ${colors.bold("How it works:")}
   3. Access via https://<name>.localhost
   4. .localhost domains auto-resolve to 127.0.0.1
   5. Frameworks that ignore PORT (Vite, VitePlus, VitePress, Rsbuild, Astro,
-     React Router, Angular, Laravel, Expo, React Native, Wrangler) get --port and, when needed,
-     --host or --ip flags injected automatically; safe bun run, npm run, pnpm run, or yarn run
+     React Router, Angular, Laravel, Expo, React Native, Wrangler, vinext) get --port and, when needed,
+     --host, --hostname or --ip flags injected automatically; safe bun run, npm run, pnpm run, or yarn run
      scripts resolving directly to those server commands receive the same injection
      Package runners are looked through too; npm exec and npm x get the flags
      after a -- so npm does not read them. Commands run with your PATH first and
@@ -4299,7 +4303,7 @@ ${colors.bold("JSON fields:")}
 }
 
 async function handleGet(args: string[]): Promise<void> {
-  if (args[1] === "--help" || args[1] === "-h") {
+  if (hasHelpFlag(args.slice(1))) {
     console.log(`
 ${colors.bold("portless get")} - Print the URL for a service.
 
@@ -4531,7 +4535,7 @@ ${colors.bold("Examples:")}
 }
 
 async function handleAlias(args: string[]): Promise<void> {
-  if (args[1] === "--help" || args[1] === "-h") {
+  if (hasHelpFlag(args.slice(1))) {
     console.log(`
 ${colors.bold("portless alias")} - Register a static route for services not managed by portless.
 
@@ -4795,11 +4799,30 @@ function resolveRoutesCleanupIntervalSeconds(args: string[]): number {
 
 async function handleProxy(args: string[]): Promise<void> {
   if (args[1] === "stop") {
+    if (hasHelpFlag(args.slice(2))) {
+      console.log(`
+${colors.bold("portless proxy stop")} - Stop the proxy.
+
+${colors.bold("Usage:")}
+  ${colors.cyan("portless proxy stop")}             Stop the discovered proxy
+  ${colors.cyan("portless proxy stop -p 1355")}     Stop the proxy on a specific port
+
+${colors.bold("Options:")}
+  --port, -p <port>      Port of the proxy to stop
+  --help, -h             Show this help
+`);
+      process.exit(0);
+    }
+
     let explicitPort: number | undefined;
-    const portIdx = args.indexOf("--port") !== -1 ? args.indexOf("--port") : args.indexOf("-p");
-    if (portIdx !== -1) {
-      const portValue = args[portIdx + 1];
-      if (portValue && !portValue.startsWith("-")) {
+    for (let i = 2; i < args.length; i++) {
+      const arg = args[i]!;
+      if (arg === "--port" || arg === "-p") {
+        const portValue = args[i + 1];
+        if (portValue === undefined || portValue.startsWith("-")) {
+          console.error(colors.red(`Error: ${arg} requires a port number.`));
+          process.exit(1);
+        }
         const parsed = parsePort(portValue);
         if (parsed === null) {
           console.error(colors.red(`Error: Invalid port number: ${portValue}`));
@@ -4807,6 +4830,13 @@ async function handleProxy(args: string[]): Promise<void> {
           process.exit(1);
         }
         explicitPort = parsed;
+        i++;
+      } else {
+        // Refuse anything else instead of stopping the proxy: a mistyped flag
+        // or a probe such as `--help` must never take the proxy down.
+        console.error(colors.red(`Error: Unknown argument "${arg}".`));
+        console.error(colors.blue("Known flags: --port, -p, --help"));
+        process.exit(1);
       }
     }
 
@@ -4846,6 +4876,7 @@ ${colors.bold("Usage:")}
   ${colors.cyan("portless proxy start --wildcard")}     Allow unregistered subdomains to fall back to parent (local only)
   ${colors.cyan("portless proxy start --routes-cleanup-interval 60")}  Sweep dead routes every 60s (default 300, 0 disables)
   ${colors.cyan("portless proxy stop")}                 Stop the proxy
+  ${colors.cyan("portless proxy stop -p 1355")}         Stop the proxy on a specific port
 
 ${colors.bold("LAN mode (--lan):")}
   Without LAN mode, the proxy listens only on 127.0.0.1 and ::1.
@@ -5671,7 +5702,10 @@ async function spawnProxiedApp(
       PORT: String(appPort),
       HOST: "127.0.0.1",
       PORTLESS_URL: url,
-      __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: formatViteAllowedHosts(tlds, viteRouteMetadata),
+      __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: formatViteAllowedHosts(tlds, viteRouteMetadata, {
+        packageDir: app.pkg.dir,
+        onNotice: (message) => console.log(colors.gray(`[${app.name}] ${message}`)),
+      }),
     };
 
     if (tls) {
@@ -5971,7 +6005,10 @@ async function runWithTurbo(
       PORT: String(appPort),
       HOST: "127.0.0.1",
       PORTLESS_URL: url,
-      __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: formatViteAllowedHosts(tlds, viteRouteMetadata),
+      __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: formatViteAllowedHosts(tlds, viteRouteMetadata, {
+        packageDir: app.pkg.dir,
+        onNotice: (message) => console.log(colors.gray(`[${app.name}] ${message}`)),
+      }),
     };
     if (tls) {
       const caPath = path.join(stateDir, "ca.pem");
