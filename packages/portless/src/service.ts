@@ -5,6 +5,11 @@ import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import { ensureCerts, isCATrusted, trustCA } from "./certs.js";
 import {
+  findUserWritableLocation,
+  resolveOpensslBinary,
+  SERVICE_OPENSSL_ENV,
+} from "./openssl-path.js";
+import {
   buildProxyStartConfig,
   DEFAULT_TLD,
   discoverState,
@@ -68,6 +73,7 @@ type ServiceContext = {
   stateDir: string;
   user: UserContext;
   pathEnv: string;
+  opensslPath?: string;
   programData: string;
   config: NormalizedServiceConfig;
 };
@@ -487,6 +493,12 @@ function buildServiceEnv(ctx: ServiceContext): Record<string, string> {
     env.PORTLESS_SUFFIX = ctx.config.tlds.join(",");
   }
 
+  // Pinned at install time so the root or SYSTEM proxy never looks `openssl`
+  // up through PATH. Set last so nothing else can override it.
+  if (ctx.opensslPath) {
+    env[SERVICE_OPENSSL_ENV] = ctx.opensslPath;
+  }
+
   if (ctx.platform === "win32") {
     env.USERPROFILE = ctx.user.home;
     env.PATH = ctx.pathEnv;
@@ -630,6 +642,7 @@ export function buildServiceSpec(options: {
   username?: string;
   stateDir?: string;
   pathEnv?: string;
+  opensslPath?: string;
   programData?: string;
   installConfig?: Partial<ServiceInstallConfig>;
 }): ServiceSpec {
@@ -671,6 +684,7 @@ export function buildServiceSpec(options: {
       username: options.username,
     },
     pathEnv: options.pathEnv || "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    opensslPath: options.opensslPath,
     programData: options.programData || "C:\\ProgramData",
     config: normalizedConfig,
   };
@@ -726,7 +740,8 @@ export function buildServiceSpec(options: {
 
 function currentServiceSpec(
   entryScript: string,
-  installConfig?: ServiceInstallConfig
+  installConfig?: ServiceInstallConfig,
+  opensslPath?: string
 ): ServiceSpec {
   if (!isSupportedPlatform(process.platform)) {
     throw new Error(`Unsupported platform: ${process.platform}`);
@@ -752,6 +767,7 @@ function currentServiceSpec(
     username: user.username,
     stateDir,
     pathEnv: process.env.PATH,
+    opensslPath,
     programData: process.env.ProgramData,
     installConfig: config,
   });
@@ -1074,6 +1090,22 @@ function ensureServiceConfigSupported(config: ServiceInstallConfig): void {
   );
 }
 
+function warnIfOpensslUserWritable(opensslPath: string): void {
+  const writable = findUserWritableLocation(opensslPath);
+  if (!writable) return;
+  console.warn(
+    colors.yellow(
+      `The service will run ${opensslPath} as ${process.platform === "win32" ? "SYSTEM" : "root"}, ` +
+        `but ${writable} can be changed by a non-privileged user.`
+    )
+  );
+  console.warn(
+    colors.gray(
+      "Install openssl in a system-owned location and re-run `portless service install` to pin that one."
+    )
+  );
+}
+
 async function installService(
   entryScript: string,
   runner: CommandRunner,
@@ -1082,7 +1114,12 @@ async function installService(
   const installConfig = normalizeServiceInstallPaths(parseServiceInstallConfig(args));
   ensureServiceConfigSupported(installConfig);
   requireUnixElevation([entryScript, ...args], runner);
-  const spec = currentServiceSpec(entryScript, installConfig);
+  const opensslPath = resolveOpensslBinary();
+  warnIfOpensslUserWritable(opensslPath);
+  // Certificate generation during this install must use the same binary the
+  // service will be pinned to.
+  process.env[SERVICE_OPENSSL_ENV] = opensslPath;
+  const spec = currentServiceSpec(entryScript, installConfig, opensslPath);
   prepareServiceState(spec.stateDir);
 
   if (spec.config.useHttps && !spec.config.customCertPath) {

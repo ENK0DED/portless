@@ -5,6 +5,7 @@ import * as tls from "node:tls";
 import { execFile as execFileCb, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { fixOwnership } from "./utils.js";
+import { SERVICE_OPENSSL_ENV } from "./openssl-path.js";
 import {
   isWSL,
   isWindowsCATrusted,
@@ -27,6 +28,19 @@ const CA_COMMON_NAME = "portless Local CA";
 
 /** openssl command timeout (ms). */
 const OPENSSL_TIMEOUT_MS = 30_000;
+
+/** The openssl executable to run: the service-pinned absolute path, or `openssl`. */
+function opensslCommand(): string {
+  const pinned = process.env[SERVICE_OPENSSL_ENV];
+  if (!pinned) return "openssl";
+  if (!path.isAbsolute(pinned)) {
+    throw new Error(
+      `${SERVICE_OPENSSL_ENV} must be an absolute path (got "${pinned}"). ` +
+        "Re-run `portless service install`."
+    );
+  }
+  return pinned;
+}
 
 /**
  * Timeout for non-interactive macOS `security` commands (verify-cert, etc.).
@@ -167,6 +181,13 @@ function getOpensslEnv(): Record<string, string> | undefined {
 }
 
 function opensslErrorMessage(): string {
+  const pinned = process.env[SERVICE_OPENSSL_ENV];
+  if (pinned) {
+    return (
+      `The installed service pins openssl to ${pinned}. ` +
+      "If it was moved or removed, re-run `portless service install` to pin a new one."
+    );
+  }
   if (process.platform === "win32") {
     return (
       "Make sure openssl is installed and working.\n" +
@@ -273,7 +294,7 @@ function hasDuplicateExtensions(certPath: string): boolean {
 function openssl(args: string[], options?: { input?: string }): string {
   try {
     const extraEnv = getOpensslEnv();
-    return execFileSync("openssl", args, {
+    return execFileSync(opensslCommand(), args, {
       encoding: "utf-8",
       timeout: OPENSSL_TIMEOUT_MS,
       input: options?.input,
@@ -326,7 +347,7 @@ const execFileAsync = promisify(execFileCb);
 async function opensslAsync(args: string[]): Promise<string> {
   try {
     const extraEnv = getOpensslEnv();
-    const { stdout } = await execFileAsync("openssl", args, {
+    const { stdout } = await execFileAsync(opensslCommand(), args, {
       encoding: "utf-8",
       timeout: OPENSSL_TIMEOUT_MS,
       windowsHide: true,
