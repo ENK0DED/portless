@@ -229,6 +229,101 @@ export function applyWorktreePrefix(
   return truncateLabel(`${flattened}-${tupleHash}`);
 }
 
+/** Prefix of the generated peer URL environment variables. */
+export const PEER_URL_ENV_PREFIX = "PORTLESS_URL_";
+
+/** Uppercase a name and turn every non-alphanumeric run character into `_`. */
+function envNameSegment(value: string): string {
+  return value.toUpperCase().replace(/[^A-Z0-9]/g, "_");
+}
+
+/**
+ * Environment variable name carrying one app's URL in a multi-app run. Derived
+ * from the app's base name, before any worktree prefix, so the variable name
+ * stays the same in every worktree while its value follows the prefix. That is
+ * what lets a service reference a peer from committed config: the value moves,
+ * the name does not.
+ *
+ * When several apps share one hostname at different path prefixes, the base
+ * name alone cannot tell them apart, so the route's path is appended. The
+ * app at the root path keeps the plain name:
+ * `PORTLESS_URL_APP` and `PORTLESS_URL_APP_API` for `/api`.
+ */
+export function peerUrlEnvName(baseName: string, sharedHostPathPrefix?: string): string {
+  const base = PEER_URL_ENV_PREFIX + envNameSegment(baseName);
+  const pathPart = sharedHostPathPrefix ? envNameSegment(sharedHostPathPrefix.slice(1)) : "";
+  return pathPart ? `${base}_${pathPart}` : base;
+}
+
+export interface PeerApp {
+  /** Name before any worktree prefix; names the variable. */
+  baseName: string;
+  /** Final hostname label (worktree prefix included); decides who shares a host. */
+  hostname: string;
+  /** Normalized route path prefix, `/` for none. */
+  pathPrefix: string;
+  /** Full URL of the app's primary route, path prefix included. */
+  url: string;
+}
+
+/**
+ * A name made only of punctuation would yield a variable of bare underscores,
+ * which tells a reader nothing and cannot be guessed from the app name.
+ */
+function hasUsableEnvName(baseName: string): boolean {
+  return /[a-z0-9]/i.test(baseName);
+}
+
+/**
+ * Build the peer URL environment every proxied app in a multi-app run
+ * receives, so one service can reach another without a hardcoded hostname that
+ * a worktree prefix would invalidate. Each app appears once, the reader's own
+ * entry included, so the map does not vary by reader.
+ *
+ * Variables are unique per app. Apps that share a hostname at different path
+ * prefixes get the path appended (see peerUrlEnvName). Two apps that still
+ * collapse to one variable name (`web.api` and `web-api`) keep the first and
+ * report the second, rather than silently overwriting a peer URL with the
+ * wrong host.
+ */
+export function buildPeerUrlEnv(
+  peers: PeerApp[],
+  onWarning?: (message: string) => void
+): Record<string, string> {
+  const env: Record<string, string> = {};
+  const claimedBy = new Map<string, string>();
+
+  const perHostname = new Map<string, number>();
+  for (const peer of peers) {
+    perHostname.set(peer.hostname, (perHostname.get(peer.hostname) ?? 0) + 1);
+  }
+
+  for (const peer of peers) {
+    if (!hasUsableEnvName(peer.baseName)) continue;
+    const shared = (perHostname.get(peer.hostname) ?? 0) > 1;
+    const varName = peerUrlEnvName(
+      peer.baseName,
+      shared && peer.pathPrefix !== "/" ? peer.pathPrefix : undefined
+    );
+    const id = peer.pathPrefix === "/" ? peer.baseName : `${peer.baseName}${peer.pathPrefix}`;
+
+    const owner = claimedBy.get(varName);
+    if (owner !== undefined) {
+      if (owner !== id) {
+        onWarning?.(
+          `Peer URL variable ${varName} is already taken by "${owner}", so "${id}" gets none. Rename one of them to give both a peer URL.`
+        );
+      }
+      continue;
+    }
+
+    claimedBy.set(varName, id);
+    env[varName] = peer.url;
+  }
+
+  return env;
+}
+
 /** Branch names that represent the default/primary checkout — no prefix needed. */
 const DEFAULT_BRANCHES = new Set(["main", "master"]);
 

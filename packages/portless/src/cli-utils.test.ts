@@ -24,7 +24,11 @@ import {
   USER_STATE_DIR,
   discoverState,
   isExplicitStateDirEmpty,
+  appPortKey,
   findFreePort,
+  parseAppPortRange,
+  parseAppPortStrategy,
+  resolveAppPortAllocation,
   getDefaultPort,
   caRegeneratedRestartHint,
   getDefaultTld,
@@ -76,6 +80,7 @@ import {
   writeWildcardMarker,
   hasHelpFlag,
 } from "./cli-utils.js";
+import type { AppConfig } from "./config.js";
 import { PORTLESS_HEADER, PORTLESS_LISTENER_PORT_HEADER } from "./proxy.js";
 
 describe("formatMdnsUnavailableWarning", () => {
@@ -234,6 +239,158 @@ describe("findFreePort", () => {
 
   it("skips a blocked port even when it is the only one in range", async () => {
     await expect(findFreePort(4045, 4045)).rejects.toThrow("No free port found");
+  });
+});
+
+describe("findFreePort strategies", () => {
+  /** An OS-assigned free port, so the ranges below do not depend on fixed numbers. */
+  async function freeBase(): Promise<number> {
+    const probe = net.createServer();
+    const port = await new Promise<number>((resolve) => {
+      probe.listen(0, "127.0.0.1", () => resolve((probe.address() as net.AddressInfo).port));
+    });
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+    return port;
+  }
+  async function hold(port: number): Promise<net.Server> {
+    const server = net.createServer();
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(port, "127.0.0.1", () => resolve());
+    });
+    return server;
+  }
+  const release = (server: net.Server) =>
+    new Promise<void>((resolve) => server.close(() => resolve()));
+
+  it("sequential returns the bottom of the range when it is free", async () => {
+    const base = await freeBase();
+    expect(await findFreePort(base, base + 5, { strategy: "sequential" })).toBe(base);
+  });
+
+  it("sequential moves to the next port when the bottom is held", async () => {
+    const base = await freeBase();
+    const holder = await hold(base);
+    try {
+      expect(await findFreePort(base, base + 5, { strategy: "sequential" })).toBe(base + 1);
+    } finally {
+      await release(holder);
+    }
+  });
+
+  it("stable returns the same port for the same key", async () => {
+    const base = await freeBase();
+    const first = await findFreePort(base, base + 99, { strategy: "stable", key: "login.myapp" });
+    const second = await findFreePort(base, base + 99, { strategy: "stable", key: "login.myapp" });
+    expect(second).toBe(first);
+  });
+
+  it("stable spreads different keys across the range", async () => {
+    const base = await freeBase();
+    const ports = new Set<number>();
+    for (const key of ["a.myapp", "b.myapp", "c.myapp"]) {
+      ports.add(await findFreePort(base, base + 99, { strategy: "stable", key }));
+    }
+    expect(ports.size).toBe(3);
+  });
+
+  it("stable wraps around the range instead of failing at the top", async () => {
+    const base = await freeBase();
+    const holder = await hold(base);
+    try {
+      // A two-port range with the bottom held: every key ends on the other port.
+      for (const key of ["wrap", "around", "x", "y"]) {
+        expect(await findFreePort(base, base + 1, { strategy: "stable", key })).toBe(base + 1);
+      }
+    } finally {
+      await release(holder);
+    }
+  });
+
+  it("skips browser-blocked ports in every strategy", async () => {
+    for (const strategy of ["sequential", "stable", "random"] as const) {
+      // 6000 is blocked; 6001 is the only candidate.
+      expect(await findFreePort(6000, 6001, { strategy, key: "k" })).toBe(6001);
+    }
+  });
+
+  it("skips ports another route already owns before that app has bound them", async () => {
+    const base = await freeBase();
+    const exclude = new Set([base, base + 1]);
+    for (const strategy of ["sequential", "stable", "random"] as const) {
+      expect(await findFreePort(base, base + 2, { strategy, key: "k", exclude })).toBe(base + 2);
+    }
+  });
+});
+
+describe("appPortKey", () => {
+  it("is the app name at the root path", () => {
+    expect(appPortKey("api.myrepo")).toBe("api.myrepo");
+    expect(appPortKey("api.myrepo", "/")).toBe("api.myrepo");
+  });
+
+  it("adds the normalized path prefix so path-routed apps on one host differ", () => {
+    expect(appPortKey("app", "/api/")).toBe("app/api");
+    expect(appPortKey("app", "/web")).not.toBe(appPortKey("app", "/api"));
+  });
+});
+
+describe("resolveAppPortAllocation", () => {
+  it("defaults to random over 4000-4999", () => {
+    expect(resolveAppPortAllocation(null, {})).toEqual({
+      strategy: "random",
+      range: [4000, 4999],
+    });
+  });
+
+  it("reads the config", () => {
+    expect(
+      resolveAppPortAllocation({ appPortStrategy: "sequential", appPortRange: [4200, 4999] }, {})
+    ).toEqual({ strategy: "sequential", range: [4200, 4999] });
+  });
+
+  it("lets the environment beat the config, each key on its own", () => {
+    const config: AppConfig = { appPortStrategy: "sequential", appPortRange: [4200, 4999] };
+    expect(
+      resolveAppPortAllocation(config, {
+        PORTLESS_APP_PORT_STRATEGY: "stable",
+        PORTLESS_APP_PORT_RANGE: "5000-5010",
+      })
+    ).toEqual({ strategy: "stable", range: [5000, 5010] });
+    expect(resolveAppPortAllocation(config, { PORTLESS_APP_PORT_STRATEGY: "stable" })).toEqual({
+      strategy: "stable",
+      range: [4200, 4999],
+    });
+  });
+
+  it("ignores empty environment values", () => {
+    expect(
+      resolveAppPortAllocation(
+        { appPortStrategy: "stable" },
+        { PORTLESS_APP_PORT_STRATEGY: " ", PORTLESS_APP_PORT_RANGE: "" }
+      )
+    ).toEqual({ strategy: "stable", range: [4000, 4999] });
+  });
+
+  it("rejects an unknown strategy or a malformed range", () => {
+    expect(() => resolveAppPortAllocation(null, { PORTLESS_APP_PORT_STRATEGY: "first" })).toThrow(
+      /PORTLESS_APP_PORT_STRATEGY/
+    );
+    for (const range of ["4200", "5000-4000", "abc-def", "4200-70000"]) {
+      expect(() => resolveAppPortAllocation(null, { PORTLESS_APP_PORT_RANGE: range })).toThrow(
+        /PORTLESS_APP_PORT_RANGE/
+      );
+    }
+  });
+
+  it("rejects a range that starts below the unprivileged ports", () => {
+    expect(() => parseAppPortRange("80-4999")).toThrow(/1024 or higher/);
+    expect(parseAppPortRange("1024-2000")).toEqual([1024, 2000]);
+  });
+
+  it("accepts case-insensitive strategy names", () => {
+    expect(parseAppPortStrategy(" Sequential ")).toBe("sequential");
+    expect(parseAppPortRange(" 4200-4999 ")).toEqual([4200, 4999]);
   });
 });
 

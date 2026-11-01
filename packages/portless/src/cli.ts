@@ -69,6 +69,7 @@ import {
 import {
   inferProjectName,
   applyWorktreePrefix,
+  buildPeerUrlEnv,
   detectWorktreePrefix,
   resolveWorktreeFlat,
   truncateLabel,
@@ -95,7 +96,9 @@ import {
   WAIT_FOR_PROXY_INTERVAL_MS,
   WAIT_FOR_PROXY_MAX_ATTEMPTS,
   discoverState,
+  appPortKey,
   findFreePort,
+  resolveAppPortAllocation,
   findPidOnPort,
   findPidsOnPort,
   findSelfDaemonizedListener,
@@ -148,6 +151,7 @@ import {
   writeTlsMarker,
   writeWildcardMarker,
 } from "./cli-utils.js";
+import type { AppPortAllocation } from "./cli-utils.js";
 import {
   attemptCATrustRemovalForCleanup,
   collectStateDirsForCleanup,
@@ -164,6 +168,7 @@ import {
 import {
   loadConfig,
   resolveAppConfig,
+  withRootAppPortDefaults,
   resolveScriptCommand,
   hasScript,
   isServerCommand,
@@ -1776,7 +1781,8 @@ async function runApp(
   childEnv: Record<string, string> = {},
   protocol?: RouteProtocol,
   pathPrefix?: string,
-  tunnel?: ManagedTunnelOptions
+  tunnel?: ManagedTunnelOptions,
+  allocation: AppPortAllocation = resolveAppPortAllocation(null)
 ) {
   let store = initialStore;
   console.log(chalk.blue.bold(`\nportless\n`));
@@ -1979,11 +1985,23 @@ async function runApp(
     }
   }
 
-  const port = desiredPort ?? (await findFreePort());
+  const port =
+    desiredPort ??
+    (await findFreePort(allocation.range[0], allocation.range[1], {
+      strategy: allocation.strategy,
+      key: appPortKey(name, routePathPrefix),
+      exclude: registeredPorts(store, hostnames, routePathPrefix),
+    }));
   if (desiredPort) {
     console.log(colors.green(`-- Using port ${port} (fixed)`));
-  } else {
+  } else if (allocation.strategy === "random") {
     console.log(colors.green(`-- Using port ${port}`));
+  } else {
+    console.log(
+      colors.green(
+        `-- Using port ${port} (${allocation.strategy} in ${allocation.range[0]}-${allocation.range[1]})`
+      )
+    );
   }
 
   // Register route (--force kills the existing owner if any)
@@ -2656,6 +2674,47 @@ function parseAppPort(value: string | undefined): number {
   return port;
 }
 
+/**
+ * Ports that live routes already own, so a new pick never doubles up on one
+ * whose app has not bound it yet. Routes on the app's own hostname and path are
+ * left out: a restart or `--force` replaces them, and a `stable` port must not
+ * move because its previous owner is still shutting down.
+ */
+function registeredPorts(
+  store: RouteStore,
+  ownHostnames: string[],
+  ownPathPrefix: string
+): Set<number> {
+  try {
+    const own = new Set(ownHostnames);
+    return new Set(
+      store
+        .loadRoutes()
+        .filter(
+          (route) =>
+            !(own.has(route.hostname) && normalizePathPrefix(route.pathPrefix) === ownPathPrefix)
+        )
+        .map((route) => route.port)
+    );
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * Resolve the app port strategy and range from the environment and the app's
+ * config, or exit with the error. Done before anything starts so a typo in
+ * `PORTLESS_APP_PORT_STRATEGY` fails fast.
+ */
+function appPortAllocationOrExit(config: AppConfig | null | undefined): AppPortAllocation {
+  try {
+    return resolveAppPortAllocation(config);
+  } catch (err) {
+    console.error(colors.red(`Error: ${(err as Error).message}`));
+    process.exit(1);
+  }
+}
+
 function appPortFromEnv(): number | undefined {
   const envVal = process.env.PORTLESS_APP_PORT;
   if (!envVal) return undefined;
@@ -3012,6 +3071,12 @@ ${colors.bold("Worktree prefix (flag, then environment, then git):")}
   PORTLESS_WORKTREE_PREFIX=     (empty) turns the prefix off for this shell
   "worktreeBranch": "full" in portless.json uses the whole branch name
   (team-a/login becomes team-a-login) instead of the last segment.
+
+${colors.bold("App port (fixed port, then strategy):")}
+  --app-port, PORTLESS_APP_PORT or "appPort" fix the port. Otherwise it is picked
+  by PORTLESS_APP_PORT_STRATEGY (random, stable, sequential) and
+  PORTLESS_APP_PORT_RANGE (e.g. 4200-4999), which override "appPortStrategy"
+  and "appPortRange" in config. stable keys the port by app name and path.
 
 ${colors.bold("Command placeholders:")}
   {PORT}                 Assigned app port
@@ -4047,6 +4112,12 @@ ${colors.bold("Options:")}
 ${colors.bold("Environment variables:")}
   PORTLESS_PORT=<number>        Override the default proxy port (e.g. in .bashrc)
   PORTLESS_APP_PORT=<number>    Use a fixed app port (same as --app-port)
+  PORTLESS_APP_PORT_STRATEGY=<s>
+                                How to pick an app port: random (default), stable (same
+                                name and path, same port), sequential (lowest free port)
+  PORTLESS_APP_PORT_RANGE=<a>-<b>
+                                Range to pick from, e.g. 4200-4999 (default 4000-4999,
+                                lowest allowed port 1024)
   PORTLESS_H2C=1                Forward app routes to HTTP/2 cleartext upstreams
   PORTLESS_MULTIPLEX=1          Share the hostname with other apps (same as --multiplex)
   PORTLESS_LABEL=<label>        Label for this multiplexed app (same as --label)
@@ -4091,6 +4162,7 @@ ${colors.bold("Child process environment:")}
   PORT                          Ephemeral port the child should listen on
   HOST                          Usually 127.0.0.1 (omitted for Expo in LAN mode)
   PORTLESS_URL                  Public URL of the app (e.g. https://myapp.localhost)
+  PORTLESS_URL_<APP>            URL of each app in a monorepo run (see below)
   PORTLESS_CLOUDFLARE_URL       Public URL from a managed Cloudflare tunnel
   PORTLESS_TUNNEL_URL           Public URL from a managed tunnel provider
   PORTLESS_LAN                  Set to 1 when proxy is in LAN mode
@@ -4100,6 +4172,29 @@ ${colors.bold("Child process environment:")}
   PORTLESS_NGROK_URL            ngrok URL of the app (when --ngrok is active)
   PORTLESS_NETBIRD_URL          NetBird URL of the app (when --netbird is active)
   NODE_EXTRA_CA_CERTS           Path to the portless CA (set when HTTPS is active)
+
+${colors.bold("Referencing another app (monorepo run):")}
+  A monorepo run gives every proxied app the URL of every other proxied app, and
+  its own, as PORTLESS_URL_<APP>. The name is the app name before any worktree
+  prefix, uppercased with dots and dashes as underscores (api.myrepo gives
+  PORTLESS_URL_API_MYREPO), so it is the same in every worktree while the URL
+  it holds carries the branch prefix. When several apps share one hostname at
+  different paths, the path is appended to all but the root one (an app at /api
+  on myrepo.localhost gives PORTLESS_URL_MYREPO_API, and the value includes
+  /api). Names that still collide keep the first app and warn about the rest.
+  Apps whose command is itself portless get none. Outside a monorepo run,
+  "portless get <name>" prints the same URL.
+
+${colors.bold("App port strategy:")}
+  The port an app gets is random in 4000-4999 unless a strategy says otherwise.
+  Set "appPortStrategy" (random, stable or sequential) and "appPortRange" ([min, max])
+  in portless.json or the package.json "portless" key, per app or at the top level,
+  or export PORTLESS_APP_PORT_STRATEGY and PORTLESS_APP_PORT_RANGE, which win over
+  the files. stable derives the port from the app name (worktree prefix included)
+  and path, so a checkout keeps its port; sequential takes the lowest free port.
+  A fixed port (--app-port, PORTLESS_APP_PORT or "appPort") always wins; "appPort"
+  next to "appPortStrategy" in one object is rejected. bg start saves the exported
+  values and bg restart replays them.
 
 ${colors.bold("Command placeholders:")}
   {PORT}                        Assigned app port
@@ -5841,7 +5936,10 @@ function loadAppConfig(cwd: string = process.cwd()): LoadedAppConfig | null {
   try {
     const loaded = loadConfig(cwd);
     if (!loaded) return null;
-    const config = resolveAppConfig(loaded.config, loaded.configDir, cwd);
+    const config = withRootAppPortDefaults(
+      resolveAppConfig(loaded.config, loaded.configDir, cwd),
+      loaded.config
+    );
     return {
       config,
       sourceLabel: configSourceLabel(loaded.sourcePath, cwd),
@@ -5962,7 +6060,9 @@ async function handleDefaultSingle(
     { scriptName, packageDir: cwd },
     {},
     undefined,
-    pathPrefixFromEnv() ?? appConfig?.config.path
+    pathPrefixFromEnv() ?? appConfig?.config.path,
+    undefined,
+    appPortAllocationOrExit(appConfig?.config)
   );
 }
 
@@ -5974,12 +6074,58 @@ interface MultiAppEntry {
   pkg: WorkspacePackage;
   /** Portless hostname (e.g. "web.json-render") */
   name: string;
+  /** Hostname before any worktree prefix, which names this app's peer URL variable */
+  baseName: string;
   /** Human-readable package label for display (e.g. "web") */
   label: string;
   commandArgs: string[];
   appPort?: number;
+  allocation: AppPortAllocation;
   path?: string;
   proxied: boolean;
+}
+
+/** Pick a port for a multi-app entry with its own strategy, keyed by its name and path. */
+function pickAppPort(
+  app: MultiAppEntry,
+  store: RouteStore,
+  hostnames: string[],
+  pathPrefix: string
+): Promise<number> {
+  return findFreePort(app.allocation.range[0], app.allocation.range[1], {
+    strategy: app.allocation.strategy,
+    key: appPortKey(app.name, pathPrefix),
+    exclude: registeredPorts(store, hostnames, pathPrefix),
+  });
+}
+
+/**
+ * Peer URLs handed to every proxied app in a multi-app run. An app URL depends
+ * only on its name, path prefix, the proxy port and the TLDs, never on the
+ * app's own port, so the whole map is known before the first app is spawned.
+ *
+ * Apps that run their own `portless` are left out: they register their own
+ * routes, so this process does not own their URL.
+ */
+function buildPeerUrls(
+  proxiedApps: MultiAppEntry[],
+  proxyPort: number,
+  tls: boolean,
+  tlds: string[]
+): Record<string, string> {
+  const peers = proxiedApps
+    .filter((app) => app.commandArgs[0] !== "portless")
+    .map((app) => {
+      const pathPrefix = normalizePathPrefix(pathPrefixFromEnv() ?? app.path);
+      return {
+        baseName: app.baseName,
+        hostname: app.name,
+        pathPrefix,
+        url: formatUrl(buildHostnames(app.name, tlds)[0]!, proxyPort, tls, pathPrefix),
+      };
+    });
+
+  return buildPeerUrlEnv(peers, (msg) => console.warn(colors.yellow(msg)));
 }
 
 function spawnChildProcess(
@@ -6067,7 +6213,8 @@ async function spawnProxiedApp(
   tlds: string[],
   lanMode: boolean,
   exitCodes: Map<string, number | null>,
-  lifecycle: { stopping: boolean }
+  lifecycle: { stopping: boolean },
+  peerUrls: Record<string, string>
 ): Promise<{
   child: ReturnType<typeof spawn>;
   displayUrl: string;
@@ -6095,10 +6242,10 @@ async function spawnProxiedApp(
       onWarning: (msg) => console.warn(colors.yellow(`[${app.name}] ${msg}`)),
     });
 
-    const appPort = app.appPort ?? (await findFreePort());
-    assignedAppPort = appPort;
     routePathPrefix = normalizePathPrefix(pathPrefixFromEnv() ?? app.path);
     hostnames = buildHostnames(app.name, tlds);
+    const appPort = app.appPort ?? (await pickAppPort(app, store, hostnames, routePathPrefix));
+    assignedAppPort = appPort;
     const url = formatUrl(hostnames[0]!, proxyPort, tls, routePathPrefix);
     displayUrl = url;
 
@@ -6116,6 +6263,7 @@ async function spawnProxiedApp(
 
     env = {
       ...pkgEnv,
+      ...peerUrls,
       PORT: String(appPort),
       HOST: "127.0.0.1",
       PORTLESS_URL: url,
@@ -6306,6 +6454,8 @@ async function handleDefaultMulti(
       ...Object.fromEntries(Object.entries(rootOverride ?? {}).filter(([, v]) => v !== undefined)),
       ...Object.fromEntries(Object.entries(pkgConfig ?? {}).filter(([, v]) => v !== undefined)),
     };
+    // A top-level port strategy is the repo-wide default for apps that do not fix a port.
+    const portConfig = loaded ? withRootAppPortDefaults(appOverride, loaded.config) : appOverride;
 
     const worktree = worktreeFor(appOverride.worktreeBranch ?? loaded?.config.worktreeBranch);
     const effectiveScript = appOverride.script ?? scriptName;
@@ -6321,9 +6471,10 @@ async function handleDefaultMulti(
     const proxied = appOverride.proxy ?? isServerCommand(rawScript);
 
     let name: string;
+    let baseName: string;
     let label: string;
     if (appOverride.name) {
-      const baseName = appOverride.name
+      baseName = appOverride.name
         .split(".")
         .map((l) => truncateLabel(l))
         .join(".");
@@ -6337,7 +6488,7 @@ async function handleDefaultMulti(
       } else {
         pkgLabel = rel.replace(/\//g, "-");
       }
-      const baseName = pkgLabel === projectName ? projectName : `${pkgLabel}.${projectName}`;
+      baseName = pkgLabel === projectName ? projectName : `${pkgLabel}.${projectName}`;
       name = applyWorktreePrefix(baseName, worktree, worktreeFlat);
       label = pkg.scope ? `@${pkg.scope}/${pkg.name}` : (pkg.name ?? rel);
     }
@@ -6345,9 +6496,11 @@ async function handleDefaultMulti(
     apps.push({
       pkg,
       name,
+      baseName,
       label,
       commandArgs,
       appPort: appOverride.appPort,
+      allocation: appPortAllocationOrExit(portConfig),
       path: appOverride.path,
       proxied,
     });
@@ -6430,6 +6583,7 @@ async function runWithTurbo(
   const manifest: Record<string, ManifestEntry> = {};
   const routes: { hostnames: string[]; pathPrefix: string }[] = [];
   const appUrls: { label: string; url: string }[] = [];
+  const peerUrls = buildPeerUrls(proxiedApps, proxyPort, tls, tlds);
 
   for (const app of proxiedApps) {
     const usesPortless = app.commandArgs[0] === "portless";
@@ -6438,9 +6592,9 @@ async function runWithTurbo(
       continue;
     }
 
-    const appPort = app.appPort ?? (await findFreePort());
     const routePathPrefix = normalizePathPrefix(pathPrefixFromEnv() ?? app.path);
     const hostnames = buildHostnames(app.name, tlds);
+    const appPort = app.appPort ?? (await pickAppPort(app, store, hostnames, routePathPrefix));
     const url = formatUrl(hostnames[0]!, proxyPort, tls, routePathPrefix);
     appUrls.push({ label: app.label, url });
 
@@ -6458,6 +6612,7 @@ async function runWithTurbo(
     routes.push({ hostnames, pathPrefix: routePathPrefix });
 
     const entry: ManifestEntry = {
+      ...peerUrls,
       PORT: String(appPort),
       HOST: "127.0.0.1",
       PORTLESS_URL: url,
@@ -6568,6 +6723,7 @@ async function runWithDirectSpawn(
   const routeEntries: { store: RouteStore; hostnames: string[]; pathPrefix: string }[] = [];
   const routeSettlements: Promise<void>[] = [];
   const lifecycle = { stopping: false };
+  const peerUrls = buildPeerUrls(proxiedApps, proxyPort, tls, tlds);
 
   // Sequential: each spawnProxiedApp calls findFreePort() which binds/releases
   // a port, so parallel spawning could cause port collisions.
@@ -6580,7 +6736,8 @@ async function runWithDirectSpawn(
       tlds,
       lanMode,
       exitCodes,
-      lifecycle
+      lifecycle,
+      peerUrls
     );
     children.push(child);
     routeSettlements.push(settled);
@@ -6737,7 +6894,8 @@ async function handleRunMode(args: string[], globalScript?: string): Promise<voi
     parsed.childEnv,
     parsed.protocol,
     parsed.pathPrefix,
-    parsed.tunnel
+    parsed.tunnel,
+    appPortAllocationOrExit(appConfig?.config)
   );
 }
 
@@ -6787,7 +6945,8 @@ async function handleNamedMode(args: string[]): Promise<void> {
     parsed.childEnv,
     parsed.protocol,
     parsed.pathPrefix,
-    parsed.tunnel
+    parsed.tunnel,
+    appPortAllocationOrExit(appConfig?.config)
   );
 }
 

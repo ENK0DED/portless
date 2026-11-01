@@ -10,6 +10,8 @@ import {
   detectWorktreePrefix,
   applyWorktreePrefix,
   resolveWorktreeFlat,
+  peerUrlEnvName,
+  buildPeerUrlEnv,
   WorktreePrefixError,
 } from "./auto.js";
 
@@ -693,5 +695,126 @@ describe("detectWorktreePrefix (git CLI path)", { timeout: 15_000 }, () => {
 
     expect(detectWorktreePrefix(repo, { prefix: "qa", env: {} })?.prefix).toBe("qa");
     expect(detectWorktreePrefix(repo, { env: {} })).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// peerUrlEnvName
+// ---------------------------------------------------------------------------
+
+describe("peerUrlEnvName", () => {
+  it("uppercases and replaces dots and dashes with underscores", () => {
+    expect(peerUrlEnvName("web.myrepo")).toBe("PORTLESS_URL_WEB_MYREPO");
+    expect(peerUrlEnvName("web.json-render")).toBe("PORTLESS_URL_WEB_JSON_RENDER");
+    expect(peerUrlEnvName("api")).toBe("PORTLESS_URL_API");
+  });
+
+  it("appends the path prefix when the hostname is shared", () => {
+    expect(peerUrlEnvName("app", "/api")).toBe("PORTLESS_URL_APP_API");
+    expect(peerUrlEnvName("app.repo", "/api/v1")).toBe("PORTLESS_URL_APP_REPO_API_V1");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildPeerUrlEnv
+// ---------------------------------------------------------------------------
+
+describe("buildPeerUrlEnv", () => {
+  const peer = (baseName: string, url: string, pathPrefix = "/", hostname = baseName) => ({
+    baseName,
+    hostname,
+    pathPrefix,
+    url,
+  });
+
+  it("maps every app to its own variable", () => {
+    expect(
+      buildPeerUrlEnv([
+        peer("web.myrepo", "https://web.myrepo.localhost"),
+        peer("api.myrepo", "https://api.myrepo.localhost"),
+      ])
+    ).toEqual({
+      PORTLESS_URL_WEB_MYREPO: "https://web.myrepo.localhost",
+      PORTLESS_URL_API_MYREPO: "https://api.myrepo.localhost",
+    });
+  });
+
+  it("names variables from the base name while values carry the worktree prefix", () => {
+    expect(
+      buildPeerUrlEnv([
+        peer("api.myrepo", "https://feature-x.api.myrepo.localhost", "/", "feature-x.api.myrepo"),
+      ])
+    ).toEqual({ PORTLESS_URL_API_MYREPO: "https://feature-x.api.myrepo.localhost" });
+  });
+
+  it("keeps the plain name for a lone path-routed app and includes the path in the value", () => {
+    expect(buildPeerUrlEnv([peer("api.myrepo", "https://api.myrepo.localhost/v1", "/v1")])).toEqual(
+      { PORTLESS_URL_API_MYREPO: "https://api.myrepo.localhost/v1" }
+    );
+  });
+
+  it("gives apps that share a hostname distinct variables by path", () => {
+    const warnings: string[] = [];
+    const env = buildPeerUrlEnv(
+      [
+        peer("app.myrepo", "https://app.myrepo.localhost", "/"),
+        peer("app.myrepo", "https://app.myrepo.localhost/api", "/api"),
+        peer("app.myrepo", "https://app.myrepo.localhost/admin/ui", "/admin/ui"),
+        peer("other", "https://other.localhost"),
+      ],
+      (msg) => warnings.push(msg)
+    );
+
+    expect(env).toEqual({
+      PORTLESS_URL_APP_MYREPO: "https://app.myrepo.localhost",
+      PORTLESS_URL_APP_MYREPO_API: "https://app.myrepo.localhost/api",
+      PORTLESS_URL_APP_MYREPO_ADMIN_UI: "https://app.myrepo.localhost/admin/ui",
+      PORTLESS_URL_OTHER: "https://other.localhost",
+    });
+    expect(warnings).toEqual([]);
+  });
+
+  it("keeps the first of two names that collapse to one variable, and reports it", () => {
+    const warnings: string[] = [];
+    const env = buildPeerUrlEnv(
+      [peer("web.api", "https://web.api.localhost"), peer("web-api", "https://web-api.localhost")],
+      (msg) => warnings.push(msg)
+    );
+
+    expect(env).toEqual({ PORTLESS_URL_WEB_API: "https://web.api.localhost" });
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("PORTLESS_URL_WEB_API");
+    expect(warnings[0]).toContain("web-api");
+  });
+
+  it("reports colliding path variables on a shared hostname", () => {
+    const warnings: string[] = [];
+    const env = buildPeerUrlEnv(
+      [
+        peer("app", "https://app.localhost", "/"),
+        peer("app", "https://app.localhost/a-b", "/a-b"),
+        peer("app", "https://app.localhost/a/b", "/a/b"),
+      ],
+      (msg) => warnings.push(msg)
+    );
+
+    expect(Object.keys(env)).toEqual(["PORTLESS_URL_APP", "PORTLESS_URL_APP_A_B"]);
+    expect(env.PORTLESS_URL_APP_A_B).toBe("https://app.localhost/a-b");
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('"app/a/b"');
+  });
+
+  it("does not report a repeated identical app", () => {
+    const warnings: string[] = [];
+    buildPeerUrlEnv(
+      [peer("api", "https://api.localhost"), peer("api", "https://api.localhost")],
+      (msg) => warnings.push(msg)
+    );
+    expect(warnings).toEqual([]);
+  });
+
+  it("skips a name that sanitizes to nothing, and returns an empty map for no apps", () => {
+    expect(buildPeerUrlEnv([peer("...", "https://x.localhost")])).toEqual({});
+    expect(buildPeerUrlEnv([])).toEqual({});
   });
 });

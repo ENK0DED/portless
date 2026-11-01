@@ -1844,6 +1844,48 @@ describe("CLI", () => {
         }
       });
 
+      it("saves an exported app port strategy and replays it on restart without the variable", async () => {
+        const appDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-bg-strategy-"));
+        // An OS-assigned port is far above 4000-4999, so a random default could not land on it.
+        const base = await getFreePort();
+        const strategyEnv = {
+          PORTLESS_APP_PORT_STRATEGY: "sequential",
+          PORTLESS_APP_PORT_RANGE: `${base}-${base + 20}`,
+        };
+        const routePorts = () => readRoutesFile(tmpDir).map((route) => route.port);
+        try {
+          const start = run(["bg", "start", "--name", "strategy-web", ...longRunningCommand()], {
+            env: bgEnv(strategyEnv),
+            cwd: appDir,
+          });
+          expect(start.status).toBe(0);
+          const [before] = readBgRegistry(tmpDir);
+          expect(before.intent?.appPortStrategy).toBe("sequential");
+          expect(before.intent?.appPortRange).toEqual([base, base + 20]);
+          expect(routePorts()).toEqual([base]);
+
+          // The restarting shell has no strategy variables at all.
+          const restart = run(["bg", "restart", "strategy-web"], { env: bgEnv() });
+          expect(restart.status).toBe(0);
+          const [after] = readBgRegistry(tmpDir);
+          expect(after.pid).not.toBe(before.pid);
+          expect(after.intent?.appPortStrategy).toBe("sequential");
+          expect(after.intent?.appPortRange).toEqual([base, base + 20]);
+          expect(routePorts()).toEqual([base]);
+        } finally {
+          fs.rmSync(appDir, { recursive: true, force: true });
+        }
+      });
+
+      it("bg start rejects an invalid app port strategy before spawning", () => {
+        const { status, stderr } = run(["bg", "start", "--name", "bad", ...longRunningCommand()], {
+          env: bgEnv({ PORTLESS_APP_PORT_STRATEGY: "first" }),
+        });
+        expect(status).not.toBe(0);
+        expect(stderr).toContain("PORTLESS_APP_PORT_STRATEGY");
+        expect(readBgRegistry(tmpDir)).toEqual([]);
+      });
+
       it("restart flags stay out of the explicit child command", () => {
         const intent = makeRestartIntent();
         const startArgs = buildRestartStartArgs(intent, {
@@ -3806,6 +3848,148 @@ describe("CLI", () => {
       const stop = run(["proxy", "stop"], { env: proxyEnv() });
       expect(stop.status).toBe(0);
       expect(stop.stdout).toContain("Proxy stopped");
+    });
+
+    describe.skipIf(process.platform === "win32")("app port strategy", () => {
+      // Each app listens on the PORT it is given and records it, so a second
+      // pick sees the first one taken. The test ends the apps itself.
+      const children: ReturnType<typeof spawn>[] = [];
+      const appPids: number[] = [];
+
+      afterEach(async () => {
+        for (const child of children.splice(0)) await stopChild(child);
+        for (const pid of appPids.splice(0)) {
+          try {
+            process.kill(pid, "SIGKILL");
+          } catch {
+            // Already gone.
+          }
+          for (let i = 0; i < 50 && isPidAlive(pid); i++) {
+            await new Promise((resolve) => setTimeout(resolve, 100));
+          }
+        }
+      });
+
+      async function startApp(
+        name: string,
+        config: Record<string, unknown>,
+        env: Record<string, string | undefined> = {}
+      ): Promise<{ port: number; output: () => string }> {
+        fs.writeFileSync(path.join(tmpDir, "portless.json"), JSON.stringify(config));
+        const capFile = path.join(tmpDir, `${name}.json`);
+        fs.rmSync(capFile, { force: true });
+        fs.writeFileSync(
+          path.join(tmpDir, `${name}.cjs`),
+          `require("node:http").createServer().listen(Number(process.env.PORT), "127.0.0.1", () => {\n` +
+            `  require("node:fs").writeFileSync(${JSON.stringify(capFile)}, JSON.stringify({ port: process.env.PORT, pid: process.pid }));\n` +
+            `});\n`
+        );
+        const childEnv: Record<string, string | undefined> = { ...process.env };
+        for (const key of Object.keys(childEnv)) {
+          if (key.startsWith("PORTLESS") || key.startsWith("npm_") || key.startsWith("PNPM_")) {
+            delete childEnv[key];
+          }
+        }
+        Object.assign(childEnv, proxyEnv(), { PORTLESS_SYNC_HOSTS: "0", NO_COLOR: "1" }, env);
+        let output = "";
+        const child = spawn(
+          process.execPath,
+          [CLI_PATH, "run", "--name", name, "--", process.execPath, `${name}.cjs`],
+          { cwd: tmpDir, env: childEnv, stdio: ["ignore", "pipe", "pipe"] }
+        );
+        children.push(child);
+        child.stdout?.on("data", (chunk) => (output += chunk.toString()));
+        child.stderr?.on("data", (chunk) => (output += chunk.toString()));
+        for (let i = 0; i < 60 && !fs.existsSync(capFile); i++) {
+          await new Promise((resolve) => setTimeout(resolve, 500));
+        }
+        if (!fs.existsSync(capFile)) {
+          throw new Error(`${name} never started. CLI output:\n${output}`);
+        }
+        const captured = JSON.parse(fs.readFileSync(capFile, "utf-8")) as {
+          port: string;
+          pid: number;
+        };
+        appPids.push(captured.pid);
+        return { port: Number(captured.port), output: () => output };
+      }
+
+      it("sequential gives the first app the bottom of the range and the next app the next port", async () => {
+        const base = await getFreePort();
+        const config = { appPortStrategy: "sequential", appPortRange: [base, base + 20] };
+        const first = await startApp("seq-one", config);
+        const second = await startApp("seq-two", config);
+        expect(first.port).toBe(base);
+        expect(second.port).toBe(base + 1);
+        expect(first.output()).toContain(`(sequential in ${base}-${base + 20})`);
+      }, 60_000);
+
+      it("stable gives the same name the same port across restarts", async () => {
+        const base = await getFreePort();
+        const config = { appPortStrategy: "stable", appPortRange: [base, base + 200] };
+        const first = await startApp("stable-app", config);
+        await stopChild(children[0]!);
+        try {
+          process.kill(appPids[0]!, "SIGKILL");
+        } catch {
+          // Already gone.
+        }
+        for (let i = 0; i < 50 && isPidAlive(appPids[0]!); i++) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        const again = await startApp("stable-app", config);
+        expect(again.port).toBe(first.port);
+      }, 60_000);
+
+      it("an exported strategy and range beat the file", async () => {
+        const base = await getFreePort();
+        const app = await startApp(
+          "env-wins",
+          { appPortStrategy: "random", appPortRange: [4000, 4999] },
+          {
+            PORTLESS_APP_PORT_STRATEGY: "sequential",
+            PORTLESS_APP_PORT_RANGE: `${base}-${base + 20}`,
+          }
+        );
+        expect(app.port).toBe(base);
+      }, 60_000);
+
+      it("a fixed port beats the strategy", async () => {
+        const fixed = await getFreePort();
+        const app = await startApp(
+          "fixed-wins",
+          { appPortStrategy: "sequential", appPortRange: [4000, 4999] },
+          { PORTLESS_APP_PORT: String(fixed) }
+        );
+        expect(app.port).toBe(fixed);
+        expect(app.output()).toContain(`Using port ${fixed} (fixed)`);
+      }, 60_000);
+
+      it("rejects appPort beside appPortStrategy before anything runs", () => {
+        fs.writeFileSync(
+          path.join(tmpDir, "portless.json"),
+          JSON.stringify({ appPort: 4321, appPortStrategy: "sequential" })
+        );
+        const result = run(["run", "node", "-e", "0"], { env: proxyEnv(), cwd: tmpDir });
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain('"appPort" fixes the port');
+      });
+
+      it("rejects an invalid exported strategy or range before anything runs", () => {
+        const badStrategy = run(["run", "node", "-e", "0"], {
+          env: { ...proxyEnv(), PORTLESS_APP_PORT_STRATEGY: "first" },
+          cwd: tmpDir,
+        });
+        expect(badStrategy.status).toBe(1);
+        expect(badStrategy.stderr).toContain("PORTLESS_APP_PORT_STRATEGY");
+
+        const lowRange = run(["run", "node", "-e", "0"], {
+          env: { ...proxyEnv(), PORTLESS_APP_PORT_RANGE: "80-90" },
+          cwd: tmpDir,
+        });
+        expect(lowRange.status).toBe(1);
+        expect(lowRange.stderr).toContain("PORTLESS_APP_PORT_RANGE");
+      });
     });
 
     describe("route owner liveness", () => {
@@ -6334,6 +6518,137 @@ describe("worktree prefix surface", { timeout: 30_000 }, () => {
           env: { PORTLESS_WORKTREE_PREFIX: "" },
         });
         expect(emptyEnv.stdout).toContain(`http://test-app.localhost:${emptyEnv.proxyPort}`);
+      },
+      60_000
+    );
+  });
+
+  describe("multi-app peer URLs", () => {
+    // Skipped on Windows for the same reason as multi-app worktree routing:
+    // spawnChildProcess runs `npm run dev` without a shell, which fails on
+    // npm.cmd. The peer URL map itself is platform-agnostic and unit-tested in
+    // auto.test.ts.
+    it.skipIf(process.platform === "win32")(
+      "gives every app its peers' URLs, named from the base name, with paths on a shared host",
+      async () => {
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), "portless-multi-peer-"));
+        const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-peer-state-"));
+        const proxyPort = await getFreePort();
+        const apps = ["web", "api", "admin"];
+        const capFile = (name: string) => path.join(stateDir, `peers-${name}.json`);
+        const readCap = (name: string) => {
+          try {
+            return fs.readFileSync(capFile(name), "utf-8");
+          } catch {
+            return "";
+          }
+        };
+        let cli: ReturnType<typeof spawn> | undefined;
+
+        try {
+          fs.writeFileSync(
+            path.join(root, "package.json"),
+            JSON.stringify({
+              name: "myrepo",
+              private: true,
+              packageManager: "npm@10.0.0",
+              workspaces: ["packages/*"],
+            })
+          );
+          // web and api share one hostname at different paths; admin stands alone.
+          fs.writeFileSync(
+            path.join(root, "portless.json"),
+            JSON.stringify({
+              turbo: false,
+              apps: {
+                "packages/web": { name: "site.myrepo", path: "/" },
+                "packages/api": { name: "site.myrepo", path: "/api" },
+                "packages/admin": { name: "admin.myrepo" },
+              },
+            })
+          );
+
+          // Fake a linked worktree on branch feature-x, so hostnames carry a
+          // prefix that the variable names must not inherit.
+          const gitdir = path.join(root, "fake-bare.git", "worktrees", "wt");
+          fs.mkdirSync(gitdir, { recursive: true });
+          fs.writeFileSync(path.join(gitdir, "HEAD"), "ref: refs/heads/feature-x\n");
+          fs.writeFileSync(path.join(root, ".git"), `gitdir: ${gitdir}\n`);
+
+          for (const name of apps) {
+            const dir = path.join(root, "packages", name);
+            fs.mkdirSync(dir, { recursive: true });
+            fs.writeFileSync(
+              path.join(dir, "capture.cjs"),
+              `const env = process.env;\n` +
+                `const peers = Object.fromEntries(Object.entries(env).filter(([k]) => k.startsWith("PORTLESS_URL")));\n` +
+                `require("node:fs").writeFileSync(${JSON.stringify(capFile(name))}, JSON.stringify(peers));\n`
+            );
+            fs.writeFileSync(
+              path.join(dir, "package.json"),
+              JSON.stringify({
+                name,
+                version: "0.0.0",
+                scripts: { dev: "node capture.cjs" },
+                portless: { proxy: true },
+              })
+            );
+          }
+
+          const childEnv: Record<string, string | undefined> = { ...process.env };
+          for (const key of Object.keys(childEnv)) {
+            if (key.startsWith("npm_") || key.startsWith("PNPM_")) delete childEnv[key];
+            if (key.startsWith("PORTLESS")) delete childEnv[key];
+          }
+          childEnv.PORTLESS_STATE_DIR = stateDir;
+          childEnv.PORTLESS_PORT = proxyPort.toString();
+          childEnv.PORTLESS_HTTPS = "0";
+          childEnv.PORTLESS_SYNC_HOSTS = "0";
+          childEnv.NO_COLOR = "1";
+
+          let output = "";
+          cli = spawn(process.execPath, [CLI_PATH], {
+            cwd: root,
+            env: childEnv,
+            stdio: ["ignore", "pipe", "pipe"],
+          });
+          cli.stdout?.on("data", (chunk) => (output += chunk.toString()));
+          cli.stderr?.on("data", (chunk) => (output += chunk.toString()));
+
+          for (let i = 0; i < 60; i++) {
+            if (apps.every((name) => readCap(name))) break;
+            await new Promise((resolve) => setTimeout(resolve, 500));
+          }
+          const raw = Object.fromEntries(apps.map((name) => [name, readCap(name)]));
+          if (apps.some((name) => !raw[name])) {
+            throw new Error(`capture incomplete (${JSON.stringify(raw)}). CLI output:\n${output}`);
+          }
+
+          const host = `feature-x.site.myrepo.localhost:${proxyPort}`;
+          const expected = {
+            PORTLESS_URL: "",
+            PORTLESS_URL_SITE_MYREPO: `http://${host}`,
+            PORTLESS_URL_SITE_MYREPO_API: `http://${host}/api`,
+            PORTLESS_URL_ADMIN_MYREPO: `http://feature-x.admin.myrepo.localhost:${proxyPort}`,
+          };
+          const own: Record<string, string> = {
+            web: expected.PORTLESS_URL_SITE_MYREPO,
+            api: expected.PORTLESS_URL_SITE_MYREPO_API,
+            admin: expected.PORTLESS_URL_ADMIN_MYREPO,
+          };
+          for (const name of apps) {
+            const seen = JSON.parse(raw[name]!) as Record<string, string>;
+            // The same map reaches every app, its own entry included.
+            expect(seen).toEqual({ ...expected, PORTLESS_URL: own[name] });
+          }
+        } finally {
+          if (cli) await stopChild(cli);
+          run(["proxy", "stop"], {
+            env: { PORTLESS_STATE_DIR: stateDir, PORTLESS_HTTPS: "0" },
+          });
+          fs.rmSync(root, { recursive: true, force: true });
+          fs.rmSync(stateDir, { recursive: true, force: true });
+        }
       },
       60_000
     );

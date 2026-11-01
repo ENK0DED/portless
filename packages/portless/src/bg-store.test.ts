@@ -131,6 +131,30 @@ describe("BgStore", () => {
     expect(store.loadEntries()).toEqual([]);
   });
 
+  it("persists the app port strategy and range and accepts entries written without them", () => {
+    const withPorts = sampleEntry({
+      intent: { ...sampleEntry().intent, appPortStrategy: "stable", appPortRange: [4200, 4999] },
+    });
+    store.upsertEntry(withPorts);
+    expect(store.loadEntries()).toEqual([withPorts]);
+    expect(sampleEntry().intent.appPortStrategy).toBeUndefined();
+  });
+
+  it("rejects malformed app port strategy fields", () => {
+    store.ensureDirs();
+    const badStrategy = sampleEntry();
+    (badStrategy.intent as unknown as Record<string, unknown>).appPortStrategy = "first";
+    const badRange = sampleEntry({ id: "other" });
+    (badRange.intent as unknown as Record<string, unknown>).appPortRange = [5000, 4000];
+    const shortRange = sampleEntry({ id: "short" });
+    (shortRange.intent as unknown as Record<string, unknown>).appPortRange = [5000];
+    fs.writeFileSync(
+      store.getPaths().registryPath,
+      JSON.stringify([badStrategy, badRange, shortRange])
+    );
+    expect(store.loadEntries()).toEqual([]);
+  });
+
   it("loads only valid entries from a mixed registry", () => {
     store.ensureDirs();
     fs.writeFileSync(

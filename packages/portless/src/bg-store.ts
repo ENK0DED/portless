@@ -3,6 +3,8 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { RouteProtocol, TunnelProviderName } from "./types.js";
 import { isRetryableLockError } from "./routes.js";
+import { APP_PORT_STRATEGIES } from "./config.js";
+import type { AppPortStrategy } from "./config.js";
 import { fixOwnership, isErrnoException, normalizePathPrefix } from "./utils.js";
 
 const STALE_LOCK_THRESHOLD_MS = 10_000;
@@ -40,6 +42,14 @@ export interface BgStartIntent {
   worktreePrefix?: string;
   /** Worktree prefix turned off (--no-worktree or an empty PORTLESS_WORKTREE_PREFIX). */
   noWorktree?: boolean;
+  /**
+   * App port strategy exported as PORTLESS_APP_PORT_STRATEGY at start time.
+   * Replayed on restart so it does not depend on the restarting shell. Absent
+   * means "whatever the config file says".
+   */
+  appPortStrategy?: AppPortStrategy;
+  /** Port range exported as PORTLESS_APP_PORT_RANGE at start time, as `[min, max]`. */
+  appPortRange?: [number, number];
   tunnel?: BgManagedTunnelOptions;
   sharing: {
     tailscale: boolean;
@@ -139,6 +149,23 @@ function isValidIntent(value: unknown): value is BgStartIntent {
     return false;
   }
   if (intent.noWorktree !== undefined && typeof intent.noWorktree !== "boolean") return false;
+  if (
+    intent.appPortStrategy !== undefined &&
+    !(APP_PORT_STRATEGIES as readonly string[]).includes(intent.appPortStrategy)
+  ) {
+    return false;
+  }
+  if (
+    intent.appPortRange !== undefined &&
+    !(
+      Array.isArray(intent.appPortRange) &&
+      intent.appPortRange.length === 2 &&
+      intent.appPortRange.every((port) => Number.isInteger(port) && port >= 1 && port <= 65535) &&
+      intent.appPortRange[0] <= intent.appPortRange[1]
+    )
+  ) {
+    return false;
+  }
   if (!isValidTunnel(intent.tunnel)) return false;
   if (!isValidSharing(intent.sharing)) return false;
   try {

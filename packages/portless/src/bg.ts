@@ -9,6 +9,8 @@ import {
   isWindows,
   killOrphanedProcessGroup,
   killTree,
+  parseAppPortRange,
+  parseAppPortStrategy,
 } from "./cli-utils.js";
 import {
   appendBgLifecycleLog,
@@ -313,7 +315,11 @@ function parseTunnelProviderForIntent(value: string): TunnelProviderName {
   throw new Error(`Unsupported tunnel provider "${value}"`);
 }
 
-export function parseRunIntent(runArgs: string[], cwd: string): ParsedRunIntent {
+export function parseRunIntent(
+  runArgs: string[],
+  cwd: string,
+  env: NodeJS.ProcessEnv = process.env
+): ParsedRunIntent {
   let name: string | undefined;
   let force = false;
   let appPort: number | undefined;
@@ -321,11 +327,18 @@ export function parseRunIntent(runArgs: string[], cwd: string): ParsedRunIntent 
   let pathPrefix = "/";
   // PORTLESS_WORKTREE_PREFIX is captured now so a restart from another shell
   // replays the same decision; a flag overrides it in either direction.
-  const envWorktree = process.env.PORTLESS_WORKTREE_PREFIX;
+  const envWorktree = env.PORTLESS_WORKTREE_PREFIX;
   let worktreePrefix: string | undefined = envWorktree?.trim() ? envWorktree : undefined;
   let noWorktree = envWorktree !== undefined && !envWorktree.trim();
   let flagWorktreePrefix = false;
   let flagNoWorktree = false;
+  // The app port strategy and range are captured the same way: a restart from
+  // another shell replays what the app was started with. Invalid values fail
+  // the start instead of being saved.
+  const envStrategy = env.PORTLESS_APP_PORT_STRATEGY?.trim();
+  const envRange = env.PORTLESS_APP_PORT_RANGE?.trim();
+  const appPortStrategy = envStrategy ? parseAppPortStrategy(envStrategy) : undefined;
+  const appPortRange = envRange ? parseAppPortRange(envRange) : undefined;
   const envProvider =
     process.env.PORTLESS_TUNNEL ??
     (["1", "true"].includes(process.env.PORTLESS_CLOUDFLARE ?? "") ? "cloudflare" : undefined);
@@ -441,6 +454,8 @@ export function parseRunIntent(runArgs: string[], cwd: string): ParsedRunIntent 
       pathPrefix,
       ...(worktreePrefix !== undefined ? { worktreePrefix } : {}),
       ...(noWorktree ? { noWorktree } : {}),
+      ...(appPortStrategy !== undefined ? { appPortStrategy } : {}),
+      ...(appPortRange !== undefined ? { appPortRange } : {}),
       tunnel,
       sharing,
     },
@@ -1089,6 +1104,17 @@ async function handleBgRestart(args: string[], options: { entryScript: string })
       cwd: entry.cwd,
       netbirdPassword: entry.intent.sharing.netbirdPassword,
       netbirdPin: entry.intent.sharing.netbirdPin,
+      env: {
+        ...process.env,
+        ...(entry.intent.appPortStrategy
+          ? { PORTLESS_APP_PORT_STRATEGY: entry.intent.appPortStrategy }
+          : {}),
+        ...(entry.intent.appPortRange
+          ? {
+              PORTLESS_APP_PORT_RANGE: `${entry.intent.appPortRange[0]}-${entry.intent.appPortRange[1]}`,
+            }
+          : {}),
+      },
     });
   } catch (err) {
     console.error(colors.red(`Error: ${(err as Error).message}`));
@@ -1198,7 +1224,13 @@ export async function pruneBgEntriesForState(stateDir: string): Promise<{ remove
 async function handleBgStart(
   startArgs: string[],
   options: { entryScript: string },
-  startOptions: { cwd?: string; netbirdPassword?: string; netbirdPin?: string } = {}
+  startOptions: {
+    cwd?: string;
+    netbirdPassword?: string;
+    netbirdPin?: string;
+    /** Environment the run intent is read from. Restarts overlay the saved values. */
+    env?: NodeJS.ProcessEnv;
+  } = {}
 ): Promise<void> {
   let parsed: ParsedBgStartArgs;
   try {
@@ -1217,7 +1249,13 @@ async function handleBgStart(
   const readyPath = getBgReadyPath(state.dir, id);
   const logs = getBgLogPaths(state.dir, id);
   const cwd = startOptions.cwd ?? process.cwd();
-  const parsedIntent = parseRunIntent(parsed.runArgs, cwd);
+  let parsedIntent: ParsedRunIntent;
+  try {
+    parsedIntent = parseRunIntent(parsed.runArgs, cwd, startOptions.env);
+  } catch (err) {
+    console.error(colors.red(`Error: ${(err as Error).message}`));
+    process.exit(1);
+  }
   const label = parsedIntent.label;
   const intent: BgStartIntent = {
     ...parsedIntent.intent,
@@ -1249,6 +1287,10 @@ async function handleBgStart(
       ...process.env,
       [PORTLESS_BG_ID_ENV]: id,
       [PORTLESS_BG_READY_PATH_ENV]: readyPath,
+      ...(intent.appPortStrategy ? { PORTLESS_APP_PORT_STRATEGY: intent.appPortStrategy } : {}),
+      ...(intent.appPortRange
+        ? { PORTLESS_APP_PORT_RANGE: `${intent.appPortRange[0]}-${intent.appPortRange[1]}` }
+        : {}),
       ...(intent.sharing.netbirdPassword
         ? { PORTLESS_NETBIRD_PASSWORD: intent.sharing.netbirdPassword }
         : {}),

@@ -273,3 +273,39 @@ describe("bg start parser", () => {
     });
   });
 });
+
+describe("bg app port strategy", () => {
+  it("captures PORTLESS_APP_PORT_STRATEGY and PORTLESS_APP_PORT_RANGE from the environment", () => {
+    const { intent } = parseRunIntent(["bun", "dev"], "/tmp/app", {
+      PORTLESS_APP_PORT_STRATEGY: " Stable ",
+      PORTLESS_APP_PORT_RANGE: "4200-4999",
+    });
+    expect(intent.appPortStrategy).toBe("stable");
+    expect(intent.appPortRange).toEqual([4200, 4999]);
+  });
+
+  it("saves nothing when the variables are unset or empty", () => {
+    const { intent } = parseRunIntent(["bun", "dev"], "/tmp/app", {
+      PORTLESS_APP_PORT_STRATEGY: "",
+      PORTLESS_APP_PORT_RANGE: " ",
+    });
+    expect(intent.appPortStrategy).toBeUndefined();
+    expect(intent.appPortRange).toBeUndefined();
+  });
+
+  it("fails the start on an invalid value instead of saving it", () => {
+    expect(() =>
+      parseRunIntent(["bun", "dev"], "/tmp/app", { PORTLESS_APP_PORT_STRATEGY: "first" })
+    ).toThrow(/PORTLESS_APP_PORT_STRATEGY/);
+    expect(() =>
+      parseRunIntent(["bun", "dev"], "/tmp/app", { PORTLESS_APP_PORT_RANGE: "80-90" })
+    ).toThrow(/PORTLESS_APP_PORT_RANGE/);
+  });
+
+  it("adds no run flag, since the saved values are replayed through the environment", () => {
+    const { intent } = parseRunIntent(["bun", "dev"], "/tmp/app", {
+      PORTLESS_APP_PORT_STRATEGY: "sequential",
+    });
+    expect(runArgsFromIntent(intent, false)).toEqual([]);
+  });
+});
