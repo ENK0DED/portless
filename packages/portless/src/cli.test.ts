@@ -6131,9 +6131,12 @@ server.listen(Number(process.env.PORT), "127.0.0.1", () => {
         expect(stdout.includes("reads one additional allowed host")).toBe(expectNotice);
       } finally {
         await new Promise<void>((resolve) => server.close(() => resolve()));
-        fs.rmSync(tmpDir, { recursive: true, force: true });
-        fs.rmSync(binDir, { recursive: true, force: true });
-        fs.rmSync(appDir, { recursive: true, force: true });
+        // On Windows the tunnel shim can still hold appDir as its working
+        // directory for a moment after portless exits, so retry the removal.
+        const rmOptions = { recursive: true, force: true, maxRetries: 20, retryDelay: 100 };
+        fs.rmSync(tmpDir, rmOptions);
+        fs.rmSync(binDir, rmOptions);
+        fs.rmSync(appDir, rmOptions);
       }
     });
   });

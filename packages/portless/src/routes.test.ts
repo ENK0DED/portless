@@ -688,7 +688,9 @@ describe("RouteStore", () => {
       expect(store.transferRoute("myapp.localhost", process.pid, 1, { label: "api" })).toEqual({
         hadSharing: false,
       });
-      const byLabel = new Map(store.loadRoutes().map((r) => [r.label, r]));
+      // Read raw: pid 1 is a live init process on Unix but does not exist on
+      // Windows, and this test checks the transfer, not owner liveness.
+      const byLabel = new Map(store.loadRoutesRaw().map((r) => [r.label, r]));
       expect(byLabel.get("api")?.pid).toBe(1);
       expect(byLabel.get("api")?.port).toBe(4002);
       expect(byLabel.get("web")?.pid).toBe(process.ppid);
