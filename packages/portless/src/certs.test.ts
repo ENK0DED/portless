@@ -716,6 +716,97 @@ describe("isCATrusted", () => {
       }
     }
   );
+
+  it.skipIf(process.platform !== "linux")(
+    "re-trusts a regenerated CA in the Windows store on WSL even with a stale trust marker",
+    () => {
+      const fingerprintOf = (caPath: string) =>
+        new crypto.X509Certificate(fs.readFileSync(caPath)).fingerprint.replace(/:/g, "");
+      const { caPath } = ensureCerts(tmpDir);
+      const oldFingerprint = fingerprintOf(caPath);
+
+      const fakeBinDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-wsl-regen-bin-"));
+      const storePath = path.join(fakeBinDir, "store.txt");
+      const certutilPath = path.join(fakeBinDir, "certutil");
+      const wslpathPath = path.join(fakeBinDir, "wslpath");
+      fs.writeFileSync(storePath, `Cert Hash(sha1): ${oldFingerprint}\n`);
+      fs.writeFileSync(
+        wslpathPath,
+        [
+          "#!/bin/sh",
+          'if [ "$1" = "-u" ]; then',
+          `  printf '%s\\n' ${JSON.stringify(certutilPath)}`,
+          "  exit 0",
+          "fi",
+          'if [ "$1" = "-w" ]; then',
+          "  printf '%s\\n' 'C:\\\\Users\\\\portless\\\\ca.pem'",
+          "  exit 0",
+          "fi",
+          "exit 1",
+        ].join("\n") + "\n"
+      );
+      fs.writeFileSync(
+        certutilPath,
+        [
+          "#!/bin/sh",
+          'if [ "$1" = "-store" ]; then',
+          `  while IFS= read -r line; do printf '%s\\n' "$line"; done < ${JSON.stringify(storePath)}`,
+          'elif [ "$1" = "-addstore" ]; then',
+          `  printf '%s\\n' "Cert Hash(sha1): $PORTLESS_TEST_NEW_FP" >> ${JSON.stringify(storePath)}`,
+          "fi",
+        ].join("\n") + "\n"
+      );
+      fs.chmodSync(wslpathPath, 0o755);
+      fs.chmodSync(certutilPath, 0o755);
+
+      const originalPath = process.env.PATH;
+      const originalWslDistroName = process.env.WSL_DISTRO_NAME;
+      const readFileSyncMock = vi.mocked(fs.readFileSync);
+      const originalReadFileSync = readFileSyncMock.getMockImplementation()!;
+      readFileSyncMock.mockImplementation(
+        (filePath: Parameters<typeof fs.readFileSync>[0], options) => {
+          if (String(filePath) === "/etc/os-release") return "NAME=NixOS\nID=nixos\n";
+          return originalReadFileSync(filePath, options as Parameters<typeof fs.readFileSync>[1]);
+        }
+      );
+
+      try {
+        process.env.PATH = `${fakeBinDir}${path.delimiter}${originalPath ?? ""}`;
+        process.env.WSL_DISTRO_NAME = "NixOS";
+
+        // The old CA is trusted and recorded in the marker.
+        expect(isCATrusted(tmpDir)).toBe(true);
+        expect(trustCA(tmpDir).trusted).toBe(true);
+        const marker = fs.readFileSync(path.join(tmpDir, "ca.trusted"), "utf-8").trim();
+        expect(marker).toMatch(/^wsl:[0-9a-f]+$/);
+
+        // Regenerate the CA, as ensureCerts does for a malformed one.
+        fs.rmSync(caPath);
+        const regenerated = ensureCerts(tmpDir);
+        expect(regenerated.caGenerated).toBe(true);
+        const newFingerprint = fingerprintOf(caPath);
+        expect(newFingerprint).not.toBe(oldFingerprint);
+        process.env.PORTLESS_TEST_NEW_FP = newFingerprint;
+
+        // The Windows store only knows the old CA, so the new one is untrusted.
+        expect(isCATrusted(tmpDir)).toBe(false);
+        const result = trustCA(tmpDir);
+        expect(result.trusted).toBe(true);
+        expect(isCATrusted(tmpDir)).toBe(true);
+        const newMarker = fs.readFileSync(path.join(tmpDir, "ca.trusted"), "utf-8").trim();
+        expect(newMarker).toMatch(/^wsl:[0-9a-f]+$/);
+        expect(newMarker).not.toBe(marker);
+      } finally {
+        delete process.env.PORTLESS_TEST_NEW_FP;
+        readFileSyncMock.mockImplementation(originalReadFileSync);
+        if (originalPath === undefined) delete process.env.PATH;
+        else process.env.PATH = originalPath;
+        if (originalWslDistroName === undefined) delete process.env.WSL_DISTRO_NAME;
+        else process.env.WSL_DISTRO_NAME = originalWslDistroName;
+        fs.rmSync(fakeBinDir, { recursive: true, force: true });
+      }
+    }
+  );
 });
 
 describe("trustCA", () => {

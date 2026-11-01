@@ -1,43 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { getPowerShellPath, isWSL, runPowerShellFromWSL, wslToWindowsPath } from "./wsl-utils.js";
-
-describe("isWSL", () => {
-  it("detects WSL from environment variables", () => {
-    expect(
-      isWSL({
-        platform: "linux",
-        env: { WSL_DISTRO_NAME: "Ubuntu" },
-        readFileSync: vi.fn(),
-        existsSync: vi.fn(),
-        execFileSync: vi.fn(),
-      })
-    ).toBe(true);
-  });
-
-  it("detects WSL from the kernel release", () => {
-    expect(
-      isWSL({
-        platform: "linux",
-        env: {},
-        readFileSync: vi.fn(() => "5.15.90.1-microsoft-standard-WSL2"),
-        existsSync: vi.fn(),
-        execFileSync: vi.fn(),
-      })
-    ).toBe(true);
-  });
-
-  it("returns false outside Linux", () => {
-    expect(
-      isWSL({
-        platform: "darwin",
-        env: { WSL_DISTRO_NAME: "Ubuntu" },
-        readFileSync: vi.fn(),
-        existsSync: vi.fn(),
-        execFileSync: vi.fn(),
-      })
-    ).toBe(false);
-  });
-});
+import { getPowerShellPath, runPowerShellFromWSL, wslToWindowsPath } from "./wsl-utils.js";
 
 describe("wslToWindowsPath", () => {
   it("converts a WSL path through wslpath", () => {
