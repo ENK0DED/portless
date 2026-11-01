@@ -176,6 +176,16 @@ portless run --no-worktree next dev          # -> https://myapp.localhost in any
 portless get myapp --worktree-prefix qa
 ```
 
+### Referencing another app
+
+A monorepo run gives every proxied app the URL of every proxied app, itself included, as `PORTLESS_URL_<APP>`. The name is the app name before any worktree prefix, uppercased, with dots and dashes as underscores (`api.myrepo` becomes `PORTLESS_URL_API_MYREPO`). It is the same in every worktree while its value carries the branch prefix, so a cross-service reference can live in committed config instead of a hardcoded hostname:
+
+```ts
+const api = process.env.PORTLESS_URL_API_MYREPO ?? "https://api.myrepo.localhost";
+```
+
+Apps that share one hostname at different paths each get their own variable: the root-path app keeps the plain name and the others append their path (`PORTLESS_URL_SITE_MYREPO_API` for `/api`), and the value includes the path. An app alone on its hostname keeps the plain name. Names that still collapse to one variable keep the first app and portless warns about the rest. An app whose dev script is itself `portless` gets no variable. Outside a monorepo run, use `portless get <name>`, e.g. `API_URL=$(portless get api.myrepo)`.
+
 ### Multiplexed hostnames
 
 Use `--multiplex` when several apps should share one stable hostname instead of getting unique URLs — for example multiple worktrees of the same app, all reachable at `https://myapp.localhost`:
@@ -219,7 +229,7 @@ Background mode is not a public sharing feature. It keeps the same loopback-firs
 ## How It Works
 
 1. `portless proxy start` starts an HTTPS reverse proxy on port 443 as a background daemon. Probes the listeners first and elevates only for bind permissions or enabled hosts sync with a suffix that needs hosts entries. A failed sudo exits without changing the port. Use `--no-tls` for plain HTTP on port 80. Configurable with `-p` / `--port` or the `PORTLESS_PORT` env var. The proxy also auto-starts when you run an app.
-2. `portless <name> <cmd>` assigns a random port in the 4000 to 4999 range that is free on `127.0.0.1` via the `PORT` env var and registers the app with the proxy
+2. `portless <name> <cmd>` assigns a port in the 4000 to 4999 range that is free on `127.0.0.1` (random by default; `appPortStrategy` can make it `stable` per app name and path or `sequential`) via the `PORT` env var and registers the app with the proxy
 3. The browser hits `https://<name>.localhost`; the proxy forwards to the app's assigned port
 
 By default, outside LAN mode, the proxy and its HTTP redirect listener bind only to the IPv4 and IPv6 loopback addresses, `127.0.0.1` and `::1`. They do not accept connections through LAN, VPN, or other network interfaces.
@@ -269,6 +279,8 @@ The proxy periodically removes route records whose owning process is dead. The s
 | --------------------------------- | --------------------------------------------------------------------------- |
 | `PORTLESS_PORT`                   | Override the default proxy port (default: 443 with HTTPS, 80 without)       |
 | `PORTLESS_APP_PORT`               | Use a fixed app port; browser-blocked ports are rejected                    |
+| `PORTLESS_APP_PORT_STRATEGY`      | How to pick an app port: `random` (default), `stable` or `sequential`       |
+| `PORTLESS_APP_PORT_RANGE`         | Range to pick from as `min-max`, e.g. `4200-4999` (default `4000-4999`)     |
 | `PORTLESS_H2C`                    | Set to `1` to forward app routes to HTTP/2 cleartext upstreams              |
 | `PORTLESS_MULTIPLEX`              | Set to `1` to share the hostname with other apps (same as `--multiplex`)    |
 | `PORTLESS_LABEL`                  | Label for this multiplexed app (same as `--label`)                          |
@@ -296,6 +308,7 @@ The proxy periodically removes route records whose owning process is dead. The s
 | `PORTLESS_NETBIRD_PIN`            | Require a PIN for the NetBird public URL                                    |
 | `PORTLESS_NETBIRD_GROUPS`         | Restrict the NetBird public URL to comma-separated user groups              |
 | `PORTLESS_STATE_DIR`              | Override the state directory                                                |
+| `PORTLESS_URL_<APP>`              | Set by portless, not read: URL of each app in a monorepo run                |
 | `PORTLESS=0`                      | Bypass the proxy, run the command directly                                  |
 
 `PORTLESS_ROUTES_CLEANUP_INTERVAL` sets the dead-route sweep interval in seconds. The default is 300; `0` disables the sweep.
@@ -627,19 +640,23 @@ Pass `{ worktreePrefix: "qa" }` for an explicit prefix (it applies outside linke
 
 Optional config file. Portless looks for `portless.json` in the current directory, then `.config/portless.json`.
 
-| Field            | Type                         | Default                    | Description                                              |
-| ---------------- | ---------------------------- | -------------------------- | -------------------------------------------------------- |
-| `name`           | string                       | inferred from package.json | Base app name (worktree prefix still applies)            |
-| `script`         | string                       | `"dev"`                    | Name of a package.json script to run                     |
-| `appPort`        | number                       | auto-assigned              | Fixed app port; browser-blocked ports are rejected       |
-| `path`           | string                       | `"/"`                      | Route path prefix                                        |
-| `proxy`          | boolean                      | auto-detected              | Whether to route through the proxy (`false` for tasks)   |
-| `worktreeFlat`   | boolean                      | `false`                    | Join worktree and app labels into one DNS label          |
-| `worktreeBranch` | `"last-segment"` or `"full"` | `"last-segment"`           | How a branch name becomes the worktree prefix            |
-| `apps`           | object                       |                            | Overrides for workspace packages, keyed by relative path |
-| `turbo`          | boolean                      | `true`                     | Set `false` to use direct spawning instead of turborepo  |
+| Field             | Type                                   | Default                    | Description                                                    |
+| ----------------- | -------------------------------------- | -------------------------- | -------------------------------------------------------------- |
+| `name`            | string                                 | inferred from package.json | Base app name (worktree prefix still applies)                  |
+| `script`          | string                                 | `"dev"`                    | Name of a package.json script to run                           |
+| `appPort`         | number                                 | auto-assigned              | Fixed app port; browser-blocked ports are rejected             |
+| `appPortStrategy` | `"random"`, `"stable"`, `"sequential"` | `"random"`                 | How to pick the port when `appPort` is not set                 |
+| `appPortRange`    | `[min, max]`                           | `[4000, 4999]`             | Inclusive range the strategy picks from; min is 1024 or higher |
+| `path`            | string                                 | `"/"`                      | Route path prefix                                              |
+| `proxy`           | boolean                                | auto-detected              | Whether to route through the proxy (`false` for tasks)         |
+| `worktreeFlat`    | boolean                                | `false`                    | Join worktree and app labels into one DNS label                |
+| `worktreeBranch`  | `"last-segment"` or `"full"`           | `"last-segment"`           | How a branch name becomes the worktree prefix                  |
+| `apps`            | object                                 |                            | Overrides for workspace packages, keyed by relative path       |
+| `turbo`           | boolean                                | `true`                     | Set `false` to use direct spawning instead of turborepo        |
 
-Each `apps` entry has the same shape (`name`, `script`, `appPort`, `path`, `proxy`, `worktreeFlat`, `worktreeBranch`). Apps can share a `name` when they use distinct `path` values. When `apps` is present, top-level fields apply only in single-app mode.
+Each `apps` entry has the same shape (`name`, `script`, `appPort`, `appPortStrategy`, `appPortRange`, `path`, `proxy`, `worktreeFlat`, `worktreeBranch`). Apps can share a `name` when they use distinct `path` values. When `apps` is present, top-level fields apply only in single-app mode, except `appPortStrategy` and `appPortRange`, which are the default for every app that does not fix `appPort`.
+
+App port strategy: `random` (default), `stable` (derived from the app name including the worktree prefix, plus the route path, so a checkout keeps its port when it is free) or `sequential` (lowest free port). `PORTLESS_APP_PORT_STRATEGY` and `PORTLESS_APP_PORT_RANGE` override the files. A fixed port (`--app-port`, then `PORTLESS_APP_PORT`, then `appPort`) always wins, and `appPort` next to `appPortStrategy` or `appPortRange` in one object is an error. `portless bg start` saves the exported variables and `bg restart` replays them.
 
 ### package.json "portless" key
 
@@ -649,7 +666,7 @@ Instead of a separate config file, you can add a `"portless"` key to your `packa
 { "portless": "myapp" }
 ```
 
-An object supports all per-app fields (`name`, `script`, `appPort`, `path`, `proxy`, `worktreeFlat`, `worktreeBranch`):
+An object supports all per-app fields (`name`, `script`, `appPort`, `appPortStrategy`, `appPortRange`, `path`, `proxy`, `worktreeFlat`, `worktreeBranch`):
 
 ```json
 { "portless": { "name": "myapp", "script": "dev:app" } }

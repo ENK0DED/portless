@@ -40,7 +40,7 @@ portless myapp next dev
 
 HTTPS with HTTP/2 is enabled by default. On first run, portless generates a local CA, trusts it, and binds port 443 (auto-elevates with sudo on macOS/Linux). Generated CA and server certificates are stored in the resolved state directory and reused across restarts. Use `--skip-trust` when you want certificate files without adding the CA to the trust store, or `--no-tls` for plain HTTP.
 
-The proxy auto-starts when you run an app. A random port in the 4000 to 4999 range that is free on `127.0.0.1` is assigned via the `PORT` environment variable. Portless skips browser-blocked ports during auto-assignment and rejects them for fixed app ports. Most frameworks (Next.js, Express, Nuxt, etc.) respect this automatically. For frameworks that ignore `PORT` (Vite, VitePlus, VitePress, Astro, React Router, Angular, Laravel, Expo, React Native, Wrangler, vinext), portless auto-injects the right `--port` flag and, when needed, a matching `--host` flag, Wrangler's `--ip` flag, or `--hostname` for `vinext start` (which otherwise binds `0.0.0.0`). Injection looks through package runners (`npx`, `bunx`, `pnpm exec`, `yarn dlx`, `npm exec`, `npm x`). For `npm exec` the flags go after a `--` so npm does not read them itself, and a command where npm might take the next word as an option value is left alone. `vitepress` is treated as a dev server for `dev`, `serve`, `preview` and a bare invocation, and `astro --root apps/web dev` finds its subcommand after leading global options. Commands run with your `PATH` first, the project's `node_modules/.bin` ahead of it, and portless's own Node directory last as a fallback for Windows `.cmd` wrappers, so a Node chosen by a version manager is never shadowed.
+The proxy auto-starts when you run an app. A port in the 4000 to 4999 range that is free on `127.0.0.1` is assigned via the `PORT` environment variable, random by default (`appPortStrategy` makes it stable per app or sequential). Portless skips browser-blocked ports during auto-assignment and rejects them for fixed app ports. Most frameworks (Next.js, Express, Nuxt, etc.) respect this automatically. For frameworks that ignore `PORT` (Vite, VitePlus, VitePress, Astro, React Router, Angular, Laravel, Expo, React Native, Wrangler, vinext), portless auto-injects the right `--port` flag and, when needed, a matching `--host` flag, Wrangler's `--ip` flag, or `--hostname` for `vinext start` (which otherwise binds `0.0.0.0`). Injection looks through package runners (`npx`, `bunx`, `pnpm exec`, `yarn dlx`, `npm exec`, `npm x`). For `npm exec` the flags go after a `--` so npm does not read them itself, and a command where npm might take the next word as an option value is left alone. `vitepress` is treated as a dev server for `dev`, `serve`, `preview` and a bare invocation, and `astro --root apps/web dev` finds its subcommand after leading global options. Commands run with your `PATH` first, the project's `node_modules/.bin` ahead of it, and portless's own Node directory last as a fallback for Windows `.cmd` wrappers, so a Node chosen by a version manager is never shadowed.
 
 When sharing is active (Tailscale, ngrok, a managed tunnel, or NetBird), portless also lists the exact sharing hostnames, plus any configured suffix Vite does not already allow (`localhost` and `*.localhost` are always allowed), in `__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS`. Vite 8.1 and later split that value on commas. Older Vite reads it as one host, so with more than one entry portless passes a single host (a sharing hostname first) and prints a notice naming the rest; add those to `server.allowedHosts` in your Vite config or use Vite 8.1 or later.
 
@@ -104,19 +104,64 @@ Without an `apps` map, hostnames follow the `<package>.<project>.localhost` conv
 
 In linked git worktrees, workspace URLs also get the branch prefix. For example, `apps/web` on branch `fix-ui` becomes `fix-ui.web.myorg.localhost`, and an `apps` override such as `api.myapp` becomes `fix-ui.api.myapp.localhost`.
 
+### Referencing another app
+
+A service that calls another service cannot hardcode its hostname, because the worktree prefix moves it. A monorepo run therefore gives every proxied app the URL of every proxied app, itself included:
+
+```bash
+PORTLESS_URL_WEB_MYREPO=https://fix-ui.web.myrepo.localhost
+PORTLESS_URL_API_MYREPO=https://fix-ui.api.myrepo.localhost
+```
+
+The variable is named from the app name before any worktree prefix, uppercased, with dots and dashes as underscores (`api.myrepo` becomes `PORTLESS_URL_API_MYREPO`). The name is the same in every worktree while the URL it holds carries the branch prefix, so the reference can live in committed config:
+
+```ts
+const api = process.env.PORTLESS_URL_API_MYREPO ?? "https://api.myrepo.localhost";
+```
+
+When several apps share one hostname at different paths, each variable must still name exactly one app. The app at the root path keeps the plain name, and every other one appends its path, uppercased the same way, and its value includes that path:
+
+```bash
+# apps: site.myrepo at "/", site.myrepo at "/api"
+PORTLESS_URL_SITE_MYREPO=https://fix-ui.site.myrepo.localhost
+PORTLESS_URL_SITE_MYREPO_API=https://fix-ui.site.myrepo.localhost/api
+```
+
+An app alone on its hostname keeps the plain name even when it has a path, and the path is in the value. Names that still collapse to one variable (`web.api` and `web-api`, or `/a-b` and `/a/b` on one host) keep the first app, in label order, and portless warns about the rest rather than handing out the wrong URL. An app whose command is itself `portless` registers its own route, so it gets no variable, and apps that are not served through the proxy (tasks) receive none. Sharing URLs such as `PORTLESS_TAILSCALE_URL` stay per app and are not part of the map. Outside a monorepo run, `portless get <name>` prints the same URL:
+
+```bash
+API_URL=$(portless get api.myrepo)
+```
+
 ### Config fields
 
-| Field            | Type                         | Default          | Description                                                           |
-| ---------------- | ---------------------------- | ---------------- | --------------------------------------------------------------------- |
-| `name`           | string                       | inferred         | Base app name. Worktree prefix still applies.                         |
-| `script`         | string                       | `"dev"`          | Name of a `package.json` script to run.                               |
-| `appPort`        | number                       | auto             | Fixed port for the child process. Browser-blocked ports are rejected. |
-| `path`           | string                       | `"/"`            | Route path prefix.                                                    |
-| `proxy`          | boolean                      | auto             | Whether to route through the proxy. Auto-detected.                    |
-| `worktreeFlat`   | boolean                      | `false`          | Join worktree and app labels into one DNS label.                      |
-| `worktreeBranch` | `"last-segment"` or `"full"` | `"last-segment"` | How a branch name becomes the worktree prefix.                        |
-| `apps`           | object                       |                  | Overrides for workspace packages, keyed by relative path.             |
-| `turbo`          | boolean                      | `true`           | Set `false` to use direct spawning instead of turborepo.              |
+| Field             | Type                                     | Default          | Description                                                            |
+| ----------------- | ---------------------------------------- | ---------------- | ---------------------------------------------------------------------- |
+| `name`            | string                                   | inferred         | Base app name. Worktree prefix still applies.                          |
+| `script`          | string                                   | `"dev"`          | Name of a `package.json` script to run.                                |
+| `appPort`         | number                                   | auto             | Fixed port for the child process. Browser-blocked ports are rejected.  |
+| `appPortStrategy` | `"random"`, `"stable"` or `"sequential"` | `"random"`       | How the port is picked when `appPort` is not set.                      |
+| `appPortRange`    | `[min, max]`                             | `[4000, 4999]`   | Inclusive range the strategy picks from. Must start at 1024 or higher. |
+| `path`            | string                                   | `"/"`            | Route path prefix.                                                     |
+| `proxy`           | boolean                                  | auto             | Whether to route through the proxy. Auto-detected.                     |
+| `worktreeFlat`    | boolean                                  | `false`          | Join worktree and app labels into one DNS label.                       |
+| `worktreeBranch`  | `"last-segment"` or `"full"`             | `"last-segment"` | How a branch name becomes the worktree prefix.                         |
+| `apps`            | object                                   |                  | Overrides for workspace packages, keyed by relative path.              |
+| `turbo`           | boolean                                  | `true`           | Set `false` to use direct spawning instead of turborepo.               |
+
+### App port strategy
+
+By default an app gets a random free port in 4000 to 4999. Set `appPortStrategy` and `appPortRange` to change that, in `portless.json`, the `package.json` `"portless"` key, or an `apps` entry:
+
+- `random` (default): any free port in the range.
+- `stable`: the port is derived from the app name (worktree prefix included) and its route path, so a checkout gets the same port across restarts and different checkouts spread across the range. If that port is taken, the next free one after it is used, wrapping around.
+- `sequential`: the lowest free port in the range, so the first app on a machine gets the bottom. Ports that other routes already own are skipped even before their app has bound them.
+
+```json
+{ "appPortStrategy": "stable", "appPortRange": [4200, 4999] }
+```
+
+`PORTLESS_APP_PORT_STRATEGY` and `PORTLESS_APP_PORT_RANGE` (written `4200-4999`) override the files, each on its own. A fixed port always wins, in this order: `--app-port`, `PORTLESS_APP_PORT`, then a config `appPort`; those skip the strategy entirely. Putting `appPort` next to `appPortStrategy` or `appPortRange` in one object is an error. In a workspace with an `apps` map, a top-level strategy and range are the default for every app that does not fix a port, and an app entry or its `package.json` key overrides them. The range must start at 1024 or higher, because apps cannot bind lower ports without privileges, and browser-blocked ports are skipped in every strategy. Stable ports are not reserved: an app that finds its port taken falls forward, so the guarantee is "same port when it is free". `portless bg start` saves the exported strategy and range in the app's intent, and `bg restart` replays them even from a shell without the variables.
 
 ### package.json "portless" key
 
@@ -129,7 +174,7 @@ Instead of a separate config file, you can add a `"portless"` key to your `packa
 }
 ```
 
-An object supports all per-app fields (`name`, `script`, `appPort`, `path`, `proxy`, `worktreeFlat`, `worktreeBranch`):
+An object supports all per-app fields (`name`, `script`, `appPort`, `appPortStrategy`, `appPortRange`, `path`, `proxy`, `worktreeFlat`, `worktreeBranch`):
 
 ```json
 {
@@ -641,7 +686,7 @@ Background app management currently supports macOS and Linux. Windows support ne
 
 `bg start` waits up to 30 seconds for the route to become ready by default. Use `--wait <seconds>` to customize the timeout, `--no-wait` to return immediately after spawning, or `--keep` to leave a timed-out child running for manual inspection. A timed-out child is stopped by default so stale routes are not left behind accidentally.
 
-Background apps preserve the normal `portless run` feature set, including `--path`, `--worktree-prefix`, `--no-worktree`, `--h2c`, `--tunnel`, `--tailscale-service`, `--ngrok`, and `--netbird`. Backgrounding is not a sharing feature by itself: child apps still bind to loopback by default, and public exposure still requires explicit sharing flags.
+Background apps preserve the normal `portless run` feature set, including `--path`, `--worktree-prefix`, `--no-worktree`, `PORTLESS_APP_PORT_STRATEGY` and `PORTLESS_APP_PORT_RANGE` (saved when the app starts and replayed by `bg restart`), `--h2c`, `--tunnel`, `--tailscale-service`, `--ngrok`, and `--netbird`. Backgrounding is not a sharing feature by itself: child apps still bind to loopback by default, and public exposure still requires explicit sharing flags.
 
 Private stdout, stderr, and lifecycle logs are stored under `${PORTLESS_STATE_DIR:-~/.portless}/bg/logs` with owner-only permissions. Prefer `portless bg logs` over reading those files directly because logs can contain tokens, cookies, request bodies, stack traces, or private URLs.
 
@@ -819,6 +864,8 @@ bg stop --force                  Force-stop the registered background app and it
 # Configuration
 PORTLESS_PORT=<number>           Override the default proxy port
 PORTLESS_APP_PORT=<number>       Use a fixed app port (same as --app-port)
+PORTLESS_APP_PORT_STRATEGY=<s>   How to pick an app port: random (default), stable, sequential
+PORTLESS_APP_PORT_RANGE=<a>-<b>  Range to pick from, e.g. 4200-4999 (default 4000-4999)
 PORTLESS_H2C=1                   Forward app routes to HTTP/2 cleartext upstreams
 PORTLESS_MULTIPLEX=1             Share the hostname with other apps (same as --multiplex)
 PORTLESS_LABEL=<label>           Label for this multiplexed app (same as --label)
@@ -855,6 +902,7 @@ KEY=value before <cmd>            Adds an env var only to the child command
 PORT                             Ephemeral port the child should listen on
 HOST                             Usually 127.0.0.1 (omitted for Expo in LAN mode)
 PORTLESS_URL                     Public URL (e.g. https://myapp.localhost)
+PORTLESS_URL_<APP>               URL of each app in a monorepo run (e.g. PORTLESS_URL_API_MYREPO)
 PORTLESS_TAILSCALE_URL           Tailscale URL of the app (when --tailscale is active)
 PORTLESS_TAILSCALE_SERVICE_URL   Tailscale Service URL of the app
 PORTLESS_NGROK_URL               ngrok URL of the app (when --ngrok is active)
@@ -901,7 +949,7 @@ Tools are grouped into profiles. Pass a comma separated list with `--tools`; the
 | `diagnostics` | `doctor`, `prune`, `version`                                                                                                                                      |
 | `all`         | Every tool. `default` aliases `core` and `full` aliases `all`.                                                                                                    |
 
-Tool arguments follow the CLI: `proxy_start` takes `suffix` (repeatable, like `--suffix`), `unprivileged`, `skipTrust`, and `routesCleanupInterval`; `list`, `get`, and the `bg` tools take `json`; `get`, `alias_add`, and the `bg` tools take `path`. `prune` stops the verified process group of an orphaned dev server, and `bg_stop` with `force` kills the recorded group. Every tool also accepts `cwd`, `extraArgs` (appended to the command), and `timeoutMs`.
+The app port strategy has no typed argument: the CLI each tool runs reads `PORTLESS_APP_PORT_STRATEGY` and `PORTLESS_APP_PORT_RANGE` from the MCP server's environment, `bg_start` saves them, and the `appPortStrategy` and `appPortRange` config keys apply as usual. Tool arguments follow the CLI: `proxy_start` takes `suffix` (repeatable, like `--suffix`), `unprivileged`, `skipTrust`, and `routesCleanupInterval`; `list`, `get`, and the `bg` tools take `json`; `get`, `alias_add`, and the `bg` tools take `path`. `prune` stops the verified process group of an orphaned dev server, and `bg_stop` with `force` kills the recorded group. Every tool also accepts `cwd`, `extraArgs` (appended to the command), and `timeoutMs`.
 
 Left out on purpose: foreground dev servers (`run`), commands that may prompt for sudo or a TTY (`trust`, `clean`, `hosts`, `service`), `bg clean`, and every sharing mode (`--tunnel`, `--cloudflare`, `--tailscale`, `--tailscale-http`, `--funnel`, `--ngrok`, `--netbird`, and `tunnel map`). Start shared apps from a shell.
 

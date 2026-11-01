@@ -53,6 +53,21 @@ The name is inferred from `package.json` if not set in config. The script defaul
       <td>Fixed app port. Browser-blocked ports are rejected.</td>
     </tr>
     <tr>
+      <td>`appPortStrategy`</td>
+      <td>string</td>
+      <td>`"random"`</td>
+      <td>
+        How the port is picked when `appPort` is not set: `random`, `stable` (derived from the app
+        name and path, so a checkout keeps its port) or `sequential` (lowest free port).
+      </td>
+    </tr>
+    <tr>
+      <td>`appPortRange`</td>
+      <td>[number, number]</td>
+      <td>`[4000, 4999]`</td>
+      <td>Inclusive range the strategy picks from. Must start at 1024 or higher.</td>
+    </tr>
+    <tr>
       <td>`proxy`</td>
       <td>boolean</td>
       <td>auto</td>
@@ -93,7 +108,7 @@ The name is inferred from `package.json` if not set in config. The script defaul
   </tbody>
 </table>
 
-Each `apps` entry has the same shape (`name`, `script`, `appPort`, `proxy`, `worktreeFlat`, `worktreeBranch`). When `apps` is present, top-level fields apply only in single-app mode.
+Each `apps` entry has the same shape (`name`, `script`, `appPort`, `appPortStrategy`, `appPortRange`, `proxy`, `worktreeFlat`, `worktreeBranch`). When `apps` is present, top-level fields apply only in single-app mode, except `appPortStrategy` and `appPortRange`, which are the default for every app that does not fix `appPort`.
 
 ### package.json "portless" key
 
@@ -106,7 +121,7 @@ Instead of a separate config file, you can add a `"portless"` key to your `packa
 }
 ```
 
-An object supports all per-app fields (`name`, `script`, `appPort`, `proxy`, `worktreeFlat`, `worktreeBranch`):
+An object supports all per-app fields (`name`, `script`, `appPort`, `appPortStrategy`, `appPortRange`, `proxy`, `worktreeFlat`, `worktreeBranch`):
 
 ```json
 {
@@ -146,6 +161,30 @@ The `apps` map is optional and only needed for overrides. Packages not listed st
 
 Without an `apps` map, hostnames follow the `<package>.<project>.localhost` convention. The project name comes from the most common npm scope across workspace packages (e.g. `@myorg/web` and `@myorg/api` produce project name `myorg`), falling back to the workspace root directory name. If a package's short name matches the project name, it gets the bare `<project>.localhost` without duplication.
 
+### Referencing another app
+
+A service that calls another service cannot hardcode its hostname, because the worktree prefix moves it. A monorepo run therefore gives every proxied app the URL of every proxied app, itself included:
+
+```bash
+PORTLESS_URL_WEB_MYREPO=https://fix-ui.web.myrepo.localhost
+PORTLESS_URL_API_MYREPO=https://fix-ui.api.myrepo.localhost
+```
+
+The variable is named from the app name before any worktree prefix, uppercased, with dots and dashes as underscores (`api.myrepo` becomes `PORTLESS_URL_API_MYREPO`). The name is the same in every worktree while the URL it holds carries the branch prefix, so the reference can live in committed config:
+
+```ts
+const api = process.env.PORTLESS_URL_API_MYREPO ?? "https://api.myrepo.localhost";
+```
+
+When several apps share one hostname at different paths, the root-path app keeps the plain name and the others append their path, uppercased the same way, with the path included in the value:
+
+```bash
+PORTLESS_URL_SITE_MYREPO=https://fix-ui.site.myrepo.localhost
+PORTLESS_URL_SITE_MYREPO_API=https://fix-ui.site.myrepo.localhost/api
+```
+
+An app alone on its hostname keeps the plain name even when it has a path. Names that still collapse to one variable (`web.api` and `web-api`, or `/a-b` and `/a/b` on one host) keep the first app and portless warns about the rest. An app whose command is itself `portless` registers its own route and gets no variable. Outside a monorepo run, `portless get <name>` prints the same URL.
+
 ### Turborepo
 
 For turborepo projects, use `portless` as the `dev` script and the real command in a separate script:
@@ -173,6 +212,8 @@ For `name`: CLI `--name` flag > package `package.json` `"portless"` key > root c
 For `script`: CLI `--script` flag > package `package.json` `"portless"` key > root config app entry > default `"dev"`.
 
 For `appPort`: CLI `--app-port` flag > `PORTLESS_APP_PORT` env var > package `package.json` `"portless"` key > root config app entry > auto-assigned. Browser-blocked ports are rejected for fixed app ports.
+
+For `appPortStrategy` and `appPortRange`: `PORTLESS_APP_PORT_STRATEGY` / `PORTLESS_APP_PORT_RANGE` env vars (each on its own) > package `package.json` `"portless"` key > root config app entry > top-level config > `random` over 4000 to 4999. A fixed app port from any source above always wins, and `appPort` next to `appPortStrategy` or `appPortRange` in one object is rejected.
 
 ## Programmatic API
 
@@ -229,6 +270,22 @@ Pass `{ worktreePrefix: "qa" }` for an explicit prefix (it also applies outside 
       <td>`PORTLESS_APP_PORT`</td>
       <td>Use a fixed app port. Browser-blocked ports are rejected.</td>
       <td>random 4000 to 4999</td>
+    </tr>
+    <tr>
+      <td>`PORTLESS_APP_PORT_STRATEGY`</td>
+      <td>
+        How to pick an app port: `random`, `stable` or `sequential` (same as `appPortStrategy`).
+        Saved by `portless bg start` and replayed by `bg restart`.
+      </td>
+      <td>`random`</td>
+    </tr>
+    <tr>
+      <td>`PORTLESS_APP_PORT_RANGE`</td>
+      <td>
+        Range to pick from, as `min-max` such as `4200-4999` (same as `appPortRange`). Must start
+        at 1024 or higher.
+      </td>
+      <td>`4000-4999`</td>
     </tr>
     <tr>
       <td>`PORTLESS_H2C`</td>
@@ -402,7 +459,7 @@ Auto-elevated proxy starts pass the resolved `PORTLESS_STATE_DIR` and proxy flag
 
 ## Port assignment
 
-Apps get a random port in the 4000 to 4999 range that is free on `127.0.0.1`. Portless skips browser-blocked ports during auto-assignment and rejects them for fixed app ports. Portless sets `PORT` and usually `HOST` before running your command. Most frameworks respect `PORT` automatically. For frameworks that ignore it (Vite, VitePress, Astro, React Router, Angular, Laravel, Expo, React Native, Wrangler), portless auto-injects the right `--port` flag and, when needed, a matching `--host` flag or Wrangler's `--ip` flag. Injection also reaches through a safe `bun run`, `npm run`, `pnpm run`, or `yarn run` script when its command resolves directly to a recognized framework or package runner. Only server commands receive flags; builds, checks, comments, compound commands, scripts with their own `--` terminator, environment-prefixed or delegated commands, and runner flags before the script name are left unchanged. Set the port in those scripts yourself.
+Apps get a port in the 4000 to 4999 range that is free on `127.0.0.1`, random by default. `appPortStrategy` changes how it is chosen: `stable` derives the port from the app name (worktree prefix included) and route path, so a checkout keeps its port across restarts and different checkouts spread across the range; `sequential` takes the lowest free port, so the first app on a machine gets the bottom of `appPortRange`. That matters when something outside portless, such as an OAuth redirect URI or an IDE port chip, is registered against one `localhost:<port>`. Portless skips browser-blocked ports during auto-assignment and rejects them for fixed app ports. Portless sets `PORT` and usually `HOST` before running your command. Most frameworks respect `PORT` automatically. For frameworks that ignore it (Vite, VitePress, Astro, React Router, Angular, Laravel, Expo, React Native, Wrangler), portless auto-injects the right `--port` flag and, when needed, a matching `--host` flag or Wrangler's `--ip` flag. Injection also reaches through a safe `bun run`, `npm run`, `pnpm run`, or `yarn run` script when its command resolves directly to a recognized framework or package runner. Only server commands receive flags; builds, checks, comments, compound commands, scripts with their own `--` terminator, environment-prefixed or delegated commands, and runner flags before the script name are left unchanged. Set the port in those scripts yourself.
 
 If a tool needs custom argument names, use exact command placeholders:
 
