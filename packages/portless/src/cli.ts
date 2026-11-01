@@ -6630,8 +6630,8 @@ async function runWithTurbo(
     manifest[app.pkg.dir] = entry;
   }
 
-  ensureEnvLoader();
-  writeManifest(manifest);
+  ensureEnvLoader(stateDir);
+  writeManifest(manifest, stateDir);
 
   if (appUrls.length > 0) {
     const maxLabel = Math.max(...appUrls.map((a) => a.label.length));
@@ -6658,7 +6658,7 @@ async function runWithTurbo(
     cwd: wsRoot,
     env: {
       ...process.env,
-      NODE_OPTIONS: buildNodeOptions(),
+      NODE_OPTIONS: buildNodeOptions(stateDir),
     },
     ...(isWindows ? {} : { detached: true }),
   });
@@ -6690,7 +6690,7 @@ async function runWithTurbo(
     for (const { hostnames, pathPrefix } of routes) {
       removeRoutes(store, hostnames, process.pid, { pathPrefix });
     }
-    removeManifest();
+    removeManifest(stateDir);
   };
 
   process.on("SIGHUP", cleanup);

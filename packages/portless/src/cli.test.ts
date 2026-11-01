@@ -6654,6 +6654,166 @@ describe("worktree prefix surface", { timeout: 30_000 }, () => {
     );
   });
 
+  describe("multi-app turbo mode state dir", () => {
+    // Same Windows skip as the other multi-app runs: the root script is
+    // started with `npm run dev`, which has no shell on Windows.
+    it.skipIf(process.platform === "win32")(
+      "keeps the loader and manifest in PORTLESS_STATE_DIR and delivers per-app env through them",
+      async () => {
+        const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "portless-turbo-")));
+        const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-turbo-state-"));
+        // Second guard: a stubbed HOME makes the default state dir a temp path,
+        // so a leak shows up here instead of in the real ~/.portless.
+        const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), "portless-turbo-home-"));
+        const proxyPort = await getFreePort();
+        const capFile = path.join(root, "capture.json");
+        const apps = ["web", "api"];
+        let cli: ReturnType<typeof spawn> | undefined;
+
+        try {
+          writeJson(path.join(root, "package.json"), {
+            name: "myrepo",
+            private: true,
+            packageManager: "npm@10.0.0",
+            workspaces: ["packages/*"],
+            scripts: { dev: "node simulate-turbo.cjs" },
+          });
+          // hasTurboConfig only checks that the file is readable.
+          writeJson(path.join(root, "turbo.json"), { tasks: { dev: {} } });
+          writeJson(path.join(root, "portless.json"), {
+            apps: {
+              "packages/web": { name: "site.myrepo", path: "/" },
+              "packages/api": { name: "site.myrepo", path: "/api" },
+            },
+          });
+
+          for (const name of apps) {
+            writeJson(path.join(root, "packages", name, "package.json"), {
+              name,
+              version: "0.0.0",
+              scripts: { dev: "node -e 0" },
+              portless: { proxy: true },
+            });
+          }
+
+          // Stands in for turbo: the root script runs while the CLI holds the
+          // manifest, then starts one node process per package with the
+          // NODE_OPTIONS portless built. The --require loader must fill in each
+          // package's env from the manifest.
+          fs.writeFileSync(
+            path.join(root, "simulate-turbo.cjs"),
+            `const fs = require("node:fs");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+const state = process.env.PORTLESS_STATE_DIR;
+const seen = {
+  nodeOptions: process.env.NODE_OPTIONS,
+  manifestInState: fs.existsSync(path.join(state, "dev-manifest.json")),
+  loaderInState: fs.existsSync(path.join(state, "turbo-env-loader.cjs")),
+  apps: {},
+};
+const probe =
+  "process.stdout.write(JSON.stringify(Object.fromEntries(Object.entries(process.env)" +
+  ".filter(([k]) => k === 'PORT' || k === 'HOST' || k.startsWith('PORTLESS_URL')))))";
+for (const name of ${JSON.stringify(apps)}) {
+  const result = spawnSync(process.execPath, ["-e", probe], {
+    cwd: path.join(__dirname, "packages", name),
+    encoding: "utf-8",
+  });
+  seen.apps[name] = JSON.parse(result.stdout);
+}
+fs.writeFileSync(${JSON.stringify(capFile)}, JSON.stringify(seen));
+`
+          );
+
+          const childEnv: Record<string, string | undefined> = { ...process.env };
+          for (const key of Object.keys(childEnv)) {
+            if (key.startsWith("npm_") || key.startsWith("PNPM_")) delete childEnv[key];
+            if (key.startsWith("PORTLESS")) delete childEnv[key];
+          }
+          childEnv.HOME = fakeHome;
+          childEnv.USERPROFILE = fakeHome;
+          childEnv.PORTLESS_STATE_DIR = stateDir;
+          childEnv.PORTLESS_PORT = proxyPort.toString();
+          childEnv.PORTLESS_HTTPS = "0";
+          childEnv.PORTLESS_SYNC_HOSTS = "0";
+          childEnv.NO_COLOR = "1";
+
+          let output = "";
+          cli = spawn(process.execPath, [CLI_PATH], {
+            cwd: root,
+            env: childEnv,
+            stdio: ["ignore", "pipe", "pipe"],
+          });
+          cli.stdout?.on("data", (chunk) => (output += chunk.toString()));
+          cli.stderr?.on("data", (chunk) => (output += chunk.toString()));
+          const exitCode = await new Promise<number | null>((resolve, reject) => {
+            const timer = setTimeout(
+              () => reject(new Error(`CLI did not exit. Output:\n${output}`)),
+              45_000
+            );
+            cli!.once("exit", (code) => {
+              clearTimeout(timer);
+              resolve(code);
+            });
+          });
+          expect(exitCode, output).toBe(0);
+
+          const seen = JSON.parse(fs.readFileSync(capFile, "utf-8")) as {
+            nodeOptions: string;
+            manifestInState: boolean;
+            loaderInState: boolean;
+            apps: Record<string, Record<string, string>>;
+          };
+          const loader = path.join(stateDir, "turbo-env-loader.cjs");
+
+          // Written to the isolated state dir while the run is live ...
+          expect(seen.manifestInState).toBe(true);
+          expect(seen.loaderInState).toBe(true);
+          expect(seen.nodeOptions).toBe(`--require ${loader}`);
+          // ... and the loader reads the manifest from there, so each package
+          // gets its own env, peer URL variables included.
+          const host = `site.myrepo.localhost:${proxyPort}`;
+          expect(seen.apps.web).toEqual({
+            HOST: "127.0.0.1",
+            PORT: expect.stringMatching(/^\d+$/),
+            PORTLESS_URL: `http://${host}`,
+            PORTLESS_URL_SITE_MYREPO: `http://${host}`,
+            PORTLESS_URL_SITE_MYREPO_API: `http://${host}/api`,
+          });
+          expect(seen.apps.api).toEqual({
+            HOST: "127.0.0.1",
+            PORT: expect.stringMatching(/^\d+$/),
+            PORTLESS_URL: `http://${host}/api`,
+            PORTLESS_URL_SITE_MYREPO: `http://${host}`,
+            PORTLESS_URL_SITE_MYREPO_API: `http://${host}/api`,
+          });
+          expect(seen.apps.web.PORT).not.toBe(seen.apps.api.PORT);
+
+          // Cleanup removes the manifest from the same place; the loader stays.
+          expect(fs.existsSync(path.join(stateDir, "dev-manifest.json"))).toBe(false);
+          expect(fs.readFileSync(loader, "utf-8")).toContain(JSON.stringify(stateDir));
+          // Nothing reached the default state dir.
+          expect(fs.existsSync(path.join(fakeHome, ".portless"))).toBe(false);
+        } finally {
+          if (cli) await stopChild(cli);
+          run(["proxy", "stop"], {
+            env: {
+              HOME: fakeHome,
+              USERPROFILE: fakeHome,
+              PORTLESS_STATE_DIR: stateDir,
+              PORTLESS_HTTPS: "0",
+            },
+          });
+          fs.rmSync(root, { recursive: true, force: true });
+          fs.rmSync(stateDir, { recursive: true, force: true });
+          fs.rmSync(fakeHome, { recursive: true, force: true });
+        }
+      },
+      90_000
+    );
+  });
+
   describe("multi-app mode", () => {
     async function runMulti(
       configExtra: Record<string, unknown>,
