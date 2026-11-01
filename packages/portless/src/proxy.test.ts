@@ -1971,6 +1971,68 @@ describe("createProxyServer", () => {
       }
     });
 
+    it("strips hop-by-hop headers from plain HTTP responses but keeps transfer-encoding", async () => {
+      const backend = trackServer(
+        http.createServer((_req, res) => {
+          res.writeHead(200, {
+            Connection: "keep-alive, X-Scoped",
+            "Keep-Alive": "timeout=77",
+            "Proxy-Connection": "keep-alive",
+            Upgrade: "h2c",
+            "X-Scoped": "backend-only",
+            "X-Kept": "1",
+          });
+          res.write("chunk-one;");
+          res.end("chunk-two");
+        })
+      );
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const routes: RouteInfo[] = [{ hostname: "myapp.localhost", port: backendAddr.port }];
+      const server = trackServer(
+        createProxyServer({ getRoutes: () => routes, proxyPort: TEST_PROXY_PORT })
+      );
+      await listen(server);
+
+      const res = await request(server, { host: "myapp.localhost" });
+      expect(res.status).toBe(200);
+      expect(res.body).toBe("chunk-one;chunk-two");
+      expect(res.headers["x-kept"]).toBe("1");
+      expect(res.headers["x-scoped"]).toBeUndefined();
+      // Node adds its own Keep-Alive for the client hop; the backend value must not leak.
+      expect(res.headers["keep-alive"]).not.toBe("timeout=77");
+      expect(res.headers["proxy-connection"]).toBeUndefined();
+      expect(res.headers.upgrade).toBeUndefined();
+      expect(res.headers["transfer-encoding"]).toBe("chunked");
+    });
+
+    it("does not relay a backend Connection: close to the client", async () => {
+      const backend = trackServer(
+        http.createServer((_req, res) => {
+          res.writeHead(200, { Connection: "close", "Content-Length": "2" });
+          res.end("ok");
+        })
+      );
+      await listen(backend);
+      const backendAddr = backend.address();
+      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
+
+      const routes: RouteInfo[] = [{ hostname: "myapp.localhost", port: backendAddr.port }];
+      const server = trackServer(
+        createProxyServer({ getRoutes: () => routes, proxyPort: TEST_PROXY_PORT })
+      );
+      await listen(server);
+
+      const res = await request(server, {
+        host: "myapp.localhost",
+        headers: { connection: "keep-alive" },
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.connection).not.toBe("close");
+    });
+
     it("adds the hostname filter and uptime to the 404 page above five routes only", async () => {
       const now = Date.now();
       const makeRoutes = (count: number): RouteInfo[] =>

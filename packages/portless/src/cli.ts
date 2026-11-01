@@ -112,6 +112,7 @@ import {
   isWildcardEnvEnabled,
   isLanEnvEnabled,
   isProxyRunning,
+  isExplicitStateDirEmpty,
   isWindows,
   killTree,
   listenOnProxyInterface,
@@ -1584,9 +1585,12 @@ async function ensureProxyRunning(
 ): Promise<EnsureProxyResult> {
   const { explicit, desiredConfig } = desired;
 
-  const proxyResponsive = await isProxyRunning(proxyPort, tls);
+  // An explicit state dir without a port file has no proxy; never probe the
+  // default port on its behalf.
+  const isolatedEmpty = isExplicitStateDirEmpty();
+  const proxyResponsive = !isolatedEmpty && (await isProxyRunning(proxyPort, tls));
   const proxyListeningFromStateDir =
-    !!process.env.PORTLESS_STATE_DIR && (await isPortListening(proxyPort));
+    !isolatedEmpty && !!process.env.PORTLESS_STATE_DIR && (await isPortListening(proxyPort));
 
   if (proxyResponsive || proxyListeningFromStateDir) {
     return { started: false };
@@ -3896,7 +3900,8 @@ ${colors.bold("Environment variables:")}
   PORTLESS_NETBIRD_PASSWORD=<s> Require a password for the NetBird public URL
   PORTLESS_NETBIRD_PIN=<code>   Require a PIN for the NetBird public URL
   PORTLESS_NETBIRD_GROUPS=<csv> Restrict the NetBird URL to user groups
-  PORTLESS_STATE_DIR=<path>     Override the state directory
+  PORTLESS_STATE_DIR=<path>     Override the state directory (no port file there means no
+                                proxy; the default port is not probed)
   PORTLESS=0                    Run command directly without proxy
 
 ${colors.bold("Child process environment:")}
@@ -4334,7 +4339,8 @@ ${colors.bold("Usage:")}
 
 Checks Node.js, state and sudo handoff, ordered and dotted suffixes, proxy bind
 mode, routes, generated or custom certificates, cert.<suffix> pages, hosts sync,
-mDNS tooling, background apps, tunnel providers, Tailscale, and NetBird.
+mDNS tooling, background apps, the Node binary pinned by an installed
+startup service, tunnel providers, Tailscale, and NetBird.
 
 Doctor never starts, stops, trusts, syncs, prunes, cleans, or modifies portless
 state.
@@ -5210,8 +5216,9 @@ ${colors.bold("LAN mode (--lan):")}
     const currentState = await discoverState();
     persistedLanMode = currentState.lanMode;
     if (
-      (await isProxyRunning(currentState.port)) ||
-      (!!process.env.PORTLESS_STATE_DIR && (await isPortListening(currentState.port)))
+      !isExplicitStateDirEmpty() &&
+      ((await isProxyRunning(currentState.port)) ||
+        (!!process.env.PORTLESS_STATE_DIR && (await isPortListening(currentState.port))))
     ) {
       runningPort = currentState.port;
       proxyPort = currentState.port;
@@ -5309,7 +5316,11 @@ ${colors.bold("LAN mode (--lan):")}
 
   // Check if already running. Plain HTTP check detects both TLS and non-TLS
   // proxies because the TLS-enabled proxy accepts plain HTTP via byte-peeking.
-  const proxyRunning = runningPort !== null || (await isProxyRunning(proxyPort));
+  // Without --port, an explicit state dir that has no port file never means the
+  // default port's proxy; probing it could reach an unrelated system proxy.
+  const proxyRunning =
+    runningPort !== null ||
+    (!(!hasExplicitPort && isExplicitStateDirEmpty()) && (await isProxyRunning(proxyPort)));
   if (proxyRunning) {
     const runningConfig = readCurrentProxyConfig(stateDir);
     const mismatchMessages = getProxyConfigMismatchMessages(desiredConfig, runningConfig, explicit);

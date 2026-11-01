@@ -231,6 +231,9 @@ const HOP_BY_HOP_HEADERS = new Set([
 /** Hop-by-hop request headers that never belong on a forwarded plain HTTP request. */
 const REQUEST_HOP_BY_HOP_HEADERS = ["connection", "keep-alive", "proxy-connection", "upgrade"];
 
+/** Hop-by-hop response headers stripped on every path. Plain HTTP keeps transfer-encoding. */
+const RESPONSE_HOP_BY_HOP_HEADERS = REQUEST_HOP_BY_HOP_HEADERS;
+
 /** Limit pending dials without blocking requests behind established streams. */
 const MAX_UPSTREAM_DIALS = 16;
 const UPSTREAM_CONNECT_TIMEOUT_MS = 10_000;
@@ -1456,6 +1459,12 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
         },
         (proxyRes) => {
           const responseHeaders: http.OutgoingHttpHeaders = { ...proxyRes.headers };
+          // Connection-scoped headers belong to the backend hop, never to the
+          // client hop (RFC 9110 section 7.6.1). Strip them on both paths. HTTP/2
+          // also forbids transfer-encoding; HTTP/1.1 keeps it so chunked bodies
+          // stay framed as the backend sent them.
+          stripConnectionHeaders(responseHeaders);
+          for (const h of RESPONSE_HOP_BY_HOP_HEADERS) delete responseHeaders[h];
           if (reqTls) {
             for (const h of HOP_BY_HOP_HEADERS) {
               delete responseHeaders[h];

@@ -156,6 +156,14 @@ type ServiceStatus = {
   proxyRunning: boolean;
   config: NormalizedServiceConfig;
   details?: string;
+  /** The Node binary pinned in the installed service definition, when one is readable. */
+  node?: InstalledServiceNode;
+};
+
+/** The Node binary an installed service definition pins, and whether it still exists. */
+export type InstalledServiceNode = {
+  path: string;
+  exists: boolean;
 };
 
 export type ServiceUninstallResult = {
@@ -890,6 +898,39 @@ function readInstalledServiceSnapshot(spec: ServiceSpec): InstalledServiceSnapsh
   }
 }
 
+/** Command to repair a service whose pinned Node binary is gone. */
+const SERVICE_REINSTALL_HINT = "re-run `portless service install`";
+
+function installedNodeFromSnapshot(
+  snapshot: InstalledServiceSnapshot | null,
+  fileExists: (filePath: string) => boolean = fs.existsSync
+): InstalledServiceNode | undefined {
+  const nodePath = snapshot?.command[0];
+  if (!nodePath) return undefined;
+  return { path: nodePath, exists: fileExists(nodePath) };
+}
+
+/**
+ * Read the installed service definition back and report the Node binary it
+ * pins. Returns undefined when no definition is installed or readable, or on a
+ * platform without service support. The service pins `process.execPath` at
+ * install time on purpose (a removed binary fails closed instead of falling
+ * through a PATH search as root or SYSTEM), so a missing binary is reported
+ * here instead of being papered over.
+ */
+export function inspectInstalledServiceNode(
+  options: { entryScript?: string; fileExists?: (filePath: string) => boolean } = {}
+): InstalledServiceNode | undefined {
+  try {
+    if (!isSupportedPlatform(process.platform)) return undefined;
+    // Only the definition paths are used, so the entry script is a placeholder.
+    const spec = currentServiceSpec(options.entryScript ?? "portless");
+    return installedNodeFromSnapshot(readInstalledServiceSnapshot(spec), options.fileExists);
+  } catch {
+    return undefined;
+  }
+}
+
 function installedConfigFromSnapshot(
   snapshot: InstalledServiceSnapshot,
   fallback: NormalizedServiceConfig
@@ -910,12 +951,6 @@ function installedConfigFromSnapshot(
   } catch {
     return null;
   }
-}
-
-function readInstalledServiceConfig(spec: ServiceSpec): NormalizedServiceConfig | null {
-  const snapshot = readInstalledServiceSnapshot(spec);
-  if (!snapshot) return null;
-  return installedConfigFromSnapshot(snapshot, spec.config);
 }
 
 function collectPortlessEnvArgs(
@@ -1228,7 +1263,10 @@ async function getServiceStatus(
   runner: CommandRunner
 ): Promise<ServiceStatus> {
   const spec = currentServiceSpec(entryScript);
-  const installedConfig = readInstalledServiceConfig(spec) ?? spec.config;
+  const snapshot = readInstalledServiceSnapshot(spec);
+  const installedConfig =
+    (snapshot ? installedConfigFromSnapshot(snapshot, spec.config) : null) ?? spec.config;
+  const node = installedNodeFromSnapshot(snapshot);
   const proxyRunning = await isProxyRunning(installedConfig.proxyPort, installedConfig.useHttps);
 
   if (spec.platform === "darwin") {
@@ -1247,6 +1285,7 @@ async function getServiceStatus(
       proxyRunning,
       config: installedConfig,
       details: spec.plistPath,
+      node,
     };
   }
 
@@ -1262,6 +1301,7 @@ async function getServiceStatus(
       proxyRunning,
       config: installedConfig,
       details: spec.unitPath,
+      node,
     };
   }
 
@@ -1275,6 +1315,7 @@ async function getServiceStatus(
     proxyRunning,
     config: installedConfig,
     details: spec.taskName,
+    node,
   };
 }
 
@@ -1299,6 +1340,11 @@ async function printServiceStatus(entryScript: string, runner: CommandRunner): P
   if (status.details) {
     console.log(`  Service entry: ${status.details}`);
   }
+  if (status.node) {
+    console.log(
+      `  Node binary: ${status.node.path}${status.node.exists ? "" : ` (missing; ${SERVICE_REINSTALL_HINT})`}`
+    );
+  }
 }
 
 export function printServiceHelp(): void {
@@ -1310,7 +1356,7 @@ ${colors.bold("Usage:")}
   ${colors.cyan("portless service install --lan")}       Enable LAN mode for the startup service
   ${colors.cyan("portless service install -p 8443")}     Use a custom proxy port
   ${colors.cyan("portless service uninstall")}           Stop and remove the startup service
-  ${colors.cyan("portless service status")}              Show service and proxy status
+  ${colors.cyan("portless service status")}              Show service and proxy status, including the pinned Node binary
 
 ${colors.bold("Install options:")}
   -p, --port <number>              Port for the proxy service

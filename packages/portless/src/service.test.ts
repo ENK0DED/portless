@@ -4,6 +4,7 @@ import {
   buildServiceSpec,
   buildServiceUninstallSudoArgs,
   handleService,
+  inspectInstalledServiceNode,
   tryUninstallService,
 } from "./service.js";
 
@@ -1106,5 +1107,73 @@ describe("handleService", () => {
     expect(output).toContain("LAN IP: 192.168.1.42");
     expect(output).toContain("Wildcard: yes");
     expect(output).toContain("State directory: /srv/portless");
+  });
+
+  describe("pinned Node binary", () => {
+    function installLinuxUnit(nodePath: string, nodeExists: boolean) {
+      setPlatform("linux");
+      setGetuid(0);
+      const installedSpec = buildServiceSpec({
+        platform: "linux",
+        nodePath,
+        entryScript: "/fake/cli.js",
+        userHome: "/home/alice",
+        installConfig: { stateDir: "/srv/portless", proxyPort: 8443, useHttps: false },
+      });
+      if (installedSpec.platform !== "linux") throw new Error("Expected Linux service spec");
+      vi.mocked(existsSync).mockImplementation(
+        (file) => file === installedSpec.unitPath || (nodeExists && file === nodePath)
+      );
+      vi.mocked(readFileSync).mockImplementation((file) =>
+        file === installedSpec.unitPath ? installedSpec.unit : ""
+      );
+    }
+
+    const statusRunner = vi.fn((command: string, args: string[]) => ({
+      status: command === "systemctl" && args[0] === "is-active" ? 1 : 0,
+      stdout: "",
+      stderr: "",
+    }));
+
+    it("reports a missing pinned Node binary in service status", async () => {
+      installLinuxUnit("/home/alice/.nvm/versions/node/v24.0.0/bin/node", false);
+
+      await handleService(["service", "status"], {
+        entryScript: "/fake/cli.js",
+        runner: statusRunner,
+      });
+
+      const output = logSpy.mock.calls.map((c: unknown[]) => c.join(" ")).join("\n");
+      expect(output).toContain(
+        "Node binary: /home/alice/.nvm/versions/node/v24.0.0/bin/node (missing; re-run `portless service install`)"
+      );
+    });
+
+    it("prints the pinned Node binary without a warning when it exists", async () => {
+      installLinuxUnit("/usr/bin/node", true);
+
+      await handleService(["service", "status"], {
+        entryScript: "/fake/cli.js",
+        runner: statusRunner,
+      });
+
+      const output = logSpy.mock.calls.map((c: unknown[]) => c.join(" ")).join("\n");
+      expect(output).toContain("Node binary: /usr/bin/node");
+      expect(output).not.toContain("missing");
+    });
+
+    it("inspectInstalledServiceNode reads the definition back", () => {
+      installLinuxUnit("/opt/node/bin/node", false);
+      expect(inspectInstalledServiceNode()).toEqual({ path: "/opt/node/bin/node", exists: false });
+
+      installLinuxUnit("/opt/node/bin/node", true);
+      expect(inspectInstalledServiceNode()).toEqual({ path: "/opt/node/bin/node", exists: true });
+    });
+
+    it("inspectInstalledServiceNode returns undefined when nothing is installed", () => {
+      setPlatform("linux");
+      vi.mocked(existsSync).mockImplementation(() => false);
+      expect(inspectInstalledServiceNode()).toBeUndefined();
+    });
   });
 });

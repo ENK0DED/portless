@@ -139,6 +139,7 @@ Browser (myapp.localhost) -> proxy (port 443) -> App (random port)
 ## Requirements
 
 - Node.js 24+
+- Bun 1.4.4+, only when you run portless under Bun. Earlier Bun versions ignore SNI callbacks, so every hostname receives the default `localhost` certificate. Portless adds no runtime check for this.
 - macOS, Linux, or Windows
 
 If a route hostname will not resolve, the command that registered it warns with a manual hosts-sync command.

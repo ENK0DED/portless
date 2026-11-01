@@ -236,7 +236,7 @@ Portless replaces only whole arguments matching `{PORT}`, `{HOST}`, or `{PORTLES
 
 Portless stores its state in `~/.portless`: routes, PID and port files, TLS markers, the generated local CA, server certificates, and cached per-host certificates. Override with the `PORTLESS_STATE_DIR` environment variable.
 
-Auto-elevated proxy starts pass the resolved `PORTLESS_STATE_DIR` and proxy flags such as `--skip-trust` through `sudo`, so a root-owned proxy uses the same per-user state, suffix settings, and trust choice as the command that started it. Direct `sudo portless ...` invocations resolve `SUDO_USER` back to the invoking user's home for the same reason. Set `PORTLESS_STATE_DIR` explicitly before running portless if a separate proxy state directory is required.
+Auto-elevated proxy starts pass the resolved `PORTLESS_STATE_DIR` and proxy flags such as `--skip-trust` through `sudo`, so a root-owned proxy uses the same per-user state, suffix settings, and trust choice as the command that started it. Direct `sudo portless ...` invocations resolve `SUDO_USER` back to the invoking user's home for the same reason. Set `PORTLESS_STATE_DIR` explicitly before running portless if a separate proxy state directory is required. A state directory without a port file counts as having no proxy: portless does not fall back to probing the default port, so a fresh isolated directory never reaches another proxy running on this machine.
 
 ### Custom suffixes
 
@@ -477,7 +477,7 @@ portless service uninstall
 
 The service uses portless defaults unless install options or `PORTLESS_*` environment variables are provided: HTTPS on port 443 with `.localhost` names. `service install` accepts proxy options including `--port`, `--no-tls`, `--lan`, `--ip`, `--suffix`, `--tld`, `--wildcard`, `--cert`, and `--key`. Use `--state-dir <path>` or `PORTLESS_STATE_DIR=<path>` to choose where service state and logs are written.
 
-The chosen service configuration is written into launchd, systemd, or Task Scheduler and reused after reboot. Suffix lists are persisted through `PORTLESS_SUFFIX`. `portless service status` reports the installed port, HTTPS mode, configured suffixes, LAN mode, wildcard mode, and state directory. macOS and Linux install a root-owned service so port 443 can bind at boot. Windows installs a Task Scheduler startup task that runs as SYSTEM. Installation and removal may require administrator privileges. `portless clean` automatically removes the service.
+The chosen service configuration is written into launchd, systemd, or Task Scheduler and reused after reboot. Suffix lists are persisted through `PORTLESS_SUFFIX`. `portless service status` reports the installed port, HTTPS mode, configured suffixes, LAN mode, wildcard mode, state directory, and the Node binary the service pins, flagging it when that binary no longer exists (re-run `portless service install` to repair). macOS and Linux install a root-owned service so port 443 can bind at boot. Windows installs a Task Scheduler startup task that runs as SYSTEM. Installation and removal may require administrator privileges. `portless clean` automatically removes the service.
 
 ## CLI Reference
 
@@ -648,7 +648,7 @@ For workspace package overrides, package `package.json` `"portless"` values take
 
 ### Run diagnostics first
 
-Run `portless doctor` before changing state. It is read-only and checks the resolved state directory and sudo handoff, ordered and dotted suffixes, local, guarded unprivileged, or LAN proxy bind mode, route and background-app liveness, generated or custom certificates, `cert.<suffix>` pages, hosts sync, mDNS tooling, tunnel provider binaries, Tailscale, and NetBird. Follow its printed hints only after reviewing the reported state.
+Run `portless doctor` before changing state. It is read-only and checks the resolved state directory and sudo handoff, ordered and dotted suffixes, local, guarded unprivileged, or LAN proxy bind mode, route and background-app liveness, generated or custom certificates, `cert.<suffix>` pages, hosts sync, mDNS tooling, the Node binary pinned by an installed startup service, tunnel provider binaries, Tailscale, and NetBird. Follow its printed hints only after reviewing the reported state.
 
 ### Proxy not running
 
@@ -788,6 +788,7 @@ Requires the NetBird CLI to be installed (https://netbird.io/download), connecte
 ### Requirements
 
 - Node.js 24+
+- Bun 1.4.4+, only when you run portless under Bun. Earlier Bun versions ignore SNI callbacks, so every hostname receives the default `localhost` certificate. Portless adds no runtime check for this.
 - macOS, Linux, or Windows
 - `openssl` (for `--https` cert generation; ships with macOS and most Linux distributions; on Windows, install via `winget install -e --id ShiningLight.OpenSSL.Dev` or use the copy bundled with Git for Windows)
 - `tailscale` CLI (optional, for `--tailscale`, `--tailscale-http`, `--tailscale-service`, and `--funnel`)

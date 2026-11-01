@@ -25,6 +25,7 @@ import { checkHostResolution, getManagedHostnames } from "./hosts.js";
 import { isMdnsSupported } from "./mdns.js";
 import { ensureNetbirdReady } from "./netbird.js";
 import { RouteStore, type RouteMapping } from "./routes.js";
+import { inspectInstalledServiceNode } from "./service.js";
 import { ensureTailscaleReady } from "./tailscale.js";
 import type { TunnelProviderName } from "./types.js";
 import { isProcessAlive, resolveUserHome } from "./utils.js";
@@ -111,6 +112,11 @@ export interface DoctorSnapshot {
     available: boolean;
     reason?: string;
   };
+  /** Node binary pinned by the installed system service, absent when no service is installed. */
+  service?: {
+    nodePath: string;
+    nodeExists: boolean;
+  };
   tools: {
     openssl: DoctorToolStatus;
     cloudflared: DoctorToolStatus;
@@ -157,6 +163,7 @@ export interface DoctorDependencies {
   certPageResponds: (port: number, tls: boolean, suffix: string) => Promise<boolean>;
   mdnsSupport: () => { supported: boolean; reason?: string };
   probeTool: (name: DoctorToolName, required: boolean) => DoctorToolStatus;
+  installedServiceNode: () => { path: string; exists: boolean } | undefined;
 }
 
 export interface CollectDoctorOptions {
@@ -283,6 +290,7 @@ const DEFAULT_DEPENDENCIES: DoctorDependencies = {
   certPageResponds: requestCertPage,
   mdnsSupport: isMdnsSupported,
   probeTool: probeDoctorTool,
+  installedServiceNode: () => inspectInstalledServiceNode(),
 };
 
 export function modeAllowsIdentityAccess(
@@ -564,6 +572,7 @@ export async function collectDoctorSnapshot(
   const requiredTools = requiredSharingTools(routes, background);
 
   const mdns = dependencies.mdnsSupport();
+  const serviceNode = dependencies.installedServiceNode();
   return {
     version: options.version,
     nodeVersion: process.versions.node,
@@ -603,6 +612,9 @@ export async function collectDoctorSnapshot(
     routes,
     background,
     mdns: { available: mdns.supported, ...(mdns.reason ? { reason: mdns.reason } : {}) },
+    ...(serviceNode
+      ? { service: { nodePath: serviceNode.path, nodeExists: serviceNode.exists } }
+      : {}),
     tools: {
       openssl: dependencies.probeTool("openssl", proxyTls && !customCert),
       cloudflared: dependencies.probeTool("cloudflared", requiredTools.cloudflared),
@@ -950,6 +962,18 @@ export function evaluateDoctor(snapshot: DoctorSnapshot): DoctorReport {
   addToolFinding(findings, "ngrok", snapshot.tools.ngrok, requiredTools.ngrok);
   addToolFinding(findings, "Tailscale", snapshot.tools.tailscale, requiredTools.tailscale);
   addToolFinding(findings, "NetBird", snapshot.tools.netbird, requiredTools.netbird);
+
+  if (snapshot.service) {
+    if (snapshot.service.nodeExists) {
+      add("ok", `Installed service Node binary exists: ${snapshot.service.nodePath}.`);
+    } else {
+      add(
+        "warn",
+        `Installed service pins a Node binary that no longer exists: ${snapshot.service.nodePath}.`,
+        "The service cannot start until it is reinstalled. Run: portless service install"
+      );
+    }
+  }
 
   for (const warning of snapshot.warnings) add("warn", warning);
 
