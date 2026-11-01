@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TunnelAliasStore, normalizeTunnelHostname } from "./tunnel-aliases.js";
 
 describe("TunnelAliasStore", () => {
@@ -14,6 +14,7 @@ describe("TunnelAliasStore", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
@@ -78,6 +79,24 @@ describe("TunnelAliasStore", () => {
     ]) {
       expect(() => normalizeTunnelHostname(value)).toThrow("Invalid tunnel hostname");
     }
+  });
+
+  it("keeps managed aliases whose owner process the caller cannot signal (EPERM)", () => {
+    store.setAlias({
+      externalHostname: "public.example.com",
+      targetHostname: "myapp.localhost",
+      managed: true,
+      routeOwnerPid: 123456789,
+      tunnelPid: 123456790,
+      provider: "cloudflare",
+      url: "https://public.example.com",
+    });
+    vi.spyOn(process, "kill").mockImplementation(() => {
+      throw Object.assign(new Error("EPERM"), { code: "EPERM" });
+    });
+
+    expect(store.pruneManagedAliases()).toEqual([]);
+    expect(store.loadAliases()).toHaveLength(1);
   });
 
   it("removes managed aliases for stale owner pids", () => {

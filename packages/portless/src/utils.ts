@@ -306,8 +306,15 @@ export function parseHostnames(input: string, tlds: readonly string[] = ["localh
   return hostnames;
 }
 
-/** Whether a PID exists, including processes owned by another user. */
+/**
+ * Whether a PID exists, including processes owned by another user (EPERM means
+ * the process exists but cannot be signaled by the caller). Non-positive and
+ * non-integer values are never treated as alive, because `kill(0)` and
+ * `kill(-n)` address process groups. Callers that store `pid: 0` for static
+ * aliases must handle that case themselves.
+ */
 export function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
     return true;

@@ -61,6 +61,28 @@ describe("RouteStore", () => {
       expect(fs.readFileSync(store.getRoutesPath(), "utf-8")).toBe(raw);
     });
 
+    it("keeps routes owned by a process the caller cannot signal (EPERM)", () => {
+      store.ensureDir();
+      fs.writeFileSync(
+        store.getRoutesPath(),
+        JSON.stringify([{ hostname: "other-user.localhost", port: 4001, pid: 999999 }])
+      );
+      const realKill = process.kill.bind(process);
+      const kill = vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+        if (pid === 999999 && signal === 0) {
+          throw Object.assign(new Error("EPERM"), { code: "EPERM" });
+        }
+        return realKill(pid, signal);
+      });
+      try {
+        expect(store.loadRoutes().map((r) => r.hostname)).toEqual(["other-user.localhost"]);
+        expect(store.pruneStaleRoutes()).toEqual([]);
+        expect(store.loadRoutes()).toHaveLength(1);
+      } finally {
+        kill.mockRestore();
+      }
+    });
+
     it("does not persist migration changes during an unlocked read", () => {
       store.ensureDir();
       const raw = JSON.stringify([
@@ -375,6 +397,37 @@ describe("RouteStore", () => {
         return false;
       }
     }
+
+    it("refuses to replace a static alias without --force", () => {
+      store.addRoute("db.localhost", 5432, 0);
+      expect(() => store.addRoute("db.localhost", 4002, process.pid)).toThrow(
+        '"db.localhost" is a static alias. Use --force to replace it; re-add the alias with "portless alias" afterwards.'
+      );
+    });
+
+    it("names a static alias when a multiplex member would replace it", () => {
+      store.addRoute("db.localhost", 5432, 0);
+      expect(() =>
+        store.addRoute("db.localhost", 4002, process.pid, false, { label: "web" })
+      ).toThrow(/is a static alias/);
+    });
+
+    it("replaces a static alias with --force without sending any signal", () => {
+      const realKill = process.kill.bind(process);
+      const kill = vi
+        .spyOn(process, "kill")
+        .mockImplementation((pid, signal) => (signal ? true : realKill(pid, signal)));
+      try {
+        store.addRoute("db.localhost", 5432, 0);
+        expect(store.addRoute("db.localhost", 4002, process.pid, true)).toBeUndefined();
+        expect(kill.mock.calls.filter(([, signal]) => signal)).toEqual([]);
+        const routes = store.loadRoutes();
+        expect(routes).toHaveLength(1);
+        expect(routes[0]).toMatchObject({ port: 4002, pid: process.pid });
+      } finally {
+        kill.mockRestore();
+      }
+    });
 
     it("throws RouteConflictError without --force when route is owned by another live process", () => {
       const otherPid = spawnSleeper();

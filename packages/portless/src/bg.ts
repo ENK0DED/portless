@@ -35,7 +35,7 @@ import { cleanupRouteSharing } from "./route-cleanup.js";
 import { RouteStore, type RouteMapping } from "./routes.js";
 import { TunnelAliasStore } from "./tunnel-aliases.js";
 import type { RouteProtocol, TunnelProviderName } from "./types.js";
-import { fixOwnership, normalizePathPrefix, parsePort } from "./utils.js";
+import { fixOwnership, isProcessAlive, normalizePathPrefix, parsePort } from "./utils.js";
 
 export const DEFAULT_BG_WAIT_SECONDS = 30;
 
@@ -470,15 +470,6 @@ function printStartResult(
     console.log(colors.yellow("Readiness was not requested; state remains starting."));
   }
   console.log(colors.gray(`Logs: ${logs.stdout}`));
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 async function terminateChild(child: ChildProcess): Promise<void> {
