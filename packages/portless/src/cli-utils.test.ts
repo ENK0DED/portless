@@ -23,6 +23,7 @@ import {
   SUFFIX_ENV,
   USER_STATE_DIR,
   discoverState,
+  isExplicitStateDirEmpty,
   findFreePort,
   getDefaultPort,
   caRegeneratedRestartHint,
@@ -2159,6 +2160,72 @@ describe("readLanMarker / writeLanMarker", () => {
         process.env[LEGACY_TLD_ENV] = prevLegacyTld;
       }
     }
+  });
+});
+
+describe("discoverState with an explicit, empty state dir", () => {
+  let tmpDir: string;
+  let stub: http.Server | undefined;
+  const saved: Record<string, string | undefined> = {};
+  const envKeys = ["PORTLESS_STATE_DIR", "PORTLESS_PORT", SUFFIX_ENV, LEGACY_TLD_ENV];
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-empty-state-"));
+    for (const key of envKeys) saved[key] = process.env[key];
+    delete process.env[SUFFIX_ENV];
+    delete process.env[LEGACY_TLD_ENV];
+  });
+
+  afterEach(async () => {
+    for (const key of envKeys) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+    await new Promise<void>((resolve) => (stub ? stub.close(() => resolve()) : resolve()));
+    stub = undefined;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("does not probe the default port when the state dir holds no port file", async () => {
+    // A stub that answers like a portless proxy, on a free non-default port
+    // that stands in for the default port through PORTLESS_PORT.
+    let connections = 0;
+    stub = http.createServer((_req, res) => {
+      res.setHeader(PORTLESS_HEADER, "1");
+      res.end();
+    });
+    stub.on("connection", () => {
+      connections += 1;
+    });
+    await new Promise<void>((resolve) => stub!.listen(0, "127.0.0.1", resolve));
+    const stubPort = (stub.address() as net.AddressInfo).port;
+
+    process.env.PORTLESS_STATE_DIR = tmpDir;
+    process.env.PORTLESS_PORT = String(stubPort);
+
+    expect(isExplicitStateDirEmpty()).toBe(true);
+    await expect(discoverState()).resolves.toMatchObject({ dir: tmpDir, port: stubPort });
+    expect(connections).toBe(0);
+  });
+
+  it("still probes the port recorded in the state dir", async () => {
+    let connections = 0;
+    stub = http.createServer((_req, res) => {
+      res.setHeader(PORTLESS_HEADER, "1");
+      res.end();
+    });
+    stub.on("connection", () => {
+      connections += 1;
+    });
+    await new Promise<void>((resolve) => stub!.listen(0, "127.0.0.1", resolve));
+    const stubPort = (stub.address() as net.AddressInfo).port;
+
+    fs.writeFileSync(path.join(tmpDir, "proxy.port"), String(stubPort));
+    process.env.PORTLESS_STATE_DIR = tmpDir;
+
+    expect(isExplicitStateDirEmpty()).toBe(false);
+    await expect(discoverState()).resolves.toMatchObject({ dir: tmpDir, port: stubPort });
+    expect(connections).toBeGreaterThan(0);
   });
 });
 

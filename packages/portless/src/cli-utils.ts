@@ -1108,6 +1108,16 @@ export function buildProxyStartConfig(options: {
 }
 
 /**
+ * True when PORTLESS_STATE_DIR is set but holds no port file. Such an isolated
+ * state dir has no proxy yet, so callers must not probe the default port: it
+ * would reach whatever proxy listens there (for example a system-wide one).
+ */
+export function isExplicitStateDirEmpty(): boolean {
+  const dir = process.env.PORTLESS_STATE_DIR;
+  return !!dir && readPortFromDir(dir) === null;
+}
+
+/**
  * Discover the active proxy's state directory, port, TLS mode, TLD, LAN mode,
  * and current LAN IP when available.
  * Checks the user-level dir first, then the legacy /tmp/portless dir as a
@@ -1125,9 +1135,13 @@ export async function discoverState(): Promise<{
   // Env var override
   if (process.env.PORTLESS_STATE_DIR) {
     const dir = process.env.PORTLESS_STATE_DIR;
-    const port = readPortFromDir(dir) ?? getDefaultPort();
+    const filePort = readPortFromDir(dir);
+    const port = filePort ?? getDefaultPort();
     const lanIp = readLanMarker(dir);
-    if ((await isProxyRunning(port)) || (await isPortListening(port))) {
+    // Without a port file this state dir has no proxy of its own. Probing the
+    // default port would reach whatever proxy listens there, so report it as
+    // not running instead.
+    if (filePort !== null && ((await isProxyRunning(port)) || (await isPortListening(port)))) {
       const tls = readTlsMarker(dir);
       const tlds = readTldsFromDir(dir);
       const tld = tlds[0] ?? DEFAULT_TLD;
