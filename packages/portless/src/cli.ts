@@ -98,6 +98,7 @@ import {
   getDefaultPort,
   caRegeneratedRestartHint,
   getDefaultTlds,
+  formatMdnsUnavailableWarning,
   getProxyBindTargets,
   hasConfiguredTldEnv,
   hasPlaceholders,
@@ -828,7 +829,7 @@ function startProxyServer(
   let lanMonitor: ReturnType<typeof startLanIpMonitor> | null = null;
   if (lanIp && !mdnsSupport.supported) {
     const reason = mdnsSupport.reason ?? "mDNS publishing is not supported on this platform.";
-    console.warn(chalk.yellow(`LAN mode disabled: ${reason}`));
+    console.warn(chalk.yellow(formatMdnsUnavailableWarning(reason)));
   }
 
   // Create empty routes file if it doesn't exist

@@ -30,6 +30,7 @@ import {
   getDefaultTlds,
   getProtocolPort,
   getProcessStartTime,
+  formatMdnsUnavailableWarning,
   getProxyBindTargets,
   getRiskyTldReason,
   hasLanMarker,
@@ -71,6 +72,24 @@ import {
   hasHelpFlag,
 } from "./cli-utils.js";
 import { PORTLESS_HEADER, PORTLESS_LISTENER_PORT_HEADER } from "./proxy.js";
+
+describe("formatMdnsUnavailableWarning", () => {
+  it("says the proxy is still reachable and only .local publishing is off", () => {
+    const warning = formatMdnsUnavailableWarning("dns-sd not found");
+    expect(warning).toBe(
+      "mDNS publishing is off: dns-sd not found. " +
+        "The proxy is still reachable from the network on all interfaces; " +
+        "only publishing of .local names is disabled."
+    );
+    expect(warning).not.toContain("LAN mode disabled");
+  });
+
+  it("does not double a trailing period", () => {
+    expect(formatMdnsUnavailableWarning("mDNS is not supported.")).toContain(
+      "not supported. The proxy"
+    );
+  });
+});
 
 describe("proxy listener interface", () => {
   it("uses only IPv4 and IPv6 loopback outside LAN mode", () => {

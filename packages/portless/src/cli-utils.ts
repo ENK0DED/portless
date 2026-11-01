@@ -228,6 +228,20 @@ export type ProxyBindTarget = {
   ipv6Only?: boolean;
 };
 
+/**
+ * Warning printed when LAN mode is requested but mDNS publishing is unavailable.
+ * LAN mode still binds every interface, so the proxy stays reachable from the
+ * network; only the `.local` name publishing is off.
+ */
+export function formatMdnsUnavailableWarning(reason: string): string {
+  const detail = reason.trim().replace(/\.$/, "");
+  return (
+    `mDNS publishing is off: ${detail}. ` +
+    "The proxy is still reachable from the network on all interfaces; " +
+    "only publishing of .local names is disabled."
+  );
+}
+
 /** Return explicit IPv4 and IPv6 listener targets for the effective proxy mode. */
 export function getProxyBindTargets(lanMode: boolean, unprivileged = false): ProxyBindTarget[] {
   return lanMode || unprivileged
