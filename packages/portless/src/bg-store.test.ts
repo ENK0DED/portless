@@ -107,6 +107,30 @@ describe("BgStore", () => {
     expect(store.loadEntries()).toEqual([]);
   });
 
+  it("persists the worktree prefix decision and accepts entries written without it", () => {
+    const prefixed = sampleEntry({
+      intent: { ...sampleEntry().intent, worktreePrefix: "qa" },
+    });
+    const optedOut = sampleEntry({
+      id: "other",
+      intent: { ...sampleEntry().intent, noWorktree: true },
+    });
+    store.upsertEntry(prefixed);
+    store.upsertEntry(optedOut);
+    expect(store.loadEntries()).toEqual([prefixed, optedOut]);
+    expect(sampleEntry().intent.worktreePrefix).toBeUndefined();
+  });
+
+  it("rejects malformed worktree prefix fields", () => {
+    store.ensureDirs();
+    const badPrefix = sampleEntry();
+    (badPrefix.intent as unknown as Record<string, unknown>).worktreePrefix = 7;
+    const badFlag = sampleEntry({ id: "other" });
+    (badFlag.intent as unknown as Record<string, unknown>).noWorktree = "yes";
+    fs.writeFileSync(store.getPaths().registryPath, JSON.stringify([badPrefix, badFlag]));
+    expect(store.loadEntries()).toEqual([]);
+  });
+
   it("loads only valid entries from a mixed registry", () => {
     store.ensureDirs();
     fs.writeFileSync(

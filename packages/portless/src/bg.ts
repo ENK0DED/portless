@@ -94,6 +94,7 @@ const RUN_VALUE_FLAGS = new Set([
   "--name",
   "--app-port",
   "--path",
+  "--worktree-prefix",
   "--tunnel",
   "--tunnel-hostname",
   "--tailscale-service-name",
@@ -106,6 +107,7 @@ const RUN_BOOLEAN_FLAGS = new Set([
   "--cloudflare",
   "--force",
   "--h2c",
+  "--no-worktree",
   "--tailscale",
   "--tailscale-http",
   "--tailscale-service",
@@ -152,6 +154,8 @@ ${colors.bold("Run options forwarded to portless run:")}
   --app-port <number>           Use a fixed app port
   --h2c                         Forward to an HTTP/2 cleartext upstream
   --path <prefix>               Scope route to a path prefix
+  --worktree-prefix <prefix>    Use this worktree prefix, in a linked worktree or not
+  --no-worktree                 Skip the worktree prefix
   --cloudflare                 Alias of --tunnel cloudflare
   --tunnel <provider>           Share publicly via a managed tunnel
   --tunnel-hostname <hostname>  Request a stable tunnel hostname
@@ -309,12 +313,19 @@ function parseTunnelProviderForIntent(value: string): TunnelProviderName {
   throw new Error(`Unsupported tunnel provider "${value}"`);
 }
 
-function parseRunIntent(runArgs: string[], cwd: string): ParsedRunIntent {
+export function parseRunIntent(runArgs: string[], cwd: string): ParsedRunIntent {
   let name: string | undefined;
   let force = false;
   let appPort: number | undefined;
   let protocol: RouteProtocol | undefined;
   let pathPrefix = "/";
+  // PORTLESS_WORKTREE_PREFIX is captured now so a restart from another shell
+  // replays the same decision; a flag overrides it in either direction.
+  const envWorktree = process.env.PORTLESS_WORKTREE_PREFIX;
+  let worktreePrefix: string | undefined = envWorktree?.trim() ? envWorktree : undefined;
+  let noWorktree = envWorktree !== undefined && !envWorktree.trim();
+  let flagWorktreePrefix = false;
+  let flagNoWorktree = false;
   const envProvider =
     process.env.PORTLESS_TUNNEL ??
     (["1", "true"].includes(process.env.PORTLESS_CLOUDFLARE ?? "") ? "cloudflare" : undefined);
@@ -362,6 +373,20 @@ function parseRunIntent(runArgs: string[], cwd: string): ParsedRunIntent {
       protocol = "h2c";
     } else if (token === "--path") {
       pathPrefix = normalizePathPrefix(runArgs[++i]);
+    } else if (token === "--worktree-prefix") {
+      const value = runArgs[++i];
+      if (!value?.trim()) {
+        throw new Error(
+          "--worktree-prefix requires a non-empty value. Use --no-worktree to turn the prefix off"
+        );
+      }
+      worktreePrefix = value;
+      noWorktree = false;
+      flagWorktreePrefix = true;
+    } else if (token === "--no-worktree") {
+      worktreePrefix = undefined;
+      noWorktree = true;
+      flagNoWorktree = true;
     } else if (token === "--cloudflare") {
       tunnel = { provider: "cloudflare" };
     } else if (token === "--tunnel") {
@@ -397,6 +422,10 @@ function parseRunIntent(runArgs: string[], cwd: string): ParsedRunIntent {
     }
   }
 
+  if (flagWorktreePrefix && flagNoWorktree) {
+    throw new Error("--no-worktree cannot be combined with --worktree-prefix");
+  }
+
   const fallbackLabel = path.basename(cwd) || "app";
   const label = name ?? fallbackLabel;
   return {
@@ -410,6 +439,8 @@ function parseRunIntent(runArgs: string[], cwd: string): ParsedRunIntent {
       appPort,
       protocol,
       pathPrefix,
+      ...(worktreePrefix !== undefined ? { worktreePrefix } : {}),
+      ...(noWorktree ? { noWorktree } : {}),
       tunnel,
       sharing,
     },
@@ -634,6 +665,8 @@ export function runArgsFromIntent(intent: BgStartIntent, force: boolean): string
   if (intent.appPort) args.push("--app-port", String(intent.appPort));
   if (intent.protocol === "h2c") args.push("--h2c");
   if (intent.pathPrefix && intent.pathPrefix !== "/") args.push("--path", intent.pathPrefix);
+  if (intent.noWorktree) args.push("--no-worktree");
+  else if (intent.worktreePrefix) args.push("--worktree-prefix", intent.worktreePrefix);
   if (intent.tunnel) {
     args.push("--tunnel", intent.tunnel.provider);
     if (intent.tunnel.hostname) args.push("--tunnel-hostname", intent.tunnel.hostname);
@@ -1332,6 +1365,11 @@ export function parseBgStartArgs(tokens: string[]): ParsedBgStartArgs {
     }
 
     if (RUN_VALUE_FLAGS.has(token)) {
+      if (token === "--worktree-prefix" && tokens[i + 1] === "") {
+        throw new Error(
+          "--worktree-prefix requires a non-empty value. Use --no-worktree to turn the prefix off"
+        );
+      }
       runArgs.push(token, requireForwardedValue(tokens, i));
       i++;
       continue;

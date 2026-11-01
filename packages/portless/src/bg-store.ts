@@ -32,6 +32,14 @@ export interface BgStartIntent {
   appPort?: number;
   protocol?: RouteProtocol;
   pathPrefix: string;
+  /**
+   * Explicit worktree prefix decision, from --worktree-prefix or
+   * PORTLESS_WORKTREE_PREFIX at start time. Replayed on restart so it does not
+   * depend on the restarting shell. Absent means "detect from git".
+   */
+  worktreePrefix?: string;
+  /** Worktree prefix turned off (--no-worktree or an empty PORTLESS_WORKTREE_PREFIX). */
+  noWorktree?: boolean;
   tunnel?: BgManagedTunnelOptions;
   sharing: {
     tailscale: boolean;
@@ -127,6 +135,10 @@ function isValidIntent(value: unknown): value is BgStartIntent {
     return false;
   }
   if (typeof intent.pathPrefix !== "string") return false;
+  if (intent.worktreePrefix !== undefined && typeof intent.worktreePrefix !== "string") {
+    return false;
+  }
+  if (intent.noWorktree !== undefined && typeof intent.noWorktree !== "boolean") return false;
   if (!isValidTunnel(intent.tunnel)) return false;
   if (!isValidSharing(intent.sharing)) return false;
   try {

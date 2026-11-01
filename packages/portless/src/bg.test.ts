@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { parseBgStartArgs, runArgsFromIntent } from "./bg.js";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { parseBgStartArgs, parseRunIntent, runArgsFromIntent } from "./bg.js";
 import type { BgStartIntent } from "./bg-store.js";
 
 describe("bg start parser", () => {
@@ -171,5 +171,105 @@ describe("bg start parser", () => {
     expect(args).not.toContain("--netbird-pin");
     expect(args).not.toContain("placeholder-password");
     expect(args).not.toContain("0000");
+  });
+
+  describe("worktree prefix intent", () => {
+    const baseIntent = (): BgStartIntent => ({
+      cwd: "/tmp/app",
+      commandArgs: ["bun", "run", "dev"],
+      explicitCommand: true,
+      force: false,
+      pathPrefix: "/",
+      sharing: {
+        tailscale: false,
+        tailscaleService: false,
+        funnel: false,
+        ngrok: false,
+        netbird: false,
+      },
+    });
+
+    let saved: string | undefined;
+    beforeEach(() => {
+      saved = process.env.PORTLESS_WORKTREE_PREFIX;
+      delete process.env.PORTLESS_WORKTREE_PREFIX;
+    });
+    afterEach(() => {
+      if (saved === undefined) delete process.env.PORTLESS_WORKTREE_PREFIX;
+      else process.env.PORTLESS_WORKTREE_PREFIX = saved;
+    });
+
+    it("forwards both flags through bg start", () => {
+      expect(parseBgStartArgs(["--worktree-prefix", "qa", "--", "bun", "dev"]).runArgs).toEqual([
+        "--worktree-prefix",
+        "qa",
+        "--",
+        "bun",
+        "dev",
+      ]);
+      expect(parseBgStartArgs(["--no-worktree", "bun", "dev"]).runArgs).toEqual([
+        "--no-worktree",
+        "bun",
+        "dev",
+      ]);
+    });
+
+    it("rejects an empty --worktree-prefix and points to --no-worktree", () => {
+      expect(() => parseBgStartArgs(["--worktree-prefix", "", "bun", "dev"])).toThrow(
+        /--no-worktree/
+      );
+    });
+
+    it("saves an explicit prefix from the flag and replays it", () => {
+      const { intent } = parseRunIntent(["--worktree-prefix", "qa", "bun", "dev"], "/tmp/app");
+      expect(intent.worktreePrefix).toBe("qa");
+      expect(intent.noWorktree).toBeUndefined();
+      expect(runArgsFromIntent(intent, false)).toEqual(["--worktree-prefix", "qa"]);
+    });
+
+    it("saves the opt-out and replays it", () => {
+      const { intent } = parseRunIntent(["--no-worktree", "bun", "dev"], "/tmp/app");
+      expect(intent.noWorktree).toBe(true);
+      expect(intent.worktreePrefix).toBeUndefined();
+      expect(runArgsFromIntent(intent, false)).toEqual(["--no-worktree"]);
+    });
+
+    it("captures the environment decision so a restart without the variable replays it", () => {
+      process.env.PORTLESS_WORKTREE_PREFIX = "staging";
+      const fromEnv = parseRunIntent(["bun", "dev"], "/tmp/app").intent;
+      expect(fromEnv.worktreePrefix).toBe("staging");
+
+      process.env.PORTLESS_WORKTREE_PREFIX = "";
+      const emptyEnv = parseRunIntent(["bun", "dev"], "/tmp/app").intent;
+      expect(emptyEnv.noWorktree).toBe(true);
+
+      delete process.env.PORTLESS_WORKTREE_PREFIX;
+      expect(runArgsFromIntent(fromEnv, false)).toEqual(["--worktree-prefix", "staging"]);
+      expect(runArgsFromIntent(emptyEnv, false)).toEqual(["--no-worktree"]);
+    });
+
+    it("lets a flag override the environment in both directions", () => {
+      process.env.PORTLESS_WORKTREE_PREFIX = "staging";
+      const optOut = parseRunIntent(["--no-worktree", "bun", "dev"], "/tmp/app").intent;
+      expect(optOut.noWorktree).toBe(true);
+      expect(optOut.worktreePrefix).toBeUndefined();
+
+      process.env.PORTLESS_WORKTREE_PREFIX = "";
+      const prefixed = parseRunIntent(["--worktree-prefix", "qa", "bun", "dev"], "/tmp/app").intent;
+      expect(prefixed.worktreePrefix).toBe("qa");
+      expect(prefixed.noWorktree).toBeUndefined();
+    });
+
+    it("rejects both flags together", () => {
+      expect(() =>
+        parseRunIntent(["--no-worktree", "--worktree-prefix", "qa", "bun", "dev"], "/tmp/app")
+      ).toThrow(/cannot be combined/);
+    });
+
+    it("emits nothing for an intent without a worktree decision", () => {
+      const args = runArgsFromIntent(baseIntent(), false);
+      expect(args).not.toContain("--worktree-prefix");
+      expect(args).not.toContain("--no-worktree");
+    });
   });
 });

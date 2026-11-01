@@ -6042,3 +6042,434 @@ server.listen(Number(process.env.PORT), "127.0.0.1", () => {
     );
   });
 });
+
+describe("worktree prefix surface", { timeout: 30_000 }, () => {
+  let tmpDir: string;
+  let stateDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-cli-wtprefix-"));
+    stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-cli-wtprefix-state-"));
+    writeJson(path.join(tmpDir, "package.json"), {
+      name: "test-app",
+      packageManager: "bun@1.3.14",
+      scripts: { dev: nodePrintScript("ready") },
+    });
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  /** Run the CLI against an isolated proxy on a free port, then stop that proxy. */
+  async function runIsolated(
+    args: string[],
+    options: { cwd?: string; env?: Record<string, string | undefined> } = {}
+  ) {
+    const proxyPort = await getFreePort();
+    const env = {
+      PORTLESS_STATE_DIR: stateDir,
+      PORTLESS_PORT: String(proxyPort),
+      PORTLESS_HTTPS: "0",
+      ...options.env,
+    };
+    try {
+      const result = run(args, { cwd: options.cwd ?? tmpDir, env });
+      return { ...result, proxyPort };
+    } finally {
+      run(["proxy", "stop"], { env: { PORTLESS_STATE_DIR: stateDir, PORTLESS_HTTPS: "0" } });
+    }
+  }
+
+  function addLinkedWorktree(branch: string): string {
+    const repoDir = path.join(tmpDir, "repo");
+    const worktreeDir = path.join(tmpDir, "linked");
+    fs.mkdirSync(repoDir, { recursive: true });
+    writeJson(path.join(repoDir, "package.json"), {
+      name: "test-app",
+      packageManager: "bun@1.3.14",
+      scripts: { dev: nodePrintScript("ready") },
+    });
+    runGit(repoDir, ["init"]);
+    runGit(repoDir, ["config", "user.name", "Portless Test"]);
+    runGit(repoDir, ["config", "user.email", "portless-test@example.com"]);
+    runGit(repoDir, ["branch", "-M", "main"]);
+    runGit(repoDir, ["add", "."]);
+    runGit(repoDir, ["commit", "-m", "init"]);
+    runGit(repoDir, ["worktree", "add", "-b", branch, worktreeDir]);
+    return worktreeDir;
+  }
+
+  describe("help text", () => {
+    it("documents both flags and the environment variable", () => {
+      for (const args of [
+        ["--help"],
+        ["run", "--help"],
+        ["get", "--help"],
+        ["bg", "start", "--help"],
+      ]) {
+        const { stdout } = run(args);
+        expect(stdout, args.join(" ")).toContain("--worktree-prefix");
+        expect(stdout, args.join(" ")).toContain("--no-worktree");
+      }
+      expect(run(["--help"]).stdout).toContain("PORTLESS_WORKTREE_PREFIX");
+      expect(run(["--help"]).stdout).toContain("worktreeBranch");
+    });
+
+    it("lists both flags in every completion script for run and get", () => {
+      for (const shell of ["bash", "zsh", "fish"]) {
+        const { stdout } = run(["completion", shell]);
+        expect(stdout, shell).toContain("worktree-prefix");
+        expect(stdout, shell).toContain("no-worktree");
+      }
+    });
+  });
+
+  describe("errors", () => {
+    it.each([
+      ["run", ["run", "--worktree-prefix", "", "echo", "hi"]],
+      ["get", ["get", "web", "--worktree-prefix", ""]],
+      ["bare mode", ["--worktree-prefix", ""]],
+    ])("rejects an empty --worktree-prefix on %s and points to --no-worktree", (_name, args) => {
+      const { status, stderr } = run(args, { env: { PORTLESS_STATE_DIR: stateDir } });
+      expect(status).toBe(1);
+      expect(stderr).toContain("non-empty");
+      expect(stderr).toContain("--no-worktree");
+    });
+
+    it("rejects --no-worktree combined with --worktree-prefix on run and get", () => {
+      for (const args of [
+        ["run", "--no-worktree", "--worktree-prefix", "qa", "echo", "hi"],
+        ["get", "web", "--no-worktree", "--worktree-prefix", "qa"],
+      ]) {
+        const { status, stderr } = run(args, { env: { PORTLESS_STATE_DIR: stateDir } });
+        expect(status, args.join(" ")).toBe(1);
+        expect(stderr).toContain("--no-worktree cannot be combined with --worktree-prefix");
+      }
+    });
+
+    it("rejects a value that sanitizes to nothing, from the flag and the environment", () => {
+      const fromFlag = run(["run", "--worktree-prefix", "///", "echo", "hi"], {
+        env: { PORTLESS_STATE_DIR: stateDir },
+      });
+      expect(fromFlag.status).toBe(1);
+      expect(fromFlag.stderr).toContain("no usable hostname characters");
+
+      const fromEnv = run(["get", "web"], {
+        env: { PORTLESS_STATE_DIR: stateDir, PORTLESS_WORKTREE_PREFIX: "///" },
+      });
+      expect(fromEnv.status).toBe(1);
+      expect(fromEnv.stderr).toContain("PORTLESS_WORKTREE_PREFIX");
+    });
+
+    it("requires a value for --worktree-prefix", () => {
+      const { status, stderr } = run(["run", "--worktree-prefix"], {
+        env: { PORTLESS_STATE_DIR: stateDir },
+      });
+      expect(status).toBe(1);
+      expect(stderr).toContain("--worktree-prefix requires a value");
+    });
+
+    it("does not accept the upstream --prefix spelling", () => {
+      const { status, stderr } = run(["run", "--prefix", "qa", "echo", "hi"], {
+        env: { PORTLESS_STATE_DIR: stateDir },
+      });
+      expect(status).toBe(1);
+      expect(stderr).toContain('Unknown flag "--prefix"');
+    });
+
+    it("rejects the worktree flags before a named app", () => {
+      const { status, stderr } = run(["--no-worktree", "myapp", "echo", "hi"], {
+        env: { PORTLESS_STATE_DIR: stateDir },
+      });
+      expect(status).toBe(1);
+      expect(stderr).toContain("apply to run, get, and bare mode");
+    });
+
+    it("rejects an invalid worktreeBranch config value", () => {
+      writeJson(path.join(tmpDir, "portless.json"), { worktreeBranch: "everything" });
+      const { status, stderr } = run(["run", "echo", "hi"], {
+        cwd: tmpDir,
+        env: { PORTLESS_STATE_DIR: stateDir },
+      });
+      expect(status).toBe(1);
+      expect(stderr).toContain('"last-segment", "full"');
+    });
+  });
+
+  describe("get", () => {
+    const getEnv = (extra: Record<string, string | undefined> = {}) => ({
+      PORTLESS_STATE_DIR: stateDir,
+      ...extra,
+    });
+
+    beforeEach(() => {
+      fs.writeFileSync(path.join(stateDir, "proxy.port"), "1355");
+    });
+
+    it("applies --worktree-prefix outside a git checkout", () => {
+      const { status, stdout } = run(["get", "backend", "--worktree-prefix", "qa"], {
+        cwd: tmpDir,
+        env: getEnv(),
+      });
+      expect(status).toBe(0);
+      expect(stdout.trim()).toBe("http://qa.backend.localhost:1355");
+    });
+
+    it("reads PORTLESS_WORKTREE_PREFIX, lets the flag win, and honors an empty value", () => {
+      const fromEnv = run(["get", "backend"], {
+        cwd: tmpDir,
+        env: getEnv({ PORTLESS_WORKTREE_PREFIX: "staging" }),
+      });
+      expect(fromEnv.stdout.trim()).toBe("http://staging.backend.localhost:1355");
+
+      const flagWins = run(["get", "backend", "--worktree-prefix", "qa"], {
+        cwd: tmpDir,
+        env: getEnv({ PORTLESS_WORKTREE_PREFIX: "staging" }),
+      });
+      expect(flagWins.stdout.trim()).toBe("http://qa.backend.localhost:1355");
+
+      const optOutWins = run(["get", "backend", "--no-worktree"], {
+        cwd: tmpDir,
+        env: getEnv({ PORTLESS_WORKTREE_PREFIX: "staging" }),
+      });
+      expect(optOutWins.stdout.trim()).toBe("http://backend.localhost:1355");
+
+      const emptyEnv = run(["get", "backend"], {
+        cwd: tmpDir,
+        env: getEnv({ PORTLESS_WORKTREE_PREFIX: "" }),
+      });
+      expect(emptyEnv.stdout.trim()).toBe("http://backend.localhost:1355");
+    });
+
+    it("reports the prefixed hostname in --json", () => {
+      const { stdout } = run(["get", "backend", "--worktree-prefix", "qa", "--json"], {
+        cwd: tmpDir,
+        env: getEnv(),
+      });
+      expect(JSON.parse(stdout)).toMatchObject({
+        name: "backend",
+        hostname: "qa.backend.localhost",
+      });
+    });
+
+    it.skipIf(!GIT_AVAILABLE)("matches the whole-branch derivation used by run", () => {
+      const worktreeDir = addLinkedWorktree("team-a/login");
+      const last = run(["get", "backend"], { cwd: worktreeDir, env: getEnv() });
+      expect(last.stdout.trim()).toBe("http://login.backend.localhost:1355");
+
+      writeJson(path.join(worktreeDir, "portless.json"), { worktreeBranch: "full" });
+      const full = run(["get", "backend"], { cwd: worktreeDir, env: getEnv() });
+      expect(full.stdout.trim()).toBe("http://team-a-login.backend.localhost:1355");
+
+      const skipped = run(["get", "backend", "--no-worktree"], { cwd: worktreeDir, env: getEnv() });
+      expect(skipped.stdout.trim()).toBe("http://backend.localhost:1355");
+    });
+  });
+
+  describe("run and bare mode", () => {
+    it("applies --worktree-prefix to run outside a worktree and names its source", async () => {
+      const { status, stdout, proxyPort } = await runIsolated(["run", "--worktree-prefix", "qa"]);
+      expect(status).toBe(0);
+      expect(stdout).toContain(`http://qa.test-app.localhost:${proxyPort}`);
+      expect(stdout).toContain('Prefix "qa" (from --worktree-prefix)');
+    });
+
+    it("applies a leading --worktree-prefix to bare mode", async () => {
+      const { status, stdout, proxyPort } = await runIsolated(["--worktree-prefix", "qa"]);
+      expect(status).toBe(0);
+      expect(stdout).toContain(`http://qa.test-app.localhost:${proxyPort}`);
+    });
+
+    it("applies a leading --worktree-prefix to run", async () => {
+      const { status, stdout, proxyPort } = await runIsolated(["--worktree-prefix", "qa", "run"]);
+      expect(status).toBe(0);
+      expect(stdout).toContain(`http://qa.test-app.localhost:${proxyPort}`);
+    });
+
+    it("reads PORTLESS_WORKTREE_PREFIX and lets the flag and the opt-out override it", async () => {
+      const env = { PORTLESS_WORKTREE_PREFIX: "staging" };
+      const fromEnv = await runIsolated([], { env });
+      expect(fromEnv.stdout).toContain(`http://staging.test-app.localhost:${fromEnv.proxyPort}`);
+      expect(fromEnv.stdout).toContain("from PORTLESS_WORKTREE_PREFIX");
+
+      const flagWins = await runIsolated(["run", "--worktree-prefix", "qa"], { env });
+      expect(flagWins.stdout).toContain(`http://qa.test-app.localhost:${flagWins.proxyPort}`);
+
+      const optOut = await runIsolated(["run", "--no-worktree"], { env });
+      expect(optOut.stdout).toContain(`http://test-app.localhost:${optOut.proxyPort}`);
+      expect(optOut.stdout).not.toContain("Prefix");
+    });
+
+    it("keeps a hyphenated explicit prefix collision-safe in flat mode", async () => {
+      writeJson(path.join(tmpDir, "portless.json"), { worktreeFlat: true });
+      const { stdout } = await runIsolated(["run", "--worktree-prefix", "qa-1"]);
+      expect(stdout).toMatch(/http:\/\/qa-1-test-app-[a-f0-9]{6}\.localhost:\d+/);
+    });
+
+    it.skipIf(!GIT_AVAILABLE)(
+      "derives the whole branch for worktreeBranch full and lets flags override it",
+      async () => {
+        const worktreeDir = addLinkedWorktree("team-a/login");
+
+        const last = await runIsolated([], { cwd: worktreeDir });
+        expect(last.stdout).toContain(`http://login.test-app.localhost:${last.proxyPort}`);
+
+        writeJson(path.join(worktreeDir, "portless.json"), { worktreeBranch: "full" });
+        const full = await runIsolated([], { cwd: worktreeDir });
+        expect(full.stdout).toContain(`http://team-a-login.test-app.localhost:${full.proxyPort}`);
+        expect(full.stdout).toContain("git branch (full name)");
+
+        const prefixed = await runIsolated(["run", "--worktree-prefix", "qa"], {
+          cwd: worktreeDir,
+        });
+        expect(prefixed.stdout).toContain(`http://qa.test-app.localhost:${prefixed.proxyPort}`);
+
+        const off = await runIsolated(["--no-worktree"], { cwd: worktreeDir });
+        expect(off.stdout).toContain(`http://test-app.localhost:${off.proxyPort}`);
+
+        const emptyEnv = await runIsolated([], {
+          cwd: worktreeDir,
+          env: { PORTLESS_WORKTREE_PREFIX: "" },
+        });
+        expect(emptyEnv.stdout).toContain(`http://test-app.localhost:${emptyEnv.proxyPort}`);
+      },
+      60_000
+    );
+  });
+
+  describe("multi-app mode", () => {
+    async function runMulti(
+      configExtra: Record<string, unknown>,
+      apps: Record<string, Record<string, unknown>>,
+      branch: string,
+      cliArgs: string[]
+    ): Promise<Record<string, string>> {
+      const root = tmpDir;
+      const proxyPort = await getFreePort();
+      const capFile = (name: string) => path.join(stateDir, `url-${name}.txt`);
+      const readCap = (name: string) => {
+        try {
+          return fs.readFileSync(capFile(name), "utf-8");
+        } catch {
+          return "";
+        }
+      };
+      let cli: ReturnType<typeof spawn> | undefined;
+      try {
+        writeJson(path.join(root, "package.json"), {
+          name: "myrepo",
+          private: true,
+          packageManager: "npm@10.0.0",
+          workspaces: ["packages/*"],
+        });
+        writeJson(path.join(root, "portless.json"), { turbo: false, ...configExtra, apps });
+
+        const gitdir = path.join(root, "fake-bare.git", "worktrees", "wt");
+        fs.mkdirSync(gitdir, { recursive: true });
+        fs.writeFileSync(path.join(gitdir, "HEAD"), `ref: refs/heads/${branch}\n`);
+        fs.writeFileSync(path.join(root, ".git"), `gitdir: ${gitdir}\n`);
+
+        for (const key of Object.keys(apps)) {
+          const name = path.basename(key);
+          const dir = path.join(root, key);
+          fs.mkdirSync(dir, { recursive: true });
+          fs.writeFileSync(
+            path.join(dir, "capture.cjs"),
+            `require("node:fs").writeFileSync(${JSON.stringify(capFile(name))}, process.env.PORTLESS_URL || "");\n`
+          );
+          writeJson(path.join(dir, "package.json"), {
+            name,
+            version: "0.0.0",
+            scripts: { dev: "node capture.cjs" },
+            portless: { proxy: true },
+          });
+        }
+
+        const childEnv: Record<string, string | undefined> = { ...process.env };
+        for (const key of Object.keys(childEnv)) {
+          if (key.startsWith("npm_") || key.startsWith("PNPM_")) delete childEnv[key];
+          if (key.startsWith("PORTLESS")) delete childEnv[key];
+        }
+        childEnv.PORTLESS_STATE_DIR = stateDir;
+        childEnv.PORTLESS_PORT = proxyPort.toString();
+        childEnv.PORTLESS_HTTPS = "0";
+        childEnv.NO_COLOR = "1";
+
+        let output = "";
+        cli = spawn(process.execPath, [CLI_PATH, ...cliArgs], {
+          cwd: root,
+          env: childEnv,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        cli.stdout?.on("data", (chunk) => (output += chunk.toString()));
+        cli.stderr?.on("data", (chunk) => (output += chunk.toString()));
+
+        const names = Object.keys(apps).map((key) => path.basename(key));
+        for (let i = 0; i < 60; i++) {
+          if (names.every((name) => readCap(name))) break;
+          await new Promise((resolve) => setTimeout(resolve, 500));
+        }
+        const urls = Object.fromEntries(names.map((name) => [name, readCap(name)]));
+        if (names.some((name) => !urls[name])) {
+          throw new Error(`capture incomplete (${JSON.stringify(urls)}). CLI output:\n${output}`);
+        }
+        return Object.fromEntries(
+          names.map((name) => [name, urls[name].replace(`:${proxyPort}`, ":PORT")])
+        );
+      } finally {
+        if (cli) await stopChild(cli);
+        run(["proxy", "stop"], { env: { PORTLESS_STATE_DIR: stateDir, PORTLESS_HTTPS: "0" } });
+      }
+    }
+
+    it.skipIf(process.platform === "win32")(
+      "uses worktreeBranch per app and replaces the prefix with --worktree-prefix",
+      async () => {
+        const urls = await runMulti(
+          { worktreeBranch: "full" },
+          {
+            "packages/web": { name: "web" },
+            "packages/api": { name: "api", worktreeBranch: "last-segment" },
+          },
+          "team-a/login",
+          []
+        );
+        expect(urls.web).toBe("http://team-a-login.web.localhost:PORT");
+        expect(urls.api).toBe("http://login.api.localhost:PORT");
+      },
+      90_000
+    );
+
+    it.skipIf(process.platform === "win32")(
+      "applies a leading --worktree-prefix to every app",
+      async () => {
+        const urls = await runMulti(
+          {},
+          { "packages/web": { name: "web" }, "packages/api": { name: "api" } },
+          "feature-x",
+          ["--worktree-prefix", "qa"]
+        );
+        expect(urls.web).toBe("http://qa.web.localhost:PORT");
+        expect(urls.api).toBe("http://qa.api.localhost:PORT");
+      },
+      90_000
+    );
+
+    it.skipIf(process.platform === "win32")(
+      "skips the prefix in every app with --no-worktree",
+      async () => {
+        const urls = await runMulti(
+          {},
+          { "packages/web": { name: "web" }, "packages/api": { name: "api" } },
+          "feature-x",
+          ["--no-worktree"]
+        );
+        expect(urls.web).toBe("http://web.localhost:PORT");
+        expect(urls.api).toBe("http://api.localhost:PORT");
+      },
+      90_000
+    );
+  });
+});

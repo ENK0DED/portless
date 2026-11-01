@@ -73,7 +73,9 @@ import {
   resolveWorktreeFlat,
   truncateLabel,
   sanitizeForHostname,
+  WorktreePrefixError,
 } from "./auto.js";
+import type { WorktreePrefix } from "./auto.js";
 import {
   buildProxyStartConfig,
   buildSudoEnvArgs,
@@ -170,7 +172,7 @@ import {
   loadPackagePortlessConfig,
   ConfigValidationError,
 } from "./config.js";
-import type { AppConfig } from "./config.js";
+import type { AppConfig, WorktreeBranchMode } from "./config.js";
 import { findWorkspaceRoot, discoverWorkspacePackages } from "./workspace.js";
 import type { WorkspacePackage } from "./workspace.js";
 import {
@@ -200,6 +202,7 @@ type LoadedAppConfig = {
   config: AppConfig;
   sourceLabel: string;
   worktreeFlat?: boolean;
+  worktreeBranch?: WorktreeBranchMode;
 };
 
 // ---------------------------------------------------------------------------
@@ -2623,6 +2626,8 @@ interface ParsedRunArgs {
   pathPrefix?: string;
   /** Optional managed public tunnel provider. */
   tunnel?: ManagedTunnelOptions;
+  /** Worktree prefix flags (`--worktree-prefix`, `--no-worktree`). */
+  worktreeFlags?: WorktreeFlagState;
   /** The child command and its arguments, passed through untouched. */
   commandArgs: string[];
 }
@@ -2726,6 +2731,67 @@ function parsePathPrefix(value: string | undefined, source: string): string {
   } catch (err) {
     console.error(colors.red(`Error: ${source}: ${(err as Error).message}`));
     process.exit(1);
+  }
+}
+
+/** Worktree prefix decision from `--worktree-prefix` / `--no-worktree`. */
+interface WorktreeFlagState {
+  /** Explicit prefix value. */
+  prefix?: string;
+  /** Skip worktree prefixing entirely. */
+  disabled?: boolean;
+}
+
+/**
+ * Worktree flags given before the subcommand, e.g. `portless --no-worktree`
+ * (bare mode) or `portless --worktree-prefix qa run next dev`. Run and get
+ * start from these and add their own.
+ */
+let globalWorktreeFlags: WorktreeFlagState = {};
+
+/**
+ * Consume `--worktree-prefix <value>` or `--no-worktree` at `args[i]` into
+ * `state`. Returns the index of the last consumed token, or null when
+ * `args[i]` is neither flag.
+ */
+function consumeWorktreeFlag(args: string[], i: number, state: WorktreeFlagState): number | null {
+  if (args[i] === "--no-worktree") {
+    state.disabled = true;
+    return i;
+  }
+  if (args[i] !== "--worktree-prefix") return null;
+  const value = args[i + 1];
+  if (value === undefined || (value !== "" && value.startsWith("-"))) {
+    console.error(colors.red("Error: --worktree-prefix requires a value."));
+    console.error(colors.cyan("  portless run --worktree-prefix <prefix> <command...>"));
+    process.exit(1);
+  }
+  if (!value.trim()) {
+    console.error(colors.red("Error: --worktree-prefix requires a non-empty value."));
+    console.error(colors.blue("To turn the worktree prefix off, use --no-worktree."));
+    process.exit(1);
+  }
+  state.prefix = value;
+  return i + 1;
+}
+
+/**
+ * Resolve the worktree prefix (flags, then PORTLESS_WORKTREE_PREFIX, then git
+ * detection), exiting with a readable error for a bad or conflicting setting.
+ */
+function resolveWorktree(
+  cwd: string,
+  flags: WorktreeFlagState,
+  branch?: WorktreeBranchMode
+): WorktreePrefix | null {
+  try {
+    return detectWorktreePrefix(cwd, { prefix: flags.prefix, disabled: flags.disabled, branch });
+  } catch (err) {
+    if (err instanceof WorktreePrefixError) {
+      console.error(colors.red(`Error: ${err.message}`));
+      process.exit(1);
+    }
+    throw err;
   }
 }
 
@@ -2883,6 +2949,7 @@ function parseRunArgs(args: string[]): ParsedRunArgs {
   let protocol = routeProtocolFromEnv();
   let pathPrefix = pathPrefixFromEnv();
   let tunnel = tunnelFromEnv();
+  const worktreeFlags: WorktreeFlagState = { ...globalWorktreeFlags };
   let allowChildEnv = true;
   let i = 0;
 
@@ -2907,6 +2974,8 @@ ${colors.bold("Options:")}
   --app-port <number>    Use a fixed app port; browser-blocked ports are rejected
   --h2c                  Forward this route to an HTTP/2 cleartext upstream
   --path <prefix>        Scope the route to a path prefix, e.g. /api
+  --worktree-prefix <p>  Use this worktree prefix instead of the branch name
+  --no-worktree          Skip the worktree prefix
   --cloudflare                 Alias of --tunnel cloudflare
   --tunnel <provider>    Share publicly via a managed tunnel: cloudflare or ngrok
   --tunnel-hostname <h>  Request a provider-specific stable tunnel hostname
@@ -2935,6 +3004,15 @@ ${colors.bold("Name inference (in order):")}
   Set PORTLESS_WORKTREE_FLAT=1 to join worktree and app names into one label
   (e.g. feature-auth-myapp.localhost). Use 0 to override a project setting.
 
+${colors.bold("Worktree prefix (flag, then environment, then git):")}
+  --worktree-prefix <p>  Use <p> as the prefix, in a linked worktree or not
+                         (e.g. qa.myapp.localhost). Empty values are rejected.
+  --no-worktree          Skip the prefix for this run
+  PORTLESS_WORKTREE_PREFIX=<p>  Same as --worktree-prefix for this shell
+  PORTLESS_WORKTREE_PREFIX=     (empty) turns the prefix off for this shell
+  "worktreeBranch": "full" in portless.json uses the whole branch name
+  (team-a/login becomes team-a-login) instead of the last segment.
+
 ${colors.bold("Command placeholders:")}
   {PORT}                 Assigned app port
   {HOST}                 Usually 127.0.0.1
@@ -2957,6 +3035,9 @@ ${colors.bold("Examples:")}
   portless run vite dev               # -> https://<project>.localhost
   portless run --h2c grpc-server      # h2c or gRPC upstream
   portless run --path /api api-server # -> https://<project>.localhost/api
+  portless run --worktree-prefix qa next dev
+                                      # -> https://qa.<project>.localhost
+  portless run --no-worktree next dev # -> https://<project>.localhost (skip prefix)
   portless run --tunnel cloudflare next dev
                                       # -> also https://<random>.trycloudflare.com
   portless run my-server --port {PORT}
@@ -3004,14 +3085,16 @@ ${colors.bold("Examples:")}
       // handled
     } else {
       const consumedIndex =
-        applyTailscaleServiceValueFlag(args, i) ?? applyNetbirdValueFlag(args, i);
+        applyTailscaleServiceValueFlag(args, i) ??
+        applyNetbirdValueFlag(args, i) ??
+        consumeWorktreeFlag(args, i, worktreeFlags);
       if (consumedIndex !== null) {
         i = consumedIndex;
       } else {
         console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
         console.error(
           colors.blue(
-            "Known flags: --name, --force, --app-port, --h2c, --path, --cloudflare, --tunnel, --tunnel-hostname, --tailscale, --tailscale-http, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups, --help"
+            "Known flags: --name, --force, --app-port, --h2c, --path, --worktree-prefix, --no-worktree, --cloudflare, --tunnel, --tunnel-hostname, --tailscale, --tailscale-http, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups, --help"
           )
         );
         process.exit(1);
@@ -3026,7 +3109,7 @@ ${colors.bold("Examples:")}
     ? splitLeadingChildEnv(args.slice(i))
     : { childEnv: {}, commandArgs: args.slice(i) };
 
-  return { force, appPort, name, protocol, pathPrefix, tunnel, ...parsedChild };
+  return { force, appPort, name, protocol, pathPrefix, tunnel, worktreeFlags, ...parsedChild };
 }
 
 /**
@@ -3238,6 +3321,8 @@ const GLOBAL_COMPLETION_FLAGS: CompletionFlag[] = [
   { name: "--multiplex", description: "Share the hostname with other apps (app picker)" },
   { name: "--label", description: "Label for this multiplexed app", value: "label" },
   { name: "--path", description: "Scope route to a path prefix", value: "prefix" },
+  { name: "--worktree-prefix", description: "Use this worktree prefix", value: "prefix" },
+  { name: "--no-worktree", description: "Skip the worktree prefix" },
   { name: "--cloudflare", description: "Alias of --tunnel cloudflare" },
   { name: "--tunnel", description: "Share publicly via tunnel provider", value: "provider" },
   { name: "--tunnel-hostname", description: "Request stable tunnel hostname", value: "hostname" },
@@ -3268,6 +3353,8 @@ const RUN_COMPLETION_FLAGS = GLOBAL_COMPLETION_FLAGS.filter((flag) =>
     "--multiplex",
     "--label",
     "--path",
+    "--worktree-prefix",
+    "--no-worktree",
     "--cloudflare",
     "--tunnel",
     "--tunnel-hostname",
@@ -3420,7 +3507,7 @@ _portless_completions() {
       COMPREPLY=( $(compgen -W "${completionFlagWords(RUN_COMPLETION_FLAGS)} --" -- "$cur") )
       ;;
     get|url)
-      COMPREPLY=( $(compgen -W "--json --path --help -h" -- "$cur") )
+      COMPREPLY=( $(compgen -W "--json --path --worktree-prefix --no-worktree --help -h" -- "$cur") )
       ;;
     list|ls|status)
       COMPREPLY=( $(compgen -W "--json --help -h" -- "$cur") )
@@ -3517,7 +3604,7 @@ _portless() {
           _arguments ${RUN_COMPLETION_FLAGS.map(zshFlag).join(" ")}
           ;;
         get|url)
-          _arguments '--json[Print JSON]' '--path[Scope URL to path prefix]:prefix' '--help[Show help]' '-h[Show help]'
+          _arguments '--json[Print JSON]' '--path[Scope URL to path prefix]:prefix' '--worktree-prefix[Use this worktree prefix]:prefix' '--no-worktree[Skip the worktree prefix]' '--help[Show help]' '-h[Show help]'
           ;;
         list|ls|status)
           _arguments '--json[Print JSON]' '--help[Show help]' '-h[Show help]'
@@ -3598,6 +3685,8 @@ ${fishFlagLines(RUN_COMPLETION_FLAGS, "__fish_seen_subcommand_from run")}
 ${fishFlagLines(APP_COMPLETION_FLAGS, "not __fish_seen_subcommand_from run get url list ls status doctor alias tunnel hosts clean prune proxy bg service completion")}
 complete -c portless -n "__fish_seen_subcommand_from get url list ls status" -l json -d "Print JSON"
 complete -c portless -n "__fish_seen_subcommand_from get url" -l path -d "Scope URL to path prefix" -r
+complete -c portless -n "__fish_seen_subcommand_from get url" -l worktree-prefix -d "Use this worktree prefix" -r
+complete -c portless -n "__fish_seen_subcommand_from get url" -l no-worktree -d "Skip the worktree prefix"
 complete -c portless -n "__fish_seen_subcommand_from alias" -l remove -d "Remove route"
 complete -c portless -n "__fish_seen_subcommand_from alias" -l force -d "Override existing route"
 complete -c portless -n "__fish_seen_subcommand_from alias" -l h2c -d "Forward to HTTP/2 cleartext upstream"
@@ -3715,6 +3804,9 @@ ${colors.bold("Examples:")}
   portless get backend                # -> https://backend.localhost
   portless get backend --json         # Service info for scripts and agents
   portless url backend                # Alias for get
+  portless run --worktree-prefix qa next dev
+                                      # -> https://qa.<project>.localhost
+  portless --no-worktree              # Bare mode without the worktree prefix
   portless doctor                     # Run read-only diagnostics
   portless myapp API_URL=1 next dev   # Pass API_URL only to the child command
   portless myapp --h2c grpc-server    # Proxy to an h2c or gRPC upstream
@@ -3737,9 +3829,12 @@ ${colors.bold("Configuration (portless.json or .config/portless.json):")}
   Override script: { "name": "myapp", "script": "start" }
   Route path:      { "name": "myapp", "path": "/api" }
   Flat worktree:   { "worktreeFlat": true }
+  Whole branch:    { "worktreeBranch": "full" }  (team-a/login -> team-a-login)
   Monorepo split:  { "apps": { "apps/web": { "name": "myapp", "path": "/" },
                                 "apps/api": { "name": "myapp", "path": "/api" } } }
   Path precedence: --path, then PORTLESS_PATH, then config
+  Worktree prefix: --worktree-prefix or --no-worktree, then PORTLESS_WORKTREE_PREFIX,
+                   then git detection (worktreeBranch picks last segment or full branch)
 
 ${colors.bold("In package.json:")}
   {
@@ -3924,6 +4019,9 @@ ${colors.bold("Options:")}
   --multiplex                   Share this hostname with other apps (shows an app picker)
   --label <label>               Label for this multiplexed app (default: directory name)
   --path <prefix>               Scope this route to a path prefix, e.g. /api
+  --worktree-prefix <prefix>    Use this worktree prefix, in a linked worktree or not
+                                Works with run, get, bg start, and bare portless
+  --no-worktree                 Skip the worktree prefix (run, get, bg start, bare portless)
   --cloudflare                 Alias of --tunnel cloudflare
   --tunnel <provider>           Share publicly via a managed tunnel: cloudflare or ngrok
   --tunnel-hostname <hostname>  Request a provider-specific stable tunnel hostname
@@ -3970,6 +4068,8 @@ ${colors.bold("Environment variables:")}
   PORTLESS_SYNC_HOSTS=0         Disable auto-sync of ${HOSTS_DISPLAY} (on by default)
   PORTLESS_WORKTREE_FLAT=1      Join worktree and app names into one DNS label
                                 Set to 0 to override worktreeFlat in project config
+  PORTLESS_WORKTREE_PREFIX=<p>  Use <p> as the worktree prefix (same as --worktree-prefix)
+                                Set to an empty value to turn the prefix off for the shell
   PORTLESS_TAILSCALE=1          Share apps on your Tailscale network (same as --tailscale)
   PORTLESS_TAILSCALE_HTTP=1     Share on the tailnet over plain HTTP (same as --tailscale-http)
   PORTLESS_TAILSCALE_SERVICE=1  Share apps as Tailscale Services
@@ -4523,6 +4623,7 @@ ${colors.bold("Usage:")}
   ${colors.cyan("portless get <name>")}
   ${colors.cyan("portless url <name>")}
   ${colors.cyan("portless get <name> --json")}
+  ${colors.cyan("portless get <name> --worktree-prefix <prefix>")}
 
 Constructs the URL using the same hostname and worktree logic as
 "portless run", then prints it to stdout. Useful for wiring services
@@ -4532,7 +4633,11 @@ together:
 
 With --json, prints a JSON object suitable for scripts and agents.
 
+The worktree prefix is chosen by flag, then PORTLESS_WORKTREE_PREFIX (empty
+turns it off), then git detection, the same as "portless run".
+
 ${colors.bold("Options:")}
+  --worktree-prefix <p>  Use <p> as the worktree prefix, in a linked worktree or not
   --no-worktree          Skip worktree prefix detection
   --path <prefix>        Append a route path prefix, e.g. /api
   --json                 Output a JSON object to stdout
@@ -4543,6 +4648,8 @@ ${colors.bold("Examples:")}
   portless url backend                  # -> https://backend.localhost
   portless get backend                  # in worktree -> https://auth.backend.localhost
   portless get backend --no-worktree    # -> https://backend.localhost (skip worktree)
+  portless get backend --worktree-prefix qa
+                                        # -> https://qa.backend.localhost
   portless get backend --path /api      # -> https://backend.localhost/api
   portless get backend --json           # -> {"name":"backend",...}
 
@@ -4558,14 +4665,15 @@ ${colors.bold("JSON fields:")}
     process.exit(0);
   }
 
-  let skipWorktree = false;
+  const worktreeFlags: WorktreeFlagState = { ...globalWorktreeFlags };
   let asJson = false;
   let pathPrefix = pathPrefixFromEnv();
   const positional: string[] = [];
 
   for (let i = 1; i < args.length; i++) {
-    if (args[i] === "--no-worktree") {
-      skipWorktree = true;
+    const consumedWorktree = consumeWorktreeFlag(args, i, worktreeFlags);
+    if (consumedWorktree !== null) {
+      i = consumedWorktree;
     } else if (args[i] === "--json") {
       asJson = true;
     } else if (args[i] === "--path") {
@@ -4573,7 +4681,9 @@ ${colors.bold("JSON fields:")}
       pathPrefix = parsePathPrefix(args[i], "--path");
     } else if (args[i].startsWith("-")) {
       console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
-      console.error(colors.blue("Known flags: --no-worktree, --path, --json, --help"));
+      console.error(
+        colors.blue("Known flags: --worktree-prefix, --no-worktree, --path, --json, --help")
+      );
       process.exit(1);
     } else {
       positional.push(args[i]);
@@ -4591,10 +4701,24 @@ ${colors.bold("JSON fields:")}
 
   const name = positional[0];
   const normalizedPathPrefix = normalizePathPrefix(pathPrefix);
-  const serviceUrl = await getUrl(name, {
-    worktree: !skipWorktree,
-    pathPrefix: normalizedPathPrefix,
-  });
+  if (worktreeFlags.disabled && worktreeFlags.prefix !== undefined) {
+    console.error(colors.red("Error: --no-worktree cannot be combined with --worktree-prefix."));
+    process.exit(1);
+  }
+  let serviceUrl: Awaited<ReturnType<typeof getUrl>>;
+  try {
+    serviceUrl = await getUrl(name, {
+      worktree: !worktreeFlags.disabled,
+      worktreePrefix: worktreeFlags.prefix,
+      pathPrefix: normalizedPathPrefix,
+    });
+  } catch (err) {
+    if (err instanceof WorktreePrefixError || err instanceof ConfigValidationError) {
+      console.error(colors.red(`Error: ${err.message}`));
+      process.exit(1);
+    }
+    throw err;
+  }
   if (asJson) {
     process.stdout.write(
       JSON.stringify(
@@ -5722,6 +5846,7 @@ function loadAppConfig(cwd: string = process.cwd()): LoadedAppConfig | null {
       config,
       sourceLabel: configSourceLabel(loaded.sourcePath, cwd),
       worktreeFlat: config.worktreeFlat ?? loaded.config.worktreeFlat,
+      worktreeBranch: config.worktreeBranch ?? loaded.config.worktreeBranch,
     };
   } catch (err) {
     if (err instanceof ConfigValidationError) {
@@ -5810,7 +5935,7 @@ async function handleDefaultSingle(
     nameSource = inferred.source;
   }
 
-  const worktree = detectWorktreePrefix(cwd);
+  const worktree = resolveWorktree(cwd, globalWorktreeFlags, appConfig?.worktreeBranch);
   const effectiveName = applyWorktreePrefix(
     baseName,
     worktree,
@@ -6149,7 +6274,16 @@ async function handleDefaultMulti(
     }
   }
 
-  const worktree = detectWorktreePrefix(wsRoot);
+  // Detection runs once per branch derivation mode; a package or app entry may
+  // override the top-level worktreeBranch.
+  const worktreeByMode = new Map<WorktreeBranchMode | undefined, WorktreePrefix | null>();
+  const worktreeFor = (mode: WorktreeBranchMode | undefined): WorktreePrefix | null => {
+    if (!worktreeByMode.has(mode)) {
+      worktreeByMode.set(mode, resolveWorktree(wsRoot, globalWorktreeFlags, mode));
+    }
+    return worktreeByMode.get(mode) ?? null;
+  };
+  worktreeFor(loaded?.config.worktreeBranch);
   const worktreeFlat = resolveWorktreeFlat(loaded?.config.worktreeFlat);
   const apps: MultiAppEntry[] = [];
 
@@ -6173,6 +6307,7 @@ async function handleDefaultMulti(
       ...Object.fromEntries(Object.entries(pkgConfig ?? {}).filter(([, v]) => v !== undefined)),
     };
 
+    const worktree = worktreeFor(appOverride.worktreeBranch ?? loaded?.config.worktreeBranch);
     const effectiveScript = appOverride.script ?? scriptName;
     const scriptValue = pkg.scripts[effectiveScript];
     if (!scriptValue) continue;
@@ -6570,7 +6705,11 @@ async function handleRunMode(args: string[], globalScript?: string): Promise<voi
   }
   parsed.pathPrefix ??= appConfig?.config.path;
 
-  const worktree = detectWorktreePrefix();
+  const worktree = resolveWorktree(
+    process.cwd(),
+    parsed.worktreeFlags ?? globalWorktreeFlags,
+    appConfig?.worktreeBranch
+  );
   const effectiveName = applyWorktreePrefix(
     baseName,
     worktree,
@@ -6827,6 +6966,31 @@ async function main() {
     process.exit(1);
   }
   const globalScript = typeof scriptResult === "string" ? scriptResult : undefined;
+
+  // Leading --worktree-prefix / --no-worktree apply to whatever follows
+  // (bare mode, run, get): `portless --no-worktree`.
+  {
+    const leading: WorktreeFlagState = {};
+    let consumed = 0;
+    for (;;) {
+      const next = consumeWorktreeFlag(args, consumed, leading);
+      if (next === null) break;
+      consumed = next + 1;
+    }
+    if (consumed > 0) {
+      const rest = args[consumed];
+      const accepts =
+        rest === undefined || rest === "--" || rest === "run" || rest === "get" || rest === "url";
+      if (!accepts) {
+        console.error(
+          colors.red("Error: --worktree-prefix and --no-worktree apply to run, get, and bare mode.")
+        );
+        process.exit(1);
+      }
+      args.splice(0, consumed);
+      globalWorktreeFlags = leading;
+    }
+  }
 
   // --name flag: treat the next arg as an explicit app name, bypassing
   // subcommand dispatch. Useful when the app name collides with a reserved

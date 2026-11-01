@@ -174,6 +174,30 @@ describe("buildArgv", () => {
     ).toEqual(["bg", "start", "--cloudflare", "--", "node", "server.js"]);
   });
 
+  it("maps the worktree prefix options for get and bg_start", () => {
+    expect(buildArgv("get", { name: "web", worktreePrefix: "qa" })).toEqual([
+      "get",
+      "web",
+      "--worktree-prefix",
+      "qa",
+    ]);
+    expect(buildArgv("get", { name: "web", noWorktree: true })).toEqual([
+      "get",
+      "web",
+      "--no-worktree",
+    ]);
+    expect(buildArgv("bg_start", { worktreePrefix: "qa", command: ["npm", "run", "dev"] })).toEqual(
+      ["bg", "start", "--worktree-prefix", "qa", "--", "npm", "run", "dev"]
+    );
+    expect(buildArgv("bg_start", { noWorktree: true })).toEqual(["bg", "start", "--no-worktree"]);
+  });
+
+  it("rejects a flag-shaped worktree prefix", () => {
+    expect(() => buildArgv("get", { name: "web", worktreePrefix: "--force" })).toThrow(
+      expect.objectContaining({ code: -32602 })
+    );
+  });
+
   it("rejects a flag-shaped bg name or path so it cannot become a CLI flag", () => {
     for (const tool of ["bg_status", "bg_stop", "bg_logs", "bg_restart"]) {
       expect(() => buildArgv(tool, { name: "--all" })).toThrow(
@@ -265,7 +289,9 @@ describe("tools/call validation", () => {
     });
     expect(res.result.isError).toBe(true);
     expect(res.result.content[0].text).toContain("alpha, zeta");
-    expect(res.result.content[0].text).toContain("Tool arguments: name, noWorktree, path, json");
+    expect(res.result.content[0].text).toContain(
+      "Tool arguments: name, worktreePrefix, noWorktree, path, json"
+    );
     expect(res.result.content[0].text).not.toMatch(/Unknown argument\(s\)[^.]*cwd/);
 
     const none = await call(["core", "diagnostics"], "tools/call", {

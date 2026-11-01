@@ -149,6 +149,17 @@ const PATH_PROPERTY = {
   type: "string",
   description: "Route path prefix, for example /api. Starts with a slash.",
 };
+const WORKTREE_PROPERTIES = {
+  worktreePrefix: {
+    type: "string",
+    description:
+      "Use this worktree prefix instead of the detected branch name. Applies in a linked worktree or not. Cannot be combined with noWorktree.",
+  },
+  noWorktree: {
+    type: "boolean",
+    description: "Skip the worktree prefix.",
+  },
+};
 const BG_NAME_PROPERTY = {
   type: "string",
   description:
@@ -207,10 +218,7 @@ export const TOOLS: ToolDef[] = [
     "Print the URL for an app name, using the same hostname and worktree logic as portless run. The app does not need to be running.",
     {
       name: NAME_PROPERTY,
-      noWorktree: {
-        type: "boolean",
-        description: "Skip worktree prefix detection.",
-      },
+      ...WORKTREE_PROPERTIES,
       path: PATH_PROPERTY,
       json: JSON_PROPERTY,
     },
@@ -423,6 +431,7 @@ export const TOOLS: ToolDef[] = [
       path: PATH_PROPERTY,
       appPort: { ...PORT_PROPERTY, description: "Fixed app port." },
       h2c: { type: "boolean", description: "Forward to an HTTP/2 cleartext upstream." },
+      ...WORKTREE_PROPERTIES,
       force: {
         type: "boolean",
         description: "Take over an existing route owned by portless.",
@@ -654,6 +663,13 @@ function validateShared(args: Record<string, unknown>): string[] {
   return extraArgs;
 }
 
+/** Push --worktree-prefix and --no-worktree; the CLI rejects the combination. */
+function pushWorktree(argv: string[], args: Record<string, unknown>): void {
+  const prefix = readOptionalWord(args, "worktreePrefix");
+  if (prefix !== undefined) argv.push("--worktree-prefix", prefix);
+  if (readBoolean(args, "noWorktree") === true) argv.push("--no-worktree");
+}
+
 /** The optional app name and path scope shared by the bg tools that target one app. */
 function pushBgTarget(argv: string[], args: Record<string, unknown>): void {
   const name = readOptionalWord(args, "name");
@@ -682,7 +698,7 @@ export function buildArgv(toolName: string, args: Record<string, unknown>): stri
     case "get": {
       const name = readRequiredName(args, "name");
       argv.push("get", name);
-      if (readBoolean(args, "noWorktree") === true) argv.push("--no-worktree");
+      pushWorktree(argv, args);
       const path = readOptionalWord(args, "path");
       if (path !== undefined) argv.push("--path", path);
       if (readBoolean(args, "json") === true) argv.push("--json");
@@ -773,6 +789,7 @@ export function buildArgv(toolName: string, args: Record<string, unknown>): stri
       const appPort = readPort(args, "appPort", false);
       if (appPort !== undefined) argv.push("--app-port", String(appPort));
       if (readBoolean(args, "h2c") === true) argv.push("--h2c");
+      pushWorktree(argv, args);
       if (readBoolean(args, "force") === true) argv.push("--force");
       pushBgWait(argv, args);
       if (readBoolean(args, "json") === true) argv.push("--json");
