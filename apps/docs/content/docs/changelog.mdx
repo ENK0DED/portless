@@ -2,6 +2,48 @@
 title: "Changelog"
 ---
 
+## 0.15.14000
+
+### Fork Sync
+
+- **Upstream sync**: Merges upstream `0.15.6` through `0.15.13`. The code base is upstream `5758ac5`, and upstream's `0.15.13` release-prep commit `96a3bbb` is merged on top so the base is the released tag. The merge, the earlier advisor batch and every port of an arriving commit ship here, and the 15 backports that follow ship as `0.15.14001`.
+- **Fork release mapping**: Tracks upstream `0.15.13` as `0.15.14000` for `@enk0ded/portless` and reserves `0.15.14001` for the backport batch.
+
+### New Features
+
+- **Unprivileged proxy mode**: `--unprivileged` and `PORTLESS_UNPRIVILEGED=1` bind the proxy to all interfaces without sudo, with a loopback-only peer guard on every proxy and redirect listener, including HTTP/2 Extended CONNECT streams. The mode is remembered across restarts and service installs, defaults to HTTP unless HTTPS is explicit, and skips CA trust. Automatic hosts sync stays off there; start prints `sudo portless hosts sync` guidance for suffixes that need hosts entries. `--lan` takes precedence and permits remote peers.
+- **Probe-first elevation**: The proxy now probes its real bind targets and asks for sudo only when a listener needs root or the hosts file needs entries. If elevation fails, start stops with an error. The automatic fallback to port 1355 is gone.
+- **Hosts-sync endpoint**: The proxy serves an authenticated hosts-sync endpoint (a per-start token file, a proxy challenge, origin and loopback checks) so route registration can ask a running proxy to sync the hosts file. It is disabled when hosts sync is off.
+- **Direct-to-app tunnels**: Managed Cloudflare and ngrok tunnels now connect straight to the app's loopback port with the Host header rewritten to the route hostname, so public traffic no longer passes through the portless proxy. A path-prefixed route exposes the whole app and prints a notice. Exact manual `tunnel map` aliases still go through the proxy and now honor multiplex selection cookies. Adds `--cloudflare` and `PORTLESS_CLOUDFLARE=1` as an alias of `--tunnel cloudflare`, with `PORTLESS_CLOUDFLARE_URL` beside `PORTLESS_TUNNEL_URL`, background-intent support and shell completions.
+- **`portless mcp`**: Adds the MCP server mapped onto this fork's CLI, with `suffix` support, `proxy_start` with `unprivileged`, read-only `bg` tools in the default profile, and `bg` start, stop and restart behind an opt-in. Sharing flags and `tunnel` are stated omissions.
+- **JSON proxy errors and 421**: Portless-generated 404, 502 and 508 responses are HTML or JSON (`{error, upstream, message}`) depending on the client's `Accept` header, with `Vary: Accept`. Hostnames outside the configured suffix list now get 421 without an app list, and unmatched paths on the proxy's own tunnel or Tailscale hostnames get a 404 that lists no apps.
+- **Route uptime**: The dashboard and the 404 page show how long each app has been up, and the 404 page gains a hostname filter with a newest-first toggle. `portless list` prints uptime and `list --json` reports `registered_at`.
+- **Documentation site**: The docs moved to the Geistdocs theme with WebMCP, `llms.txt` and agent-readable Markdown pages. The theme's Vercel branding is replaced with a local navbar and footer carrying the fork wordmark, and the changelog page is now `apps/docs/content/docs/changelog.mdx`.
+
+### Bug Fixes
+
+- **Orphaned command processes**: Routes now record a verified process group. `portless run` and `portless prune` stop verified orphans from crashed sessions, and the daemon sweep never kills anything: orphans stay listed as "Orphaned" in `portless list`, `list --json` (`kind: "orphan"`) and the dashboard until pruned, and their sharing is still cleaned up.
+- **`bg stop` timing**: `bg stop` now waits 12 seconds with SIGTERM before giving up, and `--force` also kills the verified child process group. Windows tunnel and multi-app spawners use the same orphan guard.
+- **Hosts file safety**: A hosts file that is missing is created with only the portless block, one that cannot be read is never rewritten, and stale managed blocks are cleared when no routes remain.
+- **Routes owned by other users**: A route whose process the current user lacks permission to signal is treated as alive, so the stale-route sweep no longer tears down other users' sharing.
+- **Proxy fixes**: The most specific registered parent wins for wildcard fallback regardless of registration order, request bodies are drained after backend errors on every path, hop-by-hop request headers are stripped, and every port flag and variable rejects malformed values.
+- **Framework injection**: Injected flags pass through `npm exec` and `npm x` after `--`, VitePress `dev`, `serve` and `preview` are covered, Astro subcommands are found after global options, and the node directory sits after the user's `PATH`.
+- **Certificates and trust**: Cached certificates with invalid sibling wildcard names regenerate, and the WSL CA re-trust path is tested. The dead `isWSL` helper in `wsl-utils.ts` is removed.
+- **Advisor batch**: The `bg` registry is written atomically and fails closed, `bg restart` keeps restart flags out of the child command, failed force stops are reported, tunnel aliases are cached between proxy reloads, and abandoned WebSocket handshakes are torn down. CI actions are pinned to immutable SHAs, the publish workflow is hardened, and CI now requires exactly one changelog marker pair.
+
+### Breaking Changes
+
+- **NetBird credentials in `bg` JSON**: `bg status --json` and `bg list --json` no longer print the stored NetBird password and PIN. They report `netbirdPasswordSet` and `netbirdPinSet` booleans in their place, and `bg restart` hands the stored credentials to the restarted run through `PORTLESS_NETBIRD_PASSWORD` and `PORTLESS_NETBIRD_PIN` instead of argv. Scripts that read the old credential fields from this JSON must switch to the new ones. The rename is not covered in the README, skill or help text.
+- **Port 1355 fallback removed**: Starting the proxy without the privilege for its port no longer falls back to port 1355. Use `--unprivileged` or a port above 1023 explicitly.
+
+### Maintenance
+
+- **Bun 1.4.4 baseline**: The repository, CI and release workflow now pin Bun 1.4.4, because the merged lockfile fails a frozen install under older releases. `bun.lock` and `minimumReleaseAge` are kept.
+
+### Contributors
+
+- @enk0ded
+
 ## 0.15.12
 
 ### New Features

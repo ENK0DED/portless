@@ -279,7 +279,7 @@ Examples:
 
 This avoids prerelease semantics and keeps room for local-only releases between upstream syncs.
 
-The current fork release `0.15.6004` tracks upstream `0.15.5` plus the `0.15.6002` backport batch, the `0.15.6003` fix to the RFC 8441 WebSocket bridge, and a fix that frames HTTP/2 request bodies sent without `content-length` (upstream #478): such bodies now reach the HTTP/1.1 backend as `transfer-encoding: chunked`, so they can no longer run as a second request on a pooled keep-alive socket, and the stale-socket retry never replays an HTTP/2 request that carried DATA. If the fork ships another local-only change before the sync to upstream `0.15.12`, use `0.15.6005`. The first synced fork release after upstream `0.15.12` is `0.15.13000`.
+The current fork release `0.15.14000` is the first synced release after upstream `0.15.13`. It tracks upstream `0.15.13`: the code base is `5758ac5`, and upstream's release-prep commit `96a3bbb` (version and changelog only) is merged on top so the recorded base is the released tag. It carries the resolutions-only merge, the advisor batch and the ports of every arriving commit: `--unprivileged` and probe-first elevation without a port 1355 fallback, the authenticated hosts-sync endpoint, direct-to-app managed tunnels with `--cloudflare`, JSON proxy errors with 421, `portless mcp`, orphan handling and the 12 second `bg stop` wait, route uptime, the Bun 1.4.4 baseline and the migrated docs site. The backport batch for the PRs triaged this round ships as `0.15.14001`. If the fork ships a further local-only change before that batch, use the next iteration of the range in use at the time. The first synced fork release after upstream `0.15.14` is `0.15.15000`.
 
 ### Package Manager
 
@@ -441,7 +441,7 @@ If a future upstream PR pass needs temporary `planned` or `deferred` states, kee
 
 ### 2026-11-01 Current Result
 
-Rechecked against upstream on 2026-11-01: GitHub reported 53 open PRs at the recorded base `5758ac5`. The open-PR table below holds 33 of them with a final fork state: 13 implemented, 13 implemented differently, and 7 won't implement. The 15 backport PRs and the five PRs opened after 2026-10-30 are listed in that table's introduction and are not stated yet.
+Rechecked against upstream on 2026-11-01: GitHub reported 53 open PRs at the recorded base `96a3bbb` (upstream v0.15.13; code identical to `5758ac5`). The open-PR table below holds 33 of them with a final fork state: 13 implemented, 13 implemented differently, and 7 won't implement. The 15 backport PRs and the five PRs opened after 2026-10-30 are listed in that table's introduction and are not stated yet.
 
 The ten PRs that closed between the 2026-06-18 and 2026-08-14 passes were all closed unmerged: #321, #303, #302, #301, #300, #292, #286, #278, #277, and #67. Since then 27 tracked PRs left the open list and are dispositioned in the Closed Upstream PRs table below the open-PR table: only #374 merged, 26 closed unmerged. Seven rows were rewritten because arriving code changed their basis: #247, #261, #329, #341 and #374 by upstream commits that arrived with the merge, #276 by upstream's VitePress commit, and #104 by the direct-to-app tunnel port. Three changed state: #247 and #329 moved to `implemented differently` and #341 moved from `won't implement` to `implemented`. Their rationale lives in the Closed Upstream PRs table.
 
@@ -533,11 +533,11 @@ Retained coverage anchors:
 
 Retained security finding notes:
 
-- Unbounded on-demand certificate minting (advisor finding, narrowed rather than closed). Upstream #497 (adopted in the 0.15.13000 sync) makes the SNI callback refuse names that contain characters outside `a-z0-9.-` or that do not end in `.<configured suffix>`, before it touches the cache or runs openssl, which closes the SAN-injection vector and bounds minting to the configured suffix list. It does not bound the `cache` and `pending` maps, and it does not require a registered route, so any `*.<suffix>` name still mints and caches a host certificate. The finding stays open for cache bounds and a registered-route gate.
+- Unbounded on-demand certificate minting (advisor finding, narrowed rather than closed). Upstream #497 (adopted in the 0.15.14000 sync) makes the SNI callback refuse names that contain characters outside `a-z0-9.-` or that do not end in `.<configured suffix>`, before it touches the cache or runs openssl, which closes the SAN-injection vector and bounds minting to the configured suffix list. It does not bound the `cache` and `pending` maps, and it does not require a registered route, so any `*.<suffix>` name still mints and caches a host certificate. The finding stays open for cache bounds and a registered-route gate.
 
 ### Full Open Upstream PR State on 2026-11-01
 
-Rechecked against upstream on 2026-11-01 at the recorded base `5758ac5`: GitHub reported 53 open PRs. 33 of them are listed below with a final fork state (13 implemented, 13 implemented differently, 7 won't implement). The other 20 are not listed: 15 backport PRs (#398, #401, #407, #412, #425, #432, #444, #454, #460, #477, #510, #515, #516, #520, #527) get their rows when the backport code lands, and five opened after 2026-10-30 (#532, #536, #537, #538, #539) are not triaged yet. `bun run check:upstream-drift` reports exactly those 20.
+Rechecked against upstream on 2026-11-01 at the recorded base `96a3bbb` (upstream v0.15.13; code identical to `5758ac5`): GitHub reported 53 open PRs. 33 of them are listed below with a final fork state (13 implemented, 13 implemented differently, 7 won't implement). The other 20 are not listed: 15 backport PRs (#398, #401, #407, #412, #425, #432, #444, #454, #460, #477, #510, #515, #516, #520, #527) get their rows when the backport code lands, and five opened after 2026-10-30 (#532, #536, #537, #538, #539) are not triaged yet. `bun run check:upstream-drift` reports exactly those 20.
 
 Stamp convention: the triage date below records the verification pass. Rows dated 2026-08-14 keep the decision from that pass because the 2026-10 reconciliation found them unchanged and their upstream heads did not move; rows dated 2026-11-01 were first triaged or had their head stamp refreshed in the 2026-10 sync. `bun run check:upstream-drift` compares each recorded upstream head SHA with the live PR head.
 
