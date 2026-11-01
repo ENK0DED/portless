@@ -52,6 +52,8 @@ For other tools, use exact command placeholders. Portless replaces whole argumen
 portless run my-server --port {PORT} --host {HOST} --url {PORTLESS_URL}
 ```
 
+If a wrapped command self-daemonizes (its launcher exits, often with code 0, while a server it started keeps listening on the assigned port), portless keeps the route pointed at that server and prints its PID instead of removing the route. `astro dev` does this when it detects an agent. A clean exit waits up to 2 seconds for a server that binds late. The route belongs to that server from then on and goes away when it stops, so the dev server is not stopped for you: stop it with `kill <pid>`. A listener that already held the port before the command ran is never adopted, a command stopped by a signal (Ctrl+C) removes its route as usual, and `portless bg start` runs keep their bg-managed route. Sharing (Tailscale, ngrok, NetBird, tunnels) ends with the command, so a kept route is local only.
+
 When auto-starting, portless reuses the configuration (port, TLS, suffix) from the most recent proxy run, so a restart or reboot does not silently revert to defaults. Explicit env vars (`PORTLESS_PORT`, `PORTLESS_HTTPS`, etc.) always take priority.
 
 Portless stores per-user state in `~/.portless`. When the proxy runs under sudo, it resolves this path from the invoking user's home so the proxy and unprivileged app processes share the same route registrations.
