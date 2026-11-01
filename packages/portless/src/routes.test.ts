@@ -592,6 +592,116 @@ describe("RouteStore", () => {
     });
   });
 
+  describe("transferRoute", () => {
+    const DEAD_PID = 99_999_991;
+
+    it("moves a route to another pid while the caller owns it", () => {
+      store.addRoute("myapp.localhost", 4001, process.pid);
+      expect(store.transferRoute("myapp.localhost", process.pid, process.ppid)).toEqual({
+        hadSharing: false,
+      });
+      const routes = store.loadRoutes();
+      expect(routes).toHaveLength(1);
+      expect(routes[0].pid).toBe(process.ppid);
+      expect(routes[0].port).toBe(4001);
+    });
+
+    it("does not move a route owned by another pid", () => {
+      store.addRoute("myapp.localhost", 4001, process.ppid);
+      expect(store.transferRoute("myapp.localhost", process.pid, 1)).toBeNull();
+      expect(store.loadRoutes()[0].pid).toBe(process.ppid);
+    });
+
+    it("clears every sharing field, because those helpers stop with the command", () => {
+      store.addRoute("myapp.localhost", 4001, process.pid);
+      store.updateRoute("myapp.localhost", {
+        ngrokUrl: "https://abc.ngrok.app",
+        ngrokPid: 123,
+        tailscaleUrl: "https://dev.tail1234.ts.net",
+        tailscaleHttpsPort: 8443,
+        tailscaleFunnel: true,
+        tailscaleHttp: true,
+        tailscaleServiceName: "svc",
+        tailscaleServiceUrl: "https://svc.tail1234.ts.net",
+        tailscaleServicePending: true,
+        tunnelProvider: "cloudflare",
+        tunnelUrl: "https://abc.trycloudflare.com",
+        tunnelExternalHostname: "abc.trycloudflare.com",
+        tunnelPid: 124,
+        netbirdUrl: "https://abc.netbird.io",
+        netbirdPid: 125,
+        cloudflareUrl: "https://abc.trycloudflare.com",
+        cloudflarePid: 126,
+      });
+      expect(store.transferRoute("myapp.localhost", process.pid, process.ppid)).toEqual({
+        hadSharing: true,
+      });
+      const route = store.loadRoutes()[0];
+      expect(Object.keys(route).sort()).toEqual(["hostname", "pid", "port", "registeredAt"].sort());
+    });
+
+    it("drops the process group record so the live daemon is never an orphan", () => {
+      store.addRoute("myapp.localhost", 4001, process.pid);
+      const startTime = getProcessStartTime(process.pid) ?? "recorded";
+      store.updateRoute("myapp.localhost", { childPgid: process.pid, childStartTime: startTime });
+      store.transferRoute("myapp.localhost", process.pid, process.ppid);
+      const route = store.loadRoutes()[0];
+      expect(route.childPgid).toBeUndefined();
+      expect(route.childStartTime).toBeUndefined();
+      expect(store.isOrphaned(route)).toBe(false);
+      expect(store.loadOrphanedRoutes()).toEqual([]);
+    });
+
+    it("leaves no orphan record when the new owner later dies", () => {
+      store.addRoute("myapp.localhost", 4001, process.pid);
+      store.updateRoute("myapp.localhost", {
+        childPgid: process.pid,
+        childStartTime: getProcessStartTime(process.pid) ?? "recorded",
+      });
+      store.transferRoute("myapp.localhost", process.pid, DEAD_PID);
+      const [route] = store.loadRoutesRaw();
+      expect(route.pid).toBe(DEAD_PID);
+      expect(store.isOrphaned(route)).toBe(false);
+      expect(store.pruneStaleRoutes({ keepOrphaned: true }).map((r) => r.hostname)).toEqual([
+        "myapp.localhost",
+      ]);
+      expect(store.loadRoutesRaw()).toEqual([]);
+    });
+
+    it("targets the route under its path prefix only", () => {
+      store.addRoute("myapp.localhost", 4001, process.pid, false, { pathPrefix: "/api" });
+      store.addRoute("myapp.localhost", 4002, process.pid, false, { pathPrefix: "/web" });
+      expect(store.transferRoute("myapp.localhost", process.pid, process.ppid)).toBeNull();
+      expect(
+        store.transferRoute("myapp.localhost", process.pid, process.ppid, { pathPrefix: "/api" })
+      ).toEqual({ hadSharing: false });
+      const byPrefix = new Map(store.loadRoutes().map((r) => [r.pathPrefix, r]));
+      expect(byPrefix.get("/api")?.pid).toBe(process.ppid);
+      expect(byPrefix.get("/web")?.pid).toBe(process.pid);
+    });
+
+    it("moves only the labelled member of a multiplexed hostname", () => {
+      // One pid can hold one member, so the sibling belongs to another live process.
+      store.addRoute("myapp.localhost", 4001, process.ppid, false, { label: "web" });
+      store.addRoute("myapp.localhost", 4002, process.pid, false, { label: "api" });
+      expect(store.transferRoute("myapp.localhost", process.pid, 1, { label: "web" })).toBeNull();
+      expect(store.transferRoute("myapp.localhost", process.pid, 1, { label: "api" })).toEqual({
+        hadSharing: false,
+      });
+      const byLabel = new Map(store.loadRoutes().map((r) => [r.label, r]));
+      expect(byLabel.get("api")?.pid).toBe(1);
+      expect(byLabel.get("api")?.port).toBe(4002);
+      expect(byLabel.get("web")?.pid).toBe(process.ppid);
+    });
+
+    it("lets the exit cleanup leave a transferred route alone", () => {
+      store.addRoute("myapp.localhost", 4001, process.pid);
+      store.transferRoute("myapp.localhost", process.pid, process.ppid);
+      store.removeRoute("myapp.localhost", process.pid);
+      expect(store.loadRoutes().map((r) => r.pid)).toEqual([process.ppid]);
+    });
+  });
+
   describe("locking (via concurrent addRoute)", () => {
     it("treats common lock directory races as retryable", () => {
       for (const code of ["EEXIST", "EPERM", "EACCES"]) {

@@ -832,6 +832,58 @@ export class RouteStore {
   }
 
   /**
+   * Hand a route to the process a self-daemonizing command left behind, so the
+   * proxy keeps serving it and the owner check drops it when that process
+   * dies. The route is matched by hostname, path prefix and (for multiplexed
+   * hostnames) label, and moves only while `fromPid` still owns it, so a
+   * `--force` takeover is never overwritten.
+   *
+   * The previous owner's session ends with the command, so everything it
+   * owned goes with it: every public exposure field (tunnels, Tailscale,
+   * NetBird; their helper processes are stopped by the exit cleanup) and the
+   * recorded process group, whose leader (the exited launcher) can no longer
+   * be verified. The transferred route is therefore never an orphan while its
+   * new owner lives. Returns null when nothing moved, otherwise whether
+   * sharing was cleared.
+   */
+  transferRoute(
+    hostname: string,
+    fromPid: number,
+    toPid: number,
+    options: RouteKeyOptions = {}
+  ): { hadSharing: boolean } | null {
+    this.ensureDir();
+    if (!this.acquireLock()) {
+      throw new Error("Failed to acquire route lock");
+    }
+    this.lockDepth++;
+    try {
+      const pathPrefix = normalizePathPrefix(options.pathPrefix);
+      const label = normalizeLabel(options.label);
+      const loaded = this.loadRoutesForWrite(true, true);
+      const index = loaded.routes.findIndex(
+        (r) =>
+          routeMatchesKey(r, hostname, pathPrefix) &&
+          r.pid === fromPid &&
+          (label === undefined || r.label === label)
+      );
+      if (index === -1) return null;
+      const current = loaded.routes[index]!;
+      const hadSharing = hasSharing(current);
+      const moved = withoutSharing(current);
+      delete moved.childPgid;
+      delete moved.childStartTime;
+      moved.pid = toPid;
+      loaded.routes[index] = moved;
+      this.saveRoutes(loaded.routes, loaded.orphans);
+      return { hadSharing };
+    } finally {
+      this.lockDepth--;
+      this.releaseLock();
+    }
+  }
+
+  /**
    * Remove a route by hostname. When `ownerPid` is provided, the entry is
    * only removed while it is still owned by that pid. Exit cleanups must
    * pass their own pid: after a `--force` takeover the killed process would

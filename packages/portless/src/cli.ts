@@ -96,6 +96,7 @@ import {
   findFreePort,
   findPidOnPort,
   findPidsOnPort,
+  findSelfDaemonizedListener,
   getConfiguredTldEnv,
   getDefaultPort,
   caRegeneratedRestartHint,
@@ -744,6 +745,63 @@ function recordChildProcessGroup(
     } catch {
       // Without the group, prune falls back to the route port; non-fatal.
     }
+  }
+}
+
+/** PIDs already listening on a port before a command is spawned. */
+async function findPreexistingListeners(port: number): Promise<number[]> {
+  return (await isPortListening(port)) ? findPidsOnPort(port) : [];
+}
+
+/**
+ * Keep routes served when the command self-daemonized: its launcher exited
+ * (on its own, not by a signal) but a new listener is on the assigned port,
+ * as `astro dev` does when it detects an agent. The routes move to that
+ * listener's pid, so the proxy keeps serving them and the owner check drops
+ * them when it exits. A listener that held the port before the command ran is
+ * not the command's daemon, so its routes are left to the normal cleanup.
+ * Nothing is signaled: identity is only "whoever listens on the port portless
+ * assigned", never a kill target. Sharing the exit cleanup tears down is
+ * cleared from the route (see RouteStore.transferRoute). Issue #411.
+ */
+async function transferRoutesToDaemon(
+  store: RouteStore,
+  hostnames: readonly string[],
+  port: number,
+  processGroupId: number | undefined,
+  preexistingPids: readonly number[],
+  exitedCleanly: boolean,
+  options: Pick<RouteRegistrationOptions, "pathPrefix" | "label"> = {}
+): Promise<void> {
+  const listenerPid = await findSelfDaemonizedListener(
+    port,
+    processGroupId,
+    EXIT_TIMEOUT_MS,
+    exitedCleanly,
+    preexistingPids
+  );
+  if (listenerPid === null) return;
+  let transferred = false;
+  let hadSharing = false;
+  for (const hostname of hostnames) {
+    try {
+      const result = store.transferRoute(hostname, process.pid, listenerPid, options);
+      if (result) {
+        transferred = true;
+        hadSharing = hadSharing || result.hadSharing;
+      }
+    } catch {
+      // Lock acquisition may fail during cleanup; the exit cleanup removes the route.
+    }
+  }
+  if (!transferred) return;
+  console.warn(
+    colors.yellow(
+      `Command exited but PID ${listenerPid} is still serving port ${port}. Keeping ${hostnames[0]} routed to it. Stop it with: kill ${listenerPid}`
+    )
+  );
+  if (hadSharing) {
+    console.warn(colors.yellow("Sharing stops with this command; the route is local only."));
   }
 }
 
@@ -2471,12 +2529,28 @@ async function runApp(
     )
   );
 
+  // A background entry is supervised by `portless bg`, which cleans up the
+  // exact route its `portless run` registered, so it keeps that route.
+  const preexistingListeners = bgId && bgReadyPath ? [] : await findPreexistingListeners(port);
   spawnCommand(commandArgs, {
     onSpawn: (pid) =>
       recordChildProcessGroup(store, hostnames, pid, {
         pathPrefix: routePathPrefix,
         label: multiplexLabelFromEnv(),
       }),
+    onExit:
+      bgId && bgReadyPath
+        ? undefined
+        : (childPid, code) =>
+            transferRoutesToDaemon(
+              store,
+              hostnames,
+              port,
+              childPid,
+              preexistingListeners,
+              code === 0,
+              { pathPrefix: routePathPrefix, label: multiplexLabelFromEnv() }
+            ),
     env: {
       ...baseChildEnv,
       ...childEnv,
@@ -2868,6 +2942,13 @@ ${colors.bold("Command placeholders:")}
 
   Placeholders are replaced only when they are whole arguments.
   When a placeholder is used, automatic framework flag injection is skipped.
+
+${colors.bold("Self-daemonizing commands:")}
+  If the command exits (without a signal) while a new server keeps listening
+  on the assigned port, as astro dev does when it detects an agent, the route
+  stays and follows that server's PID until it stops. A clean exit waits up to
+  2 seconds for a late bind. Sharing ends with the command; stop the server
+  with kill <pid>.
 
 ${colors.bold("Examples:")}
   portless run                        # Run dev script through proxy
@@ -5860,11 +5941,14 @@ async function spawnProxiedApp(
   tls: boolean,
   tlds: string[],
   lanMode: boolean,
-  exitCodes: Map<string, number | null>
+  exitCodes: Map<string, number | null>,
+  lifecycle: { stopping: boolean }
 ): Promise<{
   child: ReturnType<typeof spawn>;
   displayUrl: string;
   route: { store: RouteStore; hostnames: string[]; pathPrefix: string } | null;
+  /** Resolves once the app exited and its route was kept or removed. */
+  settled: Promise<void>;
 }> {
   const usesPortless = app.commandArgs[0] === "portless";
 
@@ -5929,6 +6013,8 @@ async function spawnProxiedApp(
     injectFrameworkFlags(app.commandArgs, assignedAppPort);
   }
 
+  const preexistingListeners =
+    assignedAppPort === undefined ? [] : await findPreexistingListeners(assignedAppPort);
   const child = spawnChildProcess(app.commandArgs, env, app.pkg.dir);
   pipeOutput(child, chalk.cyan(`[${app.name}]`));
   if (store && hostnames && routePathPrefix && child.pid) {
@@ -5941,25 +6027,52 @@ async function spawnProxiedApp(
   const capturedStore = store;
   const capturedHostnames = hostnames;
   const capturedPathPrefix = routePathPrefix;
-  child.on("exit", (code, signal) => {
-    exitCodes.set(app.name, code);
-    if (code !== 0 && code !== null) {
-      console.error(colors.red(`[${app.name}] exited with code ${code}`));
-    } else if (signal) {
-      console.error(colors.yellow(`[${app.name}] killed by ${signal}`));
-    }
-    if (capturedStore && capturedHostnames) {
-      removeRoutes(capturedStore, capturedHostnames, process.pid, {
+  const settled = new Promise<void>((resolve) => {
+    child.on("exit", (code, signal) => {
+      exitCodes.set(app.name, code);
+      if (code !== 0 && code !== null) {
+        console.error(colors.red(`[${app.name}] exited with code ${code}`));
+      } else if (signal) {
+        console.error(colors.yellow(`[${app.name}] killed by ${signal}`));
+      }
+      if (!capturedStore || !capturedHostnames || assignedAppPort === undefined) {
+        resolve();
+        return;
+      }
+      const routeOptions = {
         pathPrefix: capturedPathPrefix ?? undefined,
-      });
-    }
+        label: multiplexLabelFromEnv(),
+      };
+      // A signal or a shutdown in progress means the app was stopped on
+      // purpose, so its route is removed rather than handed to a survivor.
+      const transfer =
+        signal || lifecycle.stopping
+          ? Promise.resolve()
+          : transferRoutesToDaemon(
+              capturedStore,
+              capturedHostnames,
+              assignedAppPort,
+              child.pid,
+              preexistingListeners,
+              code === 0,
+              routeOptions
+            );
+      transfer
+        .catch(() => {
+          // Best-effort; the routes are removed below when still ours.
+        })
+        .finally(() => {
+          removeRoutes(capturedStore, capturedHostnames, process.pid, routeOptions);
+          resolve();
+        });
+    });
   });
 
   const route =
     store && hostnames && routePathPrefix
       ? { store, hostnames, pathPrefix: routePathPrefix }
       : null;
-  return { child, displayUrl, route };
+  return { child, displayUrl, route, settled };
 }
 
 function spawnTaskApp(
@@ -6318,20 +6431,24 @@ async function runWithDirectSpawn(
   const exitCodes = new Map<string, number | null>();
   const appUrls: { label: string; url: string }[] = [];
   const routeEntries: { store: RouteStore; hostnames: string[]; pathPrefix: string }[] = [];
+  const routeSettlements: Promise<void>[] = [];
+  const lifecycle = { stopping: false };
 
   // Sequential: each spawnProxiedApp calls findFreePort() which binds/releases
   // a port, so parallel spawning could cause port collisions.
   for (const app of proxiedApps) {
-    const { child, displayUrl, route } = await spawnProxiedApp(
+    const { child, displayUrl, route, settled } = await spawnProxiedApp(
       app,
       stateDir,
       proxyPort,
       tls,
       tlds,
       lanMode,
-      exitCodes
+      exitCodes,
+      lifecycle
     );
     children.push(child);
+    routeSettlements.push(settled);
     if (route) routeEntries.push(route);
     appUrls.push({ label: app.label, url: displayUrl });
   }
@@ -6358,6 +6475,7 @@ async function runWithDirectSpawn(
   const cleanup = () => {
     if (cleanedUp) return;
     cleanedUp = true;
+    lifecycle.stopping = true;
 
     for (const child of children) {
       killTree(child, "SIGTERM");
@@ -6387,6 +6505,7 @@ async function runWithDirectSpawn(
         })
     )
   );
+  await Promise.all(routeSettlements);
 
   const failed = [...exitCodes.entries()].filter(([, code]) => code !== 0 && code !== null);
   if (failed.length > 0) {
