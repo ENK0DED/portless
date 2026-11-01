@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { WorktreeBranchMode } from "./config.js";
 
 // ---------------------------------------------------------------------------
 // Hostname sanitization
@@ -161,6 +162,31 @@ export interface WorktreePrefix {
 }
 
 const WORKTREE_FLAT_ENV = "PORTLESS_WORKTREE_FLAT";
+const WORKTREE_PREFIX_ENV = "PORTLESS_WORKTREE_PREFIX";
+
+/** Raised for an unusable or contradictory worktree prefix setting. */
+export class WorktreePrefixError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WorktreePrefixError";
+  }
+}
+
+export interface WorktreePrefixOptions {
+  /**
+   * Explicit prefix (`--worktree-prefix`, `getUrl({ worktreePrefix })`). It
+   * applies in a linked worktree, the main checkout, on a default branch, and
+   * outside git. An empty string is rejected; use `disabled` to turn the
+   * prefix off.
+   */
+  prefix?: string;
+  /** Turn the worktree prefix off (`--no-worktree`, `getUrl({ worktree: false })`). */
+  disabled?: boolean;
+  /** How a detected branch becomes a prefix. Defaults to "last-segment". */
+  branch?: WorktreeBranchMode;
+  /** Environment used for `PORTLESS_WORKTREE_PREFIX`. Defaults to `process.env`. */
+  env?: NodeJS.ProcessEnv;
+}
 const FLAT_WORKTREE_HASH_LENGTH = 6;
 
 /**
@@ -207,22 +233,40 @@ export function applyWorktreePrefix(
 const DEFAULT_BRANCHES = new Set(["main", "master"]);
 
 /**
- * Convert a branch name to a worktree prefix. Uses only the last segment
- * after the final `/` (e.g. `feature/auth` → `auth`). Returns null for
- * default branches, detached HEAD, or names that sanitize to empty.
+ * Convert a branch name to a worktree prefix. The default "last-segment"
+ * mode uses only the part after the final `/` (e.g. `feature/auth` becomes
+ * `auth`); "full" sanitizes the whole name (`team-a/login` becomes
+ * `team-a-login`). Returns null for default branches (compared on the whole
+ * name, so `feature/main` is not one), detached HEAD, or names that
+ * sanitize to empty.
  */
-function branchToPrefix(branch: string): string | null {
+function branchToPrefix(branch: string, mode: WorktreeBranchMode): WorktreePrefix | null {
   if (!branch || branch === "HEAD" || DEFAULT_BRANCHES.has(branch)) return null;
-  const lastSegment = branch.split("/").pop()!;
-  const prefix = sanitizeForHostname(lastSegment);
-  return prefix || null;
+  const label = mode === "full" ? branch : branch.split("/").pop()!;
+  const prefix = sanitizeForHostname(label);
+  if (!prefix) return null;
+  return { prefix, source: mode === "full" ? "git branch (full name)" : "git branch" };
+}
+
+function explicitWorktreePrefix(value: string, source: string): WorktreePrefix {
+  const prefix = sanitizeForHostname(value);
+  if (!prefix) {
+    throw new WorktreePrefixError(
+      `${source} value "${value}" has no usable hostname characters. Use letters, digits, or hyphens.`
+    );
+  }
+  return { prefix, source };
 }
 
 /**
- * Detect if the current directory is inside a multi-worktree git repo and
- * return the current branch name as a prefix for hostname composition.
+ * Resolve the worktree prefix for hostname composition. Precedence: the
+ * `disabled` / `prefix` options (flags), then `PORTLESS_WORKTREE_PREFIX`
+ * (empty turns the prefix off), then git detection. An explicit prefix skips
+ * detection entirely and applies outside linked worktrees too. Throws
+ * `WorktreePrefixError` for an empty or unusable explicit value and for
+ * `disabled` combined with `prefix`.
  *
- * Heuristic:
+ * Detection heuristic:
  *   1. `git worktree list` — if there are multiple worktrees, this repo
  *      uses worktrees and checkouts need distinguishing.
  *   2. `git rev-parse --abbrev-ref HEAD` — get the current branch name.
@@ -231,13 +275,38 @@ function branchToPrefix(branch: string): string | null {
  *
  * Falls back to parsing `.git` file + HEAD when git CLI is unavailable.
  */
-export function detectWorktreePrefix(cwd: string = process.cwd()): WorktreePrefix | null {
+export function detectWorktreePrefix(
+  cwd: string = process.cwd(),
+  options: WorktreePrefixOptions = {}
+): WorktreePrefix | null {
+  if (options.disabled && options.prefix !== undefined) {
+    throw new WorktreePrefixError("--no-worktree cannot be combined with --worktree-prefix.");
+  }
+  if (options.disabled) return null;
+
+  if (options.prefix !== undefined) {
+    if (!options.prefix.trim()) {
+      throw new WorktreePrefixError(
+        "--worktree-prefix requires a non-empty value. Use --no-worktree to turn the prefix off."
+      );
+    }
+    return explicitWorktreePrefix(options.prefix, "--worktree-prefix");
+  }
+
+  const envValue = (options.env ?? process.env)[WORKTREE_PREFIX_ENV];
+  if (envValue !== undefined) {
+    if (!envValue.trim()) return null;
+    return explicitWorktreePrefix(envValue, WORKTREE_PREFIX_ENV);
+  }
+
+  const mode = options.branch ?? "last-segment";
+
   // Primary: git CLI
-  const cliResult = detectWorktreeViaCli(cwd);
+  const cliResult = detectWorktreeViaCli(cwd, mode);
   if (cliResult !== undefined) return cliResult;
 
   // Fallback: parse .git file and HEAD when git binary is unavailable
-  return detectWorktreeViaFilesystem(cwd);
+  return detectWorktreeViaFilesystem(cwd, mode);
 }
 
 /**
@@ -246,7 +315,10 @@ export function detectWorktreePrefix(cwd: string = process.cwd()): WorktreePrefi
  *   - `null` if not in a linked worktree, or on main/master
  *   - `undefined` if git CLI is unavailable (caller should try fallback)
  */
-function detectWorktreeViaCli(cwd: string): WorktreePrefix | null | undefined {
+function detectWorktreeViaCli(
+  cwd: string,
+  mode: WorktreeBranchMode
+): WorktreePrefix | null | undefined {
   try {
     const listOutput = execFileSync("git", ["worktree", "list", "--porcelain"], {
       cwd,
@@ -300,10 +372,7 @@ function detectWorktreeViaCli(cwd: string): WorktreePrefix | null | undefined {
       windowsHide: true,
     }).trim();
 
-    const prefix = branchToPrefix(branch);
-    if (!prefix) return null;
-
-    return { prefix, source: "git branch" };
+    return branchToPrefix(branch, mode);
   } catch {
     return undefined;
   }
@@ -314,7 +383,10 @@ function detectWorktreeViaCli(cwd: string): WorktreePrefix | null | undefined {
  * `startDir` looking for a `.git` file (worktrees have a file, not a
  * directory) and reads the branch name from the gitdir's HEAD file.
  */
-function detectWorktreeViaFilesystem(startDir: string): WorktreePrefix | null {
+function detectWorktreeViaFilesystem(
+  startDir: string,
+  mode: WorktreeBranchMode
+): WorktreePrefix | null {
   let dir = startDir;
   for (;;) {
     const gitPath = path.join(dir, ".git");
@@ -336,10 +408,7 @@ function detectWorktreeViaFilesystem(startDir: string): WorktreePrefix | null {
 
         // Read the branch name from the worktree's HEAD file
         const branch = readBranchFromHead(path.resolve(dir, gitdir));
-        const prefix = branchToPrefix(branch ?? "");
-        if (!prefix) return null;
-
-        return { prefix, source: "git branch" };
+        return branchToPrefix(branch ?? "", mode);
       }
     } catch {
       // No .git here; keep walking

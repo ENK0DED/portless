@@ -356,6 +356,47 @@ describe("loadConfig validation", () => {
     expect(() => loadConfig(tmpDir)).toThrow(ConfigValidationError);
   });
 
+  it("accepts worktreeBranch last-segment and full at the top level and per app", () => {
+    fs.writeFileSync(
+      path.join(tmpDir, "portless.json"),
+      JSON.stringify({
+        worktreeBranch: "full",
+        apps: { "apps/web": { name: "web", worktreeBranch: "last-segment" } },
+      })
+    );
+    const result = loadConfig(tmpDir);
+    expect(result?.config.worktreeBranch).toBe("full");
+    expect(result?.config.apps?.["apps/web"].worktreeBranch).toBe("last-segment");
+  });
+
+  it("rejects an invalid worktreeBranch and lists the accepted values", () => {
+    fs.writeFileSync(path.join(tmpDir, "portless.json"), JSON.stringify({ worktreeBranch: "all" }));
+    expect(() => loadConfig(tmpDir)).toThrow(/"last-segment", "full"/);
+
+    fs.writeFileSync(
+      path.join(tmpDir, "portless.json"),
+      JSON.stringify({ apps: { "apps/web": { worktreeBranch: true } } })
+    );
+    expect(() => loadConfig(tmpDir)).toThrow(/apps\.apps\/web\.worktreeBranch/);
+  });
+
+  it("does not warn that worktreeBranch is an unknown key", () => {
+    const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    fs.writeFileSync(
+      path.join(tmpDir, "portless.json"),
+      JSON.stringify({ name: "test", worktreeBranch: "full" })
+    );
+    loadConfig(tmpDir);
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
+  it("carries worktreeBranch through resolveAppConfig for a single-app config", () => {
+    expect(
+      resolveAppConfig({ name: "web", worktreeBranch: "full" }, "/repo", "/repo").worktreeBranch
+    ).toBe("full");
+  });
+
   it("throws when turbo is not a boolean", () => {
     fs.writeFileSync(path.join(tmpDir, "portless.json"), JSON.stringify({ turbo: "yes" }));
     expect(() => loadConfig(tmpDir)).toThrow(ConfigValidationError);

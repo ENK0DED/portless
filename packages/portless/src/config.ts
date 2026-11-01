@@ -9,6 +9,11 @@ export class ConfigValidationError extends Error {
   }
 }
 
+/** How a linked worktree's branch name becomes its hostname prefix. */
+export type WorktreeBranchMode = "last-segment" | "full";
+
+export const WORKTREE_BRANCH_MODES: readonly WorktreeBranchMode[] = ["last-segment", "full"];
+
 export interface AppConfig {
   name?: string;
   script?: string;
@@ -16,6 +21,7 @@ export interface AppConfig {
   path?: string;
   proxy?: boolean;
   worktreeFlat?: boolean;
+  worktreeBranch?: WorktreeBranchMode;
 }
 
 export interface PortlessConfig extends AppConfig {
@@ -147,6 +153,7 @@ export function resolveAppConfig(
     path: config.path,
     proxy: config.proxy,
     ...(config.worktreeFlat !== undefined ? { worktreeFlat: config.worktreeFlat } : {}),
+    ...(config.worktreeBranch !== undefined ? { worktreeBranch: config.worktreeBranch } : {}),
   };
 }
 
@@ -340,10 +347,28 @@ const KNOWN_TOP_KEYS = new Set([
   "path",
   "proxy",
   "worktreeFlat",
+  "worktreeBranch",
   "apps",
   "turbo",
 ]);
-const KNOWN_APP_KEYS = new Set(["name", "script", "appPort", "path", "proxy", "worktreeFlat"]);
+const KNOWN_APP_KEYS = new Set([
+  "name",
+  "script",
+  "appPort",
+  "path",
+  "proxy",
+  "worktreeFlat",
+  "worktreeBranch",
+]);
+
+function validateWorktreeBranch(obj: Record<string, unknown>, key: string, configPath: string) {
+  if (obj.worktreeBranch === undefined) return;
+  if (!WORKTREE_BRANCH_MODES.includes(obj.worktreeBranch as WorktreeBranchMode)) {
+    throw new ConfigValidationError(
+      `"${key}" in ${configPath} must be one of: ${WORKTREE_BRANCH_MODES.map((m) => `"${m}"`).join(", ")}.`
+    );
+  }
+}
 
 function validatePathConfig(obj: Record<string, unknown>, key: string, configPath: string): void {
   if (obj.path === undefined) return;
@@ -402,6 +427,8 @@ function validateConfig(config: unknown, configPath: string): asserts config is 
       throw new ConfigValidationError(`"worktreeFlat" in ${configPath} must be a boolean.`);
     }
   }
+
+  validateWorktreeBranch(obj, "worktreeBranch", configPath);
 
   if (obj.turbo !== undefined) {
     if (typeof obj.turbo !== "boolean") {
@@ -465,6 +492,8 @@ function validateAppConfig(obj: Record<string, unknown>, prefix: string, configP
       );
     }
   }
+
+  validateWorktreeBranch(obj, `${prefix}.worktreeBranch`, configPath);
 
   warnUnknownKeys(obj, KNOWN_APP_KEYS, configPath, prefix);
 }
