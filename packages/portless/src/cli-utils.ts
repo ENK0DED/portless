@@ -1632,7 +1632,7 @@ function collectBinPaths(cwd: string): string[] {
 
 /**
  * Build a PATH string with `node_modules/.bin` directories prepended and the
- * running node's directory appended as a fallback.
+ * running node's directory appended as a fallback. Empty segments are dropped.
  */
 export function augmentedPath(env: NodeJS.ProcessEnv | undefined, cwd?: string): string {
   const source = env ?? process.env;
@@ -1640,12 +1640,12 @@ export function augmentedPath(env: NodeJS.ProcessEnv | undefined, cwd?: string):
   // process.env but case-sensitive in plain objects created via spread).
   const base = source.PATH ?? source.Path ?? "";
   const bins = collectBinPaths(cwd ?? process.cwd());
-  // Windows .cmd wrappers in node_modules/.bin need node.exe to be discoverable.
-  // On Unix, do not shadow the user's version-manager-selected Node binary.
-  if (isWindows) {
-    bins.push(path.dirname(process.execPath));
-  }
-  return bins.join(path.delimiter) + path.delimiter + base;
+  // node's own directory goes last, on every platform, as a fallback for
+  // Windows .cmd wrappers in node_modules/.bin ("node not recognized").
+  // Ahead of the caller's PATH it would shadow the node a version manager
+  // (asdf, nvm, fnm, mise, nvm-windows, volta) chose.
+  const nodeBin = path.dirname(process.execPath);
+  return [...bins, base, nodeBin].filter(Boolean).join(path.delimiter);
 }
 
 export function resolveWindowsExecutable(cmd: string, pathStr: string): string | null {
@@ -1991,8 +1991,9 @@ const FRAMEWORKS_NEEDING_PORT: Record<string, FrameworkSpec> = {
   vp: { strictPort: true, serverSubcommands: ["dev"], defaultIsServer: false },
   vitepress: {
     strictPort: true,
-    serverSubcommands: ["dev", "preview"],
-    defaultIsServer: false,
+    serverSubcommands: ["dev", "serve", "preview"],
+    nonServerSubcommands: ["build", "init"],
+    defaultIsServer: true,
   },
   "react-router": { strictPort: true, serverSubcommands: ["dev"], defaultIsServer: false },
   rsbuild: {
@@ -2020,7 +2021,22 @@ const FRAMEWORKS_NEEDING_PORT: Record<string, FrameworkSpec> = {
       "--root",
     ],
   },
-  astro: { strictPort: false, serverSubcommands: ["dev", "preview"], defaultIsServer: false },
+  astro: {
+    strictPort: false,
+    serverSubcommands: ["dev", "preview"],
+    defaultIsServer: false,
+    valueFlags: [
+      "--base",
+      "--config",
+      "--host",
+      "--mode",
+      "--open",
+      "--outDir",
+      "--port",
+      "--root",
+      "--site",
+    ],
+  },
   ng: {
     strictPort: false,
     serverSubcommands: ["serve", "dev", "s"],
@@ -2048,11 +2064,22 @@ const FRAMEWORKS_NEEDING_PORT: Record<string, FrameworkSpec> = {
 type PackageRunnerSpec = {
   subcommands: string[];
   valueFlags?: string[];
+  /**
+   * The runner reads options anywhere on the line unless they follow `--`, so
+   * injected flags must go after a separator or the runner swallows them.
+   */
+  separatorRequired?: boolean;
 };
 
 /** Known package runners. Values list subcommands that run a package. */
 const PACKAGE_RUNNERS: Record<string, PackageRunnerSpec> = {
-  npm: { subcommands: ["exec"], valueFlags: ["-p", "--package"] },
+  // In npm, `-p` is the boolean `--parseable`, not `--package`, so it is not a
+  // value flag here. `npm exec` needs a `--` before the flags portless injects.
+  npm: {
+    subcommands: ["exec", "x"],
+    valueFlags: ["-c", "--call", "--package", "-w", "--workspace", "--prefix"],
+    separatorRequired: true,
+  },
   npx: {
     subcommands: [],
     valueFlags: ["-c", "--call", "-p", "--package", "-w", "--workspace", "--allow-scripts"],
@@ -2069,8 +2096,11 @@ type FrameworkInvocation = {
   basename: string;
   framework: FrameworkSpec;
   frameworkIndex: number;
-  frameworkArgs: string[];
+  /** Null when npm parses the options after the framework and one may consume the next argument. */
+  frameworkArgs: string[] | null;
   insertionIndex: number;
+  /** Inserted before the injected flags when the runner would otherwise read them. */
+  separator?: string;
 };
 
 /**
@@ -2100,6 +2130,8 @@ function parseFrameworkInvocation(commandArgs: string[]): FrameworkInvocation | 
   }
 
   let frameworkIndex: number | null = FRAMEWORKS_NEEDING_PORT[first] ? 0 : null;
+  let runnerSeparator = false;
+  let needsSeparator = false;
 
   if (frameworkIndex === null) {
     const runner = PACKAGE_RUNNERS[first];
@@ -2110,7 +2142,10 @@ function parseFrameworkInvocation(commandArgs: string[]): FrameworkInvocation | 
       while (i < commandArgs.length && commandArgs[i]!.startsWith("-")) {
         const option = commandArgs[i]!;
         i++;
-        if (option === "--") break;
+        if (option === "--") {
+          runnerSeparator = true;
+          break;
+        }
         if (!option.includes("=") && runner.valueFlags?.includes(option)) i++;
       }
     };
@@ -2132,6 +2167,10 @@ function parseFrameworkInvocation(commandArgs: string[]): FrameworkInvocation | 
       const name = path.basename(commandArgs[i]!);
       frameworkIndex = FRAMEWORKS_NEEDING_PORT[name] ? i : null;
     }
+
+    if (frameworkIndex !== null) {
+      needsSeparator = Boolean(runner.separatorRequired) && !runnerSeparator;
+    }
   }
 
   if (frameworkIndex === null) return null;
@@ -2139,13 +2178,40 @@ function parseFrameworkInvocation(commandArgs: string[]): FrameworkInvocation | 
   const framework = FRAMEWORKS_NEEDING_PORT[basename];
   if (!framework) return null;
   const optionEnd = commandArgs.indexOf("--", frameworkIndex + 1);
-  const insertionIndex = optionEnd === -1 ? commandArgs.length : optionEnd;
+  const insertionIndex = needsSeparator || optionEnd === -1 ? commandArgs.length : optionEnd;
+  let frameworkArgs: string[] | null;
+  if (needsSeparator) {
+    // npm reads every option before its own `--`, so only what follows the
+    // separator reaches the framework. Which npm flags take a value depends on
+    // npm's config; when a flag without `=` is followed by a bare word, leave
+    // the command alone instead of guessing.
+    const beforeSeparator =
+      optionEnd === -1
+        ? commandArgs.slice(frameworkIndex + 1)
+        : commandArgs.slice(frameworkIndex + 1, optionEnd);
+    const npmMayConsumeValue = beforeSeparator.some(
+      (arg, index) =>
+        arg.startsWith("-") &&
+        !arg.includes("=") &&
+        index + 1 < beforeSeparator.length &&
+        !beforeSeparator[index + 1]!.startsWith("-")
+    );
+    frameworkArgs = npmMayConsumeValue
+      ? null
+      : [
+          ...beforeSeparator.filter((arg) => !arg.startsWith("-")),
+          ...(optionEnd === -1 ? [] : commandArgs.slice(optionEnd + 1)),
+        ];
+  } else {
+    frameworkArgs = commandArgs.slice(frameworkIndex + 1, insertionIndex);
+  }
   return {
     basename,
     framework,
     frameworkIndex,
-    frameworkArgs: commandArgs.slice(frameworkIndex + 1, insertionIndex),
+    frameworkArgs,
     insertionIndex,
+    ...(needsSeparator && optionEnd === -1 ? { separator: "--" } : {}),
   };
 }
 
@@ -2236,9 +2302,9 @@ export function replacePlaceholders(commandArgs: string[], vars: PlaceholderVars
 export function injectFrameworkFlags(commandArgs: string[], port: number): string[] {
   const invocation = parseFrameworkInvocation(commandArgs);
   if (!invocation) return [];
-  const { basename, framework, frameworkArgs, insertionIndex } = invocation;
+  const { basename, framework, frameworkArgs, insertionIndex, separator } = invocation;
 
-  if (!invokesFrameworkServer(frameworkArgs, framework)) return [];
+  if (!frameworkArgs || !invokesFrameworkServer(frameworkArgs, framework)) return [];
 
   const flags: string[] = [];
   if (!hasCliOption(frameworkArgs, "--port")) {
@@ -2258,8 +2324,9 @@ export function injectFrameworkFlags(commandArgs: string[], port: number): strin
     }
   }
 
-  commandArgs.splice(insertionIndex, 0, ...flags);
-  return flags;
+  const inserted = separator && flags.length > 0 ? [separator, ...flags] : flags;
+  commandArgs.splice(insertionIndex, 0, ...inserted);
+  return inserted;
 }
 
 /** Package managers whose `run` command delegates to package.json scripts. */
@@ -2336,7 +2403,11 @@ function isSafeToInjectIntoScript(
 ): boolean {
   const rawScriptText = resolveScriptRaw(scriptName, packageDir);
   if (rawScriptText && isUnsafeToAppendArgs(rawScriptText)) return false;
-  if (rawScript.includes("--")) return false;
+  // A `--` after the framework name ends its option list, so appended flags
+  // would arrive as positional data. A `--` before it (`npm exec -- vite dev`)
+  // belongs to the runner and is fine.
+  const invocation = parseFrameworkInvocation(rawScript);
+  if (invocation && rawScript.includes("--", invocation.frameworkIndex + 1)) return false;
   return true;
 }
 
