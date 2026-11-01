@@ -262,6 +262,28 @@ describe("findFreePort strategies", () => {
   }
   const release = (server: net.Server) =>
     new Promise<void>((resolve) => server.close(() => resolve()));
+  /**
+   * A base port whose next `count` ports are all free on every probed address.
+   * An OS-assigned port is not enough for tests that need its neighbours:
+   * Windows hands out ephemeral ports in sequence, so the ports right after a
+   * fresh one are often taken on a busy CI host. Search below the ephemeral
+   * range and check each candidate with the same probe findFreePort uses.
+   */
+  async function freeRange(count: number): Promise<number> {
+    for (let attempt = 0; attempt < 50; attempt++) {
+      const base = 20_000 + Math.floor(Math.random() * 20_000);
+      let free = true;
+      for (let port = base; port < base + count && free; port++) {
+        try {
+          free = (await findFreePort(port, port, { strategy: "sequential" })) === port;
+        } catch {
+          free = false;
+        }
+      }
+      if (free) return base;
+    }
+    throw new Error(`No run of ${count} free ports found`);
+  }
 
   it("sequential returns the bottom of the range when it is free", async () => {
     const base = await freeBase();
@@ -269,7 +291,7 @@ describe("findFreePort strategies", () => {
   });
 
   it("sequential moves to the next port when the bottom is held", async () => {
-    const base = await freeBase();
+    const base = await freeRange(2);
     const holder = await hold(base);
     try {
       expect(await findFreePort(base, base + 5, { strategy: "sequential" })).toBe(base + 1);
@@ -295,7 +317,7 @@ describe("findFreePort strategies", () => {
   });
 
   it("stable wraps around the range instead of failing at the top", async () => {
-    const base = await freeBase();
+    const base = await freeRange(2);
     const holder = await hold(base);
     try {
       // A two-port range with the bottom held: every key ends on the other port.
@@ -315,7 +337,7 @@ describe("findFreePort strategies", () => {
   });
 
   it("skips ports another route already owns before that app has bound them", async () => {
-    const base = await freeBase();
+    const base = await freeRange(3);
     const exclude = new Set([base, base + 1]);
     for (const strategy of ["sequential", "stable", "random"] as const) {
       expect(await findFreePort(base, base + 2, { strategy, key: "k", exclude })).toBe(base + 2);
