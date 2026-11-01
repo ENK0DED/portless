@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vite
 import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as http from "node:http";
+import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -3598,6 +3599,194 @@ describe("CLI", () => {
       const stop = run(["proxy", "stop"], { env: proxyEnv() });
       expect(stop.status).toBe(0);
       expect(stop.stdout).toContain("Proxy stopped");
+    });
+
+    describe("route owner liveness", () => {
+      const idleScript = "setInterval(() => {}, 1000)";
+      let backend: http.Server;
+      let backendPort: number;
+      const children: Array<ReturnType<typeof spawn>> = [];
+
+      const status = (host: string): Promise<number> =>
+        new Promise((resolve, reject) => {
+          const req = http.get(
+            { hostname: "127.0.0.1", port: testPort, headers: { host } },
+            (res) => {
+              res.resume();
+              res.on("end", () => resolve(res.statusCode!));
+            }
+          );
+          req.on("error", reject);
+        });
+
+      const dashboardState = (): Promise<{ apps: Array<{ name: string }>; orphaned?: string[] }> =>
+        new Promise((resolve, reject) => {
+          http
+            .get(
+              {
+                hostname: "127.0.0.1",
+                port: testPort,
+                path: "/__portless/state.json",
+                headers: { host: "portless.localhost" },
+              },
+              (res) => {
+                let body = "";
+                res.on("data", (chunk) => (body += chunk));
+                res.on("end", () => resolve(JSON.parse(body)));
+              }
+            )
+            .on("error", reject);
+        });
+
+      const waitFor = async (
+        check: () => Promise<boolean>,
+        timeoutMs: number
+      ): Promise<boolean> => {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+          if (await check()) return true;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        return check();
+      };
+
+      const killAndWait = async (child: ReturnType<typeof spawn>): Promise<void> => {
+        if (child.exitCode !== null || child.signalCode !== null) return;
+        const exited = new Promise((resolve) => child.once("exit", resolve));
+        child.kill("SIGKILL");
+        await exited;
+      };
+
+      beforeEach(async () => {
+        backend = http.createServer((_req, res) => res.end("owned"));
+        await new Promise<void>((resolve) => backend.listen(0, "127.0.0.1", resolve));
+        backendPort = (backend.address() as net.AddressInfo).port;
+      });
+
+      afterEach(async () => {
+        for (const child of children.splice(0)) {
+          try {
+            if (process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGKILL");
+          } catch {
+            // Group already gone
+          }
+          await killAndWait(child);
+        }
+        await new Promise<void>((resolve) => backend.close(() => resolve()));
+      });
+
+      it("stops serving a route within about 2s of its owner being force-killed, without writing routes.json", async () => {
+        const owner = spawn(process.execPath, ["-e", idleScript], { stdio: "ignore" });
+        children.push(owner);
+        const start = run(["proxy", "start"], { env: proxyEnv() });
+        expect(start.status).toBe(0);
+        await waitForHttpHeader(testPort, "X-Portless", "1");
+
+        const store = new RouteStore(tmpDir);
+        store.addRoute("owned.localhost", backendPort, owner.pid!);
+        expect(await waitFor(async () => (await status("owned.localhost")) === 200, 3000)).toBe(
+          true
+        );
+
+        const before = fs.readFileSync(store.getRoutesPath(), "utf-8");
+        // SIGKILL runs no cleanup: the file and the daemon's cache keep the route.
+        await killAndWait(owner);
+        const killedAt = Date.now();
+
+        expect(await waitFor(async () => (await status("owned.localhost")) === 404, 2500)).toBe(
+          true
+        );
+        expect(Date.now() - killedAt).toBeLessThan(2500);
+        // The check reloads memory only; it must not rewrite the routes file.
+        expect(fs.readFileSync(store.getRoutesPath(), "utf-8")).toBe(before);
+      });
+
+      it("keeps serving other routes when one owner dies", async () => {
+        const doomed = spawn(process.execPath, ["-e", idleScript], { stdio: "ignore" });
+        const survivor = spawn(process.execPath, ["-e", idleScript], { stdio: "ignore" });
+        children.push(doomed, survivor);
+        const start = run(["proxy", "start"], { env: proxyEnv() });
+        expect(start.status).toBe(0);
+        await waitForHttpHeader(testPort, "X-Portless", "1");
+
+        const store = new RouteStore(tmpDir);
+        store.addRoute("doomed.localhost", backendPort, doomed.pid!);
+        store.addRoute("survivor.localhost", backendPort, survivor.pid!);
+        expect(await waitFor(async () => (await status("survivor.localhost")) === 200, 3000)).toBe(
+          true
+        );
+
+        await killAndWait(doomed);
+        expect(await waitFor(async () => (await status("doomed.localhost")) === 404, 2500)).toBe(
+          true
+        );
+        expect(await status("survivor.localhost")).toBe(200);
+      });
+
+      it.skipIf(process.platform === "win32")(
+        "shows a force-killed owner's route as orphaned on the dashboard",
+        async () => {
+          const owner = spawn(process.execPath, ["-e", idleScript], { stdio: "ignore" });
+          // The dev server the owner started: its own process group, which survives the owner.
+          const devServer = spawn(process.execPath, ["-e", idleScript], {
+            stdio: "ignore",
+            detached: true,
+          });
+          devServer.unref();
+          children.push(owner, devServer);
+          const start = run(["proxy", "start"], { env: proxyEnv() });
+          expect(start.status).toBe(0);
+          await waitForHttpHeader(testPort, "X-Portless", "1");
+
+          const store = new RouteStore(tmpDir);
+          store.addRoute("zombie.localhost", backendPort, owner.pid!);
+          store.updateRoute("zombie.localhost", {
+            childPgid: devServer.pid!,
+            childStartTime: getProcessStartTime(devServer.pid!),
+          });
+          expect(await waitFor(async () => (await status("zombie.localhost")) === 200, 3000)).toBe(
+            true
+          );
+          expect((await dashboardState()).apps.map((app) => app.name)).toContain(
+            "zombie.localhost"
+          );
+
+          await killAndWait(owner);
+
+          expect(
+            await waitFor(async () => {
+              const state = await dashboardState();
+              return state.orphaned?.includes("zombie.localhost") === true;
+            }, 2500)
+          ).toBe(true);
+          const state = await dashboardState();
+          expect(state.apps.map((app) => app.name)).not.toContain("zombie.localhost");
+          expect(await status("zombie.localhost")).toBe(404);
+          // The route stays on file as an orphan for the next run or prune.
+          expect(store.loadOrphanedRoutes().map((route) => route.hostname)).toEqual([
+            "zombie.localhost",
+          ]);
+        }
+      );
+
+      it("keeps serving a route whose owner is another user's process (EPERM)", async () => {
+        // The daemon's check treats EPERM as alive, so a foreign owner never drops the route.
+        // Pid 1 is owned by root, which an unprivileged test run cannot signal.
+        if (process.platform === "win32" || process.getuid?.() === 0) return;
+        const start = run(["proxy", "start"], { env: proxyEnv() });
+        expect(start.status).toBe(0);
+        await waitForHttpHeader(testPort, "X-Portless", "1");
+
+        fs.writeFileSync(
+          new RouteStore(tmpDir).getRoutesPath(),
+          JSON.stringify([{ hostname: "foreign.localhost", port: backendPort, pid: 1 }])
+        );
+        expect(await waitFor(async () => (await status("foreign.localhost")) === 200, 3000)).toBe(
+          true
+        );
+        await new Promise((resolve) => setTimeout(resolve, 2500));
+        expect(await status("foreign.localhost")).toBe(200);
+      });
     });
 
     it("accepts connections on IPv6 loopback when available", async (ctx) => {
