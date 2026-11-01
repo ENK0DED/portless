@@ -244,6 +244,54 @@ function killProcessGroup(pid: number): void {
   }
 }
 
+/**
+ * Stop everything a bg test left behind and remove its state directory.
+ *
+ * `proxy stop` only sends SIGTERM and returns, and signaled bg wrappers and the
+ * proxy daemon rewrite `routes.json` while shutting down. Removing the
+ * directory right away therefore leaks a running daemon or lets a dying
+ * process recreate the directory. Wait for every recorded process to exit
+ * (escalating to SIGKILL) before the directory goes away, then remove it again
+ * if anything recreated it.
+ */
+async function tearDownBgState(stateDir: string, stopProxy: () => void): Promise<void> {
+  const pids = new Set<number>();
+  for (const entry of readBgRegistry(stateDir)) {
+    if (Number.isInteger(entry.pid) && entry.pid > 0) pids.add(entry.pid);
+  }
+  try {
+    const daemonPid = parseInt(fs.readFileSync(path.join(stateDir, "proxy.pid"), "utf-8"), 10);
+    if (Number.isInteger(daemonPid) && daemonPid > 0) pids.add(daemonPid);
+  } catch {
+    // No proxy daemon was started for this state directory.
+  }
+
+  for (const pid of pids) killProcessGroup(pid);
+  stopProxy();
+
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  const deadline = Date.now() + 5000;
+  while ([...pids].some(isPidAlive) && Date.now() < deadline) {
+    await sleep(25);
+  }
+  for (const pid of pids) {
+    if (!isPidAlive(pid)) continue;
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // Exited between the check and the signal.
+      }
+    }
+  }
+
+  fs.rmSync(stateDir, { recursive: true, force: true });
+  await sleep(50);
+  fs.rmSync(stateDir, { recursive: true, force: true });
+}
+
 async function waitForFileIncludes(filePath: string, text: string, timeoutMs = 3000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() <= deadline) {
@@ -1128,12 +1176,8 @@ describe("CLI", () => {
         }
       );
 
-      afterEach(() => {
-        for (const entry of readBgRegistry(tmpDir)) {
-          killProcessGroup(entry.pid);
-        }
-        run(["proxy", "stop"], { env: bgEnv() });
-        fs.rmSync(tmpDir, { recursive: true, force: true });
+      afterEach(async () => {
+        await tearDownBgState(tmpDir, () => run(["proxy", "stop"], { env: bgEnv() }));
       });
 
       it("starts a background process and records the ready route", async () => {
