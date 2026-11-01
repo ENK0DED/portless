@@ -41,6 +41,7 @@ export interface RouteMapping extends RouteInfo {
   tailscaleUrl?: string;
   tailscaleHttpsPort?: number;
   tailscaleFunnel?: boolean;
+  tailscaleHttp?: boolean;
   tailscaleServiceName?: string;
   tailscaleServiceUrl?: string;
   tailscaleServicePending?: boolean;
@@ -61,6 +62,7 @@ const SHARING_FIELDS = [
   "tailscaleUrl",
   "tailscaleHttpsPort",
   "tailscaleFunnel",
+  "tailscaleHttp",
   "tailscaleServiceName",
   "tailscaleServiceUrl",
   "tailscaleServicePending",
@@ -92,6 +94,7 @@ type RouteMetadataPatch = {
   tailscaleUrl?: string | null;
   tailscaleHttpsPort?: number | null;
   tailscaleFunnel?: boolean | null;
+  tailscaleHttp?: boolean | null;
   tailscaleServiceName?: string | null;
   tailscaleServiceUrl?: string | null;
   tailscaleServicePending?: boolean | null;
@@ -760,6 +763,10 @@ export class RouteStore {
         if (fields.tailscaleFunnel === null) delete route.tailscaleFunnel;
         else if (fields.tailscaleFunnel !== undefined)
           route.tailscaleFunnel = fields.tailscaleFunnel;
+      }
+      if ("tailscaleHttp" in fields) {
+        if (fields.tailscaleHttp === null) delete route.tailscaleHttp;
+        else if (fields.tailscaleHttp !== undefined) route.tailscaleHttp = fields.tailscaleHttp;
       }
       if ("tailscaleServiceName" in fields) {
         if (fields.tailscaleServiceName === null) delete route.tailscaleServiceName;

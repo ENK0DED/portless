@@ -419,6 +419,7 @@ function routeHasTailscale(route: RouteMapping): boolean {
     route.tailscaleUrl ||
     route.tailscaleHttpsPort ||
     route.tailscaleFunnel ||
+    route.tailscaleHttp ||
     route.tailscaleServiceName ||
     route.tailscaleServiceUrl
   );
@@ -440,6 +441,7 @@ function backgroundSharing(entry: BgProcessEntry): DoctorBackgroundSnapshot["sha
   }
   if (
     entry.intent.sharing.tailscale ||
+    entry.intent.sharing.tailscaleHttp ||
     entry.intent.sharing.tailscaleService ||
     entry.intent.sharing.funnel
   ) {

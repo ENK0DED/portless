@@ -26,6 +26,7 @@ describe("bg start parser", () => {
       "--tunnel-hostname",
       "public.example.com",
       "--tailscale",
+      "--tailscale-http",
       "--tailscale-service",
       "--tailscale-service-name",
       "svc",
@@ -66,6 +67,7 @@ describe("bg start parser", () => {
       "--tunnel-hostname",
       "public.example.com",
       "--tailscale",
+      "--tailscale-http",
       "--tailscale-service",
       "--tailscale-service-name",
       "svc",
@@ -115,6 +117,34 @@ describe("bg start parser", () => {
     expect(parsed.waitSeconds).toBe(30);
     expect(parsed.keep).toBe(false);
     expect(parsed.runArgs).toEqual(["vite", "--no-wait", "--keep"]);
+  });
+
+  it("forwards --tailscale-http as a run flag", () => {
+    const parsed = parseBgStartArgs(["--tailscale-http", "bun", "run", "dev"]);
+    expect(parsed.runArgs).toEqual(["--tailscale-http", "bun", "run", "dev"]);
+  });
+
+  it("round-trips --tailscale-http through the intent without a plain --tailscale", () => {
+    const intent: BgStartIntent = {
+      cwd: "/tmp/app",
+      commandArgs: ["bun", "run", "dev"],
+      explicitCommand: true,
+      force: false,
+      pathPrefix: "/",
+      sharing: {
+        tailscale: true,
+        tailscaleHttp: true,
+        tailscaleService: false,
+        funnel: false,
+        ngrok: false,
+        netbird: false,
+      },
+    };
+
+    const args = runArgsFromIntent(intent, false);
+
+    expect(args).toContain("--tailscale-http");
+    expect(args).not.toContain("--tailscale");
   });
 
   it("builds restart arguments without NetBird credentials", () => {

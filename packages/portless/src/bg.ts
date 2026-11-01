@@ -107,6 +107,7 @@ const RUN_BOOLEAN_FLAGS = new Set([
   "--force",
   "--h2c",
   "--tailscale",
+  "--tailscale-http",
   "--tailscale-service",
   "--funnel",
   "--ngrok",
@@ -155,6 +156,7 @@ ${colors.bold("Run options forwarded to portless run:")}
   --tunnel <provider>           Share publicly via a managed tunnel
   --tunnel-hostname <hostname>  Request a stable tunnel hostname
   --tailscale                   Share on Tailscale
+  --tailscale-http              Share on Tailscale over plain HTTP (no MagicDNS needed)
   --tailscale-service           Share as a Tailscale Service
   --tailscale-service-name <n>  Use an explicit Tailscale Service name
   --funnel                      Share publicly via Tailscale Funnel
@@ -369,6 +371,8 @@ function parseRunIntent(runArgs: string[], cwd: string): ParsedRunIntent {
       tunnel = { ...tunnel, hostname: runArgs[++i] };
     } else if (token === "--tailscale") {
       sharing.tailscale = true;
+    } else if (token === "--tailscale-http") {
+      sharing.tailscaleHttp = true;
     } else if (token === "--tailscale-service") {
       sharing.tailscaleService = true;
     } else if (token === "--tailscale-service-name") {
@@ -634,7 +638,10 @@ export function runArgsFromIntent(intent: BgStartIntent, force: boolean): string
     args.push("--tunnel", intent.tunnel.provider);
     if (intent.tunnel.hostname) args.push("--tunnel-hostname", intent.tunnel.hostname);
   }
-  if (intent.sharing.tailscale && !intent.sharing.funnel) args.push("--tailscale");
+  if (intent.sharing.tailscale && !intent.sharing.funnel && !intent.sharing.tailscaleHttp) {
+    args.push("--tailscale");
+  }
+  if (intent.sharing.tailscaleHttp) args.push("--tailscale-http");
   if (intent.sharing.tailscaleService) args.push("--tailscale-service");
   if (intent.sharing.tailscaleServiceName) {
     args.push("--tailscale-service-name", intent.sharing.tailscaleServiceName);

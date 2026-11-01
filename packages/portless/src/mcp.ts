@@ -34,6 +34,7 @@ const SHARING_FLAGS = [
   "--tunnel",
   "--tunnel-hostname",
   "--tailscale",
+  "--tailscale-http",
   "--tailscale-service",
   "--tailscale-service-name",
   "--funnel",

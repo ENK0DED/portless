@@ -84,6 +84,29 @@ describe("BgStore", () => {
     expect(store.loadEntries().map((entry) => entry.id)).toEqual(["bg_02"]);
   });
 
+  it("persists the plain-HTTP tailnet flag and accepts entries written without it", () => {
+    const withHttp = sampleEntry({
+      intent: {
+        ...sampleEntry().intent,
+        sharing: { ...sampleEntry().intent.sharing, tailscale: true, tailscaleHttp: true },
+      },
+    });
+    store.upsertEntry(withHttp);
+    expect(store.loadEntries()).toEqual([withHttp]);
+    expect(sampleEntry().intent.sharing.tailscaleHttp).toBeUndefined();
+    store.removeEntry(withHttp.id);
+    store.upsertEntry(sampleEntry());
+    expect(store.loadEntries()).toEqual([sampleEntry()]);
+  });
+
+  it("rejects a non-boolean plain-HTTP tailnet flag", () => {
+    store.ensureDirs();
+    const bad = sampleEntry();
+    (bad.intent.sharing as Record<string, unknown>).tailscaleHttp = "yes";
+    fs.writeFileSync(store.getPaths().registryPath, JSON.stringify([bad]));
+    expect(store.loadEntries()).toEqual([]);
+  });
+
   it("loads only valid entries from a mixed registry", () => {
     store.ensureDirs();
     fs.writeFileSync(
