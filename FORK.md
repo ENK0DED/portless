@@ -254,7 +254,7 @@ The current fork release `0.15.6004` tracks upstream `0.15.5` plus the `0.15.600
 
 This fork uses Bun for repository development.
 
-- Keep `packageManager` set to `bun@1.3.14` or newer in `package.json`
+- Keep `packageManager` set to `bun@1.4.4` or newer in `package.json`, and pin the same Bun version in CI and the release workflow so `bun install --frozen-lockfile` reads the lock its writer produced
 - Keep `engines.bun` aligned with the required Bun version
 - Keep root `workspaces` in `package.json`
 - Keep `bun.lock`
