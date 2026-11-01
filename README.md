@@ -106,16 +106,17 @@ In linked git worktrees, workspace URLs also get the branch prefix. For example,
 
 ### Config fields
 
-| Field          | Type    | Default  | Description                                                           |
-| -------------- | ------- | -------- | --------------------------------------------------------------------- |
-| `name`         | string  | inferred | Base app name. Worktree prefix still applies.                         |
-| `script`       | string  | `"dev"`  | Name of a `package.json` script to run.                               |
-| `appPort`      | number  | auto     | Fixed port for the child process. Browser-blocked ports are rejected. |
-| `path`         | string  | `"/"`    | Route path prefix.                                                    |
-| `proxy`        | boolean | auto     | Whether to route through the proxy. Auto-detected.                    |
-| `worktreeFlat` | boolean | `false`  | Join worktree and app labels into one DNS label.                      |
-| `apps`         | object  |          | Overrides for workspace packages, keyed by relative path.             |
-| `turbo`        | boolean | `true`   | Set `false` to use direct spawning instead of turborepo.              |
+| Field            | Type                         | Default          | Description                                                           |
+| ---------------- | ---------------------------- | ---------------- | --------------------------------------------------------------------- |
+| `name`           | string                       | inferred         | Base app name. Worktree prefix still applies.                         |
+| `script`         | string                       | `"dev"`          | Name of a `package.json` script to run.                               |
+| `appPort`        | number                       | auto             | Fixed port for the child process. Browser-blocked ports are rejected. |
+| `path`           | string                       | `"/"`            | Route path prefix.                                                    |
+| `proxy`          | boolean                      | auto             | Whether to route through the proxy. Auto-detected.                    |
+| `worktreeFlat`   | boolean                      | `false`          | Join worktree and app labels into one DNS label.                      |
+| `worktreeBranch` | `"last-segment"` or `"full"` | `"last-segment"` | How a branch name becomes the worktree prefix.                        |
+| `apps`           | object                       |                  | Overrides for workspace packages, keyed by relative path.             |
+| `turbo`          | boolean                      | `true`           | Set `false` to use direct spawning instead of turborepo.              |
 
 ### package.json "portless" key
 
@@ -128,7 +129,7 @@ Instead of a separate config file, you can add a `"portless"` key to your `packa
 }
 ```
 
-An object supports all per-app fields (`name`, `script`, `appPort`, `path`, `proxy`, `worktreeFlat`):
+An object supports all per-app fields (`name`, `script`, `appPort`, `path`, `proxy`, `worktreeFlat`, `worktreeBranch`):
 
 ```json
 {
@@ -260,6 +261,33 @@ PORTLESS_WORKTREE_FLAT=1 portless run next dev
 ```
 
 `PORTLESS_WORKTREE_FLAT=0` disables flat mode for a shell even when the project config enables it. The environment setting overrides `worktreeFlat` for both the CLI and `getUrl()`.
+
+### Choosing the prefix
+
+By default the prefix is the last segment of the branch name, so `team-a/login` becomes `login`. Set `worktreeBranch` to `"full"` to sanitize the whole branch name instead (`team-a/login` becomes `team-a-login`). It is valid at the top level and per app, and an app's value overrides the top-level one:
+
+```json
+{ "worktreeBranch": "full" }
+```
+
+`main` and `master` never get a derived prefix. The check uses the whole branch name, so `feature/main` still gets one. Long names are shortened to a legal DNS label. In flat mode, any prefix containing a hyphen (every `"full"` prefix with a slash in the branch, and any explicit prefix such as `qa-1`) gets the short collision hash.
+
+To set the prefix yourself, use `--worktree-prefix`. An explicit prefix applies everywhere: a linked worktree, the main checkout, a default branch, and directories outside git:
+
+```bash
+portless run --worktree-prefix qa next dev   # -> https://qa.myapp.localhost
+portless --worktree-prefix qa                # bare mode, single app or workspace root
+portless get myapp --worktree-prefix qa      # -> https://qa.myapp.localhost
+PORTLESS_WORKTREE_PREFIX=qa portless run next dev
+```
+
+To turn the prefix off, use `--no-worktree` on `run`, bare `portless`, or `get`, or set `PORTLESS_WORKTREE_PREFIX=` (empty) for a shell:
+
+```bash
+portless run --no-worktree next dev   # -> https://myapp.localhost even in a linked worktree
+```
+
+The prefix is chosen by, in order: the flag, then `PORTLESS_WORKTREE_PREFIX`, then git detection. A flag wins over the variable in both directions, so `--worktree-prefix qa` beats an empty variable and `--no-worktree` beats a set one. `--worktree-prefix ""` and values that sanitize to nothing (such as `///`) exit with an error, and `--no-worktree` with `--worktree-prefix` is an error. `portless bg start` saves the resolved decision, so `bg restart` replays it without the variable. This fork does not accept upstream's `--prefix` or `PORTLESS_PREFIX`; `--path` and `PORTLESS_PATH` stay the route path prefix.
 
 ## Custom Suffixes
 
@@ -613,7 +641,7 @@ Background app management currently supports macOS and Linux. Windows support ne
 
 `bg start` waits up to 30 seconds for the route to become ready by default. Use `--wait <seconds>` to customize the timeout, `--no-wait` to return immediately after spawning, or `--keep` to leave a timed-out child running for manual inspection. A timed-out child is stopped by default so stale routes are not left behind accidentally.
 
-Background apps preserve the normal `portless run` feature set, including `--path`, `--h2c`, `--tunnel`, `--tailscale-service`, `--ngrok`, and `--netbird`. Backgrounding is not a sharing feature by itself: child apps still bind to loopback by default, and public exposure still requires explicit sharing flags.
+Background apps preserve the normal `portless run` feature set, including `--path`, `--worktree-prefix`, `--no-worktree`, `--h2c`, `--tunnel`, `--tailscale-service`, `--ngrok`, and `--netbird`. Backgrounding is not a sharing feature by itself: child apps still bind to loopback by default, and public exposure still requires explicit sharing flags.
 
 Private stdout, stderr, and lifecycle logs are stored under `${PORTLESS_STATE_DIR:-~/.portless}/bg/logs` with owner-only permissions. Prefer `portless bg logs` over reading those files directly because logs can contain tokens, cookies, request bodies, stack traces, or private URLs.
 
@@ -670,6 +698,8 @@ portless bg restart [name]       # Restart a background app
 portless bg clean [name]         # Remove dead background entries
 portless get <name>              # Print URL for a service
 portless get <name> --json       # Print service info as JSON
+portless get <name> --worktree-prefix qa   # Use qa as the worktree prefix
+portless get <name> --no-worktree          # Skip the worktree prefix
 portless url <name>              # Alias for portless get
 portless list                    # Show active routes and their uptime
 portless list --json             # Show active routes as JSON (includes registered_at)
@@ -760,6 +790,8 @@ Doctor is read-only. It inspects the active state directory and sudo handoff, or
 --multiplex                      Share this hostname with other apps (shows an app picker)
 --label <label>                  Label for this multiplexed app (default: directory name)
 --path <prefix>                  Scope this route to a path prefix, e.g. /api
+--worktree-prefix <prefix>       Use this worktree prefix, in a linked worktree or not
+--no-worktree                    Skip the worktree prefix (run, get, bare portless)
 --tunnel <provider>              Share publicly via a managed tunnel: cloudflare or ngrok
 --tunnel-hostname <hostname>     Request a provider-specific stable tunnel hostname
 --tailscale                      Share the app on your Tailscale network (tailnet)
@@ -804,6 +836,7 @@ PORTLESS_ROUTES_CLEANUP_INTERVAL=<s>
                                  Sweep dead routes every <s> seconds (default 300, `0` disables)
 PORTLESS_SYNC_HOSTS=0            Disable auto-sync of /etc/hosts (on by default)
 PORTLESS_WORKTREE_FLAT=1         Join worktree and app names into one DNS label
+PORTLESS_WORKTREE_PREFIX=<prefix>  Use <prefix> as the worktree prefix (empty turns it off)
 PORTLESS_TAILSCALE=1             Share apps on your Tailscale network (same as --tailscale)
 PORTLESS_TAILSCALE_HTTP=1        Share on the tailnet over plain HTTP (same as --tailscale-http)
 PORTLESS_TAILSCALE_SERVICE=1     Share apps as Tailscale Services
@@ -894,6 +927,8 @@ const stable = await getUrl("cms", { worktree: false });
 `getUrl()` uses the same hostname and worktree logic as `portless get`, reading port, TLS, and suffix from the active proxy's persisted state. The returned object JSON-serializes to `{ url, hostname, port, tls, tld }`.
 
 Pass `{ worktreeFlat: true }` to select flat worktree hostnames for one lookup. When omitted, `getUrl()` reads `worktreeFlat` from the project config and honors the `PORTLESS_WORKTREE_FLAT` environment override.
+
+Pass `{ worktreePrefix: "qa" }` to use an explicit prefix (it also applies outside linked worktrees) and `{ worktreeBranch: "full" }` to derive the prefix from the whole branch name. Without them, `getUrl()` reads `worktreeBranch` from the project config and honors `PORTLESS_WORKTREE_PREFIX`. Combining `worktree: false` with `worktreePrefix`, or passing an empty `worktreePrefix`, throws.
 
 ## Uninstall / reset
 

@@ -79,6 +79,14 @@ Supported placeholders are `{PORT}`, `{HOST}`, and `{PORTLESS_URL}`. Portless re
       <td>Scope this route to a path prefix, e.g. `/api`. Also configurable via `PORTLESS_PATH`.</td>
     </tr>
     <tr>
+      <td>`--worktree-prefix <prefix>`</td>
+      <td>Use this worktree prefix instead of the branch name. Applies in a linked worktree or not. Also configurable via `PORTLESS_WORKTREE_PREFIX`. Works with `portless run`, bare `portless`, `portless get`, and `portless bg start`.</td>
+    </tr>
+    <tr>
+      <td>`--no-worktree`</td>
+      <td>Skip the worktree prefix. An empty `PORTLESS_WORKTREE_PREFIX=` does the same for a shell. Works with `portless run`, bare `portless`, `portless get`, and `portless bg start`.</td>
+    </tr>
+    <tr>
       <td>`--tunnel <provider>`</td>
       <td>Share publicly via a managed tunnel: `cloudflare` or `ngrok`. Also configurable via `PORTLESS_TUNNEL`.</td>
     </tr>
@@ -263,7 +271,7 @@ Print the URL for a service. Useful for wiring services together in scripts or e
 BACKEND_URL=$(portless get backend)
 ```
 
-Applies worktree prefix detection by default. Use `--no-worktree` to skip it.
+Applies worktree prefix detection by default. Use `--no-worktree` to skip it, or `--worktree-prefix <prefix>` to use an explicit prefix (it applies outside linked worktrees too). `PORTLESS_WORKTREE_PREFIX` is honored the same way as for `portless run`, and the flag wins over it.
 
 Pass `--json` to print a JSON object for scripts and agents:
 

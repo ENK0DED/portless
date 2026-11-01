@@ -113,6 +113,17 @@ Use `--name` to override the inferred base name while keeping the worktree prefi
 portless run --name myapp next dev   # -> https://fix-ui.myapp.localhost
 ```
 
+By default the prefix is the last segment of the branch, so `team-a/login` becomes `login`. Set `"worktreeBranch": "full"` in `portless.json` to use the whole branch (`team-a-login`). `main` and `master` never get a derived prefix.
+
+Set the prefix yourself with `--worktree-prefix` (or `PORTLESS_WORKTREE_PREFIX`). An explicit prefix applies in a linked worktree, the main checkout, and outside git. Turn the prefix off with `--no-worktree`, or an empty `PORTLESS_WORKTREE_PREFIX=`:
+
+```bash
+portless run --worktree-prefix qa next dev   # -> https://qa.myapp.localhost
+portless run --no-worktree next dev          # -> https://myapp.localhost
+```
+
+The flag wins over the environment variable, which wins over git detection. `portless run`, bare `portless`, `portless get`, and `portless bg start` all accept both flags.
+
 ## Custom Suffixes
 
 By default, portless uses `.localhost` which auto-resolves to `127.0.0.1` in most browsers. Repeat `--suffix` to serve the same apps under multiple suffixes.

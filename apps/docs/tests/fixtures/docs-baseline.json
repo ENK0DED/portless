@@ -8,8 +8,8 @@
       "title": "portless | Named .localhost URLs for Development",
       "markdownTitle": "Getting Started",
       "description": "Replace port numbers with stable, named .localhost URLs. For humans and agents.",
-      "mdxSha256": "4fa057e7eb143aece49b4062d3093abb98f19a3f21cd67b89a411cd1bb398235",
-      "markdownBodySha256": "4fa057e7eb143aece49b4062d3093abb98f19a3f21cd67b89a411cd1bb398235",
+      "mdxSha256": "a071bf7c3872fad4e5774714358e68117d38c48ad2847cb1d28aed7b74a274c4",
+      "markdownBodySha256": "a071bf7c3872fad4e5774714358e68117d38c48ad2847cb1d28aed7b74a274c4",
       "ssr": [
         "Portless replaces port numbers with stable, named .localhost URLs for local development.",
         "npm install -g @enk0ded/portless",
@@ -59,8 +59,8 @@
       "title": "Commands | portless",
       "markdownTitle": "Commands",
       "description": "Replace port numbers with stable, named .localhost URLs. For humans and agents.",
-      "mdxSha256": "16469dbbda012c7755f4c145aed7cf0b81118b6fdbd63c7db48fccce17182da0",
-      "markdownBodySha256": "16469dbbda012c7755f4c145aed7cf0b81118b6fdbd63c7db48fccce17182da0",
+      "mdxSha256": "de1c6ad3bae7c83b8fd2e639c94a93ca719735559a71e37ffa2e471517cd1472",
+      "markdownBodySha256": "de1c6ad3bae7c83b8fd2e639c94a93ca719735559a71e37ffa2e471517cd1472",
       "ssr": ["portless", "portless doctor", "portless hosts sync"],
       "headings": [
         [1, "Commands", "commands"],
@@ -121,8 +121,8 @@
       "title": "Configuration | portless",
       "markdownTitle": "Configuration",
       "description": "Replace port numbers with stable, named .localhost URLs. For humans and agents.",
-      "mdxSha256": "8782252a8212405db897b12fbaceab3efd111a392fd7df88b237b3923c9c9926",
-      "markdownBodySha256": "670e8502fe69f5635c76b505a996a4edb6b0e816ae8ae850afec8fcc493de2df",
+      "mdxSha256": "8af83210d7ec55163524a5fbe1298c860d22310aff457449ae7fed28734930e2",
+      "markdownBodySha256": "e9b039bd497ffbf2c75dd49282b2da3b89e58bd077ae3374a27ac47973ac889d",
       "ssr": [
         "Bare portless works out of the box.",
         "PORTLESS_SYNC_HOSTS",

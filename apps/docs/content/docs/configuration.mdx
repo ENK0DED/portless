@@ -62,6 +62,23 @@ The name is inferred from `package.json` if not set in config. The script defaul
       </td>
     </tr>
     <tr>
+      <td>`worktreeFlat`</td>
+      <td>boolean</td>
+      <td>`false`</td>
+      <td>
+        Join worktree and app labels into one DNS label. `PORTLESS_WORKTREE_FLAT` overrides it.
+      </td>
+    </tr>
+    <tr>
+      <td>`worktreeBranch`</td>
+      <td>`"last-segment"` or `"full"`</td>
+      <td>`"last-segment"`</td>
+      <td>
+        How a branch name becomes the worktree prefix. `"full"` sanitizes the whole branch
+        (`team-a/login` becomes `team-a-login`).
+      </td>
+    </tr>
+    <tr>
       <td>`apps`</td>
       <td>object</td>
       <td></td>
@@ -76,7 +93,7 @@ The name is inferred from `package.json` if not set in config. The script defaul
   </tbody>
 </table>
 
-Each `apps` entry has the same shape (`name`, `script`, `appPort`, `proxy`). When `apps` is present, top-level fields apply only in single-app mode.
+Each `apps` entry has the same shape (`name`, `script`, `appPort`, `proxy`, `worktreeFlat`, `worktreeBranch`). When `apps` is present, top-level fields apply only in single-app mode.
 
 ### package.json "portless" key
 
@@ -89,7 +106,7 @@ Instead of a separate config file, you can add a `"portless"` key to your `packa
 }
 ```
 
-An object supports all per-app fields (`name`, `script`, `appPort`, `proxy`):
+An object supports all per-app fields (`name`, `script`, `appPort`, `proxy`, `worktreeFlat`, `worktreeBranch`):
 
 ```json
 {
@@ -172,6 +189,8 @@ const stable = await getUrl("backend", { worktree: false });
 
 `getUrl()` uses the same hostname and worktree logic as `portless get`, reading port, TLS, and suffix from the active proxy's persisted state. The returned object JSON-serializes to `{ url, hostname, port, tls, tld }`.
 
+Pass `{ worktreePrefix: "qa" }` for an explicit prefix (it also applies outside linked worktrees) or `{ worktreeBranch: "full" }` to derive the prefix from the whole branch. Without them, `getUrl()` reads `worktreeBranch` from the project config and honors `PORTLESS_WORKTREE_PREFIX`. Combining `worktree: false` with `worktreePrefix`, or passing an empty `worktreePrefix`, throws.
+
 ## Environment variables
 
 <table>
@@ -219,6 +238,11 @@ const stable = await getUrl("backend", { worktree: false });
     <tr>
       <td>`PORTLESS_PATH`</td>
       <td>Scope app routes to a path prefix (e.g. `/api`).</td>
+      <td>unset</td>
+    </tr>
+    <tr>
+      <td>`PORTLESS_WORKTREE_PREFIX`</td>
+      <td>Use this value as the worktree prefix (same as `--worktree-prefix`). An empty value turns the prefix off.</td>
       <td>unset</td>
     </tr>
     <tr>

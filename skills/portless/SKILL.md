@@ -166,6 +166,16 @@ PORTLESS_WORKTREE_FLAT=1 portless run next dev
 
 Use `PORTLESS_WORKTREE_FLAT=0` to override the project setting for a shell. The environment setting applies to both the CLI and `getUrl()`.
 
+By default the prefix is the last segment of the branch (`team-a/login` becomes `login`). Set `worktreeBranch` to `"full"` (top level or per app) to sanitize the whole branch (`team-a-login`). `main` and `master` never get a derived prefix; `feature/main` does. In flat mode a prefix containing a hyphen gets the short collision hash.
+
+Set the prefix explicitly with `--worktree-prefix <value>` on `portless run`, bare `portless`, and `portless get` (also `PORTLESS_WORKTREE_PREFIX=<value>` for a shell). An explicit prefix applies everywhere: linked worktree, main checkout, default branch, outside git. Turn the prefix off with `--no-worktree` (same three places) or `PORTLESS_WORKTREE_PREFIX=` (empty). Precedence: flag, then environment, then git detection; a flag beats the variable in both directions. `--worktree-prefix ""`, a value that sanitizes to nothing, and `--no-worktree` together with `--worktree-prefix` are errors. `portless bg start` saves the resolved decision so `bg restart` replays it. Upstream's `--prefix` and `PORTLESS_PREFIX` are not accepted; `--path` stays the route path prefix.
+
+```bash
+portless run --worktree-prefix qa next dev   # -> https://qa.myapp.localhost
+portless run --no-worktree next dev          # -> https://myapp.localhost in any worktree
+portless get myapp --worktree-prefix qa
+```
+
 ### Multiplexed hostnames
 
 Use `--multiplex` when several apps should share one stable hostname instead of getting unique URLs — for example multiple worktrees of the same app, all reachable at `https://myapp.localhost`:
@@ -272,6 +282,7 @@ The proxy periodically removes route records whose owning process is dead. The s
 | `PORTLESS_WILDCARD`               | Set to `1` to allow unregistered subdomains to fall back to parent          |
 | `PORTLESS_SYNC_HOSTS`             | Set to `0` to disable auto-sync of /etc/hosts (on by default)               |
 | `PORTLESS_WORKTREE_FLAT`          | Set to `1` to join worktree and app names into one DNS label                |
+| `PORTLESS_WORKTREE_PREFIX`        | Use this value as the worktree prefix (empty turns the prefix off)          |
 | `PORTLESS_TAILSCALE`              | Set to `1` to share apps on your Tailscale network (same as `--tailscale`)  |
 | `PORTLESS_TAILSCALE_HTTP`         | Set to `1` for plain-HTTP tailnet sharing (same as `--tailscale-http`)      |
 | `PORTLESS_TAILSCALE_SERVICE`      | Set to `1` to share apps as stable Tailscale Services                       |
@@ -496,6 +507,9 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 | `portless get <name>`                            | Print URL for a service (for cross-service wiring)             |
 | `portless url <name>`                            | Alias for `portless get <name>`                                |
 | `portless get <name> --no-worktree`              | Print URL without worktree prefix                              |
+| `portless get <name> --worktree-prefix <p>`      | Print URL with an explicit worktree prefix                     |
+| `portless run --worktree-prefix <p> <cmd>`       | Use an explicit worktree prefix (also bare mode, `bg start`)   |
+| `portless run --no-worktree <cmd>`               | Skip the worktree prefix (also bare mode, `bg start`)          |
 | `portless get <name> --json`                     | Print service info as JSON                                     |
 | `portless list`                                  | Show active routes                                             |
 | `portless ls`                                    | Alias for `portless list`                                      |
@@ -607,22 +621,25 @@ const stable = await getUrl("cms", { worktree: false });
 
 Pass `{ worktreeFlat: true }` for a one-lookup override. When omitted, `getUrl()` reads `worktreeFlat` from the project config and honors the `PORTLESS_WORKTREE_FLAT` environment override.
 
+Pass `{ worktreePrefix: "qa" }` for an explicit prefix (it applies outside linked worktrees too) and `{ worktreeBranch: "full" }` to derive the prefix from the whole branch. Without them, `getUrl()` reads `worktreeBranch` from the project config and honors `PORTLESS_WORKTREE_PREFIX`. `worktree: false` combined with `worktreePrefix`, or an empty `worktreePrefix`, throws.
+
 ## portless config
 
 Optional config file. Portless looks for `portless.json` in the current directory, then `.config/portless.json`.
 
-| Field          | Type    | Default                    | Description                                              |
-| -------------- | ------- | -------------------------- | -------------------------------------------------------- |
-| `name`         | string  | inferred from package.json | Base app name (worktree prefix still applies)            |
-| `script`       | string  | `"dev"`                    | Name of a package.json script to run                     |
-| `appPort`      | number  | auto-assigned              | Fixed app port; browser-blocked ports are rejected       |
-| `path`         | string  | `"/"`                      | Route path prefix                                        |
-| `proxy`        | boolean | auto-detected              | Whether to route through the proxy (`false` for tasks)   |
-| `worktreeFlat` | boolean | `false`                    | Join worktree and app labels into one DNS label          |
-| `apps`         | object  |                            | Overrides for workspace packages, keyed by relative path |
-| `turbo`        | boolean | `true`                     | Set `false` to use direct spawning instead of turborepo  |
+| Field            | Type                         | Default                    | Description                                              |
+| ---------------- | ---------------------------- | -------------------------- | -------------------------------------------------------- |
+| `name`           | string                       | inferred from package.json | Base app name (worktree prefix still applies)            |
+| `script`         | string                       | `"dev"`                    | Name of a package.json script to run                     |
+| `appPort`        | number                       | auto-assigned              | Fixed app port; browser-blocked ports are rejected       |
+| `path`           | string                       | `"/"`                      | Route path prefix                                        |
+| `proxy`          | boolean                      | auto-detected              | Whether to route through the proxy (`false` for tasks)   |
+| `worktreeFlat`   | boolean                      | `false`                    | Join worktree and app labels into one DNS label          |
+| `worktreeBranch` | `"last-segment"` or `"full"` | `"last-segment"`           | How a branch name becomes the worktree prefix            |
+| `apps`           | object                       |                            | Overrides for workspace packages, keyed by relative path |
+| `turbo`          | boolean                      | `true`                     | Set `false` to use direct spawning instead of turborepo  |
 
-Each `apps` entry has the same shape (`name`, `script`, `appPort`, `path`, `proxy`, `worktreeFlat`). Apps can share a `name` when they use distinct `path` values. When `apps` is present, top-level fields apply only in single-app mode.
+Each `apps` entry has the same shape (`name`, `script`, `appPort`, `path`, `proxy`, `worktreeFlat`, `worktreeBranch`). Apps can share a `name` when they use distinct `path` values. When `apps` is present, top-level fields apply only in single-app mode.
 
 ### package.json "portless" key
 
@@ -632,7 +649,7 @@ Instead of a separate config file, you can add a `"portless"` key to your `packa
 { "portless": "myapp" }
 ```
 
-An object supports all per-app fields (`name`, `script`, `appPort`, `path`, `proxy`, `worktreeFlat`):
+An object supports all per-app fields (`name`, `script`, `appPort`, `path`, `proxy`, `worktreeFlat`, `worktreeBranch`):
 
 ```json
 { "portless": { "name": "myapp", "script": "dev:app" } }
