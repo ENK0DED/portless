@@ -329,6 +329,19 @@ export const TOOLS: ToolDef[] = [
     }
   ),
   tool(
+    "proxy_status",
+    "Proxy status",
+    "Report whether the shared portless proxy is running and its pid, port, HTTPS, suffixes (tlds), LAN mode and IP, unprivileged mode, wildcard mode, and state directory, read from the proxy and its state files. Read-only: never starts, stops, or elevates the proxy, and exits 0 whether or not it is running. Pass json for one line of JSON with every field always present; everything except running and stateDir is null while the proxy is stopped.",
+    { json: { type: "boolean", description: "Print JSON instead of text." } },
+    [],
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    }
+  ),
+  tool(
     "doctor",
     "Run doctor",
     "Check local portless health, including the proxy, certificates, and routes.",
@@ -472,7 +485,8 @@ export const TOOLS: ToolDef[] = [
 /** Profile name -> description and tool names. `all` has tools: "all". Aliases are not keys here. */
 export const PROFILES: Record<string, { description: string; tools: string[] | "all" }> = {
   core: {
-    description: "Route lookup, static aliases, and read-only background app status and logs.",
+    description:
+      "Route lookup, static aliases, read-only background app status and logs, and proxy status.",
     tools: [
       "list",
       "get",
@@ -481,6 +495,7 @@ export const PROFILES: Record<string, { description: string; tools: string[] | "
       "bg_list",
       "bg_status",
       "bg_logs",
+      "proxy_status",
       "tools_profiles",
     ],
   },
@@ -489,8 +504,8 @@ export const PROFILES: Record<string, { description: string; tools: string[] | "
     tools: ["bg_start", "bg_stop", "bg_restart"],
   },
   proxy: {
-    description: "Start and stop the shared portless proxy.",
-    tools: ["proxy_start", "proxy_stop"],
+    description: "Start, stop, and inspect the shared portless proxy.",
+    tools: ["proxy_start", "proxy_stop", "proxy_status"],
   },
   diagnostics: {
     description: "Health checks, cleanup, and version information.",
@@ -714,6 +729,10 @@ export function buildArgv(toolName: string, args: Record<string, unknown>): stri
       if (port !== undefined) argv.push("-p", String(port));
       break;
     }
+    case "proxy_status":
+      argv.push("proxy", "status");
+      if (readBoolean(args, "json") === true) argv.push("--json");
+      break;
     case "doctor":
       argv.push("doctor");
       break;

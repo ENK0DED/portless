@@ -507,6 +507,7 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 | `portless proxy start --tld test`                | Compatibility alias for `--suffix`                             |
 | `portless proxy start --foreground`              | Start the proxy in foreground (for debugging)                  |
 | `portless proxy start --wildcard`                | Allow unregistered subdomains to fall back locally             |
+| `portless proxy status [--json]`                 | Show whether the proxy is running and its settings (read-only) |
 | `portless proxy stop`                            | Stop the proxy (`-p <port>`; other arguments are rejected)     |
 | `portless service install`                       | Start the HTTPS proxy when the OS starts                       |
 | `portless service install --lan`                 | Start the service in LAN mode                                  |
@@ -566,9 +567,9 @@ Generate completions from the installed portless binary so agents and humans get
 
 `portless mcp [--tools <profiles>]` starts a stdio MCP server. Each tool runs the matching CLI command in the tool's `cwd`; every tool also accepts `extraArgs` and `timeoutMs`.
 
-- `core` (default): `list`, `get`, `alias_add`, `alias_remove`, read-only `bg_list`, `bg_status`, `bg_logs`, and `tools_profiles`.
+- `core` (default): `list`, `get`, `alias_add`, `alias_remove`, read-only `bg_list`, `bg_status`, `bg_logs`, `proxy_status`, and `tools_profiles`.
 - `background` (opt in): `bg_start`, `bg_stop`, `bg_restart`. Use `--tools core,background`.
-- `proxy`: `proxy_start` (`suffix`, `unprivileged`, `skipTrust`, `routesCleanupInterval`, `wildcard`, `lan`, `noTls`, `port`), `proxy_stop`.
+- `proxy`: `proxy_start` (`suffix`, `unprivileged`, `skipTrust`, `routesCleanupInterval`, `wildcard`, `lan`, `noTls`, `port`), `proxy_stop`, `proxy_status` (also in `core`).
 - `diagnostics`: `doctor`, `prune`, `version`. `all` enables everything.
 
 `list`, `get`, and the `bg` tools take `json`; `get`, `alias_add`, and the `bg` tools take `path`. `list --json` marks routes whose owner died but whose dev server still runs as `kind: "orphan"`; `prune` stops them. Not exposed: foreground `run`, `trust`, `clean`, `hosts`, `service`, `bg clean`, `bg logs --follow`, and every sharing mode (tunnels, Tailscale, ngrok, NetBird). Start shared apps from a shell.
@@ -648,6 +649,8 @@ The proxy auto-starts when you run an app with `portless <name> <cmd>`. If it do
 ```bash
 portless proxy start
 ```
+
+To check whether it is running and how it is configured without changing anything, use `portless proxy status`. With `--json` it prints one line, `{"running":true,"pid":1841,"port":443,"tls":true,"tlds":["localhost"],"lan":false,"unprivileged":false,"stateDir":"/Users/me/.portless","wildcard":false,"lanIp":null}`, with every field always present. Everything except `running` and `stateDir` is `null` while the proxy is not running. The first eight keys match upstream portless; `wildcard` and `lanIp` are fork fields. It exits 0 either way, so read `running` instead of the exit code. `portless status` is different: it is an alias of `portless list` and shows routes.
 
 ### Port already in use
 

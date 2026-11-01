@@ -688,6 +688,8 @@ portless proxy start --tld test  # Compatibility alias for --suffix
 portless proxy start --foreground  # Start in foreground for debugging
 portless proxy start --wildcard  # Allow unregistered subdomains to fall back to parent
 portless proxy start --routes-cleanup-interval 60  # Sweep dead routes every 60s (default 300, 0 disables)
+portless proxy status            # Show whether the proxy is running and its settings (read-only)
+portless proxy status --json     # The same as one line of JSON, for scripts and launchers
 portless proxy stop              # Stop the proxy (also: -p <port>; unknown arguments are rejected)
 
 # OS startup service
@@ -697,6 +699,17 @@ portless service install --wildcard  # Persist wildcard routing in the service
 portless service status          # Show service and proxy status
 portless service uninstall       # Remove the startup service
 ```
+
+### Proxy status
+
+`portless proxy status` reports whether the proxy is running and how it is configured, without changing anything: it never starts, stops, or elevates the proxy. A script or launcher that shares a proxy can read `--json` instead of the files in the state directory:
+
+```bash
+portless proxy status --json
+# {"running":true,"pid":1841,"port":443,"tls":true,"tlds":["localhost"],"lan":false,"unprivileged":false,"stateDir":"/Users/me/.portless","wildcard":false,"lanIp":null}
+```
+
+Every field is always present. The first eight keys match upstream portless, so launchers written against it keep working; `tlds` is the suffix list. `wildcard` (unregistered subdomains fall back to the parent) and `lanIp` (the LAN IP recorded for LAN mode) are fork additions. `pid`, `port`, `tls`, `tlds`, `lan`, `unprivileged`, `wildcard`, and `lanIp` are `null` while the proxy is not running (`pid` is also `null` when the pid file cannot be read, and `lanIp` outside LAN mode). `stateDir` holds `ca.pem` when HTTPS is on. The command exits 0 whether or not the proxy is running; read `running`. It is the proxy counterpart of `portless doctor`, which also runs trust checks. `portless status` is unrelated: it is an alias of `portless list` and shows routes.
 
 ### Doctor
 
@@ -829,13 +842,13 @@ portless completion fish > ~/.config/fish/completions/portless.fish
 
 Tools are grouped into profiles. Pass a comma separated list with `--tools`; the default is `core`.
 
-| Profile       | Tools                                                                                                                               |
-| ------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `core`        | `list`, `get`, `alias_add`, `alias_remove`, `bg_list`, `bg_status`, `bg_logs`, `tools_profiles` (all read-only for background apps) |
-| `background`  | `bg_start`, `bg_stop`, `bg_restart` (opt in: `portless mcp --tools core,background`)                                                |
-| `proxy`       | `proxy_start`, `proxy_stop`                                                                                                         |
-| `diagnostics` | `doctor`, `prune`, `version`                                                                                                        |
-| `all`         | Every tool. `default` aliases `core` and `full` aliases `all`.                                                                      |
+| Profile       | Tools                                                                                                                                                             |
+| ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `core`        | `list`, `get`, `alias_add`, `alias_remove`, `bg_list`, `bg_status`, `bg_logs`, `proxy_status`, `tools_profiles` (all read-only for background apps and the proxy) |
+| `background`  | `bg_start`, `bg_stop`, `bg_restart` (opt in: `portless mcp --tools core,background`)                                                                              |
+| `proxy`       | `proxy_start`, `proxy_stop`, `proxy_status`                                                                                                                       |
+| `diagnostics` | `doctor`, `prune`, `version`                                                                                                                                      |
+| `all`         | Every tool. `default` aliases `core` and `full` aliases `all`.                                                                                                    |
 
 Tool arguments follow the CLI: `proxy_start` takes `suffix` (repeatable, like `--suffix`), `unprivileged`, `skipTrust`, and `routesCleanupInterval`; `list`, `get`, and the `bg` tools take `json`; `get`, `alias_add`, and the `bg` tools take `path`. `prune` stops the verified process group of an orphaned dev server, and `bg_stop` with `force` kills the recorded group. Every tool also accepts `cwd`, `extraArgs` (appended to the command), and `timeoutMs`.
 
