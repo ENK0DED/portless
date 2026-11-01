@@ -3585,6 +3585,9 @@ ${colors.bold("How it works:")}
      React Router, Angular, Laravel, Expo, React Native, Wrangler) get --port and, when needed,
      --host or --ip flags injected automatically; safe bun run, npm run, pnpm run, or yarn run
      scripts resolving directly to those server commands receive the same injection
+     Package runners are looked through too; npm exec and npm x get the flags
+     after a -- so npm does not read them. Commands run with your PATH first and
+     portless's own node directory last, so a version-manager node is not shadowed
   6. The proxy listens only on 127.0.0.1 and ::1 unless LAN mode is enabled
   7. Errors from portless itself are HTML for browsers and JSON
      {"error","upstream","message"} for other clients; hosts outside your suffixes get 421
