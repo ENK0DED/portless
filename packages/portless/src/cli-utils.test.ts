@@ -40,6 +40,7 @@ import {
   isHttpsEnvDisabled,
   injectFrameworkFlags,
   isPortListening,
+  findSelfDaemonizedListener,
   isProxyRunning,
   killOrphanedProcessGroup,
   listenOnProxyInterface,
@@ -309,6 +310,63 @@ describe("isProxyRunning", () => {
 
     const result = await isProxyRunning(listenerPort);
     expect(result).toBe(false);
+  });
+});
+
+describe("findSelfDaemonizedListener", () => {
+  const servers: net.Server[] = [];
+
+  afterEach(async () => {
+    for (const s of servers) {
+      await new Promise<void>((resolve) => s.close(() => resolve()));
+    }
+    servers.length = 0;
+  });
+
+  function listenOn(port = 0): Promise<number> {
+    const server = net.createServer();
+    servers.push(server);
+    return new Promise<number>((resolve) => {
+      server.listen(port, "127.0.0.1", () => {
+        resolve((server.address() as net.AddressInfo).port);
+      });
+    });
+  }
+
+  async function freePort(): Promise<number> {
+    const port = await listenOn();
+    await new Promise<void>((resolve) => servers.pop()!.close(() => resolve()));
+    return port;
+  }
+
+  it("returns the listener already on the port", async () => {
+    const port = await listenOn();
+    expect(await findSelfDaemonizedListener(port, undefined, 1000, false)).toBe(process.pid);
+  });
+
+  it("skips listeners that held the port before the command ran", async () => {
+    const port = await listenOn();
+    expect(await findSelfDaemonizedListener(port, undefined, 200, true, [process.pid])).toBeNull();
+  });
+
+  it("returns at once when a failed command left nothing behind", async () => {
+    const port = await freePort();
+    const startedAt = Date.now();
+    expect(await findSelfDaemonizedListener(port, 99_999_991, 5000, false)).toBeNull();
+    expect(Date.now() - startedAt).toBeLessThan(1000);
+  });
+
+  it("waits after a clean exit for a daemon that binds late", async () => {
+    const port = await freePort();
+    setTimeout(() => void listenOn(port), 300);
+    expect(await findSelfDaemonizedListener(port, undefined, 3000, true)).toBe(process.pid);
+  });
+
+  it("gives up at the deadline after a clean exit with no listener", async () => {
+    const port = await freePort();
+    const startedAt = Date.now();
+    expect(await findSelfDaemonizedListener(port, undefined, 300, true)).toBeNull();
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(250);
   });
 });
 
