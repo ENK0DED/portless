@@ -13,6 +13,7 @@ import { createServer } from "node:net";
 import process from "node:process";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath, URL } from "node:url";
+import { format, resolveConfig } from "prettier";
 
 const { AbortSignal, fetch } = globalThis;
 const root = new URL("../", import.meta.url);
@@ -106,7 +107,10 @@ try {
     page.headings = headingsOf(body, page.markdownTitle);
     process.stdout.write(`updated ${page.path}\n`);
   }
-  await writeFile(fixture, `${JSON.stringify(data, null, 2)}\n`);
+  // Format with the repo's Prettier config so `format:check` passes on the result.
+  const path = fileURLToPath(fixture);
+  const options = (await resolveConfig(path)) ?? {};
+  await writeFile(fixture, await format(JSON.stringify(data), { ...options, filepath: path }));
 } catch (error) {
   process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
   code = 1;

@@ -6,8 +6,6 @@ export const config = defineConfig({
   siteUrl,
   defaultLanguage: "en",
   logo: <span className="font-medium">portless</span>,
-  navbarActiveProduct: "portless",
-  navbarBrand: "vercel",
   github: {
     owner: "ENK0DED",
     repo: "portless",
@@ -17,6 +15,7 @@ export const config = defineConfig({
   content: [{ id: "docs", label: "Documentation", dir: "content/docs", route: "/" }],
   nav: [
     { label: "Docs", href: "/" },
+    { label: "GitHub", href: "https://github.com/ENK0DED/portless", external: true },
     { label: "npm", href: "https://www.npmjs.com/package/@enk0ded/portless", external: true },
   ],
   ai: { enabled: false },
