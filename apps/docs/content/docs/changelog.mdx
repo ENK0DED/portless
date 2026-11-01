@@ -2,6 +2,52 @@
 title: "Changelog"
 ---
 
+## 0.15.14001
+
+### Fork Sync
+
+- **Backport batch**: Ports the upstream pull requests triaged for backport this round, including those opened after the charting pass, on top of the `0.15.14000` sync. Upstream is unchanged at `96a3bbb` (`0.15.13`). Most ports are `implemented differently`, so the fork's own flag loops, bind rules and sharing cleanup stay in place.
+
+### Security
+
+- **Pinned openssl for the installed service**: `service install` now resolves and checks `openssl` once and pins its absolute path in the launchd plist, systemd unit and Windows script through an internal `PORTLESS_SERVICE_OPENSSL` variable. Certificate generation in a pinned service never falls back to `PATH`, and the install warns when the pinned path sits in a location a normal user can write. This closes the route by which a user-influenced `PATH` could pick the binary a root or SYSTEM service runs. The pinned path is unverified on a real Windows host, so the Windows matrix in CI is the only check so far.
+
+### New Features
+
+- **Connection pooling redesign**: The proxy now gates dials per backend port at 16 pending connections with no cap on established sockets, so long-lived server-sent-event streams can no longer starve other requests. Idle sockets bypass the gate, queued clients wake as dials settle or sockets free up, connection setup has a 10 second connect-only deadline, and shutdown answers queued clients with 503 without opening new dials. Keep-alive pools keep up to 64 free sockets, and the IPv4 loopback attempt-timeout floor from upstream #510 is shared by every loopback dial.
+- **`--tailscale-http`**: `--tailscale-http` and `PORTLESS_TAILSCALE_HTTP=1` share an app over a raw TCP forward from the tailnet to `127.0.0.1`, on port 80 and then 8080 upward, for tailnets without MagicDNS. It cannot combine with Funnel or Service sharing and records `tailscaleHttp` route metadata so crash cleanup removes the forward. Sharing now also fails early with a clear message when MagicDNS is off. A real tailnet is unverified.
+- **Worktree prefix surface**: `--worktree-prefix` and `PORTLESS_WORKTREE_PREFIX` set the worktree label explicitly, and `--no-worktree` turns it off, on `run`, bare mode, `get`, `bg start` and `getUrl()`. The `worktreeBranch` config key, valid at the top level and per app, chooses between the last branch segment (the default) and the whole branch name. The precedence is flag, then environment variable, then git. An empty flag is an error that points to `--no-worktree`, and an empty variable turns the prefix off.
+- **Peer URLs and port strategies**: Every proxied app in a monorepo run gets a path-aware `PORTLESS_URL_<APP>` variable for each peer. `appPortStrategy` (`random`, `stable`, `sequential`) and `appPortRange`, with `PORTLESS_APP_PORT_*` overrides, make app ports predictable and are replayed by `bg start` intents.
+- **Self-daemonizing commands**: When a wrapped command exits on its own and a new listener holds the assigned port, the route moves to that listener, path- and label-aware, with sharing and orphan metadata cleared. A listener that existed before the command is never adopted and `bg` entries are skipped. A clean exit now waits up to 2 seconds for a daemon that binds late, which delays the exit of commands that really did finish.
+- **Chrome trust on Linux**: `portless trust` also trusts the CA in the invoking user's existing NSS database, which Chrome and Chromium use, warns when that fails, and `portless untrust` removes it. `trust` now skips its prompt only when every store it writes already has the CA, including both the Linux and Windows stores on WSL. Real `certutil`, Chrome and WSL runs are unverified.
+- **`portless proxy status`**: A read-only `proxy status` command, with `--json`, reports the running proxy's state without starting, stopping or elevating anything. The JSON adds `wildcard` and `lanIp` to upstream's keys, and the MCP server gains a matching `proxy_status` tool.
+- **MCP batches**: `portless mcp` answers JSON-RPC batches for protocol 2025-03-26 in order, omits results for notifications, and returns `-32600` for invalid entries. The warning for LAN mode with mDNS off now reads "mDNS publishing is off" and says the proxy is still reachable from the network.
+- **More frameworks and Vite versions**: `vinext` gets the port and host flags injected. Vite's allowed hosts are written for the app's Vite version: 8.1 and later get the comma list of exact sharing hostnames, and older or unknown versions get one prioritized host plus a notice.
+
+### Bug Fixes
+
+- **`proxy stop` strictness**: `proxy stop` accepts only `--port` and `-p`, and `proxy stop --help` now prints help. Before, any unknown argument, `--help` included, stopped the running proxy (#520). A trailing `--help` also prints help for `get`, `url` and `alias`.
+- **Dead-owner routes**: The proxy checks route owners once a second in memory and reloads its routes when an owner dies, so a force-killed dev server answers 404 within about 2.5 seconds instead of staying routable. The dashboard marks it orphaned, nothing is written to `routes.json`, and a process the user cannot signal still counts as alive.
+- **One proxy per state directory**: `proxy start` exits with an error when the state directory already tracks a live proxy on another port. `proxy stop -p <port>` stops only that port's listener, and a stopping proxy clears the state files only when they name it, so one proxy can no longer erase another's state (#540).
+- **Empty `PORTLESS_STATE_DIR`**: An explicit but empty state directory no longer probes the default port during discovery, auto-start or `proxy start`, which could reach a proxy in the default location.
+- **Turbo state directory**: The turbo integration writes its loader and `dev-manifest.json` into the resolved state directory instead of `~/.portless` when `PORTLESS_STATE_DIR` is set.
+- **Response hop-by-hop headers**: Plain HTTP/1.1 responses lose `Connection`-named headers plus `keep-alive`, `proxy-connection` and `upgrade`, and keep `transfer-encoding` because the proxy relays the body framing.
+- **Doctor Node check**: `service status` and `doctor` report when the service's pinned Node binary is missing.
+
+### Breaking Changes
+
+- **Stricter `proxy stop`**: Scripts that passed other arguments to `proxy stop` and relied on them being ignored now get the help text and the proxy keeps running. Use `--port` or `-p` only.
+- **`proxy start` refuses a second proxy**: Starting a proxy on a different port while the state directory tracks a live one is now an error. Stop the first proxy, or use a separate `PORTLESS_STATE_DIR`.
+
+### Maintenance
+
+- **Bun minimum documented**: The README and the skill state Bun 1.4.4 as the minimum when running portless under Bun, because Bun 1.4.4 fixes TLS context setup for registered hostnames. Upstream's per-hostname workaround (#470) is not ported.
+- **Test hygiene**: The `bg` and tunnel test suites no longer leak proxy daemons or fake `cloudflared` shim processes after a run.
+
+### Contributors
+
+- @enk0ded
+
 ## 0.15.14000
 
 ### Fork Sync
