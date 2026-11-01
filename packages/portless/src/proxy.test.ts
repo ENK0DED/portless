@@ -8,7 +8,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as tls from "node:tls";
 import type { Duplex } from "node:stream";
-import { createProxyServer, PORTLESS_HEADER, PORTLESS_LISTENER_PORT_HEADER } from "./proxy.js";
+import {
+  createProxyServer,
+  LOOPBACK_DIAL_OPTIONS,
+  PORTLESS_HEADER,
+  PORTLESS_LISTENER_PORT_HEADER,
+} from "./proxy.js";
 import type { ProxyServer } from "./proxy.js";
 import type { RouteInfo, TunnelAlias } from "./types.js";
 import { ensureCerts } from "./certs.js";
@@ -1202,56 +1207,74 @@ describe("createProxyServer", () => {
   });
 
   describe("upstream connections", () => {
-    it("caps concurrent upstream connections at 64", async () => {
-      const connections = new Set<net.Socket>();
-      const responses: http.ServerResponse[] = [];
-      let requestCount = 0;
-      let releaseResponses = false;
-      let resolve64: (() => void) | undefined;
-      const reached64 = new Promise<void>((resolve) => {
-        resolve64 = resolve;
+    it("preserves an IPv4 loopback connection across an event-loop stall", async () => {
+      const backend = trackServer(http.createServer((_req, res) => res.end("ok")));
+      await listen(backend);
+      const socket = net.connect({
+        ...LOOPBACK_DIAL_OPTIONS,
+        port: (backend.address() as net.AddressInfo).port,
       });
+      const connected = new Promise<void>((resolve, reject) => {
+        socket.once("connect", resolve);
+        socket.once("error", reject);
+      });
+      try {
+        expect(LOOPBACK_DIAL_OPTIONS.autoSelectFamilyAttemptTimeout).toBeGreaterThanOrEqual(2_000);
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 320);
+        await connected;
+      } finally {
+        socket.destroy();
+      }
+    });
+
+    it("serves requests while 80 upstream streams remain open", async () => {
       const backend = trackServer(
-        http.createServer((_req, res) => {
-          responses.push(res);
-          requestCount++;
-          if (requestCount === 64) resolve64?.();
-          if (releaseResponses) res.end("ok");
+        http.createServer((req, res) => {
+          if (req.url === "/stream") {
+            res.writeHead(200);
+            res.write("stream");
+          } else res.end("ok");
         })
       );
-      backend.on("connection", (socket) => connections.add(socket));
       await listen(backend);
-      const backendAddr = backend.address();
-      if (!backendAddr || typeof backendAddr === "string") throw new Error("no addr");
-
-      const routes: RouteInfo[] = [{ hostname: "myapp.localhost", port: backendAddr.port }];
+      const port = (backend.address() as net.AddressInfo).port;
       const server = trackServer(
-        createProxyServer({ getRoutes: () => routes, proxyPort: TEST_PROXY_PORT })
+        createProxyServer({
+          getRoutes: () => [{ hostname: "myapp.localhost", port }],
+          proxyPort: TEST_PROXY_PORT,
+        })
       );
       await listen(server);
-
-      const requests = Array.from({ length: 65 }, () =>
-        request(server, { host: "myapp.localhost" })
-      );
+      const proxyPort = (server.address() as net.AddressInfo).port;
+      const streams: http.ClientRequest[] = [];
       try {
-        await Promise.race([
-          reached64,
-          new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error("backend did not receive 64 requests")), 1000)
-          ),
-        ]);
-        await new Promise<void>((resolve) => setImmediate(resolve));
-
-        expect(connections.size).toBeLessThanOrEqual(64);
+        await Promise.all(
+          Array.from(
+            { length: 80 },
+            () =>
+              new Promise<void>((resolve, reject) => {
+                const req = http.get(
+                  {
+                    host: "127.0.0.1",
+                    port: proxyPort,
+                    path: "/stream",
+                    headers: { host: "myapp.localhost" },
+                    agent: false,
+                  },
+                  (res) => {
+                    res.on("error", () => {});
+                    res.once("data", () => resolve());
+                  }
+                );
+                streams.push(req);
+                req.on("error", reject);
+              })
+          )
+        );
+        expect((await request(server, { host: "myapp.localhost" })).body).toBe("ok");
       } finally {
-        releaseResponses = true;
-        for (const res of responses) {
-          res.end("ok");
-        }
-        await Promise.allSettled(requests);
+        streams.forEach((req) => req.destroy());
       }
-      const results = await Promise.all(requests);
-      expect(results.every((res) => res.status === 200 && res.body === "ok")).toBe(true);
     });
 
     it("reuses one upstream connection across ordinary requests", async () => {

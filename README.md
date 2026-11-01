@@ -385,6 +385,8 @@ https://cert.localhost          # or cert.<suffix> for a custom suffix
 
 The page offers the **public** CA certificate for download (`/portless-ca.pem`), shows its SHA-256 fingerprint so you can verify it, and gives step-by-step install instructions for macOS, Linux, Windows, and Firefox. Only the public certificate is ever served — the CA private key never leaves the machine that generated it. Install a CA only on devices you control: it can vouch for any HTTPS site to that device.
 
+HTTP/1.1 backend connections are pooled with up to 16 simultaneous connection attempts per app and 64 idle sockets. Established streams do not count toward the dial limit. A connection attempt times out after 10 seconds; established streams have no proxy timeout. Proxy shutdown rejects queued requests with status 503.
+
 ### h2c and gRPC upstreams
 
 By default, portless forwards each route to the local app with HTTP/1.1. Use `--h2c` only when the upstream app expects HTTP/2 cleartext, such as a local gRPC service:

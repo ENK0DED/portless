@@ -277,7 +277,7 @@ export const TOOLS: ToolDef[] = [
   tool(
     "proxy_start",
     "Start proxy",
-    "Start the shared portless proxy as a background daemon. Without port, HTTPS uses 443; listener probes and enabled hosts sync determine whether sudo is needed. A failed sudo exits without changing ports; MCP cannot answer a sudo prompt, so pass unprivileged for a port below 1024 without sudo, or port (for example 1355). HTTPS may show an OS dialog to trust the local CA; pass skipTrust to skip it.",
+    "Start the shared portless proxy as a background daemon. Backend pooling permits 16 simultaneous dials per app and 64 idle sockets; connects have a 10-second deadline, established streams have no proxy timeout, and shutdown rejects queued requests with 503. Without port, HTTPS uses 443; listener probes and enabled hosts sync determine whether sudo is needed. A failed sudo exits without changing ports; MCP cannot answer a sudo prompt, so pass unprivileged for a port below 1024 without sudo, or port (for example 1355). HTTPS may show an OS dialog to trust the local CA; pass skipTrust to skip it.",
     {
       port: PORT_PROPERTY,
       noTls: { type: "boolean", description: "Serve plain HTTP instead of HTTPS." },
@@ -1098,6 +1098,9 @@ export function printMcpHelp(): void {
       "  bg_list         List background apps (also bg_status and bg_logs).",
       "  bg_start        Start a background app (background profile; also bg_stop, bg_restart).",
       "  tools_profiles  Show active and available profiles.",
+      "",
+      "Backend pooling: 16 concurrent dials per app, 64 idle sockets, 10-second connect",
+      "deadline, no timeout on established streams; shutdown rejects queued requests with 503.",
       "",
       "Pass --tools with a comma separated list of profiles. The default is core,",
       "which is read-only for background apps. Add background to start, stop, and",

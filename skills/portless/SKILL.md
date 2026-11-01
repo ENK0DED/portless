@@ -307,6 +307,8 @@ To trust the CA on another device (a phone over LAN mode, a second machine, or a
 
 While the proxy runs, `https://portless.localhost` (`portless.<suffix>`) serves a read-only dashboard of every running app — hostnames, ports, public-exposure state, and CA trust. It never controls processes from the browser; each row opens the app or copies its URL. The hostname is reserved; disable with `PORTLESS_DASHBOARD=0`.
 
+The HTTP/1.1 backend pool limits concurrent connection attempts to 16 per app and keeps up to 64 idle sockets. Established streams do not consume dial slots. Connects have a 10-second deadline; established streams have no proxy timeout. Shutdown rejects queued requests with status 503.
+
 ### h2c and gRPC upstreams
 
 Portless forwards to local apps with HTTP/1.1 by default. Use `--h2c` only for routes whose upstream app expects HTTP/2 cleartext, such as a local gRPC service:

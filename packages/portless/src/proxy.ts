@@ -138,6 +138,8 @@ export const LOOPBACK_DIAL_OPTIONS = {
   hostname: "localhost",
   host: "localhost",
   autoSelectFamily: true,
+  // Preserve successful local dials across brief event-loop stalls.
+  autoSelectFamilyAttemptTimeout: Math.max(2_000, net.getDefaultAutoSelectFamilyAttemptTimeout()),
   lookup: ((_hostname, _options, callback) => {
     callback(null, [
       { address: "127.0.0.1", family: 4 },
@@ -228,8 +230,9 @@ const HOP_BY_HOP_HEADERS = new Set([
 /** Hop-by-hop request headers that never belong on a forwarded plain HTTP request. */
 const REQUEST_HOP_BY_HOP_HEADERS = ["connection", "keep-alive", "proxy-connection", "upgrade"];
 
-/** Cap ordinary upstream connections so multiplexed clients cannot overload a backend. */
-const MAX_UPSTREAM_SOCKETS = 64;
+/** Limit pending dials without blocking requests behind established streams. */
+const MAX_UPSTREAM_DIALS = 16;
+const UPSTREAM_CONNECT_TIMEOUT_MS = 10_000;
 
 /** Time a backend has to answer a WebSocket handshake before the proxy gives up. */
 const WEBSOCKET_HANDSHAKE_TIMEOUT_MS = 30_000;
@@ -789,15 +792,81 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     return matched?.slice(1) ?? primaryTld;
   };
   const caFingerprint = tls?.ca ? formatFingerprint(tls.ca) : undefined;
-  const upstreamAgent = new http.Agent({
-    keepAlive: true,
-    maxSockets: MAX_UPSTREAM_SOCKETS,
+  const upstreamAgent = new http.Agent({ keepAlive: true, maxFreeSockets: 64 });
+  let closing = false;
+  type WaitingRequest = { send: () => void; fail: () => void };
+  const upstreams = new Map<number, { dialing: number; queue: WaitingRequest[] }>();
+  const stateFor = (port: number) => {
+    let state = upstreams.get(port);
+    if (!state) {
+      state = { dialing: 0, queue: [] };
+      upstreams.set(port, state);
+    }
+    return state;
+  };
+  const hasFreeSocket = (port: number) =>
+    upstreamAgent.freeSockets[upstreamAgent.getName({ host: "localhost", port })]?.some(
+      (socket) => !socket.destroyed
+    );
+  const drainUpstream = (port: number) => {
+    if (closing) return;
+    const state = stateFor(port);
+    while (
+      !closing &&
+      state.queue.length &&
+      (state.dialing < MAX_UPSTREAM_DIALS || hasFreeSocket(port))
+    ) {
+      state.queue.shift()!.send();
+    }
+  };
+  const whenUpstreamReady = (port: number, entry: WaitingRequest) => {
+    if (closing) return entry.fail();
+    const state = stateFor(port);
+    state.queue.push(entry);
+    drainUpstream(port);
+  };
+  upstreamAgent.on("free", (_socket, options) => {
+    if (!closing) drainUpstream(Number(options.port));
   });
-  upstreamAgent.createConnection = (options) =>
-    net.connect({
-      ...LOOPBACK_DIAL_OPTIONS,
-      port: options.port as number,
+  upstreamAgent.createConnection = (options) => {
+    if (closing) return new net.Socket().destroy();
+    const port = Number(options.port);
+    const state = stateFor(port);
+    state.dialing++;
+    const socket = net.connect({ ...LOOPBACK_DIAL_OPTIONS, port });
+    let settled = false;
+    const settle = () => {
+      if (settled) return;
+      settled = true;
+      state.dialing--;
+      drainUpstream(port);
+    };
+    // Only connection establishment has a deadline. Established streams stay open.
+    // ETIMEDOUT never qualifies for the reused-socket ECONNRESET replay below.
+    const timeout = () =>
+      socket.destroy(
+        Object.assign(new Error("Upstream connect timed out"), {
+          code: "ETIMEDOUT",
+        })
+      );
+    socket.setTimeout(UPSTREAM_CONNECT_TIMEOUT_MS, timeout);
+    socket.once("connect", () => {
+      socket.setTimeout(0);
+      socket.removeListener("timeout", timeout);
+      settle();
     });
+    socket.once("close", settle);
+    return socket;
+  };
+  const closeUpstreams = () => {
+    closing = true;
+    for (const state of upstreams.values()) {
+      for (const entry of state.queue.splice(0)) entry.fail();
+    }
+    upstreams.clear();
+    upstreamAgent.destroy();
+    closeH2cSessions(h2cSessions);
+  };
 
   const hostPort = (reqTls: boolean): string =>
     proxyPort === (reqTls ? 443 : 80) ? "" : `:${proxyPort}`;
@@ -1369,84 +1438,104 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       proxyReqHeaders["transfer-encoding"] = "chunked";
     }
 
-    const proxyReq = http.request(
-      {
-        agent: upstreamAgent,
-        port: route.port,
-        path: target.forwardTarget,
-        method: req.method,
-        headers: proxyReqHeaders,
-      },
-      (proxyRes) => {
-        const responseHeaders: http.OutgoingHttpHeaders = { ...proxyRes.headers };
-        if (reqTls) {
-          for (const h of HOP_BY_HOP_HEADERS) {
-            delete responseHeaders[h];
+    // Capture replay eligibility before forwarding can consume the incoming body.
+    const replayable =
+      !isReplay && REPLAYABLE_METHODS.has(req.method || "") && isBodylessRequest(req);
+    const clientGone = () =>
+      res.destroyed || (res as unknown as http2.Http2ServerResponse).stream?.destroyed;
+    const send = () => {
+      if (clientGone()) return;
+      const proxyReq = http.request(
+        {
+          agent: upstreamAgent,
+          port: route.port,
+          path: target.forwardTarget,
+          method: req.method,
+          headers: proxyReqHeaders,
+        },
+        (proxyRes) => {
+          const responseHeaders: http.OutgoingHttpHeaders = { ...proxyRes.headers };
+          if (reqTls) {
+            for (const h of HOP_BY_HOP_HEADERS) {
+              delete responseHeaders[h];
+            }
           }
+          res.writeHead(proxyRes.statusCode || 502, responseHeaders);
+          proxyRes.on("error", () => {
+            if (!res.headersSent) {
+              res.writeHead(502, { "Content-Type": "text/plain" });
+              res.end();
+            } else {
+              // Headers already sent (mid-stream): destroy instead of end to
+              // send RST_STREAM. Calling res.end() here can cause a
+              // content-length mismatch that Chrome treats as a session error.
+              res.destroy();
+            }
+          });
+          proxyRes.pipe(res);
         }
-        res.writeHead(proxyRes.statusCode || 502, responseHeaders);
-        proxyRes.on("error", () => {
-          if (!res.headersSent) {
-            res.writeHead(502, { "Content-Type": "text/plain" });
-            res.end();
-          } else {
-            // Headers already sent (mid-stream): destroy instead of end to
-            // send RST_STREAM. Calling res.end() here can cause a
-            // content-length mismatch that Chrome treats as a session error.
-            res.destroy();
-          }
-        });
-        proxyRes.pipe(res);
-      }
-    );
+      );
 
-    proxyReq.on("error", (err) => {
-      const errWithCode = err as NodeJS.ErrnoException;
-      if (
-        !isReplay &&
-        proxyReq.reusedSocket &&
-        errWithCode.code === "ECONNRESET" &&
-        !res.headersSent &&
-        REPLAYABLE_METHODS.has(req.method || "") &&
-        isBodylessRequest(req)
-      ) {
+      proxyReq.on("error", (err) => {
+        const errWithCode = err as NodeJS.ErrnoException;
+        if (
+          replayable &&
+          !clientGone() &&
+          !closing &&
+          proxyReq.reusedSocket &&
+          errWithCode.code === "ECONNRESET" &&
+          !res.headersSent
+        ) {
+          req.unpipe(proxyReq);
+          handleRequest(req, res, true);
+          return;
+        }
+        // Drain whatever the client still sends so a kept-alive connection stays
+        // usable after the error response. This must come after the replay early
+        // return above, which still needs the request.
         req.unpipe(proxyReq);
-        handleRequest(req, res, true);
-        return;
-      }
-      // Drain whatever the client still sends so a kept-alive connection stays
-      // usable after the error response. This must come after the replay early
-      // return above, which still needs the request.
-      req.unpipe(proxyReq);
-      req.resume();
-      onError(`Proxy error for ${getRequestHost(req)}: ${dialErrorMessage(err)}`);
-      if (!res.headersSent) {
-        const detail =
-          errWithCode.code === "ECONNREFUSED"
-            ? "The target app is not responding. It may have crashed."
-            : "The target app may not be running.";
-        sendBadGateway(req, res, route, detail);
-      }
-    });
+        req.resume();
+        onError(`Proxy error for ${getRequestHost(req)}: ${dialErrorMessage(err)}`);
+        if (!res.headersSent) {
+          const detail =
+            errWithCode.code === "ECONNREFUSED"
+              ? "The target app is not responding. It may have crashed."
+              : "The target app may not be running.";
+          sendBadGateway(req, res, route, detail);
+        }
+      });
 
-    // Abort the outgoing request if the client disconnects
-    res.on("close", () => {
-      if (!proxyReq.destroyed) {
-        proxyReq.destroy();
-      }
-    });
+      // Abort the outgoing request if the client disconnects
+      res.on("close", () => {
+        if (!proxyReq.destroyed) {
+          proxyReq.destroy();
+        }
+      });
 
-    req.on("error", () => {
-      if (!proxyReq.destroyed) {
-        proxyReq.destroy();
-      }
-    });
+      req.on("error", () => {
+        if (!proxyReq.destroyed) {
+          proxyReq.destroy();
+        }
+      });
 
-    if (isReplay) {
-      proxyReq.end();
-    } else {
-      req.pipe(proxyReq);
-    }
+      if (isReplay) {
+        proxyReq.end();
+      } else {
+        req.pipe(proxyReq);
+      }
+    };
+    whenUpstreamReady(route.port, {
+      send,
+      fail: () => {
+        if (clientGone()) return;
+        req.resume();
+        if (res.headersSent) res.destroy();
+        else {
+          res.writeHead(503);
+          res.end();
+        }
+      },
+    });
   };
 
   const handleUpgrade = (req: http.IncomingMessage, socket: net.Socket, head: Buffer) => {
@@ -1753,8 +1842,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     // Proxy close() through to inner servers so tests and cleanup work.
     const origClose = wrapper.close.bind(wrapper);
     wrapper.close = function (cb?: (err?: Error) => void) {
-      closeH2cSessions(h2cSessions);
-      upstreamAgent.destroy();
+      closeUpstreams();
       h2Server.close();
       plainServer.close();
       return origClose(cb);
@@ -1765,10 +1853,12 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
 
   const httpServer = http.createServer(handleRequest);
   httpServer.on("upgrade", handleUpgrade);
-  httpServer.on("close", () => {
-    closeH2cSessions(h2cSessions);
-    upstreamAgent.destroy();
-  });
+  const origHttpClose = httpServer.close.bind(httpServer);
+  httpServer.close = function (cb?: (err?: Error) => void) {
+    closeUpstreams();
+    return origHttpClose(cb);
+  } as typeof httpServer.close;
+  httpServer.on("close", closeUpstreams);
 
   return loopbackOnly ? guardLoopbackOnly(httpServer) : httpServer;
 }

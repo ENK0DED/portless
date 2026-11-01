@@ -3592,6 +3592,9 @@ ${colors.bold("How it works:")}
   6. The proxy listens only on 127.0.0.1 and ::1 unless LAN mode is enabled
   7. Errors from portless itself are HTML for browsers and JSON
      {"error","upstream","message"} for other clients; hosts outside your suffixes get 421
+  8. Backend pooling permits 16 simultaneous dials per app and 64 idle sockets.
+     Connects time out after 10 seconds; established streams have no proxy timeout.
+     Queued requests receive 503 when the proxy shuts down
 
 ${colors.bold("Background apps:")}
   Use portless bg start for long-lived local servers that should keep running
