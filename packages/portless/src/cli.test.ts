@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll, vi } from "vitest";
 import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as http from "node:http";
@@ -397,13 +397,67 @@ function writeExpoShim(dir: string): void {
   fs.chmodSync(shimPath, 0o755);
 }
 
+/**
+ * Directory where every cloudflared shim records its pid. It lives outside the
+ * per-test state and bin directories so the pids survive when those are
+ * removed, which lets `reapCloudflaredShims` stop shims that outlived a test.
+ */
+let shimPidDir: string | undefined;
+
+function getShimPidDir(): string {
+  shimPidDir ??= fs.mkdtempSync(path.join(os.tmpdir(), "portless-cloudflared-shim-pids-"));
+  return shimPidDir;
+}
+
+function isCloudflaredShimProcess(pid: number): boolean {
+  const result = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" });
+  return result.status === 0 && result.stdout.includes("cloudflared-shim.js");
+}
+
+/** SIGKILL every recorded shim that is still running and wait for it to exit. */
+async function reapCloudflaredShims(): Promise<void> {
+  if (!shimPidDir || process.platform === "win32") return;
+  let names: string[];
+  try {
+    names = fs.readdirSync(shimPidDir);
+  } catch {
+    return;
+  }
+  const targets: number[] = [];
+  for (const name of names) {
+    const pid = Number(name);
+    // A shim removes its own pid file on a normal exit, so a file that is left
+    // either names a live leak or a dead pid that may have been reused.
+    if (Number.isInteger(pid) && pid > 0 && isPidAlive(pid) && isCloudflaredShimProcess(pid)) {
+      targets.push(pid);
+    }
+    fs.rmSync(path.join(shimPidDir, name), { force: true });
+  }
+  for (const pid of targets) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // The shim exited between the check and the signal.
+    }
+  }
+  const deadline = Date.now() + 2000;
+  while (targets.some(isPidAlive) && Date.now() < deadline) {
+    await sleepMs(25);
+  }
+}
+
 function writeCloudflaredShim(dir: string, url = "https://abc.trycloudflare.com"): void {
   const scriptPath = path.join(dir, "cloudflared-shim.js");
+  const pidDir = getShimPidDir();
   fs.writeFileSync(
     scriptPath,
     [
       "if (process.argv.includes('version') || process.argv.includes('--version')) { console.log('cloudflared version test'); process.exit(0); }",
-      "if (process.env.PORTLESS_TEST_TUNNEL_ARGS) require('node:fs').writeFileSync(process.env.PORTLESS_TEST_TUNNEL_ARGS, JSON.stringify(process.argv.slice(2)));",
+      "const fs = require('node:fs');",
+      `const pidFile = require('node:path').join(${JSON.stringify(pidDir)}, String(process.pid));`,
+      "fs.writeFileSync(pidFile, '');",
+      "process.on('exit', () => { try { fs.unlinkSync(pidFile); } catch {} });",
+      "if (process.env.PORTLESS_TEST_TUNNEL_ARGS) fs.writeFileSync(process.env.PORTLESS_TEST_TUNNEL_ARGS, JSON.stringify(process.argv.slice(2)));",
       `console.log(${JSON.stringify(url)});`,
       "console.log('Registered tunnel connection');",
       "setInterval(() => {}, 1000);",
@@ -419,8 +473,11 @@ function writeCloudflaredShim(dir: string, url = "https://abc.trycloudflare.com"
     return;
   }
 
+  // exec so the node process is the child portless spawns and signals, like the
+  // single cloudflared binary. Without it, SIGTERM stops only the shell and
+  // leaves the node shim running as an orphan.
   const shimPath = path.join(dir, "cloudflared");
-  fs.writeFileSync(shimPath, `#!/bin/sh\n"${process.execPath}" "${scriptPath}" "$@"\n`);
+  fs.writeFileSync(shimPath, `#!/bin/sh\nexec "${process.execPath}" "${scriptPath}" "$@"\n`);
   fs.chmodSync(shimPath, 0o755);
 }
 
@@ -508,6 +565,14 @@ describe("CLI", () => {
         `Built CLI not found at ${CLI_PATH}. Run 'bun run build' before running tests.`
       );
     }
+  });
+
+  // Runs after the nested afterEach hooks, so bg teardown has already stopped its wrappers.
+  afterEach(reapCloudflaredShims);
+
+  afterAll(async () => {
+    await reapCloudflaredShims();
+    if (shimPidDir) fs.rmSync(shimPidDir, { recursive: true, force: true });
   });
 
   describe("--help", () => {
