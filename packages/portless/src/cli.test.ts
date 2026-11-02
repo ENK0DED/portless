@@ -2307,8 +2307,13 @@ describe("CLI", () => {
         const [entry] = readBgRegistry(tmpDir);
 
         try {
+          // clean stops the proxy and the bg entry and waits for both to exit,
+          // which can pass the default 10 s on a loaded CI runner.
           expect(
-            run(["clean"], { env: bgEnv({ HOME: homeDir, USERPROFILE: homeDir }) }).status
+            run(["clean"], {
+              env: bgEnv({ HOME: homeDir, USERPROFILE: homeDir }),
+              timeoutMs: 30_000,
+            }).status
           ).toBe(0);
         } finally {
           fs.rmSync(homeDir, { recursive: true, force: true });
@@ -2316,7 +2321,7 @@ describe("CLI", () => {
 
         await expect(waitForPidGone(entry.pid)).resolves.toBe(true);
         expect(fs.existsSync(path.join(tmpDir, "bg"))).toBe(false);
-      });
+      }, 60_000);
 
       it("portless prune removes dead bg entries without stopping live entries", async () => {
         const livePort = await getFreePort();
