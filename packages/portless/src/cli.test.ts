@@ -2493,6 +2493,38 @@ describe("CLI", () => {
       expect(stderr).not.toContain("ENOENT");
     });
 
+    it("proxy stop without -p never probes the default port from an empty state dir", async () => {
+      // A stub that answers like a portless proxy on a free non-default port,
+      // which stands in for the default port through PORTLESS_PORT. An isolated
+      // state dir has no proxy, so the stop must neither connect nor stop it.
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-stop-empty-"));
+      let connections = 0;
+      const stub = http.createServer((_req, res) => {
+        res.setHeader("X-Portless", "1");
+        res.end();
+      });
+      stub.on("connection", () => {
+        connections += 1;
+      });
+      await new Promise<void>((resolve) => stub.listen(0, "127.0.0.1", resolve));
+      const stubPort = (stub.address() as net.AddressInfo).port;
+      try {
+        const { status, stdout, stderr } = run(["proxy", "stop"], {
+          env: { PORTLESS_STATE_DIR: tmpDir, PORTLESS_PORT: String(stubPort) },
+        });
+        // The synchronous child blocked this event loop, so let any queued
+        // connection event fire before counting.
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(status).toBe(0);
+        expect(stdout).toContain("Proxy is not running.");
+        expect(stderr).not.toContain("sudo");
+        expect(connections).toBe(0);
+      } finally {
+        await new Promise<void>((resolve) => stub.close(() => resolve()));
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
     it("passes through exit code from bypassed command", () => {
       const { status } = run(["myapp", "node", "-e", "process.exit(42)"], {
         env: { PORTLESS: "0" },
@@ -4286,6 +4318,46 @@ describe("CLI", () => {
         expect(fs.readFileSync(store.getRoutesPath(), "utf-8")).toBe(before);
       });
 
+      it.skipIf(process.platform !== "linux")(
+        "stops the sharing tunnel within about 2s of its owner being force-killed, leaving other processes alone",
+        async () => {
+          // A stand-in tunnel: a shell script named cloudflared (Linux reports a
+          // script's file name as its command), so the binary check in
+          // stopTunnelPid accepts it. It is not a real tunnel.
+          const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-owner-tunnel-"));
+          try {
+            const fakeTunnelPath = path.join(shimDir, "cloudflared");
+            fs.writeFileSync(fakeTunnelPath, "#!/bin/sh\nwhile :; do sleep 1; done\n");
+            fs.chmodSync(fakeTunnelPath, 0o755);
+            const tunnel = spawn(fakeTunnelPath, [], { stdio: "ignore" });
+            const bystander = spawn(process.execPath, ["-e", idleScript], { stdio: "ignore" });
+            const owner = spawn(process.execPath, ["-e", idleScript], { stdio: "ignore" });
+            children.push(tunnel, bystander, owner);
+            const exited = (child: ReturnType<typeof spawn>) =>
+              child.exitCode !== null || child.signalCode !== null;
+
+            const start = run(["proxy", "start"], { env: proxyEnv() });
+            expect(start.status).toBe(0);
+            await waitForHttpHeader(testPort, "X-Portless", "1");
+
+            const store = new RouteStore(tmpDir);
+            store.addRoute("shared.localhost", backendPort, owner.pid!);
+            store.updateRoute("shared.localhost", { tunnelPid: tunnel.pid! });
+            expect(
+              await waitFor(async () => (await status("shared.localhost")) === 200, 3000)
+            ).toBe(true);
+            expect(exited(tunnel)).toBe(false);
+
+            await killAndWait(owner);
+            expect(await waitFor(async () => exited(tunnel), 2500)).toBe(true);
+            // Only sharing helpers are signaled: an unrelated process survives.
+            expect(exited(bystander)).toBe(false);
+          } finally {
+            fs.rmSync(shimDir, { recursive: true, force: true });
+          }
+        }
+      );
+
       it("keeps serving other routes when one owner dies", async () => {
         const doomed = spawn(process.execPath, ["-e", idleScript], { stdio: "ignore" });
         const survivor = spawn(process.execPath, ["-e", idleScript], { stdio: "ignore" });
@@ -4732,6 +4804,15 @@ describe("CLI", () => {
       });
       expect(mismatch.status).toBe(1);
       expect(mismatch.stderr).toContain("unprivileged mode differs");
+    });
+
+    it("answers the hosts-sync endpoint with disabled in unprivileged mode without PORTLESS_SYNC_HOSTS", async () => {
+      // run() pins PORTLESS_SYNC_HOSTS=0; clear it so the 409 comes from the
+      // daemon's unprivileged mode alone, not from the env opt-out.
+      const env = { ...proxyEnv(), PORTLESS_SYNC_HOSTS: undefined };
+      const start = run(["proxy", "start", "--unprivileged", "--suffix", "test"], { env });
+      expect(start.status, start.stdout + start.stderr).toBe(0);
+      expect(await triggerHostsSync(testPort, false, tmpDir)).toBe("disabled");
     });
 
     it("refuses forced hosts sync in unprivileged mode", () => {

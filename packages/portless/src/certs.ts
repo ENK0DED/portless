@@ -825,6 +825,21 @@ function linuxNSSDatabase(): string | undefined {
   return fs.existsSync(current) ? current : undefined;
 }
 
+/** Thrown when the NSS `certutil` tool is not installed. */
+class NssCertutilMissingError extends Error {
+  constructor(database: string, cause: unknown) {
+    super(
+      `Chrome/Chromium keep their certificates in an NSS database (${database}) and need ` +
+        "`certutil` to trust the portless CA, but `certutil` is not installed. " +
+        "Install it (Debian/Ubuntu: sudo apt install libnss3-tools; " +
+        "Fedora/RHEL: sudo dnf install nss-tools; Arch: sudo pacman -S nss; " +
+        "openSUSE: sudo zypper install mozilla-nss-tools), then run `portless trust`.",
+      { cause }
+    );
+    this.name = "NssCertutilMissingError";
+  }
+}
+
 function nssCertutil(database: string, args: string[], input?: string): string {
   const commandArgs = ["-d", `sql:${database}`, ...args];
   const sudoUser = process.getuid?.() === 0 ? process.env.SUDO_USER : undefined;
@@ -838,6 +853,12 @@ function nssCertutil(database: string, args: string[], input?: string): string {
       { encoding: "utf-8", stdio: "pipe", timeout: 15_000, input }
     );
   } catch (err) {
+    // Directly, a missing certutil is ENOENT. Under `sudo -u`, sudo itself
+    // reports "command not found" on stderr and exits non-zero.
+    const missing = dropPrivileges
+      ? /command not found/i.test(String((err as { stderr?: unknown } | undefined)?.stderr ?? ""))
+      : (err as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
+    if (missing) throw new NssCertutilMissingError(database, err);
     const message = err instanceof Error ? err.message : String(err);
     throw new Error(
       `Chrome/Chromium NSS trust failed (${database}): ${message}\n` +
@@ -847,6 +868,23 @@ function nssCertutil(database: string, args: string[], input?: string): string {
       { cause: err }
     );
   }
+}
+
+/**
+ * A warning when the user's Chrome/Chromium NSS database exists but `certutil`
+ * is not installed, so portless cannot read or write that database. Callers
+ * only warn: it is never incomplete trust (see isCATrustedNSS).
+ */
+export function nssCertutilMissingWarning(): string | undefined {
+  if (process.platform !== "linux") return undefined;
+  const database = linuxNSSDatabase();
+  if (!database) return undefined;
+  try {
+    nssCertutil(database, ["-L"]);
+  } catch (err) {
+    if (err instanceof NssCertutilMissingError) return err.message;
+  }
+  return undefined;
 }
 
 function nssNickname(caCertPath: string): string {
@@ -866,7 +904,11 @@ function nssTrustFlags(database: string, nickname: string): string | undefined {
 
 /**
  * Whether the user's Chrome/Chromium NSS database trusts the CA for SSL.
- * True when no database exists (portless never creates one).
+ * True when no database exists (portless never creates one). Also true when a
+ * database exists but `certutil` is missing: trust cannot be checked or fixed
+ * from here, and counting it as untrusted would defeat the `trust` skip and
+ * retry trust on every `proxy start`. That state is a warning instead
+ * (nssCertutilMissingWarning).
  */
 function isCATrustedNSS(caCertPath: string): boolean {
   if (process.platform !== "linux") return true;
@@ -881,8 +923,8 @@ function isCATrustedNSS(caCertPath: string): boolean {
       new crypto.X509Certificate(installed).fingerprint256 ===
       new crypto.X509Certificate(fs.readFileSync(caCertPath)).fingerprint256
     );
-  } catch {
-    return false;
+  } catch (err) {
+    return err instanceof NssCertutilMissingError;
   }
 }
 
@@ -906,6 +948,7 @@ function updateCATrustNSS(caCertPath: string, remove = false): void {
 }
 
 function nssWarning(err: unknown): string {
+  if (err instanceof NssCertutilMissingError) return err.message;
   return (
     "Chrome/Chromium may still show certificate warnings. " +
     (err instanceof Error ? err.message : String(err))

@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
+import { guardWindowsOrphans } from "./cli-utils.js";
 
 const NETBIRD_BINARY = "netbird";
 const NETBIRD_START_TIMEOUT_MS = 30_000;
@@ -58,10 +59,15 @@ export interface StartedNetbirdExpose {
 }
 
 function defaultSpawner(args: string[]): NetbirdExposeProcess {
-  return spawn(NETBIRD_BINARY, args, {
+  const spawnedAt = Date.now();
+  const child = spawn(NETBIRD_BINARY, args, {
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
-  }) as NetbirdExposeProcess;
+  });
+  // The expose child publishes a public URL, so on Windows it must not outlive
+  // a force-killed portless (nothing else would end it).
+  guardWindowsOrphans(child, spawnedAt);
+  return child as NetbirdExposeProcess;
 }
 
 function defaultRunner(args: string[]): NetbirdCommandResult {

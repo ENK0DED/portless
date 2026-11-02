@@ -9,6 +9,7 @@ import {
   findPidOnPort,
   getDefaultPort,
   getProxyBindTargets,
+  isExplicitStateDirEmpty,
   isHttpsEnvDisabled,
   isPortListening,
   isProxyRunning,
@@ -20,7 +21,7 @@ import {
   resolveWindowsCommandInvocation,
   validateTld,
 } from "./cli-utils.js";
-import { isCATrusted } from "./certs.js";
+import { isCATrusted, nssCertutilMissingWarning } from "./certs.js";
 import { checkHostResolution, getManagedHostnames } from "./hosts.js";
 import { isMdnsSupported } from "./mdns.js";
 import { ensureNetbirdReady } from "./netbird.js";
@@ -160,6 +161,7 @@ export interface DoctorDependencies {
   managedHostnames: () => string[];
   resolvesHostname: (hostname: string) => Promise<boolean>;
   isCATrusted: (stateDir: string) => boolean;
+  nssCertutilMissingWarning: () => string | undefined;
   certPageResponds: (port: number, tls: boolean, suffix: string) => Promise<boolean>;
   mdnsSupport: () => { supported: boolean; reason?: string };
   probeTool: (name: DoctorToolName, required: boolean) => DoctorToolStatus;
@@ -287,6 +289,7 @@ const DEFAULT_DEPENDENCIES: DoctorDependencies = {
   managedHostnames: getManagedHostnames,
   resolvesHostname: checkHostResolution,
   isCATrusted,
+  nssCertutilMissingWarning,
   certPageResponds: requestCertPage,
   mdnsSupport: isMdnsSupported,
   probeTool: probeDoctorTool,
@@ -496,7 +499,13 @@ export async function collectDoctorSnapshot(
   }
 
   const hasPortFile = fs.existsSync(path.join(state.dir, "proxy.port"));
-  const stateProxyRunning = await dependencies.isProxyRunning(state.port, state.tls);
+  // An explicit state dir without a port file has no proxy of its own. Probing
+  // the default port would reach whatever proxy listens there (for example a
+  // system-wide one), so report it as not running without opening a connection.
+  const isolatedEmpty = isExplicitStateDirEmpty();
+  const stateProxyRunning = isolatedEmpty
+    ? false
+    : await dependencies.isProxyRunning(state.port, state.tls);
   const proxyTls = stateProxyRunning || hasPortFile ? state.tls : !isHttpsEnvDisabled();
   const proxyPort = stateProxyRunning || hasPortFile ? state.port : getDefaultPort(proxyTls);
 
@@ -504,11 +513,13 @@ export async function collectDoctorSnapshot(
   const bgStore = new BgStore(state.dir, { onWarning: (warning) => warnings.push(warning) });
   const rawRoutes = routeStore.loadRoutesRaw();
   const bgEntries = bgStore.loadEntries();
-  const proxyRunning =
-    stateProxyRunning && proxyPort === state.port
+  const proxyRunning = isolatedEmpty
+    ? false
+    : stateProxyRunning && proxyPort === state.port
       ? true
       : await dependencies.isProxyRunning(proxyPort, proxyTls);
-  const portListening = proxyRunning || (await dependencies.isPortListening(proxyPort));
+  const portListening =
+    proxyRunning || (!isolatedEmpty && (await dependencies.isPortListening(proxyPort)));
   const pid = readPidFile(state.dir, warnings);
   const managedHostnames = new Set(dependencies.managedHostnames());
 
@@ -561,6 +572,9 @@ export async function collectDoctorSnapshot(
   const customCert = readCustomCertMarker(state.dir);
   const internalPages = !readInternalPagesDisabledMarker(state.dir);
   const ca = fs.existsSync(path.join(state.dir, "ca.pem"));
+  // A Chrome NSS database without certutil is a warning, never incomplete trust.
+  const nssWarning = ca ? dependencies.nssCertutilMissingWarning() : undefined;
+  if (nssWarning) warnings.push(nssWarning);
   const certPages: Record<string, boolean> = {};
   for (const suffix of state.tlds) {
     certPages[suffix] =

@@ -294,6 +294,36 @@ export function stopNgrokProcess(child: TunnelChildProcess | undefined): void {
   terminateTunnelChild(child);
 }
 
+/**
+ * The command line of a Windows process, or null when it cannot be read.
+ * `pid` must already be a validated integer.
+ */
+function getWindowsCommandLine(pid: number): string | null {
+  const result = spawnSync(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      `(Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}').CommandLine`,
+    ],
+    { encoding: "utf-8", timeout: NGROK_COMMAND_TIMEOUT_MS, windowsHide: true }
+  );
+  return result.status === 0 ? result.stdout?.trim() || null : null;
+}
+
+/**
+ * True for the command line of the `cmd.exe` wrapper that runs an ngrok or
+ * cloudflared `.cmd` shim, as built by resolveWindowsCommandInvocation: the
+ * shim must be the command that `/c` runs, not an argument of something else.
+ */
+const WINDOWS_TUNNEL_SHIM_COMMAND =
+  /\/c\s+(?:""[^"\r\n]*[\\/]|"?(?:[^\s"]*[\\/])?)(?:ngrok|cloudflared)\.(?:cmd|bat)(?=["\s]|$)/i;
+
+export function isWindowsTunnelShimCommandLine(commandLine: string): boolean {
+  return WINDOWS_TUNNEL_SHIM_COMMAND.test(commandLine);
+}
+
 export function stopTunnelPid(pid: number | undefined): void {
   if (!pid || !Number.isInteger(pid) || pid <= 1) return;
   let binary = getProcessCommand(pid);
@@ -311,6 +341,21 @@ export function stopTunnelPid(pid: number | undefined): void {
             ?.toLowerCase()
             .replace(/\.exe$/, "") ?? null)
         : null;
+    // A tunnel started from a .cmd shim runs under a cmd.exe wrapper, and that
+    // wrapper's pid is what gets persisted. Accept a cmd.exe only when its
+    // command line runs the ngrok or cloudflared shim, then end the whole tree
+    // so the tunnel itself does not survive the wrapper.
+    if (binary === "cmd") {
+      const commandLine = getWindowsCommandLine(pid);
+      if (commandLine && isWindowsTunnelShimCommandLine(commandLine)) {
+        spawnSync("taskkill", ["/T", "/F", "/PID", String(pid)], {
+          stdio: "ignore",
+          timeout: NGROK_COMMAND_TIMEOUT_MS,
+          windowsHide: true,
+        });
+      }
+      return;
+    }
   }
   if (binary !== "ngrok" && binary !== "cloudflared") return;
   try {

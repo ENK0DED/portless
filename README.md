@@ -256,7 +256,9 @@ start time, so a reused process ID is never targeted. The proxy's background swe
 anything: it keeps such a route on file as orphaned, and `portless list` and the dashboard show it
 until you run or prune. The proxy does not serve an orphaned route: it checks route owners about
 once a second and answers 404 for the hostname as soon as the owner is gone, without writing the
-routes file. Process groups do not exist on Windows, so this recovery is Unix only.
+routes file. In the same check it stops the sharing the dead owner started for that route (managed
+tunnel, Tailscale serve, NetBird), once per death, so a public URL closes within about a second
+instead of waiting for the sweep. Only sharing helpers are stopped, never the dev server. Process groups do not exist on Windows, so this recovery is Unix only.
 
 ## Subdomains
 
@@ -375,7 +377,7 @@ In LAN mode, an explicit suffix list is preserved and `.local` is appended when 
 
 Suffix values are lowercased and validated as DNS names: each label may contain lowercase letters, digits, and hyphens, must start and end with a letter or digit, and must be 63 characters or less. The full suffix and generated hostname must be 253 characters or less. Leading dots, trailing dots, and consecutive dots are rejected.
 
-Auto-elevated proxy starts pass the resolved `PORTLESS_STATE_DIR` and proxy flags such as `--skip-trust` through `sudo`, so a root-owned proxy uses the same per-user state, suffix settings, and trust choice as the command that started it. Set `PORTLESS_STATE_DIR` explicitly before running portless if you want a separate proxy state directory. A state directory without a port file counts as having no proxy: portless does not fall back to probing the default port, so a fresh isolated directory never reaches another proxy running on this machine. A state directory tracks one proxy: `proxy start -p <other port>` exits 1 while a live proxy is tracked there (give a second proxy its own `PORTLESS_STATE_DIR`), and `proxy stop -p <port>` stops only the proxy on that port without clearing the state of the tracked one.
+Auto-elevated proxy starts pass the resolved `PORTLESS_STATE_DIR` and proxy flags such as `--skip-trust` through `sudo`, so a root-owned proxy uses the same per-user state, suffix settings, and trust choice as the command that started it. Set `PORTLESS_STATE_DIR` explicitly before running portless if you want a separate proxy state directory. A state directory without a port file counts as having no proxy: portless does not fall back to probing the default port, so a fresh isolated directory never reaches another proxy running on this machine. This holds for every command: `proxy stop` without `-p` reports "Proxy is not running.", `doctor` reports the proxy as not running, and the restart hint after `trust` regenerates the CA stays silent, all without opening a connection. A state directory tracks one proxy: `proxy start -p <other port>` exits 1 while a live proxy is tracked there (give a second proxy its own `PORTLESS_STATE_DIR`), and `proxy stop -p <port>` stops only the proxy on that port without clearing the state of the tracked one.
 
 The proxy auto-syncs `/etc/hosts` for route hostnames, so `.test`, `.server01.acme.com`, and other configured suffixes resolve on your machine.
 
@@ -456,7 +458,7 @@ On Linux, `portless trust` supports Debian/Ubuntu, Arch, Fedora/RHEL/CentOS, and
 
 On Linux, portless also trusts the CA in the invoking user's existing Chrome/Chromium NSS database (also under `sudo`): `~/.pki/nssdb` if present, otherwise `~/.local/share/pki/nssdb` (Chromium M146+). This needs NSS `certutil`: install `libnss3-tools` on Debian/Ubuntu, `nss-tools` on Fedora/RHEL, `nss` on Arch, or `mozilla-nss-tools` on openSUSE, then run `portless trust` and restart the browser. No NSS database is created; if neither path exists, open Chrome once and rerun `portless trust`. In WSL the NSS database is updated as well, whichever of the Linux and Windows stores succeeded. `portless clean` removes the CA from the active NSS database too.
 
-If NSS registration fails (including when `certutil` is missing), the system trust that succeeded is kept and `portless trust` exits successfully with a browser-trust warning. Chrome may still reject the certificate until you install the NSS tools and rerun `portless trust`. `portless doctor` reports incomplete trust until the NSS entry verifies. If NSS removal fails during `portless clean`, the CA certificate and key are kept for a retry.
+If NSS registration fails, the system trust that succeeded is kept and `portless trust` exits successfully with a browser-trust warning, and `portless doctor` reports incomplete trust until the NSS entry verifies. A missing `certutil` is different: when an NSS database exists but `certutil` is not installed, portless cannot read or write it, so it only warns that Chrome needs `certutil` to trust the CA (from `portless trust`, from the first trust attempt, and from `portless doctor`). That warning never counts as incomplete trust, so it does not block the `portless trust` skip below, make `proxy start` retry trust every time, or fail `doctor`. Install the NSS tools and rerun `portless trust` to finish. If NSS removal fails during `portless clean`, the CA certificate and key are kept for a retry.
 
 `portless trust` does nothing when every store it writes already has the CA (both the Linux and Windows stores on WSL, plus the NSS database on Linux when one exists), so setup scripts can run it every time without a prompt. It checks the stores themselves rather than the trust marker, so it still repairs a CA that was removed.
 
