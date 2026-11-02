@@ -7,10 +7,14 @@
 ### Fork Sync
 
 - **Backport batch**: Ports the upstream pull requests triaged for backport this round, including those opened after the charting pass, on top of the `0.15.14000` sync. Upstream is unchanged at `96a3bbb` (`0.15.13`). Most ports are `implemented differently`, so the fork's own flag loops, bind rules and sharing cleanup stay in place.
+- **One publish**: `0.15.6004` and `0.15.14000` were prepared but not published on their own, so this release ships the hotfix, the upstream sync and the backport batch together, along with the fixes from the pre-release audit listed below.
 
 ### Security
 
 - **Windows tunnels stop with portless**: Stopping a managed Cloudflare or ngrok tunnel on Windows now ends the whole process tree. When the provider binary resolves to a `.cmd` shim, the old stop path ended only the `cmd.exe` wrapper, so the tunnel process kept running and its public URL stayed reachable after portless exited. Found by the Windows CI matrix on the sync PR.
+- **Sharing stops when its owner dies**: When the process behind a route dies, the proxy now stops that route's managed tunnel, Tailscale and NetBird helpers once, within about a second, instead of leaving the app publicly reachable until the next stale-route sweep. A direct-to-app tunnel no longer survives its owner being killed with SIGKILL. The dev server itself is never signaled, and a process the user cannot signal still counts as alive.
+- **Windows crash cleanup for tunnel shims**: A persisted tunnel PID that is a `cmd.exe` wrapper around an `ngrok` or `cloudflared` `.cmd` or `.bat` shim is now accepted after verifying its command line, and its whole tree is killed. NetBird's helper gets the same Windows orphan guard as the tunnel runner. Unverified on a real Windows host.
+- **MCP cannot share**: `extraArgs` on every MCP tool now rejects the 13 sharing flags, also as `--flag=value`, with a JSON-RPC `-32602` error, so an MCP client cannot expose an app publicly through `bg_start`, `bg_restart` or `get`.
 - **Pinned openssl for the installed service**: `service install` now resolves and checks `openssl` once and pins its absolute path in the launchd plist, systemd unit and Windows script through an internal `PORTLESS_SERVICE_OPENSSL` variable. Certificate generation in a pinned service never falls back to `PATH`, and the install warns when the pinned path sits in a location a normal user can write. This closes the route by which a user-influenced `PATH` could pick the binary a root or SYSTEM service runs. The pinned path is unverified on a real Windows host, so the Windows matrix in CI is the only check so far.
 
 ### New Features
@@ -20,30 +24,36 @@
 - **Worktree prefix surface**: `--worktree-prefix` and `PORTLESS_WORKTREE_PREFIX` set the worktree label explicitly, and `--no-worktree` turns it off, on `run`, bare mode, `get`, `bg start` and `getUrl()`. The `worktreeBranch` config key, valid at the top level and per app, chooses between the last branch segment (the default) and the whole branch name. The precedence is flag, then environment variable, then git. An empty flag is an error that points to `--no-worktree`, and an empty variable turns the prefix off.
 - **Peer URLs and port strategies**: Every proxied app in a monorepo run gets a path-aware `PORTLESS_URL_<APP>` variable for each peer. `appPortStrategy` (`random`, `stable`, `sequential`) and `appPortRange`, with `PORTLESS_APP_PORT_*` overrides, make app ports predictable and are replayed by `bg start` intents.
 - **Self-daemonizing commands**: When a wrapped command exits on its own and a new listener holds the assigned port, the route moves to that listener, path- and label-aware, with sharing and orphan metadata cleared. A listener that existed before the command is never adopted and `bg` entries are skipped. A clean exit now waits up to 2 seconds for a daemon that binds late, which delays the exit of commands that really did finish.
-- **Chrome trust on Linux**: `portless trust` also trusts the CA in the invoking user's existing NSS database, which Chrome and Chromium use, warns when that fails, and `portless untrust` removes it. `trust` now skips its prompt only when every store it writes already has the CA, including both the Linux and Windows stores on WSL. Real `certutil`, Chrome and WSL runs are unverified.
+- **Chrome trust on Linux**: `portless trust` also trusts the CA in the invoking user's existing NSS database, which Chrome and Chromium use, warns when that fails, and `portless untrust` removes it. A machine with an NSS database but no `certutil` gets a warning from `trust` and `doctor` that names `certutil`, not a failure, and `proxy start` no longer retries or reports incomplete trust. `trust` now skips its prompt only when every store it writes already has the CA, including both the Linux and Windows stores on WSL. Real `certutil`, Chrome and WSL runs are unverified.
 - **`portless proxy status`**: A read-only `proxy status` command, with `--json`, reports the running proxy's state without starting, stopping or elevating anything. The JSON adds `wildcard` and `lanIp` to upstream's keys, and the MCP server gains a matching `proxy_status` tool.
 - **MCP batches**: `portless mcp` answers JSON-RPC batches for protocol 2025-03-26 in order, omits results for notifications, and returns `-32600` for invalid entries. The warning for LAN mode with mDNS off now reads "mDNS publishing is off" and says the proxy is still reachable from the network.
 - **More frameworks and Vite versions**: `vinext` gets the port and host flags injected. Vite's allowed hosts are written for the app's Vite version: 8.1 and later get the comma list of exact sharing hostnames, and older or unknown versions get one prioritized host plus a notice.
 
 ### Bug Fixes
 
-- **`proxy stop` strictness**: `proxy stop` accepts only `--port` and `-p`, and `proxy stop --help` now prints help. Before, any unknown argument, `--help` included, stopped the running proxy (#520). A trailing `--help` also prints help for `get`, `url` and `alias`.
+- **`proxy stop` strictness**: `proxy stop` accepts only `--port` and `-p`. Any other argument exits 1 with `Unknown argument`, and `proxy stop --help` prints help. Before, any unknown argument, `--help` included, stopped the running proxy (#520). A trailing `--help` also prints help for `get`, `url` and `alias`.
 - **Dead-owner routes**: The proxy checks route owners once a second in memory and reloads its routes when an owner dies, so a force-killed dev server answers 404 within about 2.5 seconds instead of staying routable. The dashboard marks it orphaned, nothing is written to `routes.json`, and a process the user cannot signal still counts as alive.
 - **One proxy per state directory**: `proxy start` exits with an error when the state directory already tracks a live proxy on another port. `proxy stop -p <port>` stops only that port's listener, and a stopping proxy clears the state files only when they name it, so one proxy can no longer erase another's state (#540).
-- **Empty `PORTLESS_STATE_DIR`**: An explicit but empty state directory no longer probes the default port during discovery, auto-start or `proxy start`, which could reach a proxy in the default location.
+- **Empty `PORTLESS_STATE_DIR`**: An explicit but empty state directory no longer probes the default port during discovery, auto-start, `proxy start`, `proxy stop` without `--port`, `doctor` or the restart hint printed by `trust`, any of which could reach a proxy in the default location.
 - **Turbo state directory**: The turbo integration writes its loader and `dev-manifest.json` into the resolved state directory instead of `~/.portless` when `PORTLESS_STATE_DIR` is set.
 - **Response hop-by-hop headers**: Plain HTTP/1.1 responses lose `Connection`-named headers plus `keep-alive`, `proxy-connection` and `upgrade`, and keep `transfer-encoding` because the proxy relays the body framing.
 - **Doctor Node check**: `service status` and `doctor` report when the service's pinned Node binary is missing.
+- **Clearer sudo hints**: The elevation message now tells a hosts-file sync apart from a privileged port. The hosts message names `/etc/hosts` and the suffixes and suggests `PORTLESS_SYNC_HOSTS=0`, `--unprivileged` or the default suffix, and the port message also mentions `--unprivileged`.
+- **Legacy `--ngrok` notice**: The legacy `--ngrok` path now prints the whole-app notice for a path-prefixed route, like the managed tunnel path.
+- **Help, completions and reserved names**: `mcp` is a reserved name and appears in the bash, zsh and fish completions. The `bg stop --force` help line mentions the recorded command group, the `--cloudflare` help line is aligned, and `PORTLESS_UNPRIVILEGED` and `PORTLESS_CLOUDFLARE` are in the README and skill environment tables. The MCP `worktreePrefix` and `noWorktree` arguments for `get` and `bg_start` are documented.
 
 ### Breaking Changes
 
-- **Stricter `proxy stop`**: Scripts that passed other arguments to `proxy stop` and relied on them being ignored now get the help text and the proxy keeps running. Use `--port` or `-p` only.
+- **Stricter `proxy stop`**: Scripts that passed other arguments to `proxy stop` and relied on them being ignored now get `Unknown argument` and exit 1, and the proxy keeps running. `proxy stop --help` prints help. Use `--port` or `-p` only.
 - **`proxy start` refuses a second proxy**: Starting a proxy on a different port while the state directory tracks a live one is now an error. Stop the first proxy, or use a separate `PORTLESS_STATE_DIR`.
 
 ### Maintenance
 
 - **Bun minimum documented**: The README and the skill state Bun 1.4.4 as the minimum when running portless under Bun, because Bun 1.4.4 fixes TLS context setup for registered hostnames. Upstream's per-hostname workaround (#470) is not ported.
 - **Test hygiene**: The `bg` and tunnel test suites no longer leak proxy daemons or fake `cloudflared` shim processes after a run.
+- **Dead code removed**: The unused cloudflare helpers (`startCloudflare`, `ensureCloudflaredAvailable`), `wsl-utils.ts` and its test, a duplicate process-alive helper in `cli.ts` and an unreachable 502 branch in the proxy are gone. Upstream's four-address free-port test (#447) is restored.
+- **Docs site matches the CLI**: The docs pages now describe direct-to-app tunnels with `--cloudflare`, prune and the orphan state, the dead-owner 404, hosts sync, `bg stop` and the MCP worktree arguments. The canonical site URL is one constant, `NEXT_PUBLIC_SITE_URL`, defaulting to the GitHub repository.
+- **Identity links**: The npm `homepage`, the in-product footer links and `PRODUCT.md` point at the GitHub README instead of the upstream site.
 
 ### Contributors
 
@@ -53,9 +63,11 @@
 
 ## 0.15.14000
 
+Prepared but not published on its own. It ships as part of `0.15.14001`.
+
 ### Fork Sync
 
-- **Upstream sync**: Merges upstream `0.15.6` through `0.15.13`. The code base is upstream `5758ac5`, and upstream's `0.15.13` release-prep commit `96a3bbb` is merged on top so the base is the released tag. The merge, the earlier advisor batch and every port of an arriving commit ship here, and the 15 backports that follow ship as `0.15.14001`.
+- **Upstream sync**: Merges upstream `0.15.6` through `0.15.13`. The code base is upstream `5758ac5`, and upstream's `0.15.13` release-prep commit `96a3bbb` is merged on top so the base is the released tag. The merge, the earlier advisor batch and every port of an arriving commit are in this release, and the backport batch follows in `0.15.14001`.
 - **Fork release mapping**: Tracks upstream `0.15.13` as `0.15.14000` for `@enk0ded/portless` and reserves `0.15.14001` for the backport batch.
 
 ### New Features
@@ -64,7 +76,7 @@
 - **Probe-first elevation**: The proxy now probes its real bind targets and asks for sudo only when a listener needs root or the hosts file needs entries. If elevation fails, start stops with an error. The automatic fallback to port 1355 is gone.
 - **Hosts-sync endpoint**: The proxy serves an authenticated hosts-sync endpoint (a per-start token file, a proxy challenge, origin and loopback checks) so route registration can ask a running proxy to sync the hosts file. It is disabled when hosts sync is off.
 - **Direct-to-app tunnels**: Managed Cloudflare and ngrok tunnels now connect straight to the app's loopback port with the Host header rewritten to the route hostname, so public traffic no longer passes through the portless proxy. A path-prefixed route exposes the whole app and prints a notice. Exact manual `tunnel map` aliases still go through the proxy and now honor multiplex selection cookies. Adds `--cloudflare` and `PORTLESS_CLOUDFLARE=1` as an alias of `--tunnel cloudflare`, with `PORTLESS_CLOUDFLARE_URL` beside `PORTLESS_TUNNEL_URL`, background-intent support and shell completions.
-- **`portless mcp`**: Adds the MCP server mapped onto this fork's CLI, with `suffix` support, `proxy_start` with `unprivileged`, read-only `bg` tools in the default profile, and `bg` start, stop and restart behind an opt-in. Sharing flags and `tunnel` are stated omissions.
+- **`portless mcp`**: Adds the MCP server mapped onto this fork's CLI, with `suffix` support, `proxy_start` with `unprivileged`, read-only `bg` tools in the default profile, and `bg` start, stop and restart behind an opt-in. Sharing flags and `tunnel` are stated omissions, and `extraArgs` rejects the sharing flags.
 - **JSON proxy errors and 421**: Portless-generated 404, 502 and 508 responses are HTML or JSON (`{error, upstream, message}`) depending on the client's `Accept` header, with `Vary: Accept`. Hostnames outside the configured suffix list now get 421 without an app list, and unmatched paths on the proxy's own tunnel or Tailscale hostnames get a 404 that lists no apps.
 - **Route uptime**: The dashboard and the 404 page show how long each app has been up, and the 404 page gains a hostname filter with a newest-first toggle. `portless list` prints uptime and `list --json` reports `registered_at`.
 - **Documentation site**: The docs moved to the Geistdocs theme with WebMCP, `llms.txt` and agent-readable Markdown pages. The theme's Vercel branding is replaced with a local navbar and footer carrying the fork wordmark, and the changelog page is now `apps/docs/content/docs/changelog.mdx`.
@@ -94,6 +106,8 @@
 - @enk0ded
 
 ## 0.15.6004
+
+Prepared but not published on its own. It ships as part of `0.15.14001`.
 
 ### Bug Fixes
 

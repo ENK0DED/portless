@@ -151,8 +151,8 @@
       "title": "Changelog | portless",
       "markdownTitle": "Changelog",
       "description": "Replace port numbers with stable, named .localhost URLs. For humans and agents.",
-      "mdxSha256": "47c5fc0ac4a7a9938139bc78e87ec18ab70899710ac465cf39366c8c5c2785f3",
-      "markdownBodySha256": "47c5fc0ac4a7a9938139bc78e87ec18ab70899710ac465cf39366c8c5c2785f3",
+      "mdxSha256": "ca394be9cec6c3bb94803763db389fb1c4efd325a57c592a5542fa839845029e",
+      "markdownBodySha256": "ca394be9cec6c3bb94803763db389fb1c4efd325a57c592a5542fa839845029e",
       "ssr": [
         "Agent-readable documentation",
         "Framework flags through package scripts",
