@@ -3,6 +3,7 @@ import type { ModelMessage, UIMessage } from "ai";
 import { createBashTool } from "bash-tool";
 import { headers } from "next/headers";
 import { loadAllDocsSources } from "@/lib/docs-source";
+import { siteUrl } from "@/lib/site";
 import { minuteRateLimit, dailyRateLimit } from "@/lib/rate-limit";
 
 export const maxDuration = 60;
@@ -12,7 +13,7 @@ const DEFAULT_MODEL = "anthropic/claude-haiku-4.5";
 const SYSTEM_PROMPT = `You are a helpful documentation assistant for portless, a CLI tool that replaces port numbers with stable, named .localhost URLs.
 
 GitHub repository: https://github.com/enk0ded/portless
-Documentation: https://portless.sh
+Documentation: ${siteUrl}
 npm package: @enk0ded/portless
 
 You have access to the full portless documentation via the bash and readFile tools. The docs are available as markdown files in the /workspace/ directory.

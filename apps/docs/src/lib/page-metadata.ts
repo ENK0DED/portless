@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import { PAGE_TITLES } from "./page-titles";
-import { siteDescription, siteUrl } from "./site";
+import { canonicalUrlFor, siteDescription, siteUrl } from "./site";
 
 export function pageMetadata(slug: string): Metadata {
   const title = PAGE_TITLES[slug];
@@ -19,7 +19,7 @@ export function pageMetadata(slug: string): Metadata {
       ? { robots: { index: false, follow: false } }
       : {}),
     alternates: {
-      canonical: `/${slug}`,
+      canonical: canonicalUrlFor(`/${slug}`),
       types: { "text/markdown": slug ? `/${slug}.md` : "/index.md" },
     },
     openGraph: {

@@ -4,6 +4,7 @@ import { GET as getMarkdown } from "../app/api/docs-md/[[...slug]]/route";
 import { allDocsPages } from "./docs-navigation";
 import { isSafePathSegments, loadAllDocsSources } from "./docs-source";
 import { markdownForPathname } from "./page-markdown";
+import { siteUrl } from "./site";
 
 describe("docs source", () => {
   test("loads every inventory page as clean Markdown", async () => {
@@ -43,14 +44,14 @@ describe("public Markdown", () => {
   });
 
   test("serves missing pages with Markdown attribution", async () => {
-    const response = await getMarkdown(new Request("https://portless.sh/missing.md"), {
+    const response = await getMarkdown(new Request(`${siteUrl}/missing.md`), {
       params: Promise.resolve({ slug: ["missing"] }),
     });
 
     expect(response.status).toBe(404);
     expect(response.headers.get("content-type")).toBe("text/markdown; charset=utf-8");
     expect(response.headers.get("vary")).toContain("Accept");
-    expect(response.headers.get("link")).toBe('<https://portless.sh/missing>; rel="canonical"');
+    expect(response.headers.get("link")).toBe(`<${siteUrl}/missing>; rel="canonical"`);
     expect(await response.text()).toContain("# Page Not Found");
   });
 });

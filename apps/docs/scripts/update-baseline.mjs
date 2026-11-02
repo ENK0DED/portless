@@ -14,6 +14,7 @@ import process from "node:process";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath, URL } from "node:url";
 import { format, resolveConfig } from "prettier";
+import { siteUrl } from "../src/lib/site.ts";
 
 const { AbortSignal, fetch } = globalThis;
 const root = new URL("../", import.meta.url);
@@ -92,7 +93,7 @@ try {
     if (only.size > 0 && !only.has(slug)) continue;
     const raw = await readFile(new URL(`content/docs/${slug}.mdx`, root), "utf8");
     const body = raw.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, "");
-    const canonical = `https://portless.sh${page.path === "/" ? "" : page.path}`;
+    const canonical = `${siteUrl}${page.path === "/" ? "" : page.path}`;
     const response = await fetch(`${url}${page.path === "/" ? "/index.md" : `${page.path}.md`}`, {
       headers: { "user-agent": "Mozilla/5.0" },
       signal: AbortSignal.timeout(30000),

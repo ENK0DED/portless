@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { request } from "node:http";
 import { test } from "node:test";
+import { siteUrl } from "../src/lib/site.ts";
 
 const base = process.env.DOCS_TEST_URL;
 if (!base) throw new Error("Run bun run --cwd apps/docs test:routes after building the docs.");
@@ -10,7 +11,7 @@ const noindex = process.env.DOCS_EXPECT_NOINDEX === "1";
 const { pages } = JSON.parse(
   await readFile(new URL("fixtures/docs-baseline.json", import.meta.url), "utf8")
 );
-const origin = "https://portless.sh";
+const origin = siteUrl;
 const browser = { "user-agent": "Mozilla/5.0", accept: "text/html" };
 const representationInputs = [
   "accept",
@@ -391,7 +392,7 @@ test("sitemap, robots and agent indexes expose exactly the six production URLs",
     .map((line) => line.trim().toLowerCase())
     .filter(Boolean);
   assert.ok(directives.includes("user-agent: *"));
-  assert.ok(directives.includes(`sitemap: ${origin}/sitemap.xml`));
+  assert.ok(directives.includes(`sitemap: ${origin}/sitemap.xml`.toLowerCase()));
   assert.ok(directives.includes(noindex ? "disallow: /" : "allow: /"));
   if (!noindex) assert.ok(!directives.some((line) => /^disallow:\s*\S/.test(line)));
 });

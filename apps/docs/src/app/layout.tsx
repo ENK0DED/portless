@@ -8,25 +8,26 @@ import { DocsProvider } from "@/components/geistdocs-provider";
 import { SiteFooter } from "@/components/site-footer";
 import { SiteNavbar } from "@/components/site-navbar";
 import { config } from "@/lib/geistdocs/config";
+import { siteUrl } from "@/lib/site";
 import "./globals.css";
 
 export const viewport: Viewport = { viewportFit: "cover" };
 
 export const metadata: Metadata = {
-  metadataBase: new URL("https://portless.sh"),
+  metadataBase: new URL(siteUrl),
   title: {
     default: "portless | Named .localhost URLs for Development",
     template: "%s | portless",
   },
   description: "Replace port numbers with stable, named .localhost URLs. For humans and agents.",
   alternates: {
-    canonical: "/",
+    canonical: siteUrl,
     types: { "text/markdown": "/index.md" },
   },
   openGraph: {
     type: "website",
     locale: "en_US",
-    url: "https://portless.sh",
+    url: siteUrl,
     siteName: "portless",
     title: "portless | Named .localhost URLs for Development",
     description: "Replace port numbers with stable, named .localhost URLs. For humans and agents.",
@@ -52,7 +53,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
     "@context": "https://schema.org",
     "@type": "WebSite",
     name: "portless",
-    url: "https://portless.sh",
+    url: siteUrl,
     description: "Replace port numbers with stable, named .localhost URLs. For humans and agents.",
   };
 

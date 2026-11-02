@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { applyDocsResponseHeaders } from "./docs-response-headers";
+import { siteUrl } from "./site";
 
 const required = [
   "accept",
@@ -27,7 +28,7 @@ describe("docs response headers", () => {
       "CDN-Cache-Control": "max-age=3600",
       "Vercel-CDN-Cache-Control": "max-age=3600",
       "Content-Type": "text/markdown; charset=utf-8",
-      Link: '<https://portless.sh/commands>; rel="canonical"',
+      Link: `<${siteUrl}/commands>; rel="canonical"`,
     });
 
     applyDocsResponseHeaders(headers);
@@ -37,7 +38,7 @@ describe("docs response headers", () => {
     expect(headers.get("cdn-cache-control")).toBe("no-store");
     expect(headers.get("vercel-cdn-cache-control")).toBe("no-store");
     expect(headers.get("content-type")).toBe("text/markdown; charset=utf-8");
-    expect(headers.get("link")).toBe('<https://portless.sh/commands>; rel="canonical"');
+    expect(headers.get("link")).toBe(`<${siteUrl}/commands>; rel="canonical"`);
   });
 
   test("merges case-insensitively, preserves Next RSC tokens, and is idempotent", () => {

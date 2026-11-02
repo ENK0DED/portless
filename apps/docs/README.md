@@ -14,6 +14,6 @@ RSC and prefetch requests bypass Markdown negotiation but retain the unprefixed 
 
 ## Verification
 
-Use `bun run --cwd apps/docs build`, `bun run --cwd apps/docs type-check`, `bun run --cwd apps/docs test` and `bun run --cwd apps/docs test:routes` from the repository root. For a normal production build, leave `VERCEL_ENV` unset or set it to `production`. Preview builds retain noindex while all page and Markdown canonicals use `https://portless.sh`.
+Use `bun run --cwd apps/docs build`, `bun run --cwd apps/docs type-check`, `bun run --cwd apps/docs test` and `bun run --cwd apps/docs test:routes` from the repository root. For a normal production build, leave `VERCEL_ENV` unset or set it to `production`. Preview builds retain noindex while all page and Markdown canonicals use the single `siteUrl` constant in `src/lib/site.ts`. It defaults to `https://github.com/ENK0DED/portless` until the docs are hosted, and `NEXT_PUBLIC_SITE_URL` overrides it at build time.
 
 See [the regression guide](tests/README.md) for production/preview commands, frozen content baselines and server cleanup. [Verification](tests/VERIFICATION.md) records results and deployment limits. The route suite runs in Linux CI after the build.

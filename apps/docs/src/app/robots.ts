@@ -1,4 +1,5 @@
 import type { MetadataRoute } from "next";
+import { siteUrl } from "@/lib/site";
 
 export default function robots(): MetadataRoute.Robots {
   return {
@@ -6,6 +7,6 @@ export default function robots(): MetadataRoute.Robots {
       process.env.VERCEL_ENV && process.env.VERCEL_ENV !== "production"
         ? { userAgent: "*", disallow: "/" }
         : { userAgent: "*", allow: "/" },
-    sitemap: "https://portless.sh/sitemap.xml",
+    sitemap: `${siteUrl}/sitemap.xml`,
   };
 }
