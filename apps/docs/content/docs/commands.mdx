@@ -91,6 +91,10 @@ Supported placeholders are `{PORT}`, `{HOST}`, and `{PORTLESS_URL}`. Portless re
       <td>Share publicly via a managed tunnel: `cloudflare` or `ngrok`. Also configurable via `PORTLESS_TUNNEL`.</td>
     </tr>
     <tr>
+      <td>`--cloudflare`</td>
+      <td>Alias of `--tunnel cloudflare`. Also configurable via `PORTLESS_CLOUDFLARE=1`.</td>
+    </tr>
+    <tr>
       <td>`--tunnel-hostname <hostname>`</td>
       <td>Request a provider-specific stable tunnel hostname. Also configurable via `PORTLESS_TUNNEL_HOSTNAME`. Cloudflare Quick Tunnels do not support this mode.</td>
     </tr>
@@ -219,7 +223,7 @@ Path routing uses longest-prefix matching and is boundary-aware on segment bound
 
 ### Public tunnel aliases
 
-Use managed tunnels when a public HTTPS URL should route through the portless proxy instead of directly to a child app:
+Use managed tunnels to expose a public HTTPS URL directly to a child app:
 
 ```bash
 portless myapp --tunnel cloudflare next dev
@@ -230,7 +234,9 @@ portless myapp --tunnel ngrok next dev
 # -> https://abc123.ngrok.app
 ```
 
-Managed tunnel requests are public internet traffic. Portless keeps the child app bound to `127.0.0.1`, starts the tunnel to the local proxy, and registers an exact tunnel alias for the generated public hostname. Child processes receive `PORTLESS_TUNNEL_URL`. Unknown public `Host` headers are rejected; portless does not route arbitrary tunnel hostnames to the only running app, and wildcard tunnel hosts are rejected.
+Managed tunnel requests are public internet traffic. Portless keeps the child app bound to `127.0.0.1` and points the tunnel at the app port directly, rewriting `Host` to the route hostname. Public requests bypass the portless proxy, and no managed alias is registered for the generated public hostname. A path-prefixed route still exposes the whole app, including paths outside the prefix; portless prints a notice when starting one. Child processes receive `PORTLESS_TUNNEL_URL`. Manual aliases remain exact proxy routes, and unknown public `Host` headers are rejected.
+
+`--cloudflare` and `PORTLESS_CLOUDFLARE=1` are aliases of `--tunnel cloudflare`. Cloudflare children receive both `PORTLESS_TUNNEL_URL` and `PORTLESS_CLOUDFLARE_URL`. Cloudflare startup waits for a registered connection and uses an empty config in the portless state directory.
 
 `--tunnel cloudflare` uses [Cloudflare Quick Tunnels](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/) through the `cloudflared` CLI. `--tunnel ngrok` requires the `ngrok` CLI and authentication. `--tunnel-hostname <hostname>` requests a provider-specific stable hostname when supported; Cloudflare Quick Tunnels do not support this mode.
 
@@ -379,7 +385,23 @@ portless prune
 portless prune --force
 ```
 
-Finds and kills orphaned dev server processes left behind by crashed portless sessions. When the CLI is killed with `kill -9` or crashes, child dev servers may survive and continue holding their ports. This command checks routes whose owning process is dead but whose port is still in use, terminates the orphans, and removes the stale route entries. Use `--force` to send SIGKILL instead of SIGTERM.
+Finds and stops orphaned dev server processes left behind by crashed portless sessions. When the CLI is killed with `kill -9` or crashes, the command it started can keep running. Portless records that command's process group and start time on the route, and `prune` (like the next `portless run`) stops the group, and only while its leader still has the recorded start time, so a reused process ID is never targeted. Use `--force` to send SIGKILL instead of SIGTERM. Process groups do not exist on Windows, so this recovery is Unix only.
+
+The proxy's background sweep never kills anything. It keeps such a route on file in the orphan state, and `portless list` and the dashboard show it (`"kind": "orphan"` in `portless list --json`) until you run or prune. The proxy does not serve an orphaned route: it checks route owners about once a second and answers 404 for the hostname as soon as the owner is gone, without writing the routes file. `prune` also removes dead background app entries without stopping live ones.
+
+## Background apps
+
+```bash
+portless bg start --name web bun run dev
+portless bg status web
+portless bg logs web --tail 100
+portless bg stop web
+portless bg stop web --force
+```
+
+Use `portless bg start` when a dev server should keep running after the shell command returns, such as agent workflows or long-lived local services. `bg start` waits up to 30 seconds for the route to become ready; use `--wait <seconds>` to change that, `--no-wait` to return right after spawning, or `--keep` to leave a timed-out child running.
+
+`bg stop` sends SIGTERM and waits up to 12 seconds, so `portless run` can finish its own graceful shutdown (it sends SIGKILL after 10 seconds). `bg stop --force` sends SIGKILL to the app and also to the command it started, when that process group is still the one recorded on the route. `bg list`, `bg status`, `bg logs`, `bg restart`, and `bg clean` list, inspect, read logs for, restart from the stored command intent, and remove dead entries and logs of background apps. Background app management supports macOS and Linux.
 
 ## Shell completion
 
@@ -559,7 +581,9 @@ portless hosts clean    # remove portless entries from /etc/hosts
 
 Auto-sync is on by default. Set `PORTLESS_SYNC_HOSTS=0` to disable. If a route hostname will not resolve, the command that registered it warns and points you to `portless hosts sync`.
 
-Manual sync reconciles portless-managed entries with current routes and removes stale entries when there are no routes. It requires a successful initial hosts-file read before writing and verifies each write. A read or verification failure follows the normal sync error path.
+Manual sync reconciles the portless-managed block with the current routes, so stale entries are removed and, with no routes, a leftover block is cleared. A missing hosts file is created containing only the portless block. If the hosts file exists but cannot be read, portless refuses to rewrite it rather than risk losing your own entries, and it verifies each write. Edits are made in place, so the file's permissions and any symlink are kept.
+
+When a command registers a route, it asks the running proxy to write the entry immediately through an authenticated, loopback-only request, and falls back to waiting for the proxy's route watcher with an older proxy. The request uses a random token the proxy keeps in its state directory while it runs, and the proxy does nothing when automatic hosts sync is off or the proxy runs with `--unprivileged`.
 
 ## MCP server
 
@@ -567,7 +591,7 @@ Manual sync reconciles portless-managed entries with current routes and removes 
 portless mcp [--tools <profiles>]
 ```
 
-Starts a stdio MCP server using line-delimited JSON-RPC. The default `core` profile includes route listing, URL lookup, static alias management, read-only background app tools (`bg_list`, `bg_status`, `bg_logs`), proxy status, and profile discovery. Use comma-separated profiles: `background` adds `bg_start`, `bg_stop`, and `bg_restart`, `proxy` adds proxy start, stop, and status tools, `diagnostics` adds doctor, prune, and version tools, and `all` enables every tool. Proxy start takes `suffix` (repeatable), `unprivileged`, `skipTrust`, and `routesCleanupInterval`. Sharing modes, `tunnel map`, and `bg clean` are not exposed. `default` aliases `core`; `full` aliases `all`.
+Starts a stdio MCP server using line-delimited JSON-RPC. The default `core` profile includes route listing, URL lookup, static alias management, read-only background app tools (`bg_list`, `bg_status`, `bg_logs`), proxy status, and profile discovery. Use comma-separated profiles: `background` adds `bg_start`, `bg_stop`, and `bg_restart`, `proxy` adds proxy start, stop, and status tools, `diagnostics` adds doctor, prune, and version tools, and `all` enables every tool. Proxy start takes `suffix` (repeatable), `unprivileged`, `skipTrust`, and `routesCleanupInterval`. `get` and `bg_start` take `worktreePrefix` (use this prefix instead of the detected branch name, in a linked worktree or not) and `noWorktree` (skip the prefix); the two cannot be combined. `prune` stops the verified process group of an orphaned dev server, and `bg_stop` with `force` kills the recorded group. Sharing modes, `tunnel map`, and `bg clean` are not exposed. `default` aliases `core`; `full` aliases `all`.
 
 Tools accept shared `cwd`, `extraArgs`, and `timeoutMs` arguments, except `tools_profiles`. Bad arguments (unknown or wrong type) and calls to a tool that is not enabled return a tool result with `isError: true` that explains the fix, so the model can correct its call; unknown arguments list the tool's own arguments. The server does not run dev servers; use `portless run <cmd>` in a shell.
 
