@@ -1471,17 +1471,11 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
             }
           }
           res.writeHead(proxyRes.statusCode || 502, responseHeaders);
-          proxyRes.on("error", () => {
-            if (!res.headersSent) {
-              res.writeHead(502, { "Content-Type": "text/plain" });
-              res.end();
-            } else {
-              // Headers already sent (mid-stream): destroy instead of end to
-              // send RST_STREAM. Calling res.end() here can cause a
-              // content-length mismatch that Chrome treats as a session error.
-              res.destroy();
-            }
-          });
+          // writeHead above already sent the status, so a failure here is always
+          // mid-stream: destroy instead of end to send RST_STREAM. Calling
+          // res.end() can cause a content-length mismatch that Chrome treats as
+          // a session error.
+          proxyRes.on("error", () => res.destroy());
           proxyRes.pipe(res);
         }
       );
