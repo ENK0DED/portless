@@ -28,7 +28,7 @@ export const OMITTED_COMMANDS: Record<string, string> = {
   "portless completion": "prints a shell script for humans to source",
 };
 
-/** Sharing flags on bg start. They are not typed; extraArgs can still carry them. */
+/** Sharing flags on bg start. They are not typed, and extraArgs rejects them. */
 const SHARING_FLAGS = [
   "--cloudflare",
   "--tunnel",
@@ -78,7 +78,8 @@ const SHARED_PROPERTIES: Record<string, unknown> = {
   extraArgs: {
     type: "array",
     items: { type: "string" },
-    description: "Arguments appended verbatim after the typed arguments.",
+    description:
+      "Arguments appended verbatim after the typed arguments. Public sharing flags (tunnels, Tailscale, ngrok, NetBird) are rejected.",
   },
   timeoutMs: {
     type: "integer",
@@ -649,6 +650,12 @@ function validateShared(args: Record<string, unknown>): string[] {
   const cwd = readString(args, "cwd", false);
   if (cwd !== undefined && cwd.length === 0) fail("cwd must not be empty");
   const extraArgs = readStringArray(args, "extraArgs");
+  for (const arg of extraArgs) {
+    const flag = arg.split("=", 1)[0];
+    if (SHARING_FLAGS.includes(flag)) {
+      fail(`extraArgs must not include ${flag} because MCP tools do not open public URLs`);
+    }
+  }
   const timeout = args.timeoutMs;
   if (timeout !== undefined && timeout !== null) {
     if (
@@ -1161,7 +1168,7 @@ export function printMcpHelp(): void {
       "restart them. Public sharing (tunnels, Tailscale, ngrok, NetBird) is not typed",
       "into any tool; start shared apps from a shell.",
       "Aliases: default = core, full = all. Use the extraArgs argument on any tool",
-      "to append CLI flags that are not typed into the tool schema.",
+      "to append CLI flags that are not typed into the tool schema; sharing flags are rejected.",
       "",
       "Environment:",
       "  PORTLESS_STATE_DIR  Directory for portless state.",
