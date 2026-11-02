@@ -341,7 +341,7 @@ export function renderDashboard(data: DashboardData): string {
   ${orphanedSection(data)}
 </div>`;
 
-  const footerLinks = `<a href="https://portless.sh/commands">docs</a>`;
+  const footerLinks = `<a href="https://github.com/ENK0DED/portless#commands">docs</a>`;
 
   return renderShell({
     title: "portless · dashboard",
@@ -476,7 +476,7 @@ export function renderCertPage(data: CertPageData): string {
     hero: renderWordmarkHero("Certificate authority"),
     body,
     top: true,
-    footerLinks: `<a href="https://portless.sh/https">about HTTPS</a>`,
+    footerLinks: `<a href="https://github.com/ENK0DED/portless#http2--https">about HTTPS</a>`,
   });
 }
 

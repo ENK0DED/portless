@@ -29,7 +29,7 @@ them exactly what is running, what went wrong, or what to do next, then gets out
 
 Precise, calm, infrastructural. Three words: **minimal, exact, dependable.** The voice is the
 voice of a good error message — plain, specific, never cute, always actionable. It borrows the
-Vercel/Geist design tradition (this is a `vercel-labs` project): monochrome surfaces, one
+Vercel/Geist design tradition (the fork inherits the Vercel look from upstream): monochrome surfaces, one
 restrained blue accent, generous whitespace, a single pixel display face for the big numeral.
 
 ## Anti-references
