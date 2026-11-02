@@ -12,14 +12,18 @@ const MARKER_START = "# portless-start";
 const MARKER_END = "# portless-end";
 
 /**
- * Read the current /etc/hosts file content.
- * Returns empty string if the file cannot be read.
+ * Read the current hosts file content. A file that does not exist reads as an
+ * empty string, so the first sync creates it holding only portless's block.
+ * Returns null when the file exists but cannot be read (a lock, an I/O error, a
+ * permissions problem) so callers refuse to rewrite it from empty content,
+ * which would destroy every hand-written entry.
  */
-function readHostsFile(): string {
+function readHostsFile(hostsPath: string): string | null {
   try {
-    return fs.readFileSync(HOSTS_PATH, "utf-8");
-  } catch {
-    return "";
+    return fs.readFileSync(hostsPath, "utf-8");
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return "";
+    return null;
   }
 }
 
@@ -133,37 +137,46 @@ export function blockMatchesHostnames(content: string, hostnames: string[]): boo
 /**
  * Rewrite the managed block to include exactly these hostnames. Requires root
  * access. Returns whether the desired block is present after the operation.
+ *
+ * Writes are in place, not a temp file plus rename: a rename would replace the
+ * file with a new inode and drop its mode, owner, ACLs and any symlink. The
+ * optional path lets tests use a real file instead of the system hosts file.
  */
-export function syncHostsFile(hostnames: string[]): boolean {
+export function syncHostsFile(hostnames: string[], hostsPath = HOSTS_PATH): boolean {
   const uniqueHostnames = deduplicateHostnames(hostnames);
-  const content = readHostsFile();
+  const content = readHostsFile(hostsPath);
+  if (content === null) return false;
   if (blockMatchesHostnames(content, uniqueHostnames)) return true;
 
   try {
     const cleaned = removeBlock(content);
 
     if (uniqueHostnames.length === 0) {
-      fs.writeFileSync(HOSTS_PATH, cleaned);
+      fs.writeFileSync(hostsPath, cleaned);
     } else {
       const block = buildBlock(uniqueHostnames);
-      fs.writeFileSync(HOSTS_PATH, cleaned.trimEnd() + "\n\n" + block + "\n");
+      // A missing or empty file holds only the block, with no leading blank line.
+      const prefix = cleaned.trim() === "" ? "" : cleaned.trimEnd() + "\n\n";
+      fs.writeFileSync(hostsPath, prefix + block + "\n");
     }
   } catch {
     return false;
   }
 
-  return blockMatchesHostnames(readHostsFile(), uniqueHostnames);
+  const verification = readHostsFile(hostsPath);
+  return verification !== null && blockMatchesHostnames(verification, uniqueHostnames);
 }
 
 /**
  * Remove the portless-managed block from /etc/hosts.
  * Returns true on success, false on failure.
  */
-export function cleanHostsFile(): boolean {
+export function cleanHostsFile(hostsPath = HOSTS_PATH): boolean {
+  const content = readHostsFile(hostsPath);
+  if (content === null) return false;
   try {
-    const content = readHostsFile();
     if (!content.includes(MARKER_START)) return true;
-    fs.writeFileSync(HOSTS_PATH, removeBlock(content));
+    fs.writeFileSync(hostsPath, removeBlock(content));
     return true;
   } catch {
     return false;
@@ -172,9 +185,12 @@ export function cleanHostsFile(): boolean {
 
 /**
  * Return the current portless-managed hostnames from /etc/hosts.
+ * A read failure returns an empty array for best-effort callers; it does not
+ * prove that the hosts file is empty or was read successfully.
  */
-export function getManagedHostnames(): string[] {
-  const content = readHostsFile();
+export function getManagedHostnames(hostsPath = HOSTS_PATH): string[] {
+  const content = readHostsFile(hostsPath);
+  if (content === null) return [];
   return extractManagedBlock(content).flatMap((line) => {
     const [, ...aliases] = line.split("#", 1)[0].trim().split(/\s+/);
     return aliases;
@@ -182,17 +198,17 @@ export function getManagedHostnames(): string[] {
 }
 
 /**
- * Check whether a hostname resolves to 127.0.0.1 via the system DNS resolver.
- * Returns true if resolution works, false otherwise.
+ * Check whether the system DNS resolver selects an address where the local
+ * proxy listens.
  */
 export function checkHostResolution(hostname: string): Promise<boolean> {
   return new Promise((resolve) => {
-    dns.lookup(hostname, { family: 4 }, (err, address) => {
+    dns.lookup(hostname, (err, address) => {
       if (err) {
         resolve(false);
         return;
       }
-      resolve(address === "127.0.0.1");
+      resolve(address === "127.0.0.1" || address === "::1");
     });
   });
 }

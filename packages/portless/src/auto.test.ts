@@ -10,6 +10,9 @@ import {
   detectWorktreePrefix,
   applyWorktreePrefix,
   resolveWorktreeFlat,
+  peerUrlEnvName,
+  buildPeerUrlEnv,
+  WorktreePrefixError,
 } from "./auto.js";
 
 // ---------------------------------------------------------------------------
@@ -369,6 +372,156 @@ describe("detectWorktreePrefix", () => {
 });
 
 // ---------------------------------------------------------------------------
+// detectWorktreePrefix: explicit prefix, opt-out, and branch derivation
+// ---------------------------------------------------------------------------
+
+describe("detectWorktreePrefix explicit prefix and derivation", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-prefix-test-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  /** Fake linked worktree (filesystem fallback path; no git repo in tmp). */
+  function setupWorktree(dir: string, branch: string) {
+    const gitdir = path.join(tmpDir, "fake-bare.git", "worktrees", "wt");
+    fs.mkdirSync(gitdir, { recursive: true });
+    fs.writeFileSync(path.join(gitdir, "HEAD"), `ref: refs/heads/${branch}\n`);
+    fs.writeFileSync(path.join(dir, ".git"), `gitdir: ${gitdir}\n`);
+  }
+
+  it("applies an explicit prefix outside any git checkout", () => {
+    expect(detectWorktreePrefix(tmpDir, { prefix: "qa", env: {} })).toEqual({
+      prefix: "qa",
+      source: "--worktree-prefix",
+    });
+  });
+
+  it("applies an explicit prefix in a main checkout and on a default branch", () => {
+    fs.mkdirSync(path.join(tmpDir, ".git"));
+    expect(detectWorktreePrefix(tmpDir, { prefix: "qa", env: {} })?.prefix).toBe("qa");
+  });
+
+  it("sanitizes an explicit prefix into a hostname label", () => {
+    expect(detectWorktreePrefix(tmpDir, { prefix: "Team_A.QA", env: {} })?.prefix).toBe(
+      "team-a-qa"
+    );
+  });
+
+  it("lets an explicit prefix skip branch derivation in a linked worktree", () => {
+    setupWorktree(tmpDir, "feature/auth");
+    expect(detectWorktreePrefix(tmpDir, { prefix: "qa", env: {} })?.prefix).toBe("qa");
+  });
+
+  it("reads PORTLESS_WORKTREE_PREFIX and reports it as the source", () => {
+    expect(detectWorktreePrefix(tmpDir, { env: { PORTLESS_WORKTREE_PREFIX: "Staging" } })).toEqual({
+      prefix: "staging",
+      source: "PORTLESS_WORKTREE_PREFIX",
+    });
+  });
+
+  it("applies the environment prefix outside a linked worktree too", () => {
+    fs.mkdirSync(path.join(tmpDir, ".git"));
+    expect(detectWorktreePrefix(tmpDir, { env: { PORTLESS_WORKTREE_PREFIX: "qa" } })?.prefix).toBe(
+      "qa"
+    );
+  });
+
+  it("treats an empty PORTLESS_WORKTREE_PREFIX as off, even in a linked worktree", () => {
+    setupWorktree(tmpDir, "feature-auth");
+    expect(detectWorktreePrefix(tmpDir, { env: { PORTLESS_WORKTREE_PREFIX: "" } })).toBeNull();
+  });
+
+  it("prefers the flag over the environment", () => {
+    expect(
+      detectWorktreePrefix(tmpDir, { prefix: "flag", env: { PORTLESS_WORKTREE_PREFIX: "env" } })
+        ?.prefix
+    ).toBe("flag");
+    expect(
+      detectWorktreePrefix(tmpDir, { prefix: "flag", env: { PORTLESS_WORKTREE_PREFIX: "" } })
+        ?.prefix
+    ).toBe("flag");
+  });
+
+  it("lets the opt-out flag win over a set environment prefix", () => {
+    setupWorktree(tmpDir, "feature-auth");
+    expect(
+      detectWorktreePrefix(tmpDir, { disabled: true, env: { PORTLESS_WORKTREE_PREFIX: "env" } })
+    ).toBeNull();
+  });
+
+  it("falls back to git detection when no override is set", () => {
+    setupWorktree(tmpDir, "feature-auth");
+    expect(detectWorktreePrefix(tmpDir, { env: {} })).toEqual({
+      prefix: "feature-auth",
+      source: "git branch",
+    });
+  });
+
+  it("rejects the opt-out combined with an explicit prefix", () => {
+    expect(() => detectWorktreePrefix(tmpDir, { disabled: true, prefix: "qa", env: {} })).toThrow(
+      WorktreePrefixError
+    );
+  });
+
+  it("rejects an empty explicit prefix and points to --no-worktree", () => {
+    expect(() => detectWorktreePrefix(tmpDir, { prefix: "", env: {} })).toThrow(/--no-worktree/);
+    expect(() => detectWorktreePrefix(tmpDir, { prefix: "   ", env: {} })).toThrow(
+      WorktreePrefixError
+    );
+  });
+
+  it("rejects a value that sanitizes to nothing, from the flag and the environment", () => {
+    expect(() => detectWorktreePrefix(tmpDir, { prefix: "///", env: {} })).toThrow(
+      /--worktree-prefix/
+    );
+    expect(() =>
+      detectWorktreePrefix(tmpDir, { env: { PORTLESS_WORKTREE_PREFIX: "///" } })
+    ).toThrow(/PORTLESS_WORKTREE_PREFIX/);
+  });
+
+  it("sanitizes the whole branch with the full derivation (filesystem path)", () => {
+    setupWorktree(tmpDir, "team-a/Login_Fix");
+    expect(detectWorktreePrefix(tmpDir, { branch: "full", env: {} })).toEqual({
+      prefix: "team-a-login-fix",
+      source: "git branch (full name)",
+    });
+    expect(detectWorktreePrefix(tmpDir, { branch: "last-segment", env: {} })?.prefix).toBe(
+      "login-fix"
+    );
+  });
+
+  it("compares default branches on the whole name under both derivations", () => {
+    setupWorktree(tmpDir, "main");
+    expect(detectWorktreePrefix(tmpDir, { branch: "full", env: {} })).toBeNull();
+    fs.rmSync(path.join(tmpDir, ".git"));
+    setupWorktree(tmpDir, "feature/main");
+    expect(detectWorktreePrefix(tmpDir, { branch: "full", env: {} })?.prefix).toBe("feature-main");
+  });
+
+  it("truncates a long whole-branch prefix to a legal label", () => {
+    setupWorktree(tmpDir, "team-a/" + "very-long-branch-name-".repeat(5));
+    const result = detectWorktreePrefix(tmpDir, { branch: "full", env: {} });
+    expect(result!.prefix.length).toBeLessThanOrEqual(63);
+  });
+
+  it("hashes flat hostnames for hyphenated explicit and whole-branch prefixes", () => {
+    const explicit = detectWorktreePrefix(tmpDir, { prefix: "qa-1", env: {} })!;
+    const plain = detectWorktreePrefix(tmpDir, { prefix: "qa", env: {} })!;
+    expect(applyWorktreePrefix("web", explicit, true)).toMatch(/^qa-1-web-[a-f0-9]{6}$/);
+    expect(applyWorktreePrefix("web", plain, true)).toBe("qa-web");
+
+    setupWorktree(tmpDir, "team-a/login");
+    const full = detectWorktreePrefix(tmpDir, { branch: "full", env: {} })!;
+    expect(applyWorktreePrefix("web", full, true)).toMatch(/^team-a-login-web-[a-f0-9]{6}$/);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // detectWorktreePrefix (git CLI path)
 // ---------------------------------------------------------------------------
 
@@ -504,5 +657,164 @@ describe("detectWorktreePrefix (git CLI path)", { timeout: 15_000 }, () => {
     expect(result).not.toBeNull();
     expect(result!.prefix.length).toBeLessThanOrEqual(63);
     expect(result!.source).toBe("git branch");
+  });
+
+  it("derives the whole branch name with the full derivation", () => {
+    const repo = path.join(tmpDir, "repo");
+    initRepoWithCommit(repo);
+
+    runGit(repo, ["branch", "team-a/login"]);
+    const wtDir = path.join(tmpDir, "wt-team-a-login");
+    runGit(repo, ["worktree", "add", wtDir, "team-a/login"]);
+
+    expect(detectWorktreePrefix(wtDir, { branch: "full", env: {} })).toEqual({
+      prefix: "team-a-login",
+      source: "git branch (full name)",
+    });
+    expect(detectWorktreePrefix(wtDir, { env: {} })).toEqual({
+      prefix: "login",
+      source: "git branch",
+    });
+  });
+
+  it("keeps feature/main distinct from main under the full derivation", () => {
+    const repo = path.join(tmpDir, "repo");
+    initRepoWithCommit(repo);
+
+    runGit(repo, ["branch", "feature/main"]);
+    const wtDir = path.join(tmpDir, "wt-feature-main");
+    runGit(repo, ["worktree", "add", wtDir, "feature/main"]);
+
+    expect(detectWorktreePrefix(wtDir, { branch: "full", env: {} })?.prefix).toBe("feature-main");
+    expect(detectWorktreePrefix(repo, { branch: "full", env: {} })).toBeNull();
+  });
+
+  it("applies an explicit prefix in a plain checkout with no linked worktrees", () => {
+    const repo = path.join(tmpDir, "repo");
+    initRepoWithCommit(repo);
+
+    expect(detectWorktreePrefix(repo, { prefix: "qa", env: {} })?.prefix).toBe("qa");
+    expect(detectWorktreePrefix(repo, { env: {} })).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// peerUrlEnvName
+// ---------------------------------------------------------------------------
+
+describe("peerUrlEnvName", () => {
+  it("uppercases and replaces dots and dashes with underscores", () => {
+    expect(peerUrlEnvName("web.myrepo")).toBe("PORTLESS_URL_WEB_MYREPO");
+    expect(peerUrlEnvName("web.json-render")).toBe("PORTLESS_URL_WEB_JSON_RENDER");
+    expect(peerUrlEnvName("api")).toBe("PORTLESS_URL_API");
+  });
+
+  it("appends the path prefix when the hostname is shared", () => {
+    expect(peerUrlEnvName("app", "/api")).toBe("PORTLESS_URL_APP_API");
+    expect(peerUrlEnvName("app.repo", "/api/v1")).toBe("PORTLESS_URL_APP_REPO_API_V1");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildPeerUrlEnv
+// ---------------------------------------------------------------------------
+
+describe("buildPeerUrlEnv", () => {
+  const peer = (baseName: string, url: string, pathPrefix = "/", hostname = baseName) => ({
+    baseName,
+    hostname,
+    pathPrefix,
+    url,
+  });
+
+  it("maps every app to its own variable", () => {
+    expect(
+      buildPeerUrlEnv([
+        peer("web.myrepo", "https://web.myrepo.localhost"),
+        peer("api.myrepo", "https://api.myrepo.localhost"),
+      ])
+    ).toEqual({
+      PORTLESS_URL_WEB_MYREPO: "https://web.myrepo.localhost",
+      PORTLESS_URL_API_MYREPO: "https://api.myrepo.localhost",
+    });
+  });
+
+  it("names variables from the base name while values carry the worktree prefix", () => {
+    expect(
+      buildPeerUrlEnv([
+        peer("api.myrepo", "https://feature-x.api.myrepo.localhost", "/", "feature-x.api.myrepo"),
+      ])
+    ).toEqual({ PORTLESS_URL_API_MYREPO: "https://feature-x.api.myrepo.localhost" });
+  });
+
+  it("keeps the plain name for a lone path-routed app and includes the path in the value", () => {
+    expect(buildPeerUrlEnv([peer("api.myrepo", "https://api.myrepo.localhost/v1", "/v1")])).toEqual(
+      { PORTLESS_URL_API_MYREPO: "https://api.myrepo.localhost/v1" }
+    );
+  });
+
+  it("gives apps that share a hostname distinct variables by path", () => {
+    const warnings: string[] = [];
+    const env = buildPeerUrlEnv(
+      [
+        peer("app.myrepo", "https://app.myrepo.localhost", "/"),
+        peer("app.myrepo", "https://app.myrepo.localhost/api", "/api"),
+        peer("app.myrepo", "https://app.myrepo.localhost/admin/ui", "/admin/ui"),
+        peer("other", "https://other.localhost"),
+      ],
+      (msg) => warnings.push(msg)
+    );
+
+    expect(env).toEqual({
+      PORTLESS_URL_APP_MYREPO: "https://app.myrepo.localhost",
+      PORTLESS_URL_APP_MYREPO_API: "https://app.myrepo.localhost/api",
+      PORTLESS_URL_APP_MYREPO_ADMIN_UI: "https://app.myrepo.localhost/admin/ui",
+      PORTLESS_URL_OTHER: "https://other.localhost",
+    });
+    expect(warnings).toEqual([]);
+  });
+
+  it("keeps the first of two names that collapse to one variable, and reports it", () => {
+    const warnings: string[] = [];
+    const env = buildPeerUrlEnv(
+      [peer("web.api", "https://web.api.localhost"), peer("web-api", "https://web-api.localhost")],
+      (msg) => warnings.push(msg)
+    );
+
+    expect(env).toEqual({ PORTLESS_URL_WEB_API: "https://web.api.localhost" });
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("PORTLESS_URL_WEB_API");
+    expect(warnings[0]).toContain("web-api");
+  });
+
+  it("reports colliding path variables on a shared hostname", () => {
+    const warnings: string[] = [];
+    const env = buildPeerUrlEnv(
+      [
+        peer("app", "https://app.localhost", "/"),
+        peer("app", "https://app.localhost/a-b", "/a-b"),
+        peer("app", "https://app.localhost/a/b", "/a/b"),
+      ],
+      (msg) => warnings.push(msg)
+    );
+
+    expect(Object.keys(env)).toEqual(["PORTLESS_URL_APP", "PORTLESS_URL_APP_A_B"]);
+    expect(env.PORTLESS_URL_APP_A_B).toBe("https://app.localhost/a-b");
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('"app/a/b"');
+  });
+
+  it("does not report a repeated identical app", () => {
+    const warnings: string[] = [];
+    buildPeerUrlEnv(
+      [peer("api", "https://api.localhost"), peer("api", "https://api.localhost")],
+      (msg) => warnings.push(msg)
+    );
+    expect(warnings).toEqual([]);
+  });
+
+  it("skips a name that sanitizes to nothing, and returns an empty map for no apps", () => {
+    expect(buildPeerUrlEnv([peer("...", "https://x.localhost")])).toEqual({});
+    expect(buildPeerUrlEnv([])).toEqual({});
   });
 });

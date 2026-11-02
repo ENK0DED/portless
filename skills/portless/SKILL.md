@@ -111,6 +111,8 @@ For turborepo projects, use portless as the `dev` script with the real command i
 
 `bun dev` runs turbo, which runs `portless` in each package. Portless detects the package manager and runs `bun run dev:app` through the proxy.
 
+When `portless` runs from a workspace root, it uses the existing Turbo integration to preserve task ordering when either `turbo.json` or `turbo.jsonc` is readable. Set `"turbo": false` in the root portless configuration to use direct spawning instead.
+
 ### package.json scripts
 
 You can still use portless directly in scripts:
@@ -133,7 +135,7 @@ portless api.myapp bun start    # https://api.myapp.localhost
 portless docs.myapp next dev     # https://docs.myapp.localhost
 ```
 
-By default, only explicitly registered subdomains are routed (strict mode). Start the proxy with `--wildcard` to allow any subdomain of a registered route to fall back to that app (e.g. `tenant1.myapp.localhost` routes to the `myapp` app). Exact matches always take priority over wildcards. Wildcard routing is local proxy behavior only; mDNS LAN mode cannot resolve wildcard subdomains on other devices. To change wildcard mode for a running proxy, stop it and start it again with the desired mode.
+By default, only explicitly registered subdomains are routed (strict mode). Start the proxy with `--wildcard` to allow any subdomain of a registered route to fall back to that app (e.g. `tenant1.myapp.localhost` routes to the `myapp` app). Exact matches always take priority over wildcards. Wildcard routing is local proxy behavior only; mDNS LAN mode cannot resolve wildcard subdomains on other devices. When several registered hostnames could answer a wildcard request, the longest (most specific) parent hostname wins, then the longest path prefix within it. To change wildcard mode for a running proxy, stop it and start it again with the desired mode.
 
 ### Git worktrees
 
@@ -163,6 +165,26 @@ PORTLESS_WORKTREE_FLAT=1 portless run next dev
 ```
 
 Use `PORTLESS_WORKTREE_FLAT=0` to override the project setting for a shell. The environment setting applies to both the CLI and `getUrl()`.
+
+By default the prefix is the last segment of the branch (`team-a/login` becomes `login`). Set `worktreeBranch` to `"full"` (top level or per app) to sanitize the whole branch (`team-a-login`). `main` and `master` never get a derived prefix; `feature/main` does. In flat mode a prefix containing a hyphen gets the short collision hash.
+
+Set the prefix explicitly with `--worktree-prefix <value>` on `portless run`, bare `portless`, and `portless get` (also `PORTLESS_WORKTREE_PREFIX=<value>` for a shell). An explicit prefix applies everywhere: linked worktree, main checkout, default branch, outside git. Turn the prefix off with `--no-worktree` (same three places) or `PORTLESS_WORKTREE_PREFIX=` (empty). Precedence: flag, then environment, then git detection; a flag beats the variable in both directions. `--worktree-prefix ""`, a value that sanitizes to nothing, and `--no-worktree` together with `--worktree-prefix` are errors. `portless bg start` saves the resolved decision so `bg restart` replays it. Upstream's `--prefix` and `PORTLESS_PREFIX` are not accepted; `--path` stays the route path prefix.
+
+```bash
+portless run --worktree-prefix qa next dev   # -> https://qa.myapp.localhost
+portless run --no-worktree next dev          # -> https://myapp.localhost in any worktree
+portless get myapp --worktree-prefix qa
+```
+
+### Referencing another app
+
+A monorepo run gives every proxied app the URL of every proxied app, itself included, as `PORTLESS_URL_<APP>`. The name is the app name before any worktree prefix, uppercased, with dots and dashes as underscores (`api.myrepo` becomes `PORTLESS_URL_API_MYREPO`). It is the same in every worktree while its value carries the branch prefix, so a cross-service reference can live in committed config instead of a hardcoded hostname:
+
+```ts
+const api = process.env.PORTLESS_URL_API_MYREPO ?? "https://api.myrepo.localhost";
+```
+
+Apps that share one hostname at different paths each get their own variable: the root-path app keeps the plain name and the others append their path (`PORTLESS_URL_SITE_MYREPO_API` for `/api`), and the value includes the path. An app alone on its hostname keeps the plain name. Names that still collapse to one variable keep the first app and portless warns about the rest. An app whose dev script is itself `portless` gets no variable. Outside a monorepo run, use `portless get <name>`, e.g. `API_URL=$(portless get api.myrepo)`.
 
 ### Multiplexed hostnames
 
@@ -196,21 +218,29 @@ portless bg stop web
 
 Background app management currently supports macOS and Linux. Do not use it on Windows until portless has a Windows process-group design.
 
+`bg stop` sends SIGTERM and waits up to 12 seconds (portless escalates to SIGKILL after 10 seconds on its own). `bg stop --force` sends SIGKILL to the app and to the command it started.
+
+If portless itself is killed without cleanup, the command it started can keep running. portless records that command's process group and start time on the route, and the next `portless run` or `portless prune` stops it (Unix only). The proxy sweep never kills: it keeps the route, and `portless list` and the dashboard show it as orphaned (`kind: "orphan"` in `list --json`). The proxy stops serving an orphaned route within about a second of its owner dying (the hostname answers 404) and writes nothing to do so. In the same check it stops the route's sharing (managed tunnel, Tailscale serve, NetBird) once, so a public URL closes within about a second; the dev server is never killed. Run `portless prune` to stop the dev server.
+
 `bg start` waits up to 30 seconds for route readiness by default. Use `--wait <seconds>` for a longer known startup, `--no-wait` only when fire-and-forget behavior is acceptable, and `--keep` only when a timed-out process should be left running for inspection. Logs are private files under `PORTLESS_STATE_DIR/bg/logs`; use `portless bg logs` instead of scraping paths directly.
 
 Background mode is not a public sharing feature. It keeps the same loopback-first binding behavior as foreground `portless run`. Public exposure still requires explicit flags such as `--tunnel`, `--tailscale-service`, `--ngrok`, or `--netbird`, and the same `--path` and `--h2c` route semantics apply.
 
 ## How It Works
 
-1. `portless proxy start` starts an HTTPS reverse proxy on port 443 as a background daemon. Auto-elevates with sudo on macOS/Linux; falls back to port 1355 if sudo is unavailable. Use `--no-tls` for plain HTTP on port 80. Configurable with `-p` / `--port` or the `PORTLESS_PORT` env var. The proxy also auto-starts when you run an app.
-2. `portless <name> <cmd>` assigns a random port in the 4000 to 4999 range that is free on `127.0.0.1` via the `PORT` env var and registers the app with the proxy
+1. `portless proxy start` starts an HTTPS reverse proxy on port 443 as a background daemon. Probes the listeners first and elevates only for bind permissions or enabled hosts sync with a suffix that needs hosts entries. A failed sudo exits without changing the port. Use `--no-tls` for plain HTTP on port 80. Configurable with `-p` / `--port` or the `PORTLESS_PORT` env var. The proxy also auto-starts when you run an app.
+2. `portless <name> <cmd>` assigns a port in the 4000 to 4999 range that is free on `127.0.0.1` (random by default; `appPortStrategy` can make it `stable` per app name and path or `sequential`) via the `PORT` env var and registers the app with the proxy
 3. The browser hits `https://<name>.localhost`; the proxy forwards to the app's assigned port
 
-Outside LAN mode, the proxy and its HTTP redirect listener bind only to the IPv4 and IPv6 loopback addresses, `127.0.0.1` and `::1`. They do not accept connections through LAN, VPN, or other network interfaces.
+By default, outside LAN mode, the proxy and its HTTP redirect listener bind only to the IPv4 and IPv6 loopback addresses, `127.0.0.1` and `::1`. They do not accept connections through LAN, VPN, or other network interfaces.
+
+With `--unprivileged` (or `PORTLESS_UNPRIVILEGED=1`) the proxy takes a port below 1024 without `sudo`: it binds the wildcard addresses, which macOS allows for non-root processes, and refuses every non-loopback peer itself. It serves plain HTTP on port 80 unless `--https` is given, because installing the CA would be a prompt; with `--https` the CA is generated but not installed, so run `portless trust` once yourself. It never writes the hosts file: automatic hosts sync is off, `PORTLESS_SYNC_HOSTS=1` together with it is refused, and Safari or a custom TLD need `sudo portless hosts sync` run once by you. Linux needs `net.ipv4.ip_unprivileged_port_start` to cover the port; portless checks and prints the sysctl command instead of falling back to another port. The mode is remembered for auto-start; use `PORTLESS_UNPRIVILEGED=0` for a start to switch back. LAN mode takes precedence over the loopback peer guard and permits remote peers. Unprivileged mode never triggers a sudo prompt, so it suits scripts, agents and managed machines.
+
+When portless itself returns an error (404 for an unknown host, 421 for a misdirected request, 502 when the app is unreachable, 508 for a request loop), the body depends on the `Accept` header, and both forms send `Vary: Accept`. Browsers (`text/html`) get an HTML page. curl, `fetch`, and other clients get JSON such as `{"error":"bad_gateway","upstream":"myapp.localhost","message":"..."}`, with `error` set to `not_found`, `misdirected_request`, `bad_gateway`, or `loop_detected`; `message` holds the hint, such as the target port and `portless list` for a 502. Parse that JSON instead of scraping HTML. Responses from the app itself are forwarded unchanged. Hostnames outside the configured suffixes, for example a site a DNS blocklist points at 127.0.0.1, get 421 Misdirected Request with no app list. A tunnel or Tailscale hostname whose path matches no route gets a 404 without the app list. The 404 page for an unknown name under a configured suffix lists active apps with their uptime and, above five apps, adds a hostname filter and a "Newest first" toggle.
 
 `.localhost` domains resolve to `127.0.0.1` natively in Chrome, Firefox, and Edge. Safari relies on the system DNS resolver, which may not handle `.localhost` subdomains on all configurations. Run `portless hosts sync` to add entries to `/etc/hosts` if needed.
 
-Most frameworks (Next.js, Express, Nuxt, etc.) respect the `PORT` env var automatically. Portless skips browser-blocked ports during auto-assignment and rejects them for fixed app ports. For frameworks that ignore `PORT` (Vite, VitePlus, VitePress, Astro, React Router, Angular, Laravel, Expo, React Native, Wrangler), portless auto-injects the correct `--port` flag and, when needed, a matching `--host` CLI flag or Wrangler's `--ip` flag.
+Most frameworks (Next.js, Express, Nuxt, etc.) respect the `PORT` env var automatically. Portless skips browser-blocked ports during auto-assignment and rejects them for fixed app ports. For frameworks that ignore `PORT` (Vite, VitePlus, VitePress, Astro, React Router, Angular, Laravel, Expo, React Native, Wrangler, vinext), portless auto-injects the correct `--port` flag and, when needed, a matching `--host` CLI flag, Wrangler's `--ip` flag, or `--hostname` for `vinext start`. Injection looks through package runners (`npx`, `bunx`, `pnpm exec`, `yarn dlx`, `npm exec`, `npm x`). For `npm exec` the flags go after a `--` so npm does not read them itself, and a command where npm might take the next word as an option value is left alone. `vitepress` is treated as a dev server for `dev`, `serve`, `preview` and a bare invocation, and `astro --root apps/web dev` finds its subcommand after leading global options. Commands run with your `PATH` first, the project's `node_modules/.bin` ahead of it, and portless's own Node directory last as a fallback for Windows `.cmd` wrappers, so a Node chosen by a version manager is never shadowed.
 
 The same injection applies when a safe `bun run`, `npm run`, `pnpm run`, or `yarn run` script resolves directly to a recognized framework or package runner. Only server commands receive flags. Builds, checks, comments, compound commands, scripts with their own `--` terminator, environment-prefixed or delegated commands, and runner flags before the script name are left unchanged. Exact `{PORT}`, `{HOST}`, and `{PORTLESS_URL}` placeholders still take precedence and disable automatic framework flag injection.
 
@@ -222,11 +252,13 @@ portless run my-server --port {PORT} --host {HOST} --url {PORTLESS_URL}
 
 Portless replaces only whole arguments matching `{PORT}`, `{HOST}`, or `{PORTLESS_URL}` after assigning the app port. When any placeholder is present, automatic framework flag injection is skipped.
 
+If a wrapped command self-daemonizes (its launcher exits, often with code 0, while a server it started keeps listening on the assigned port), portless keeps the route pointed at that server and prints its PID instead of removing the route. `astro dev` does this when it detects an agent. A clean exit waits up to 2 seconds for a server that binds late. The route belongs to that server from then on and goes away when it stops, so the dev server is not stopped for you: stop it with `kill <pid>`. A listener that already held the port before the command ran is never adopted, a command stopped by a signal (Ctrl+C) removes its route as usual, and `portless bg start` runs keep their bg-managed route. Sharing (Tailscale, ngrok, NetBird, tunnels) ends with the command, so a kept route is local only.
+
 ### State directory
 
 Portless stores its state in `~/.portless`: routes, PID and port files, TLS markers, the generated local CA, server certificates, and cached per-host certificates. Override with the `PORTLESS_STATE_DIR` environment variable.
 
-Auto-elevated proxy starts pass the resolved `PORTLESS_STATE_DIR` and proxy flags such as `--skip-trust` through `sudo`, so a root-owned proxy uses the same per-user state, suffix settings, and trust choice as the command that started it. Direct `sudo portless ...` invocations resolve `SUDO_USER` back to the invoking user's home for the same reason. Set `PORTLESS_STATE_DIR` explicitly before running portless if a separate proxy state directory is required.
+Auto-elevated proxy starts pass the resolved `PORTLESS_STATE_DIR` and proxy flags such as `--skip-trust` through `sudo`, so a root-owned proxy uses the same per-user state, suffix settings, and trust choice as the command that started it. Direct `sudo portless ...` invocations resolve `SUDO_USER` back to the invoking user's home for the same reason. Set `PORTLESS_STATE_DIR` explicitly before running portless if a separate proxy state directory is required. A state directory without a port file counts as having no proxy: portless does not fall back to probing the default port, so a fresh isolated directory never reaches another proxy running on this machine. This holds for every command: `proxy stop` without `-p` reports "Proxy is not running.", `doctor` reports the proxy as not running, and the restart hint after `trust` regenerates the CA stays silent, all without opening a connection. A state directory tracks one proxy: `proxy start -p <other port>` exits 1 while a live proxy is tracked there (give a second proxy its own `PORTLESS_STATE_DIR`), and `proxy stop -p <port>` stops only the proxy on that port without clearing the state of the tracked one.
 
 ### Custom suffixes
 
@@ -247,6 +279,8 @@ The proxy periodically removes route records whose owning process is dead. The s
 | --------------------------------- | --------------------------------------------------------------------------- |
 | `PORTLESS_PORT`                   | Override the default proxy port (default: 443 with HTTPS, 80 without)       |
 | `PORTLESS_APP_PORT`               | Use a fixed app port; browser-blocked ports are rejected                    |
+| `PORTLESS_APP_PORT_STRATEGY`      | How to pick an app port: `random` (default), `stable` or `sequential`       |
+| `PORTLESS_APP_PORT_RANGE`         | Range to pick from as `min-max`, e.g. `4200-4999` (default `4000-4999`)     |
 | `PORTLESS_H2C`                    | Set to `1` to forward app routes to HTTP/2 cleartext upstreams              |
 | `PORTLESS_MULTIPLEX`              | Set to `1` to share the hostname with other apps (same as `--multiplex`)    |
 | `PORTLESS_LABEL`                  | Label for this multiplexed app (same as `--label`)                          |
@@ -260,18 +294,23 @@ The proxy periodically removes route records whose owning process is dead. The s
 | `PORTLESS_WILDCARD`               | Set to `1` to allow unregistered subdomains to fall back to parent          |
 | `PORTLESS_SYNC_HOSTS`             | Set to `0` to disable auto-sync of /etc/hosts (on by default)               |
 | `PORTLESS_WORKTREE_FLAT`          | Set to `1` to join worktree and app names into one DNS label                |
+| `PORTLESS_WORKTREE_PREFIX`        | Use this value as the worktree prefix (empty turns the prefix off)          |
 | `PORTLESS_TAILSCALE`              | Set to `1` to share apps on your Tailscale network (same as `--tailscale`)  |
+| `PORTLESS_TAILSCALE_HTTP`         | Set to `1` for plain-HTTP tailnet sharing (same as `--tailscale-http`)      |
 | `PORTLESS_TAILSCALE_SERVICE`      | Set to `1` to share apps as stable Tailscale Services                       |
 | `PORTLESS_TAILSCALE_SERVICE_NAME` | Use an explicit Tailscale Service name                                      |
 | `PORTLESS_FUNNEL`                 | Set to `1` to share apps publicly via Tailscale Funnel (same as `--funnel`) |
 | `PORTLESS_NGROK`                  | Set to `1` to share apps publicly via ngrok (same as `--ngrok`)             |
 | `PORTLESS_TUNNEL`                 | Managed public tunnel provider selector (`cloudflare` or `ngrok`)           |
 | `PORTLESS_TUNNEL_HOSTNAME`        | Request a provider-specific stable tunnel hostname                          |
+| `PORTLESS_CLOUDFLARE`             | Set to `1` to share via a Cloudflare tunnel (same as `--cloudflare`)        |
+| `PORTLESS_UNPRIVILEGED`           | Set to `1` to bind without sudo (`0` switches back); see Unprivileged mode  |
 | `PORTLESS_NETBIRD`                | Set to `1` to share apps publicly via NetBird (same as `--netbird`)         |
 | `PORTLESS_NETBIRD_PASSWORD`       | Require a password for the NetBird public URL                               |
 | `PORTLESS_NETBIRD_PIN`            | Require a PIN for the NetBird public URL                                    |
 | `PORTLESS_NETBIRD_GROUPS`         | Restrict the NetBird public URL to comma-separated user groups              |
 | `PORTLESS_STATE_DIR`              | Override the state directory                                                |
+| `PORTLESS_URL_<APP>`              | Set by portless, not read: URL of each app in a monorepo run                |
 | `PORTLESS=0`                      | Bypass the proxy, run the command directly                                  |
 
 `PORTLESS_ROUTES_CLEANUP_INTERVAL` sets the dead-route sweep interval in seconds. The default is 300; `0` disables the sweep.
@@ -289,13 +328,21 @@ portless proxy start --no-tls                       # Disable HTTPS (plain HTTP)
 portless trust                                      # Add CA to trust store later
 ```
 
-On Linux, `portless trust` supports Debian/Ubuntu, Arch, Fedora/RHEL/CentOS, and openSUSE (via `update-ca-certificates` or `update-ca-trust`). NixOS and unrecognized Linux distributions receive manual setup guidance instead of being written to an unsupported trust layout. On Windows, it uses `certutil` to add the CA to the system trust store. In WSL, portless also installs the CA into the Windows CurrentUser Root store so Windows browsers trust WSL-served portless HTTPS URLs.
+On Linux, `portless trust` supports Debian/Ubuntu, Arch, Fedora/RHEL/CentOS, and openSUSE (via `update-ca-certificates` or `update-ca-trust`). NixOS and unrecognized Linux distributions receive manual setup guidance instead of being written to an unsupported trust layout. On Windows, it uses `certutil` to add the CA to the system trust store. In WSL, portless also installs the CA into the Windows CurrentUser Root store so Windows browsers trust WSL-served portless HTTPS URLs. Linux containers on a WSL2 host use only the Linux trust store.
+
+On Linux, portless also trusts the CA in the invoking user's existing Chrome/Chromium NSS database (also under `sudo`): `~/.pki/nssdb` if present, otherwise `~/.local/share/pki/nssdb` (Chromium M146+). This needs NSS `certutil`: install `libnss3-tools` on Debian/Ubuntu, `nss-tools` on Fedora/RHEL, `nss` on Arch, or `mozilla-nss-tools` on openSUSE, then run `portless trust` and restart the browser. No NSS database is created; if neither path exists, open Chrome once and rerun `portless trust`. In WSL the NSS database is updated as well, whichever of the Linux and Windows stores succeeded. `portless clean` removes the CA from the active NSS database too.
+
+If NSS registration fails, the system trust that succeeded is kept and `portless trust` exits successfully with a browser-trust warning, and `portless doctor` reports incomplete trust until the NSS entry verifies. A missing `certutil` is different: when an NSS database exists but `certutil` is not installed, portless cannot read or write it, so it only warns that Chrome needs `certutil` to trust the CA (from `portless trust`, from the first trust attempt, and from `portless doctor`). That warning never counts as incomplete trust, so it does not block the `portless trust` skip below, make `proxy start` retry trust every time, or fail `doctor`. Install the NSS tools and rerun `portless trust` to finish. If NSS removal fails during `portless clean`, the CA certificate and key are kept for a retry.
+
+`portless trust` does nothing when every store it writes already has the CA (both the Linux and Windows stores on WSL, plus the NSS database on Linux when one exists), so setup scripts can run it every time without a prompt. It checks the stores themselves rather than the trust marker, so it still repairs a CA that was removed.
 
 To trust the CA on another device (a phone over LAN mode, a second machine, or a browser with its own store), open `https://cert.localhost` (`cert.<suffix>`) in that browser. It serves the **public** CA only (`/portless-ca.pem`, with its SHA-256 fingerprint) plus per-OS install steps; the private key is never exposed. On the host machine, `portless trust` already does this.
 
 ### Dashboard
 
 While the proxy runs, `https://portless.localhost` (`portless.<suffix>`) serves a read-only dashboard of every running app — hostnames, ports, public-exposure state, and CA trust. It never controls processes from the browser; each row opens the app or copies its URL. The hostname is reserved; disable with `PORTLESS_DASHBOARD=0`.
+
+The HTTP/1.1 backend pool limits concurrent connection attempts to 16 per app and keeps up to 64 idle sockets. Established streams do not consume dial slots. Connects have a 10-second deadline; established streams have no proxy timeout. Shutdown rejects queued requests with status 503.
 
 ### h2c and gRPC upstreams
 
@@ -351,12 +398,16 @@ LAN mode depends on the system mDNS helpers that portless launches: macOS includ
 
 ### Tailscale sharing
 
-Share dev servers with teammates on your Tailscale network using `--tailscale`, give them stable Tailscale Service names with `--tailscale-service`, or expose to the public internet with `--funnel`:
+Share dev servers with teammates on your Tailscale network using `--tailscale` (or `--tailscale-http` on tailnets without MagicDNS), give them stable Tailscale Service names with `--tailscale-service`, or expose to the public internet with `--funnel`:
 
 ```bash
 portless myapp --tailscale next dev
 # -> https://myapp.localhost           (local)
 # -> https://devbox.yourteam.ts.net    (tailnet)
+
+portless myapp --tailscale-http next dev
+# -> https://myapp.localhost           (local)
+# -> http://100.101.102.103            (tailnet, plain HTTP, no MagicDNS needed)
 
 portless myapp --tailscale-service next dev
 # -> https://myapp.localhost           (local)
@@ -370,7 +421,9 @@ portless myapp --funnel next dev
 # -> https://devbox.yourteam.ts.net    (public internet)
 ```
 
-MagicDNS and Tailscale HTTPS certificates must be enabled before `--tailscale`, `--tailscale-service`, or `--funnel` can register HTTPS URLs. Funnel must also be enabled for the tailnet and node before `--funnel` can register the public URL. If either setting is missing, portless exits before starting the child process.
+MagicDNS and Tailscale HTTPS certificates must be enabled before `--tailscale`, `--tailscale-service`, or `--funnel` can register HTTPS URLs. Funnel must also be enabled for the tailnet and node before `--funnel` can register the public URL. If either setting is missing, portless exits before starting the child process. When the tailnet reports MagicDNS as off, portless exits early for the same reason and points at `--tailscale-http`.
+
+`--tailscale-http` forwards a raw TCP port (80, then 8080, 8081, etc.) straight to the app, addressed by the node's tailnet IP (or its MagicDNS name when the tailnet has one), so no certificate is needed. Traffic stays inside WireGuard, but browsers treat the plain-HTTP URL as an insecure context (no service workers or `crypto.subtle`, no `Secure` cookies), and the app does not receive `Tailscale-User-*` or `X-Forwarded-*` headers. It cannot be combined with `--funnel` or `--tailscale-service`. Background apps keep it across `bg restart`.
 
 Each `--tailscale` app is root-mounted on its own Tailscale HTTPS port (443, then 8443, 8444, etc.) so no framework `basePath` configuration is needed. Set `PORTLESS_TAILSCALE=1` to share every app by default. `portless list` shows both local and tailnet URLs. Tailscale serve registrations are cleaned up when the app exits. Requires `tailscale` CLI installed and connected, with MagicDNS and Tailscale HTTPS certificates enabled on the active tailnet.
 
@@ -392,14 +445,16 @@ Set `PORTLESS_NGROK=1` to enable ngrok by default when portless runs an app. `po
 
 ### Public tunnel aliases
 
-Use managed tunnels when public internet traffic should enter through the portless proxy:
+Use managed tunnels to send public internet traffic directly to the selected app:
 
 ```bash
 portless myapp --tunnel cloudflare next dev
 portless myapp --tunnel ngrok next dev
 ```
 
-Managed tunnels are public. Portless keeps child apps bound to `127.0.0.1`, starts the tunnel to the local proxy, and registers an exact tunnel alias for the generated public hostname. Unknown public `Host` headers remain rejected. Do not create wildcard tunnel aliases.
+Managed tunnels are public. Portless keeps the child app bound to `127.0.0.1` and targets its app port directly, rewriting Host to the route hostname. Public requests bypass the portless proxy. A path-prefixed route still exposes the whole app, including paths outside the prefix; portless prints a notice when starting it. Manual aliases remain exact proxy routes; unknown public Host headers are rejected.
+
+`--cloudflare` and `PORTLESS_CLOUDFLARE=1` are aliases of `--tunnel cloudflare`. Cloudflare children receive both `PORTLESS_TUNNEL_URL` and `PORTLESS_CLOUDFLARE_URL`. Cloudflare startup waits for a registered connection and uses an empty config in the portless state directory.
 
 Use manual aliases when another tunnel tool already owns the external hostname:
 
@@ -410,7 +465,7 @@ portless tunnel list
 portless tunnel unmap abc.trycloudflare.com
 ```
 
-`--tunnel cloudflare` uses Cloudflare Quick Tunnels through `cloudflared`. `--tunnel ngrok` requires the `ngrok` CLI and authentication. Child commands receive `PORTLESS_TUNNEL_URL` when managed tunnel startup succeeds.
+`--tunnel cloudflare` uses Cloudflare Quick Tunnels through `cloudflared`. `--tunnel ngrok` requires the `ngrok` CLI and authentication. Child commands receive `PORTLESS_TUNNEL_URL` when managed tunnel startup succeeds. Cloudflare also sets `PORTLESS_CLOUDFLARE_URL`.
 
 ### NetBird sharing
 
@@ -450,7 +505,7 @@ portless service uninstall
 
 The service uses portless defaults unless install options or `PORTLESS_*` environment variables are provided: HTTPS on port 443 with `.localhost` names. `service install` accepts proxy options including `--port`, `--no-tls`, `--lan`, `--ip`, `--suffix`, `--tld`, `--wildcard`, `--cert`, and `--key`. Use `--state-dir <path>` or `PORTLESS_STATE_DIR=<path>` to choose where service state and logs are written.
 
-The chosen service configuration is written into launchd, systemd, or Task Scheduler and reused after reboot. Suffix lists are persisted through `PORTLESS_SUFFIX`. `portless service status` reports the installed port, HTTPS mode, configured suffixes, LAN mode, wildcard mode, and state directory. macOS and Linux install a root-owned service so port 443 can bind at boot. Windows installs a Task Scheduler startup task that runs as SYSTEM. Installation and removal may require administrator privileges. `portless clean` automatically removes the service.
+The chosen service configuration is written into launchd, systemd, or Task Scheduler and reused after reboot. Suffix lists are persisted through `PORTLESS_SUFFIX`. `portless service status` reports the installed port, HTTPS mode, configured suffixes, LAN mode, wildcard mode, state directory, and the Node binary the service pins, flagging it when that binary no longer exists (re-run `portless service install` to repair). macOS and Linux install a root-owned service so port 443 can bind at boot. Windows installs a Task Scheduler startup task that runs as SYSTEM. Installation and removal may require administrator privileges. `portless clean` automatically removes the service.
 
 ## CLI Reference
 
@@ -467,11 +522,14 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 | `portless get <name>`                            | Print URL for a service (for cross-service wiring)             |
 | `portless url <name>`                            | Alias for `portless get <name>`                                |
 | `portless get <name> --no-worktree`              | Print URL without worktree prefix                              |
+| `portless get <name> --worktree-prefix <p>`      | Print URL with an explicit worktree prefix                     |
+| `portless run --worktree-prefix <p> <cmd>`       | Use an explicit worktree prefix (also bare mode, `bg start`)   |
+| `portless run --no-worktree <cmd>`               | Skip the worktree prefix (also bare mode, `bg start`)          |
 | `portless get <name> --json`                     | Print service info as JSON                                     |
 | `portless list`                                  | Show active routes                                             |
 | `portless ls`                                    | Alias for `portless list`                                      |
 | `portless status`                                | Alias for `portless list`                                      |
-| `portless list --json`                           | Show active routes as JSON                                     |
+| `portless list --json`                           | Show active routes as JSON, including `registered_at`          |
 | `portless doctor`                                | Run read-only diagnostics across local portless state          |
 | `portless trust`                                 | Add local CA to system trust store (for HTTPS)                 |
 | `portless clean`                                 | Remove state, CA trust entry, and /etc/hosts block             |
@@ -487,7 +545,8 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 | `portless proxy start --tld test`                | Compatibility alias for `--suffix`                             |
 | `portless proxy start --foreground`              | Start the proxy in foreground (for debugging)                  |
 | `portless proxy start --wildcard`                | Allow unregistered subdomains to fall back locally             |
-| `portless proxy stop`                            | Stop the proxy                                                 |
+| `portless proxy status [--json]`                 | Show whether the proxy is running and its settings (read-only) |
+| `portless proxy stop`                            | Stop the proxy (`-p <port>`; other arguments are rejected)     |
 | `portless service install`                       | Start the HTTPS proxy when the OS starts                       |
 | `portless service install --lan`                 | Start the service in LAN mode                                  |
 | `portless service install --wildcard`            | Persist wildcard routing in the startup service                |
@@ -515,8 +574,9 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 | `portless <name> --h2c <cmd>`                    | Forward this route to an HTTP/2 cleartext upstream             |
 | `portless <name> --path /api <cmd>`              | Scope this route to a path prefix                              |
 | `portless <name> --tunnel cloudflare <cmd>`      | Share publicly via a managed Cloudflare Quick Tunnel           |
-| `portless <name> --tunnel ngrok <cmd>`           | Share publicly via a managed ngrok tunnel through portless     |
+| `portless <name> --tunnel ngrok <cmd>`           | Share publicly via a managed ngrok tunnel directly to the app  |
 | `portless <name> --tailscale <cmd>`              | Share the app on your Tailscale network (tailnet)              |
+| `portless <name> --tailscale-http <cmd>`         | Share on the tailnet over plain HTTP (no MagicDNS needed)      |
 | `portless <name> --tailscale-service <cmd>`      | Share the app as a stable Tailscale Service                    |
 | `portless <name> --funnel <cmd>`                 | Share the app publicly via Tailscale Funnel                    |
 | `portless <name> --ngrok <cmd>`                  | Share the app publicly via ngrok                               |
@@ -525,11 +585,12 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 | `portless --name <name> <cmd>`                   | Force `<name>` as app name (bypasses subcommand dispatch)      |
 | `portless <name> KEY=value <cmd>`                | Pass `KEY` only to the child command                           |
 | `portless <name> -- <cmd> [args...]`             | Stop flag parsing; everything after `--` is passed to child    |
+| `portless mcp [--tools <profiles>]`              | Start a stdio MCP server for agents                            |
 | `portless --help` / `-h`                         | Show help                                                      |
 | `portless run --help`                            | Show help for a subcommand (also: alias, hosts, doctor, clean) |
 | `portless --version` / `-v`                      | Show version                                                   |
 
-**Reserved names:** `run`, `get`, `url`, `alias`, `tunnel`, `hosts`, `list`, `ls`, `status`, `doctor`, `trust`, `clean`, `prune`, `proxy`, `bg`, `service`, and `completion` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name, or `portless --name <name> <cmd>` to force any name including reserved ones.
+**Reserved names:** `run`, `get`, `url`, `alias`, `tunnel`, `hosts`, `list`, `ls`, `status`, `doctor`, `trust`, `clean`, `prune`, `proxy`, `bg`, `service`, `mcp`, and `completion` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name, or `portless --name <name> <cmd>` to force any name including reserved ones.
 
 ### Shell completion
 
@@ -540,6 +601,17 @@ portless completion fish > ~/.config/fish/completions/portless.fish
 ```
 
 Generate completions from the installed portless binary so agents and humans get the flags supported by that version.
+
+### MCP server
+
+`portless mcp [--tools <profiles>]` starts a stdio MCP server. Each tool runs the matching CLI command in the tool's `cwd`; every tool also accepts `extraArgs` and `timeoutMs`.
+
+- `core` (default): `list`, `get`, `alias_add`, `alias_remove`, read-only `bg_list`, `bg_status`, `bg_logs`, `proxy_status`, and `tools_profiles`.
+- `background` (opt in): `bg_start`, `bg_stop`, `bg_restart`. Use `--tools core,background`.
+- `proxy`: `proxy_start` (`suffix`, `unprivileged`, `skipTrust`, `routesCleanupInterval`, `wildcard`, `lan`, `noTls`, `port`), `proxy_stop`, `proxy_status` (also in `core`).
+- `diagnostics`: `doctor`, `prune`, `version`. `all` enables everything.
+
+`list`, `get`, and the `bg` tools take `json`; `get`, `alias_add`, and the `bg` tools take `path`; `get` and `bg_start` take `worktreePrefix` (same as `--worktree-prefix`) and `noWorktree` (same as `--no-worktree`). `extraArgs` rejects the sharing flags, so an MCP agent cannot open a public URL. `list --json` marks routes whose owner died but whose dev server still runs as `kind: "orphan"`; `prune` stops them. Not exposed: foreground `run`, `trust`, `clean`, `hosts`, `service`, `bg clean`, `bg logs --follow`, and every sharing mode (tunnels, Tailscale including `--tailscale-http`, ngrok, NetBird). Start shared apps from a shell.
 
 ## Programmatic API
 
@@ -564,22 +636,29 @@ const stable = await getUrl("cms", { worktree: false });
 
 Pass `{ worktreeFlat: true }` for a one-lookup override. When omitted, `getUrl()` reads `worktreeFlat` from the project config and honors the `PORTLESS_WORKTREE_FLAT` environment override.
 
+Pass `{ worktreePrefix: "qa" }` for an explicit prefix (it applies outside linked worktrees too) and `{ worktreeBranch: "full" }` to derive the prefix from the whole branch. Without them, `getUrl()` reads `worktreeBranch` from the project config and honors `PORTLESS_WORKTREE_PREFIX`. `worktree: false` combined with `worktreePrefix`, or an empty `worktreePrefix`, throws.
+
 ## portless config
 
 Optional config file. Portless looks for `portless.json` in the current directory, then `.config/portless.json`.
 
-| Field          | Type    | Default                    | Description                                              |
-| -------------- | ------- | -------------------------- | -------------------------------------------------------- |
-| `name`         | string  | inferred from package.json | Base app name (worktree prefix still applies)            |
-| `script`       | string  | `"dev"`                    | Name of a package.json script to run                     |
-| `appPort`      | number  | auto-assigned              | Fixed app port; browser-blocked ports are rejected       |
-| `path`         | string  | `"/"`                      | Route path prefix                                        |
-| `proxy`        | boolean | auto-detected              | Whether to route through the proxy (`false` for tasks)   |
-| `worktreeFlat` | boolean | `false`                    | Join worktree and app labels into one DNS label          |
-| `apps`         | object  |                            | Overrides for workspace packages, keyed by relative path |
-| `turbo`        | boolean | `true`                     | Set `false` to use direct spawning instead of turborepo  |
+| Field             | Type                                   | Default                    | Description                                                    |
+| ----------------- | -------------------------------------- | -------------------------- | -------------------------------------------------------------- |
+| `name`            | string                                 | inferred from package.json | Base app name (worktree prefix still applies)                  |
+| `script`          | string                                 | `"dev"`                    | Name of a package.json script to run                           |
+| `appPort`         | number                                 | auto-assigned              | Fixed app port; browser-blocked ports are rejected             |
+| `appPortStrategy` | `"random"`, `"stable"`, `"sequential"` | `"random"`                 | How to pick the port when `appPort` is not set                 |
+| `appPortRange`    | `[min, max]`                           | `[4000, 4999]`             | Inclusive range the strategy picks from; min is 1024 or higher |
+| `path`            | string                                 | `"/"`                      | Route path prefix                                              |
+| `proxy`           | boolean                                | auto-detected              | Whether to route through the proxy (`false` for tasks)         |
+| `worktreeFlat`    | boolean                                | `false`                    | Join worktree and app labels into one DNS label                |
+| `worktreeBranch`  | `"last-segment"` or `"full"`           | `"last-segment"`           | How a branch name becomes the worktree prefix                  |
+| `apps`            | object                                 |                            | Overrides for workspace packages, keyed by relative path       |
+| `turbo`           | boolean                                | `true`                     | Set `false` to use direct spawning instead of turborepo        |
 
-Each `apps` entry has the same shape (`name`, `script`, `appPort`, `path`, `proxy`, `worktreeFlat`). Apps can share a `name` when they use distinct `path` values. When `apps` is present, top-level fields apply only in single-app mode.
+Each `apps` entry has the same shape (`name`, `script`, `appPort`, `appPortStrategy`, `appPortRange`, `path`, `proxy`, `worktreeFlat`, `worktreeBranch`). Apps can share a `name` when they use distinct `path` values. When `apps` is present, top-level fields apply only in single-app mode, except `appPortStrategy` and `appPortRange`, which are the default for every app that does not fix `appPort`.
+
+App port strategy: `random` (default), `stable` (derived from the app name including the worktree prefix, plus the route path, so a checkout keeps its port when it is free) or `sequential` (lowest free port). `PORTLESS_APP_PORT_STRATEGY` and `PORTLESS_APP_PORT_RANGE` override the files. A fixed port (`--app-port`, then `PORTLESS_APP_PORT`, then `appPort`) always wins, and `appPort` next to `appPortStrategy` or `appPortRange` in one object is an error. `portless bg start` saves the exported variables and `bg restart` replays them.
 
 ### package.json "portless" key
 
@@ -589,7 +668,7 @@ Instead of a separate config file, you can add a `"portless"` key to your `packa
 { "portless": "myapp" }
 ```
 
-An object supports all per-app fields (`name`, `script`, `appPort`, `path`, `proxy`, `worktreeFlat`):
+An object supports all per-app fields (`name`, `script`, `appPort`, `appPortStrategy`, `appPortRange`, `path`, `proxy`, `worktreeFlat`, `worktreeBranch`):
 
 ```json
 { "portless": { "name": "myapp", "script": "dev:app" } }
@@ -607,7 +686,7 @@ For workspace package overrides, package `package.json` `"portless"` values take
 
 ### Run diagnostics first
 
-Run `portless doctor` before changing state. It is read-only and checks the resolved state directory and sudo handoff, ordered and dotted suffixes, local or LAN proxy bind mode, route and background-app liveness, generated or custom certificates, `cert.<suffix>` pages, hosts sync, mDNS tooling, tunnel provider binaries, Tailscale, and NetBird. Follow its printed hints only after reviewing the reported state.
+Run `portless doctor` before changing state. It is read-only and checks the resolved state directory and sudo handoff, ordered and dotted suffixes, local, guarded unprivileged, or LAN proxy bind mode, route and background-app liveness, generated or custom certificates, `cert.<suffix>` pages, hosts sync, mDNS tooling, the Node binary pinned by an installed startup service, tunnel provider binaries, Tailscale, and NetBird. Follow its printed hints only after reviewing the reported state.
 
 ### Proxy not running
 
@@ -616,6 +695,8 @@ The proxy auto-starts when you run an app with `portless <name> <cmd>`. If it do
 ```bash
 portless proxy start
 ```
+
+To check whether it is running and how it is configured without changing anything, use `portless proxy status`. With `--json` it prints one line, `{"running":true,"pid":1841,"port":443,"tls":true,"tlds":["localhost"],"lan":false,"unprivileged":false,"stateDir":"/Users/me/.portless","wildcard":false,"lanIp":null}`, with every field always present. Everything except `running` and `stateDir` is `null` while the proxy is not running. The first eight keys match upstream portless; `wildcard` and `lanIp` are fork fields. It exits 0 either way, so read `running` instead of the exit code. `portless status` is different: it is an alias of `portless list` and shows routes.
 
 ### Port already in use
 
@@ -627,7 +708,9 @@ portless proxy start -p 8080
 
 ### Framework not respecting PORT
 
-Portless auto-injects the right `--port` flag and, when needed, a matching `--host` flag for frameworks that ignore the `PORT` env var: **Vite**, **VitePlus** (`vp`), **VitePress**, **Rsbuild**, **Astro**, **React Router**, **Angular**, **Laravel**, **Expo**, **React Native**, and **Wrangler**. Wrangler gets `--ip` because its `--host` flag means route hostname. SvelteKit uses Vite internally and is handled automatically. The injection also works through a safe `bun run`, `npm run`, `pnpm run`, or `yarn run` script that resolves directly to a recognized server command. Exact whole-argument placeholders remain the escape hatch for custom flag shapes.
+Portless auto-injects the right `--port` flag and, when needed, a matching `--host` flag for frameworks that ignore the `PORT` env var: **Vite**, **VitePlus** (`vp`), **VitePress**, **Rsbuild**, **Astro**, **React Router**, **Angular**, **Laravel**, **Expo**, **React Native**, **Wrangler**, and **vinext** (`dev` and `start`). Wrangler gets `--ip` because its `--host` flag means route hostname, and `vinext start` gets `--hostname` because it binds `0.0.0.0` otherwise. SvelteKit uses Vite internally and is handled automatically. The injection also works through a safe `bun run`, `npm run`, `pnpm run`, or `yarn run` script that resolves directly to a recognized server command. Exact whole-argument placeholders remain the escape hatch for custom flag shapes.
+
+While sharing is active, portless puts the exact sharing hostnames (and any configured suffix beyond `localhost`) in `__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS`. Vite 8.1 and later read it as a comma list. Older Vite reads one host, so with more than one entry portless passes a single host (a sharing hostname first) and prints a notice naming the rest; add them to `server.allowedHosts` or use Vite 8.1 or later.
 
 If a tool needs a custom flag shape, use exact command placeholders instead:
 
@@ -644,11 +727,12 @@ For other frameworks that don't read `PORT`, pass the assigned values with place
 
 ### Permission errors
 
-The default ports (80 for HTTP, 443 for HTTPS) require `sudo` on macOS and Linux. Portless auto-elevates with sudo when needed. If sudo is unavailable, it falls back to port 1355 (no sudo needed). On Windows, no elevation is required.
+Portless probes the default ports (80 for HTTP, 443 for HTTPS) and auto-elevates only when binding needs permission or enabled hosts sync needs root for a configured suffix. A failed sudo exits without changing the port. On Windows, no elevation is required. `-p 1355` removes the port reason only: with a custom suffix and hosts sync on, the proxy still asks for sudo to write `/etc/hosts`. To skip it, set `PORTLESS_SYNC_HOSTS=0`, pass `--unprivileged`, or keep the default `.localhost` suffix.
 
 ```bash
 portless proxy start --https           # Auto-elevates with sudo for port 443
-portless proxy start -p 1355 --https   # No sudo needed (URLs include :1355)
+portless proxy start -p 1355 --https   # No port sudo (URLs include :1355)
+portless proxy start --unprivileged    # Plain HTTP on port 80, no sudo, clean URLs
 portless proxy stop                    # Stop (use sudo if started with sudo)
 ```
 
@@ -659,11 +743,13 @@ Safari relies on the system DNS resolver for `.localhost` subdomains, which may 
 Fix:
 
 ```bash
-portless hosts sync    # Adds current routes to /etc/hosts
+portless hosts sync    # Reconcile current routes with /etc/hosts
 portless hosts clean   # Remove entries later
 ```
 
-Auto-syncs `/etc/hosts` for route hostnames by default. Set `PORTLESS_SYNC_HOSTS=0` to disable.
+Auto-syncs `/etc/hosts` for route hostnames by default. Set `PORTLESS_SYNC_HOSTS=0` to disable. If a route hostname will not resolve, the command that registered it warns and points you to `portless hosts sync`.
+
+Manual sync reconciles portless-managed entries with current routes and removes stale entries, including a leftover block when there are no routes. A missing hosts file is created holding only the portless block; a file that exists but cannot be read is never rewritten. Writes are in place, so permissions and symlinks are kept. A registering command asks the running proxy to sync through an authenticated loopback request (a token in the state directory), falling back to waiting for an older proxy's route watcher; the request is a no-op with `PORTLESS_SYNC_HOSTS=0` or `--unprivileged`. It requires a successful initial hosts-file read before writing and verifies each write. A read or verification failure follows the normal sync error path.
 
 If a route hostname will not resolve, the command that registered it warns instead of failing silently and points you to `portless hosts sync`.
 
@@ -706,14 +792,14 @@ Portless automatically sets `NODE_EXTRA_CA_CERTS` in child processes so Node.js 
 
 ### Tailscale not working
 
-If `--tailscale`, `--tailscale-service`, or `--funnel` fails:
+If `--tailscale`, `--tailscale-http`, `--tailscale-service`, or `--funnel` fails:
 
 ```bash
 tailscale status     # Check if connected
 tailscale up         # Connect to your tailnet
 ```
 
-Requires the Tailscale CLI to be installed (https://tailscale.com/download) and on PATH, with MagicDNS and Tailscale HTTPS certificates enabled on the active tailnet. Tailscale Service mode also requires a tagged device identity and may need admin approval before the service URL resolves.
+Requires the Tailscale CLI to be installed (https://tailscale.com/download) and on PATH, with MagicDNS and Tailscale HTTPS certificates enabled on the active tailnet (not needed for `--tailscale-http`). Tailscale Service mode also requires a tagged device identity and may need admin approval before the service URL resolves.
 
 ### ngrok not working
 
@@ -740,8 +826,9 @@ Requires the NetBird CLI to be installed (https://netbird.io/download), connecte
 ### Requirements
 
 - Node.js 24+
+- Bun 1.4.4+, only when you run portless under Bun. Earlier Bun versions ignore SNI callbacks, so every hostname receives the default `localhost` certificate. Portless adds no runtime check for this.
 - macOS, Linux, or Windows
 - `openssl` (for `--https` cert generation; ships with macOS and most Linux distributions; on Windows, install via `winget install -e --id ShiningLight.OpenSSL.Dev` or use the copy bundled with Git for Windows)
-- `tailscale` CLI (optional, for `--tailscale`, `--tailscale-service`, and `--funnel`)
+- `tailscale` CLI (optional, for `--tailscale`, `--tailscale-http`, `--tailscale-service`, and `--funnel`)
 - `ngrok` CLI (optional, for `--ngrok`)
 - `netbird` CLI (optional, for `--netbird`)

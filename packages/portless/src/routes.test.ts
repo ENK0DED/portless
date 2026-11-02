@@ -1,10 +1,23 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { pathToFileURL } from "node:url";
-import { spawn } from "node:child_process";
-import { FILE_MODE, RouteStore, RouteConflictError, isRetryableLockError } from "./routes.js";
+import { spawn, spawnSync } from "node:child_process";
+import {
+  FILE_MODE,
+  RouteStore,
+  RouteConflictError,
+  hasDeadRouteOwner,
+  isRetryableLockError,
+  isRouteOwnerAlive,
+} from "./routes.js";
+import { getProcessStartTime } from "./process-group.js";
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return { ...actual, renameSync: vi.fn(actual.renameSync) };
+});
 
 describe("RouteStore", () => {
   let tmpDir: string;
@@ -42,6 +55,52 @@ describe("RouteStore", () => {
       store.ensureDir();
       fs.writeFileSync(store.getRoutesPath(), "not json");
       expect(store.loadRoutes()).toEqual([]);
+    });
+
+    it("aborts a route mutation on corrupt JSON without changing the file", () => {
+      store.ensureDir();
+      const raw = "{ not json";
+      fs.writeFileSync(store.getRoutesPath(), raw);
+
+      expect(() => store.addRoute("new.localhost", 4001, process.pid)).toThrow(
+        `Refusing to modify a corrupt routes file: ${store.getRoutesPath()}`
+      );
+      expect(fs.readFileSync(store.getRoutesPath(), "utf-8")).toBe(raw);
+    });
+
+    it("keeps routes owned by a process the caller cannot signal (EPERM)", () => {
+      store.ensureDir();
+      fs.writeFileSync(
+        store.getRoutesPath(),
+        JSON.stringify([{ hostname: "other-user.localhost", port: 4001, pid: 999999 }])
+      );
+      const realKill = process.kill.bind(process);
+      const kill = vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+        if (pid === 999999 && signal === 0) {
+          throw Object.assign(new Error("EPERM"), { code: "EPERM" });
+        }
+        return realKill(pid, signal);
+      });
+      try {
+        expect(store.loadRoutes().map((r) => r.hostname)).toEqual(["other-user.localhost"]);
+        expect(store.pruneStaleRoutes()).toEqual([]);
+        expect(store.loadRoutes()).toHaveLength(1);
+      } finally {
+        kill.mockRestore();
+      }
+    });
+
+    it("does not persist migration changes during an unlocked read", () => {
+      store.ensureDir();
+      const raw = JSON.stringify([
+        { hostname: "api.localhost", port: 4001, pid: process.pid, pathPrefix: "/api/" },
+      ]);
+      fs.writeFileSync(store.getRoutesPath(), raw);
+
+      expect(store.loadRoutesRaw()).toEqual([
+        { hostname: "api.localhost", port: 4001, pid: process.pid, pathPrefix: "/api" },
+      ]);
+      expect(fs.readFileSync(store.getRoutesPath(), "utf-8")).toBe(raw);
     });
 
     it("calls onWarning for invalid JSON", () => {
@@ -93,6 +152,7 @@ describe("RouteStore", () => {
         ])
       );
 
+      store.updateRoute("missing.localhost", {});
       expect(store.loadRoutes()).toEqual([
         { hostname: "api.localhost", port: 4001, pid: process.pid, pathPrefix: "/api" },
         { hostname: "web.localhost", port: 4002, pid: process.pid },
@@ -122,6 +182,7 @@ describe("RouteStore", () => {
         ])
       );
 
+      warnStore.updateRoute("missing.localhost", {});
       expect(warnStore.loadRoutes()).toEqual([
         { hostname: "valid.localhost", port: 4002, pid: process.pid, pathPrefix: "/api" },
       ]);
@@ -225,7 +286,9 @@ describe("RouteStore", () => {
 
     it("cleans the temp file when the atomic rename fails", async () => {
       store.ensureDir();
-      fs.mkdirSync(store.getRoutesPath());
+      vi.mocked(fs.renameSync).mockImplementationOnce(() => {
+        throw new Error("simulated rename failure");
+      });
       const events: string[] = [];
       // Watch the canonical spelling: Windows 8.3 short temp paths make
       // libuv's fs-event assert and abort the vitest worker.
@@ -233,13 +296,15 @@ describe("RouteStore", () => {
         if (filename) events.push(filename.toString());
       });
       try {
-        expect(() => store.addRoute("new.localhost", 4002, process.pid)).toThrow();
+        expect(() => store.addRoute("new.localhost", 4002, process.pid)).toThrow(
+          "simulated rename failure"
+        );
         for (let attempt = 0; attempt < 20; attempt++) {
           if (events.some((entry) => entry.startsWith("routes.json.tmp-"))) break;
           await new Promise((resolve) => setTimeout(resolve, 25));
         }
         expect(events.some((entry) => entry.startsWith("routes.json.tmp-"))).toBe(true);
-        expect(fs.statSync(store.getRoutesPath()).isDirectory()).toBe(true);
+        expect(fs.existsSync(store.getRoutesPath())).toBe(false);
         expect(
           fs.readdirSync(tmpDir).filter((entry) => entry.startsWith("routes.json.tmp-"))
         ).toEqual([]);
@@ -268,7 +333,19 @@ describe("RouteStore", () => {
         hostname: "myapp.localhost",
         port: 4001,
         pid: process.pid,
+        registeredAt: expect.any(Number),
       });
+    });
+
+    it("records when a route registered, for sole-owner and multiplex members", () => {
+      const before = Date.now();
+      store.addRoute("solo.localhost", 4001, process.pid);
+      store.addRoute("multi.localhost", 4002, process.pid, false, { label: "a" });
+      const after = Date.now();
+      for (const route of store.loadRoutes()) {
+        expect(route.registeredAt).toBeGreaterThanOrEqual(before);
+        expect(route.registeredAt).toBeLessThanOrEqual(after);
+      }
     });
 
     it("replaces existing route with same hostname", () => {
@@ -327,6 +404,37 @@ describe("RouteStore", () => {
         return false;
       }
     }
+
+    it("refuses to replace a static alias without --force", () => {
+      store.addRoute("db.localhost", 5432, 0);
+      expect(() => store.addRoute("db.localhost", 4002, process.pid)).toThrow(
+        '"db.localhost" is a static alias. Use --force to replace it; re-add the alias with "portless alias" afterwards.'
+      );
+    });
+
+    it("names a static alias when a multiplex member would replace it", () => {
+      store.addRoute("db.localhost", 5432, 0);
+      expect(() =>
+        store.addRoute("db.localhost", 4002, process.pid, false, { label: "web" })
+      ).toThrow(/is a static alias/);
+    });
+
+    it("replaces a static alias with --force without sending any signal", () => {
+      const realKill = process.kill.bind(process);
+      const kill = vi
+        .spyOn(process, "kill")
+        .mockImplementation((pid, signal) => (signal ? true : realKill(pid, signal)));
+      try {
+        store.addRoute("db.localhost", 5432, 0);
+        expect(store.addRoute("db.localhost", 4002, process.pid, true)).toBeUndefined();
+        expect(kill.mock.calls.filter(([, signal]) => signal)).toEqual([]);
+        const routes = store.loadRoutes();
+        expect(routes).toHaveLength(1);
+        expect(routes[0]).toMatchObject({ port: 4002, pid: process.pid });
+      } finally {
+        kill.mockRestore();
+      }
+    });
 
     it("throws RouteConflictError without --force when route is owned by another live process", () => {
       const otherPid = spawnSleeper();
@@ -484,6 +592,118 @@ describe("RouteStore", () => {
     });
   });
 
+  describe("transferRoute", () => {
+    const DEAD_PID = 99_999_991;
+
+    it("moves a route to another pid while the caller owns it", () => {
+      store.addRoute("myapp.localhost", 4001, process.pid);
+      expect(store.transferRoute("myapp.localhost", process.pid, process.ppid)).toEqual({
+        hadSharing: false,
+      });
+      const routes = store.loadRoutes();
+      expect(routes).toHaveLength(1);
+      expect(routes[0].pid).toBe(process.ppid);
+      expect(routes[0].port).toBe(4001);
+    });
+
+    it("does not move a route owned by another pid", () => {
+      store.addRoute("myapp.localhost", 4001, process.ppid);
+      expect(store.transferRoute("myapp.localhost", process.pid, 1)).toBeNull();
+      expect(store.loadRoutes()[0].pid).toBe(process.ppid);
+    });
+
+    it("clears every sharing field, because those helpers stop with the command", () => {
+      store.addRoute("myapp.localhost", 4001, process.pid);
+      store.updateRoute("myapp.localhost", {
+        ngrokUrl: "https://abc.ngrok.app",
+        ngrokPid: 123,
+        tailscaleUrl: "https://dev.tail1234.ts.net",
+        tailscaleHttpsPort: 8443,
+        tailscaleFunnel: true,
+        tailscaleHttp: true,
+        tailscaleServiceName: "svc",
+        tailscaleServiceUrl: "https://svc.tail1234.ts.net",
+        tailscaleServicePending: true,
+        tunnelProvider: "cloudflare",
+        tunnelUrl: "https://abc.trycloudflare.com",
+        tunnelExternalHostname: "abc.trycloudflare.com",
+        tunnelPid: 124,
+        netbirdUrl: "https://abc.netbird.io",
+        netbirdPid: 125,
+        cloudflareUrl: "https://abc.trycloudflare.com",
+        cloudflarePid: 126,
+      });
+      expect(store.transferRoute("myapp.localhost", process.pid, process.ppid)).toEqual({
+        hadSharing: true,
+      });
+      const route = store.loadRoutes()[0];
+      expect(Object.keys(route).sort()).toEqual(["hostname", "pid", "port", "registeredAt"].sort());
+    });
+
+    it("drops the process group record so the live daemon is never an orphan", () => {
+      store.addRoute("myapp.localhost", 4001, process.pid);
+      const startTime = getProcessStartTime(process.pid) ?? "recorded";
+      store.updateRoute("myapp.localhost", { childPgid: process.pid, childStartTime: startTime });
+      store.transferRoute("myapp.localhost", process.pid, process.ppid);
+      const route = store.loadRoutes()[0];
+      expect(route.childPgid).toBeUndefined();
+      expect(route.childStartTime).toBeUndefined();
+      expect(store.isOrphaned(route)).toBe(false);
+      expect(store.loadOrphanedRoutes()).toEqual([]);
+    });
+
+    it("leaves no orphan record when the new owner later dies", () => {
+      store.addRoute("myapp.localhost", 4001, process.pid);
+      store.updateRoute("myapp.localhost", {
+        childPgid: process.pid,
+        childStartTime: getProcessStartTime(process.pid) ?? "recorded",
+      });
+      store.transferRoute("myapp.localhost", process.pid, DEAD_PID);
+      const [route] = store.loadRoutesRaw();
+      expect(route.pid).toBe(DEAD_PID);
+      expect(store.isOrphaned(route)).toBe(false);
+      expect(store.pruneStaleRoutes({ keepOrphaned: true }).map((r) => r.hostname)).toEqual([
+        "myapp.localhost",
+      ]);
+      expect(store.loadRoutesRaw()).toEqual([]);
+    });
+
+    it("targets the route under its path prefix only", () => {
+      store.addRoute("myapp.localhost", 4001, process.pid, false, { pathPrefix: "/api" });
+      store.addRoute("myapp.localhost", 4002, process.pid, false, { pathPrefix: "/web" });
+      expect(store.transferRoute("myapp.localhost", process.pid, process.ppid)).toBeNull();
+      expect(
+        store.transferRoute("myapp.localhost", process.pid, process.ppid, { pathPrefix: "/api" })
+      ).toEqual({ hadSharing: false });
+      const byPrefix = new Map(store.loadRoutes().map((r) => [r.pathPrefix, r]));
+      expect(byPrefix.get("/api")?.pid).toBe(process.ppid);
+      expect(byPrefix.get("/web")?.pid).toBe(process.pid);
+    });
+
+    it("moves only the labelled member of a multiplexed hostname", () => {
+      // One pid can hold one member, so the sibling belongs to another live process.
+      store.addRoute("myapp.localhost", 4001, process.ppid, false, { label: "web" });
+      store.addRoute("myapp.localhost", 4002, process.pid, false, { label: "api" });
+      expect(store.transferRoute("myapp.localhost", process.pid, 1, { label: "web" })).toBeNull();
+      expect(store.transferRoute("myapp.localhost", process.pid, 1, { label: "api" })).toEqual({
+        hadSharing: false,
+      });
+      // Read raw: pid 1 is a live init process on Unix but does not exist on
+      // Windows, and this test checks the transfer, not owner liveness.
+      const byLabel = new Map(store.loadRoutesRaw().map((r) => [r.label, r]));
+      expect(byLabel.get("api")?.pid).toBe(1);
+      expect(byLabel.get("api")?.port).toBe(4002);
+      expect(byLabel.get("web")?.pid).toBe(process.ppid);
+    });
+
+    it("lets the exit cleanup leave a transferred route alone", () => {
+      store.addRoute("myapp.localhost", 4001, process.pid);
+      store.transferRoute("myapp.localhost", process.pid, process.ppid);
+      store.removeRoute("myapp.localhost", process.pid);
+      expect(store.loadRoutes().map((r) => r.pid)).toEqual([process.ppid]);
+    });
+  });
+
   describe("locking (via concurrent addRoute)", () => {
     it("treats common lock directory races as retryable", () => {
       for (const code of ["EEXIST", "EPERM", "EACCES"]) {
@@ -630,6 +850,22 @@ describe("RouteStore", () => {
       const routes = store.loadRoutes();
       expect(routes).toHaveLength(1);
       expect(routes[0].tailscaleFunnel).toBe(true);
+    });
+
+    it("persists and clears the plain-HTTP flag via updateRoute", () => {
+      store.addRoute("api.localhost", 4456, process.pid);
+      store.updateRoute("api.localhost", {
+        tailscaleUrl: "http://100.101.102.103:8080",
+        tailscaleHttpsPort: 8080,
+        tailscaleHttp: true,
+      });
+      let routes = store.loadRoutes();
+      expect(routes[0].tailscaleHttp).toBe(true);
+      expect(routes[0].tailscaleFunnel).toBeUndefined();
+
+      store.updateRoute("api.localhost", { tailscaleHttp: null });
+      routes = store.loadRoutes();
+      expect(routes[0].tailscaleHttp).toBeUndefined();
     });
 
     it("persists and clears Tailscale Service metadata via updateRoute", () => {
@@ -883,5 +1119,199 @@ describe("RouteStore multiplex", { timeout: 15_000 }, () => {
     const routes = store.loadRoutes();
     expect(routes[0].label).toBeUndefined();
     expect(isAlive(sleepers[0])).toBe(true);
+  });
+});
+
+describe.skipIf(process.platform === "win32")("orphaned routes", () => {
+  let tmpDir: string;
+  let store: RouteStore;
+  let group: number | undefined;
+
+  /** A detached process leading its own group, like a dev server portless spawned. */
+  function startGroup(): number {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    child.unref();
+    group = child.pid!;
+    return group;
+  }
+
+  /** A pid that is guaranteed dead, standing in for the exited portless owner. */
+  function deadPid(): number {
+    const result = spawnSync(
+      process.execPath,
+      ["-e", "process.stdout.write(String(process.pid))"],
+      {
+        encoding: "utf-8",
+      }
+    );
+    return Number(result.stdout);
+  }
+
+  function writeOrphan(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    const pgid = startGroup();
+    const route = {
+      hostname: "orphan.localhost",
+      port: 4555,
+      pid: deadPid(),
+      childPgid: pgid,
+      childStartTime: getProcessStartTime(pgid),
+      ...overrides,
+    };
+    store.ensureDir();
+    fs.writeFileSync(store.getRoutesPath(), JSON.stringify([route]));
+    return route;
+  }
+
+  const raw = (): Array<{ hostname: string; ngrokPid?: number }> =>
+    JSON.parse(fs.readFileSync(store.getRoutesPath(), "utf-8"));
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-orphans-test-"));
+    store = new RouteStore(tmpDir);
+  });
+
+  afterEach(() => {
+    if (group) {
+      try {
+        process.kill(-group, "SIGKILL");
+      } catch {
+        // already gone
+      }
+    }
+    group = undefined;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("is not routable but is reported as orphaned", () => {
+    writeOrphan();
+
+    expect(store.loadRoutes()).toEqual([]);
+    expect(store.loadOrphanedRoutes().map((r) => r.hostname)).toEqual(["orphan.localhost"]);
+  });
+
+  it("does not treat a route without a verified group as orphaned", () => {
+    writeOrphan({ childStartTime: "Thu Jan  1 00:00:00 1970" });
+    expect(store.loadOrphanedRoutes()).toEqual([]);
+
+    writeOrphan({ childPgid: undefined, childStartTime: undefined });
+    expect(store.loadOrphanedRoutes()).toEqual([]);
+  });
+
+  it("keeps the orphan on file when another route is registered or removed", () => {
+    writeOrphan();
+
+    store.addRoute("other.localhost", 4556, process.pid);
+    expect(
+      raw()
+        .map((r) => r.hostname)
+        .sort()
+    ).toEqual(["orphan.localhost", "other.localhost"]);
+
+    store.updateRoute("other.localhost", { childPgid: 1234 });
+    store.removeRoute("other.localhost", process.pid);
+    expect(raw().map((r) => r.hostname)).toEqual(["orphan.localhost"]);
+  });
+
+  it("drops the orphan when a new owner registers the same slot", () => {
+    writeOrphan();
+
+    store.addRoute("orphan.localhost", 4557, process.pid);
+
+    expect(raw()).toHaveLength(1);
+    expect(store.loadRoutes()[0]).toMatchObject({ hostname: "orphan.localhost", port: 4557 });
+  });
+
+  it("drops a dead-owner route once its group is gone", async () => {
+    writeOrphan();
+    process.kill(-group!, "SIGKILL");
+    // The leader is a child of this process, so the event loop must run to reap it.
+    for (let i = 0; i < 100 && store.loadOrphanedRoutes().length > 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    store.addRoute("other.localhost", 4556, process.pid);
+
+    expect(raw().map((r) => r.hostname)).toEqual(["other.localhost"]);
+  });
+
+  describe("pruneStaleRoutes", () => {
+    it("removes orphaned routes by default", () => {
+      writeOrphan();
+
+      expect(store.pruneStaleRoutes().map((r) => r.hostname)).toEqual(["orphan.localhost"]);
+      expect(raw()).toEqual([]);
+    });
+
+    it("keeps orphaned routes when asked, and strips their sharing once", () => {
+      writeOrphan({ ngrokPid: 99_999_991, ngrokUrl: "https://x.ngrok.app" });
+
+      const first = store.pruneStaleRoutes({ keepOrphaned: true });
+      expect(first.map((r) => r.ngrokPid)).toEqual([99_999_991]);
+      expect(raw()).toHaveLength(1);
+      expect(raw()[0].ngrokPid).toBeUndefined();
+      expect(store.loadOrphanedRoutes()).toHaveLength(1);
+
+      expect(store.pruneStaleRoutes({ keepOrphaned: true })).toEqual([]);
+      expect(raw()).toHaveLength(1);
+    });
+
+    it("still removes dead-owner routes without a live group when keeping orphans", () => {
+      writeOrphan({ childStartTime: "Thu Jan  1 00:00:00 1970" });
+
+      expect(store.pruneStaleRoutes({ keepOrphaned: true })).toHaveLength(1);
+      expect(raw()).toEqual([]);
+    });
+  });
+});
+
+describe("isRouteOwnerAlive", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function mockKill(code: string | undefined) {
+    return vi.spyOn(process, "kill").mockImplementation(() => {
+      if (code === undefined) return true;
+      throw Object.assign(new Error(code), { code });
+    });
+  }
+
+  it("treats pid 0 as a live reserved route without signaling anything", () => {
+    const kill = mockKill("ESRCH");
+    expect(isRouteOwnerAlive({ pid: 0 })).toBe(true);
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it("is true for a live owner and false for a dead one", () => {
+    mockKill(undefined);
+    expect(isRouteOwnerAlive({ pid: 4242 })).toBe(true);
+    vi.restoreAllMocks();
+    mockKill("ESRCH");
+    expect(isRouteOwnerAlive({ pid: 4242 })).toBe(false);
+  });
+
+  it("keeps a route owned by another user's process (EPERM) live", () => {
+    mockKill("EPERM");
+    expect(isRouteOwnerAlive({ pid: 4242 })).toBe(true);
+    expect(hasDeadRouteOwner([{ pid: 4242 }, { pid: 0 }])).toBe(false);
+  });
+
+  it("only sends signal 0, so the check never kills", () => {
+    const kill = mockKill(undefined);
+    hasDeadRouteOwner([{ pid: 11 }, { pid: 12 }]);
+    expect(kill.mock.calls.every((call) => call[1] === 0)).toBe(true);
+  });
+
+  it("reports a dead owner among live ones", () => {
+    vi.spyOn(process, "kill").mockImplementation((pid) => {
+      if (pid === 13) throw Object.assign(new Error("ESRCH"), { code: "ESRCH" });
+      return true;
+    });
+    expect(hasDeadRouteOwner([{ pid: 11 }, { pid: 13 }])).toBe(true);
+    expect(hasDeadRouteOwner([{ pid: 11 }, { pid: 12 }])).toBe(false);
+    expect(hasDeadRouteOwner([])).toBe(false);
   });
 });

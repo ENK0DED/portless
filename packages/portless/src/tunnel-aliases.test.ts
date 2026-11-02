@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TunnelAliasStore, normalizeTunnelHostname } from "./tunnel-aliases.js";
 
 describe("TunnelAliasStore", () => {
@@ -14,11 +14,26 @@ describe("TunnelAliasStore", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
   it("returns an empty list when no alias file exists", () => {
     expect(store.loadAliases()).toEqual([]);
+  });
+
+  it("aborts an alias mutation on corrupt JSON without changing the file", () => {
+    store.ensureDir();
+    const raw = "{ not json";
+    fs.writeFileSync(store.getAliasesPath(), raw);
+
+    expect(() =>
+      store.setAlias({
+        externalHostname: "public.example.com",
+        targetHostname: "myapp.localhost",
+      })
+    ).toThrow(`Refusing to modify a corrupt tunnel aliases file: ${store.getAliasesPath()}`);
+    expect(fs.readFileSync(store.getAliasesPath(), "utf-8")).toBe(raw);
   });
 
   it("persists and updates exact tunnel aliases", () => {
@@ -64,6 +79,24 @@ describe("TunnelAliasStore", () => {
     ]) {
       expect(() => normalizeTunnelHostname(value)).toThrow("Invalid tunnel hostname");
     }
+  });
+
+  it("keeps managed aliases whose owner process the caller cannot signal (EPERM)", () => {
+    store.setAlias({
+      externalHostname: "public.example.com",
+      targetHostname: "myapp.localhost",
+      managed: true,
+      routeOwnerPid: 123456789,
+      tunnelPid: 123456790,
+      provider: "cloudflare",
+      url: "https://public.example.com",
+    });
+    vi.spyOn(process, "kill").mockImplementation(() => {
+      throw Object.assign(new Error("EPERM"), { code: "EPERM" });
+    });
+
+    expect(store.pruneManagedAliases()).toEqual([]);
+    expect(store.loadAliases()).toHaveLength(1);
   });
 
   it("removes managed aliases for stale owner pids", () => {

@@ -38,6 +38,7 @@ describe("removePortlessStateFiles", () => {
 
   it("removes allowlisted files and generated state directories", () => {
     fs.writeFileSync(path.join(tmpDir, "routes.json"), "[]");
+    fs.writeFileSync(path.join(tmpDir, "cloudflared.yml"), "{}");
     fs.writeFileSync(path.join(tmpDir, "ca.pem"), "pem");
     fs.writeFileSync(path.join(tmpDir, "ca.trusted"), "fingerprint");
     fs.writeFileSync(path.join(tmpDir, "ca.trust-refresh-pending"), "1");
@@ -45,6 +46,7 @@ describe("removePortlessStateFiles", () => {
     fs.writeFileSync(path.join(tmpDir, "proxy.custom-cert"), "1");
     fs.writeFileSync(path.join(tmpDir, "proxy.internal-pages-disabled"), "1");
     fs.writeFileSync(path.join(tmpDir, "proxy.wildcard"), "1");
+    fs.writeFileSync(path.join(tmpDir, "proxy.unprivileged"), "1");
     fs.mkdirSync(path.join(tmpDir, "host-certs"));
     fs.writeFileSync(path.join(tmpDir, "host-certs", "x.pem"), "x");
     fs.mkdirSync(path.join(tmpDir, "bg", "logs"), { recursive: true });
@@ -55,10 +57,12 @@ describe("removePortlessStateFiles", () => {
     removePortlessStateFiles(tmpDir);
 
     expect(fs.existsSync(path.join(tmpDir, "routes.json"))).toBe(false);
+    expect(fs.existsSync(path.join(tmpDir, "cloudflared.yml"))).toBe(false);
     expect(fs.existsSync(path.join(tmpDir, "proxy.custom-cert"))).toBe(false);
     expect(fs.existsSync(path.join(tmpDir, "proxy.internal-pages-disabled"))).toBe(false);
     expect(fs.existsSync(path.join(tmpDir, "ca.pem"))).toBe(false);
     expect(fs.existsSync(path.join(tmpDir, "proxy.wildcard"))).toBe(false);
+    expect(fs.existsSync(path.join(tmpDir, "proxy.unprivileged"))).toBe(false);
     expect(fs.existsSync(path.join(tmpDir, "ca.trusted"))).toBe(false);
     expect(fs.existsSync(path.join(tmpDir, "ca.trust-refresh-pending"))).toBe(false);
     expect(fs.existsSync(path.join(tmpDir, "host-certs"))).toBe(false);
@@ -72,6 +76,7 @@ describe("removePortlessStateFiles", () => {
 
   it("retains the CA identity when trust removal must be retried", () => {
     fs.writeFileSync(path.join(tmpDir, "routes.json"), "[]");
+    fs.writeFileSync(path.join(tmpDir, "cloudflared.yml"), "{}");
     fs.writeFileSync(path.join(tmpDir, "ca.pem"), "certificate");
     fs.writeFileSync(path.join(tmpDir, "ca-key.pem"), "private key");
     fs.writeFileSync(path.join(tmpDir, "ca.trusted"), "stale marker");
@@ -85,6 +90,7 @@ describe("removePortlessStateFiles", () => {
     expect(fs.existsSync(path.join(tmpDir, "ca.trusted"))).toBe(false);
     expect(fs.readFileSync(path.join(tmpDir, "ca.trust-refresh-pending"), "utf-8")).toBe("1");
     expect(fs.existsSync(path.join(tmpDir, "routes.json"))).toBe(false);
+    expect(fs.existsSync(path.join(tmpDir, "cloudflared.yml"))).toBe(false);
     expect(fs.existsSync(path.join(tmpDir, "server.pem"))).toBe(false);
   });
 });

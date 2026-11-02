@@ -1,0 +1,156 @@
+---
+title: "Getting Started"
+---
+
+Portless replaces port numbers with stable, named `.localhost` URLs for local development. For humans and agents.
+
+```diff
+- "dev": "next dev"                  # http://localhost:3000
++ "dev": "portless myapp next dev"   # https://myapp.localhost
+```
+
+## Install
+
+**Global (recommended):**
+
+```bash
+npm install -g @enk0ded/portless
+```
+
+**Or as a project dev dependency:**
+
+```bash
+npm install -D @enk0ded/portless
+```
+
+> portless is pre-1.0. When installed per-project, different contributors may run different versions. The state directory format may change between releases, which can require re-running `portless trust`.
+
+## Run your app
+
+Just run `portless`. It reads the `"dev"` script from `package.json` and runs it through the proxy:
+
+```bash
+portless
+# -> runs "dev" script, https://<project>.localhost
+```
+
+The app name is inferred from portless config, `package.json`, git root, or directory name. Use `portless.json` or `.config/portless.json` to override (e.g. `{ "name": "myapp" }` for `https://myapp.localhost`).
+
+You can also run with an explicit command:
+
+```bash
+portless myapp next dev
+# -> https://myapp.localhost
+```
+
+HTTPS with HTTP/2 is enabled by default. On first run, portless generates a local CA, trusts it, and binds port 443 (auto-elevates with sudo on macOS/Linux). Generated CA and server certificates are stored in the resolved state directory and reused across restarts. Use `--skip-trust` when you want certificate files without adding the CA to the trust store, or `--no-tls` for plain HTTP.
+
+The proxy auto-starts when you run an app. A port in the 4000 to 4999 range that is free on `127.0.0.1` is assigned via the `PORT` environment variable, random by default (`appPortStrategy` makes it stable per app or sequential). Portless skips browser-blocked ports during auto-assignment and rejects them for fixed app ports. Most frameworks (Next.js, Express, Nuxt, etc.) respect this automatically. For frameworks that ignore `PORT` (Vite, VitePress, Astro, React Router, Angular, Laravel, Expo, React Native, Wrangler), portless auto-injects the right `--port` flag and, when needed, a matching `--host` flag or Wrangler's `--ip` flag.
+
+Injection also reaches through a safe `bun run`, `npm run`, `pnpm run`, or `yarn run` script when its command resolves directly to a recognized framework or package runner. Only server commands receive flags: `dev`, `serve`, `preview`, `start`, `php artisan serve`, `wrangler dev`, and bare server invocations such as `vite` or `vite [root]`. Builds, checks, comments, compound commands, scripts with their own `--` terminator, environment-prefixed or delegated commands, and runner flags before the script name are left unchanged. Set the port in those scripts yourself.
+
+For other tools, use exact command placeholders. Portless replaces whole arguments matching `{PORT}`, `{HOST}`, or `{PORTLESS_URL}` after assigning the app port and skips automatic framework flag injection when any placeholder is present.
+
+```bash
+portless run my-server --port {PORT} --host {HOST} --url {PORTLESS_URL}
+```
+
+## Use in package.json
+
+Your scripts stay clean:
+
+```json
+{
+  "scripts": {
+    "dev": "next dev"
+  }
+}
+```
+
+Then run `portless` or `portless run` to go through the proxy.
+
+You can also use portless directly in scripts:
+
+```json
+{
+  "scripts": {
+    "dev": "portless myapp next dev"
+  }
+}
+```
+
+## Subdomains
+
+Organize services with subdomains:
+
+```bash
+portless api.myapp pnpm start
+# -> https://api.myapp.localhost
+
+portless docs.myapp next dev
+# -> https://docs.myapp.localhost
+```
+
+## Git Worktrees
+
+`portless run` automatically detects git worktrees. In a linked worktree, the branch name is prepended as a subdomain so each worktree gets its own URL without any config changes:
+
+```bash
+# Main worktree (no prefix)
+portless run next dev   # -> https://myapp.localhost
+
+# Linked worktree on branch "fix-ui"
+portless run next dev   # -> https://fix-ui.myapp.localhost
+```
+
+Put `portless run` in your `package.json` once and it works everywhere. The main checkout uses the plain name, each worktree gets a unique subdomain. No collisions, no `--force`.
+
+Monorepo workspace apps use the same prefixing rule, including names set through the root `apps` map.
+
+Use `--name` to override the inferred base name while keeping the worktree prefix:
+
+```bash
+portless run --name myapp next dev   # -> https://fix-ui.myapp.localhost
+```
+
+By default the prefix is the last segment of the branch, so `team-a/login` becomes `login`. Set `"worktreeBranch": "full"` in `portless.json` to use the whole branch (`team-a-login`). `main` and `master` never get a derived prefix.
+
+Set the prefix yourself with `--worktree-prefix` (or `PORTLESS_WORKTREE_PREFIX`). An explicit prefix applies in a linked worktree, the main checkout, and outside git. Turn the prefix off with `--no-worktree`, or an empty `PORTLESS_WORKTREE_PREFIX=`:
+
+```bash
+portless run --worktree-prefix qa next dev   # -> https://qa.myapp.localhost
+portless run --no-worktree next dev          # -> https://myapp.localhost
+```
+
+The flag wins over the environment variable, which wins over git detection. `portless run`, bare `portless`, `portless get`, and `portless bg start` all accept both flags.
+
+## Custom Suffixes
+
+By default, portless uses `.localhost` which auto-resolves to `127.0.0.1` in most browsers. Repeat `--suffix` to serve the same apps under multiple suffixes.
+Each value may be a single label such as `test` or a full dotted suffix such as `acme.com`. Each label is limited to 63 characters, and every full suffix and generated hostname is limited to 253 characters. `PORTLESS_SUFFIX` accepts comma-separated values, and repeatable `--tld` remains a compatibility alias:
+
+```bash
+portless proxy start --suffix test --suffix local.example.com
+portless myapp next dev
+# -> https://myapp.test and https://myapp.local.example.com
+```
+
+The proxy auto-syncs `/etc/hosts` for route hostnames, so `.test`, `.acme.com`, and other dev hostnames resolve on your machine. Explicit lists are preserved in LAN mode with `.local` appended; mDNS publishes only the `.local` routes.
+
+Recommended: `.test` (IANA-reserved, no collision risk). Avoid `.local` (conflicts with mDNS/Bonjour) and `.dev` (Google-owned, forces HTTPS via HSTS).
+
+## How it works
+
+Portless runs an HTTPS reverse proxy on port 443 by default. Each app registers a route mapping its hostname to an assigned port. Requests to `https://<name>.localhost` are proxied to the app.
+
+```
+Browser (myapp.localhost) -> proxy (port 443) -> App (random port)
+```
+
+## Requirements
+
+- Node.js 24+
+- Bun 1.4.4+, only when you run portless under Bun. Earlier Bun versions ignore SNI callbacks, so every hostname receives the default `localhost` certificate. Portless adds no runtime check for this.
+- macOS, Linux, or Windows
+
+If a route hostname will not resolve, the command that registered it warns with a manual hosts-sync command.

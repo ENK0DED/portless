@@ -1,10 +1,27 @@
+import {
+  HOSTS_SYNC_AUTH_CHALLENGE_HEADER,
+  HOSTS_SYNC_AUTH_HEADER,
+  HOSTS_SYNC_AUTH_PROOF_HEADER,
+  createHostsSyncProof,
+  isValidHostsSyncToken,
+} from "./hosts-sync-auth.js";
+
 import * as http from "node:http";
 import * as http2 from "node:http2";
 import * as net from "node:net";
 import * as crypto from "node:crypto";
+import { parsePort } from "./utils.js";
 import type { ProxyServerOptions, RouteInfo, TunnelAlias } from "./types.js";
 import { escapeHtml, formatUrl, matchesPathPrefix, normalizePathPrefix } from "./utils.js";
-import { APP_SCRIPT, appList, renderPage } from "./pages.js";
+import {
+  APP_FILTER_CONTROLS,
+  APP_FILTER_NO_MATCH,
+  APP_FILTER_SCRIPT,
+  APP_FILTER_THRESHOLD,
+  APP_SCRIPT,
+  appList,
+  renderPage,
+} from "./pages.js";
 import {
   dashboardStateJson,
   renderAppPicker,
@@ -67,6 +84,7 @@ function routeSignature(routes: RouteInfo[]): string {
           r.tailscaleUrl,
           r.tailscaleServiceUrl,
           r.tailscaleFunnel ? "f" : "",
+          r.tailscaleHttp ? "h" : "",
           r.ngrokUrl,
           r.tunnelUrl,
           r.netbirdUrl,
@@ -121,6 +139,8 @@ export const LOOPBACK_DIAL_OPTIONS = {
   hostname: "localhost",
   host: "localhost",
   autoSelectFamily: true,
+  // Preserve successful local dials across brief event-loop stalls.
+  autoSelectFamilyAttemptTimeout: Math.max(2_000, net.getDefaultAutoSelectFamilyAttemptTimeout()),
   lookup: ((_hostname, _options, callback) => {
     callback(null, [
       { address: "127.0.0.1", family: 4 },
@@ -140,8 +160,53 @@ function wantsHtml(req: http.IncomingMessage): boolean {
   return value.split(",").some((entry) => entry.trim().toLowerCase().split(";")[0] === "text/html");
 }
 
-function textSafe(value: string): string {
-  return value.replace(/[\r\n]/g, " ");
+/**
+ * Send a portless-generated error. Clients that accept text/html get the
+ * branded page; everything else gets a small JSON body of the form
+ * `{ error, upstream, message }`. `Vary: Accept` is always set so shared
+ * caches keep the two representations apart. `renderHtml` only runs for HTML
+ * clients, so JSON clients never pay for building the page.
+ */
+function sendProxyError(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  status: number,
+  error: string,
+  message: string,
+  upstream: string,
+  renderHtml: () => string
+): void {
+  res.setHeader("Vary", "Accept");
+  if (wantsHtml(req)) {
+    res.writeHead(status, { "Content-Type": "text/html" });
+    res.end(renderHtml());
+    return;
+  }
+  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify({ error, upstream, message }));
+}
+
+/** Send the 502 shared by the HTTP/1.1 and h2c forwarding paths. */
+function sendBadGateway(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  route: { port: number },
+  detail: string
+): void {
+  sendProxyError(
+    req,
+    res,
+    502,
+    "bad_gateway",
+    `${detail} Target: 127.0.0.1:${route.port}. Check active routes with: portless list`,
+    getRequestHost(req),
+    () =>
+      renderPage(
+        502,
+        "Bad Gateway",
+        `<div class="content"><p class="desc">${escapeHtml(detail)}</p></div>`
+      )
+  );
 }
 
 function activeAppLinkSuffix(url: string): string {
@@ -163,8 +228,18 @@ const HOP_BY_HOP_HEADERS = new Set([
   "upgrade",
 ]);
 
-/** Cap ordinary upstream connections so multiplexed clients cannot overload a backend. */
-const MAX_UPSTREAM_SOCKETS = 64;
+/** Hop-by-hop request headers that never belong on a forwarded plain HTTP request. */
+const REQUEST_HOP_BY_HOP_HEADERS = ["connection", "keep-alive", "proxy-connection", "upgrade"];
+
+/** Hop-by-hop response headers stripped on every path. Plain HTTP keeps transfer-encoding. */
+const RESPONSE_HOP_BY_HOP_HEADERS = REQUEST_HOP_BY_HOP_HEADERS;
+
+/** Limit pending dials without blocking requests behind established streams. */
+const MAX_UPSTREAM_DIALS = 16;
+const UPSTREAM_CONNECT_TIMEOUT_MS = 10_000;
+
+/** Time a backend has to answer a WebSocket handshake before the proxy gives up. */
+const WEBSOCKET_HANDSHAKE_TIMEOUT_MS = 30_000;
 const REPLAYABLE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
 /** Remove Connection and every header named by its comma-separated token list. */
@@ -189,8 +264,19 @@ function stripConnectionHeaders(headers: http.OutgoingHttpHeaders): void {
   }
 }
 
-/** A request can be replayed only when its headers prove it has no body. */
+/** The HTTP/2 stream behind a compatibility-API request, or undefined for HTTP/1.1. */
+function getHttp2Stream(req: http.IncomingMessage): http2.ServerHttp2Stream | undefined {
+  return (req as unknown as http2.Http2ServerRequest).stream;
+}
+
+/**
+ * A request can be replayed only when it provably has no body. HTTP/2 frames
+ * bodies itself, so a stream with DATA may carry neither content-length nor
+ * transfer-encoding; only HEADERS with END_STREAM proves it is bodyless.
+ */
 function isBodylessRequest(req: http.IncomingMessage): boolean {
+  const h2Stream = getHttp2Stream(req);
+  if (h2Stream && !h2Stream.endAfterHeaders) return false;
   if (req.headers["transfer-encoding"] !== undefined) return false;
   const contentLength = req.headers["content-length"];
   if (contentLength === undefined) return true;
@@ -379,21 +465,6 @@ function h2cRequestHeaders(
   return headers;
 }
 
-function writePlainBadGateway(
-  res: http.ServerResponse,
-  route: { port: number },
-  detail = "The target app may not be running."
-): void {
-  res.writeHead(502, { "Content-Type": "text/plain" });
-  res.end(
-    [
-      `Bad Gateway: ${detail}`,
-      `Target: 127.0.0.1:${route.port}`,
-      "Check active routes with: portless list",
-    ].join("\n") + "\n"
-  );
-}
-
 function proxyH2c(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -425,8 +496,10 @@ function proxyH2c(
 
   proxyReq.on("error", (err) => {
     onError(`h2c proxy error for ${getRequestHost(req)}: ${dialErrorMessage(err)}`);
+    req.unpipe(proxyReq);
+    req.resume();
     if (!res.headersSent) {
-      writePlainBadGateway(res, route);
+      sendBadGateway(req, res, route, "The target app may not be running.");
     } else {
       res.destroy();
     }
@@ -522,7 +595,8 @@ function findRoute(
   tunnelAliases: TunnelAlias[],
   host: string,
   requestPath: string,
-  strict?: boolean
+  strict?: boolean,
+  selectedLabel?: string
 ): RouteInfo | undefined {
   const authority = normalizeAuthority(host);
   const hostname = authorityHostname(authority);
@@ -536,10 +610,15 @@ function findRoute(
   if (alias) {
     const targetPathPrefix = normalizePathPrefix(alias.targetPathPrefix);
     if (matchesPathPrefix(requestPath, targetPathPrefix)) {
-      return routes.find(
+      const targets = routes.filter(
         (route) =>
           route.hostname === alias.targetHostname &&
-          normalizePathPrefix(route.pathPrefix) === targetPathPrefix
+          normalizePathPrefix(route.pathPrefix) === targetPathPrefix &&
+          (!alias.routeOwnerPid || route.pid === alias.routeOwnerPid)
+      );
+      return (
+        targets.find((route) => selectedLabel && route.label === selectedLabel) ??
+        defaultMember(targets)
       );
     }
   }
@@ -561,10 +640,46 @@ function findRoute(
   if (tailscaleHostnameRoute) return tailscaleHostnameRoute;
 
   if (strict) return undefined;
+
+  // Wildcard tier: the most specific parent hostname wins, then the longest
+  // path prefix within it. Storage order never decides.
+  const parents = routes.filter(
+    (r) =>
+      hostname.endsWith("." + r.hostname) &&
+      matchesPathPrefix(requestPath, normalizePathPrefix(r.pathPrefix))
+  );
+  const longestParent = parents.reduce((max, r) => Math.max(max, r.hostname.length), 0);
   return pickLongestPathRoute(
-    routes.filter((r) => hostname.endsWith("." + r.hostname)),
+    parents.filter((r) => r.hostname.length === longestParent),
     requestPath
   );
+}
+
+/**
+ * True when the request authority is an exact public hostname the proxy
+ * accepts through a tunnel alias or a persisted Tailscale URL. Such a host
+ * reaching the no-route branch means only its path missed, and the visitor may
+ * be anyone on the internet.
+ */
+function isKnownPublicHost(
+  rawHost: string,
+  routes: RouteInfo[],
+  tunnelAliases: TunnelAlias[]
+): boolean {
+  const hostname = authorityHostname(normalizeAuthority(rawHost));
+  return (
+    tunnelAliases.some((alias) => alias.externalHostname === hostname) ||
+    routes.some((route) =>
+      routeTailscaleAuthorities(route).some(
+        (authority) => authorityHostname(authority) === hostname
+      )
+    )
+  );
+}
+
+/** True for IPv4 and bracketed IPv6 request hosts. */
+function isIpLiteral(host: string, rawHost: string): boolean {
+  return net.isIPv4(host) || rawHost.startsWith("[");
 }
 
 interface H2WebSocketRouteSelection {
@@ -641,11 +756,15 @@ export type ProxyServer = http.Server | net.Server;
 export function createProxyServer(options: ProxyServerOptions): ProxyServer {
   const {
     getRoutes,
+    getOrphanedRoutes,
+    onHostsSyncRequest,
+    hostsSyncToken,
     getTunnelAliases = () => [],
     proxyPort,
     tld = "localhost",
     tlds = [tld],
     strict = true,
+    loopbackOnly = false,
     onError = (msg: string) => console.error(msg),
     tls,
     internalPages = true,
@@ -657,6 +776,13 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
   const tldSuffixes = configuredTlds
     .map((configuredTld) => `.${configuredTld}`)
     .sort((a, b) => b.length - a.length);
+  const refusesPeer = (address: string | undefined) => loopbackOnly && !isLoopbackPeer(address);
+  /** A name under one of the configured suffixes; a trailing dot still counts. */
+  const isPortlessName = (host: string): boolean => {
+    const lower = host.toLowerCase();
+    const name = lower.endsWith(".") ? lower.slice(0, -1) : lower;
+    return tldSuffixes.some((suffix) => name === suffix.slice(1) || name.endsWith(suffix));
+  };
   const h2cSessions: H2cSessionCache = new Map();
 
   // Reserved internal hostnames. Intercepted before route dispatch so a user
@@ -670,15 +796,81 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     return matched?.slice(1) ?? primaryTld;
   };
   const caFingerprint = tls?.ca ? formatFingerprint(tls.ca) : undefined;
-  const upstreamAgent = new http.Agent({
-    keepAlive: true,
-    maxSockets: MAX_UPSTREAM_SOCKETS,
+  const upstreamAgent = new http.Agent({ keepAlive: true, maxFreeSockets: 64 });
+  let closing = false;
+  type WaitingRequest = { send: () => void; fail: () => void };
+  const upstreams = new Map<number, { dialing: number; queue: WaitingRequest[] }>();
+  const stateFor = (port: number) => {
+    let state = upstreams.get(port);
+    if (!state) {
+      state = { dialing: 0, queue: [] };
+      upstreams.set(port, state);
+    }
+    return state;
+  };
+  const hasFreeSocket = (port: number) =>
+    upstreamAgent.freeSockets[upstreamAgent.getName({ host: "localhost", port })]?.some(
+      (socket) => !socket.destroyed
+    );
+  const drainUpstream = (port: number) => {
+    if (closing) return;
+    const state = stateFor(port);
+    while (
+      !closing &&
+      state.queue.length &&
+      (state.dialing < MAX_UPSTREAM_DIALS || hasFreeSocket(port))
+    ) {
+      state.queue.shift()!.send();
+    }
+  };
+  const whenUpstreamReady = (port: number, entry: WaitingRequest) => {
+    if (closing) return entry.fail();
+    const state = stateFor(port);
+    state.queue.push(entry);
+    drainUpstream(port);
+  };
+  upstreamAgent.on("free", (_socket, options) => {
+    if (!closing) drainUpstream(Number(options.port));
   });
-  upstreamAgent.createConnection = (options) =>
-    net.connect({
-      ...LOOPBACK_DIAL_OPTIONS,
-      port: options.port as number,
+  upstreamAgent.createConnection = (options) => {
+    if (closing) return new net.Socket().destroy();
+    const port = Number(options.port);
+    const state = stateFor(port);
+    state.dialing++;
+    const socket = net.connect({ ...LOOPBACK_DIAL_OPTIONS, port });
+    let settled = false;
+    const settle = () => {
+      if (settled) return;
+      settled = true;
+      state.dialing--;
+      drainUpstream(port);
+    };
+    // Only connection establishment has a deadline. Established streams stay open.
+    // ETIMEDOUT never qualifies for the reused-socket ECONNRESET replay below.
+    const timeout = () =>
+      socket.destroy(
+        Object.assign(new Error("Upstream connect timed out"), {
+          code: "ETIMEDOUT",
+        })
+      );
+    socket.setTimeout(UPSTREAM_CONNECT_TIMEOUT_MS, timeout);
+    socket.once("connect", () => {
+      socket.setTimeout(0);
+      socket.removeListener("timeout", timeout);
+      settle();
     });
+    socket.once("close", settle);
+    return socket;
+  };
+  const closeUpstreams = () => {
+    closing = true;
+    for (const state of upstreams.values()) {
+      for (const entry of state.queue.splice(0)) entry.fail();
+    }
+    upstreams.clear();
+    upstreamAgent.destroy();
+    closeH2cSessions(h2cSessions);
+  };
 
   const hostPort = (reqTls: boolean): string =>
     proxyPort === (reqTls ? 443 : 80) ? "" : `:${proxyPort}`;
@@ -741,17 +933,20 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
 
     // Dashboard host
     const routes = getRoutes();
-    const signature = routeSignature(routes);
+    const orphaned = getOrphanedRoutes?.() ?? [];
+    const signature =
+      routeSignature(routes) + (orphaned.length > 0 ? `\n!${routeSignature(orphaned)}` : "");
     if (pathname === "/__portless/state.json") {
       res.writeHead(200, {
         "Content-Type": "application/json; charset=utf-8",
         "Cache-Control": "no-store",
       });
-      res.end(isHead ? undefined : dashboardStateJson({ routes, signature }));
+      res.end(isHead ? undefined : dashboardStateJson({ routes, orphaned, signature }));
       return true;
     }
     const body = renderDashboard({
       routes,
+      orphaned,
       proxyPort,
       tls: reqTls,
       suffix: pageSuffix,
@@ -884,7 +1079,14 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
         (selected ? members.find((member) => member.label === selected) : undefined) ??
         defaultMember(members);
     } else {
-      route = findRoute(routes, tunnelAliases, authority, matchPath, strict);
+      route = findRoute(
+        routes,
+        tunnelAliases,
+        authority,
+        matchPath,
+        strict,
+        parseCookieHeader(cookieHeaderValue(headers.cookie))[SELECTION_COOKIE]
+      );
     }
 
     if (!route) return { ...base, rejectReason: "missing-route" };
@@ -904,6 +1106,11 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     headers: http2.IncomingHttpHeaders
   ): void => {
     stream.on("error", () => stream.destroy());
+    if (refusesPeer(stream.session?.socket.remoteAddress)) {
+      stream.respond({ ":status": 403 });
+      stream.end();
+      return;
+    }
     // The response is deferred until the backend's 101 arrives so its
     // negotiated subprotocol and extensions can be relayed. RFC 8441 clients
     // wait for the 2xx before sending frames, so nothing is lost by waiting.
@@ -1018,6 +1225,11 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
   };
 
   const handleRequest = (req: http.IncomingMessage, res: http.ServerResponse, isReplay = false) => {
+    if (refusesPeer(req.socket.remoteAddress)) {
+      res.writeHead(403, { [PORTLESS_HEADER]: "1" });
+      res.end("Forbidden");
+      return;
+    }
     const reqTls = isEncrypted(req);
     res.setHeader(PORTLESS_HEADER, "1");
     res.setHeader(PORTLESS_LISTENER_PORT_HEADER, getListenerPort(req, proxyPort));
@@ -1025,6 +1237,33 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     const routes = getRoutes();
     const tunnelAliases = getTunnelAliases();
     const rawHost = getRequestHost(req);
+    if (hostsSyncToken && isValidHostsSyncToken(hostsSyncToken)) {
+      const challenge = getSingleRawHeader(req, HOSTS_SYNC_AUTH_CHALLENGE_HEADER);
+      const proof =
+        req.method === "HEAD" &&
+        req.url === "/" &&
+        isLoopbackPeer(req.socket.remoteAddress) &&
+        isLoopbackAuthority(rawHost.toLowerCase()) &&
+        req.headers.origin === undefined &&
+        req.headers["sec-fetch-site"] === undefined &&
+        challenge !== null
+          ? createHostsSyncProof(hostsSyncToken, challenge)
+          : null;
+      if (proof) {
+        res.setHeader(HOSTS_SYNC_AUTH_PROOF_HEADER, proof);
+        res.setHeader("Cache-Control", "no-store");
+      }
+    }
+
+    if (
+      req.method === "POST" &&
+      req.url === HOSTS_SYNC_PATH &&
+      isLoopbackAuthority(rawHost.toLowerCase())
+    ) {
+      handleHostsSyncRequest(req, res, onHostsSyncRequest, hostsSyncToken);
+      return;
+    }
+
     const host = rawHost.split(":")[0];
 
     if (!host) {
@@ -1050,30 +1289,27 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
           `This usually means a backend is proxying back through portless without rewriting ` +
           `the Host header. If you use Vite/webpack proxy, set changeOrigin: true.`
       );
-      if (!wantsHtml(req)) {
-        res.writeHead(508, { "Content-Type": "text/plain" });
-        res.end(
-          [
-            `Loop Detected: request for ${textSafe(host)} has passed through portless ${hops} times.`,
-            "This usually means a dev server proxy is forwarding back through portless without rewriting the Host header.",
-            "Set changeOrigin: true in your dev server proxy config.",
-            `Example target: ${reqTls ? "https" : "http"}://<backend>${tldSuffix}${reqTls ? "" : ":<port>"}`,
-          ].join("\n") + "\n"
-        );
-        return;
-      }
-      res.writeHead(508, { "Content-Type": "text/html" });
-      res.end(
-        renderPage(
-          508,
-          "Loop Detected",
-          `<div class="content"><p class="desc">This request has passed through portless ${hops} times. This usually means a dev server (Vite, webpack, etc.) is proxying requests back through portless without rewriting the Host header.</p><div class="section"><p class="label">Fix: add changeOrigin to your proxy config</p><pre class="terminal">proxy: {
+      sendProxyError(
+        req,
+        res,
+        508,
+        "loop_detected",
+        `Request for ${host} has passed through portless ${hops} times. ` +
+          "This usually means a dev server proxy is forwarding back through portless without rewriting the Host header. " +
+          "Set changeOrigin: true in your dev server proxy config. " +
+          `Example target: ${reqTls ? "https" : "http"}://<backend>${tldSuffix}${reqTls ? "" : ":<port>"}`,
+        host,
+        () =>
+          renderPage(
+            508,
+            "Loop Detected",
+            `<div class="content"><p class="desc">This request has passed through portless ${hops} times. This usually means a dev server (Vite, webpack, etc.) is proxying requests back through portless without rewriting the Host header.</p><div class="section"><p class="label">Fix: add changeOrigin to your proxy config</p><pre class="terminal">proxy: {
   "/api": {
     target: "${reqTls ? "https" : "http"}://&lt;backend&gt;${escapeHtml(tldSuffix)}${reqTls ? "" : ":&lt;port&gt;"}",
     changeOrigin: true,
   },
 }</pre></div></div>`
-        )
+          )
       );
       return;
     }
@@ -1085,10 +1321,44 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       route = resolveMultiplex(req, res, members, host, requestPath, reqTls);
       if (!route) return; // a picker page or selection redirect was served
     } else {
-      route = findRoute(routes, tunnelAliases, rawHost, requestPath, strict);
+      route = findRoute(
+        routes,
+        tunnelAliases,
+        rawHost,
+        requestPath,
+        strict,
+        readSelectionCookie(req)
+      );
     }
 
     if (!route) {
+      if (isKnownPublicHost(rawHost, routes, tunnelAliases)) {
+        // An exact tunnel alias or Tailscale host reached us with a path that
+        // matches no route. The visitor may be on the public internet, so do
+        // not reveal the local app list or the registration command.
+        const message = `No app registered for ${host} at this path.`;
+        sendProxyError(req, res, 404, "not_found", message, host, () =>
+          renderPage(
+            404,
+            "Not Found",
+            `<div class="content"><p class="desc">No app registered for <strong>${escapeHtml(host)}</strong> at this path.</p></div>`
+          )
+        );
+        return;
+      }
+
+      if (!isPortlessName(host) && !isIpLiteral(host, rawHost)) {
+        const message = `DNS sent ${host} to this computer. This is not the real site.`;
+        sendProxyError(req, res, 421, "misdirected_request", message, host, () =>
+          renderPage(
+            421,
+            "Misdirected Request",
+            `<div class="content"><p class="desc">${escapeHtml(message)}</p></div>`
+          )
+        );
+        return;
+      }
+
       const safeHost = escapeHtml(host);
       const matchedSuffix = tldSuffixes.find((suffix) => host.endsWith(suffix));
       const strippedHost =
@@ -1096,43 +1366,40 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
           ? host.slice(0, -matchedSuffix.length)
           : host;
       const safeSuggestion = escapeHtml(strippedHost);
-      if (!wantsHtml(req)) {
-        const lines = [`No app registered for ${textSafe(host)}.`];
-        if (routes.length > 0) {
-          lines.push("Active apps:");
-          for (const route of routes) {
-            const pathPrefix = normalizePathPrefix(route.pathPrefix);
-            const label = pathPrefix === "/" ? route.hostname : `${route.hostname}${pathPrefix}`;
-            lines.push(`- ${textSafe(label)} -> 127.0.0.1:${route.port}`);
-          }
-        } else {
-          lines.push("No apps running.");
-        }
-        lines.push(`Register it with: portless ${textSafe(strippedHost)} your-command`);
-        res.writeHead(404, { "Content-Type": "text/plain" });
-        res.end(lines.join("\n") + "\n");
-        return;
-      }
       const linkSuffix = activeAppLinkSuffix(target.forwardTarget);
-      const routesList =
-        routes.length > 0
-          ? `<div class="section"><p class="label">Apps <span class="count">${routes.length}</span></p>${appList(
-              routes.map((r) => {
-                const pathPrefix = normalizePathPrefix(r.pathPrefix);
-                const hrefSuffix = pathPrefix === "/" ? linkSuffix : "";
-                const url = `${formatUrl(r.hostname, proxyPort, reqTls, pathPrefix)}${hrefSuffix}`;
-                return renderRouteRow(r, { url, copyUrl: url, status: "active", newTab: true });
-              })
-            )}</div>`
-          : '<p class="empty">No apps running.</p>';
-      res.writeHead(404, { "Content-Type": "text/html" });
-      res.end(
-        renderPage(
-          404,
-          "Not Found",
-          `<div class="content"><p class="desc">No app registered for <strong>${safeHost}</strong></p>${routesList}<div class="section"><div class="terminal"><span class="prompt">$ </span>portless ${safeSuggestion} your-command</div></div></div>`,
-          APP_SCRIPT
-        )
+      sendProxyError(
+        req,
+        res,
+        404,
+        "not_found",
+        `No app registered for ${host}. Register it with: portless ${strippedHost} your-command. List active apps with: portless list`,
+        host,
+        () => {
+          const now = Date.now();
+          const routesList =
+            routes.length > 0
+              ? `<div class="section"><p class="label">Apps <span class="count">${routes.length}</span></p>${routes.length > APP_FILTER_THRESHOLD ? APP_FILTER_CONTROLS : ""}${appList(
+                  routes.map((r) => {
+                    const pathPrefix = normalizePathPrefix(r.pathPrefix);
+                    const hrefSuffix = pathPrefix === "/" ? linkSuffix : "";
+                    const url = `${formatUrl(r.hostname, proxyPort, reqTls, pathPrefix)}${hrefSuffix}`;
+                    return renderRouteRow(r, {
+                      url,
+                      copyUrl: url,
+                      status: "active",
+                      newTab: true,
+                      now,
+                    });
+                  })
+                )}${routes.length > APP_FILTER_THRESHOLD ? APP_FILTER_NO_MATCH : ""}</div>`
+              : '<p class="empty">No apps running.</p>';
+          return renderPage(
+            404,
+            "Not Found",
+            `<div class="content"><p class="desc">No app registered for <strong>${safeHost}</strong></p>${routesList}<div class="section"><div class="terminal"><span class="prompt">$ </span>portless ${safeSuggestion} your-command</div></div></div>`,
+            routes.length > APP_FILTER_THRESHOLD ? APP_SCRIPT + APP_FILTER_SCRIPT : APP_SCRIPT
+          );
+        }
       );
       return;
     }
@@ -1149,6 +1416,10 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     }
     proxyReqHeaders[PORTLESS_HOPS_HEADER] = String(hops + 1);
     stripConnectionHeaders(proxyReqHeaders);
+    // These are hop-by-hop whether or not Connection names them. Forwarding
+    // them leaves the backend with an unlistened keep-alive socket, or asks it
+    // to switch protocols for a plain request.
+    for (const header of REQUEST_HOP_BY_HOP_HEADERS) delete proxyReqHeaders[header];
     // Remove HTTP/2 pseudo-headers before forwarding to HTTP/1.1 backend
     for (const key of Object.keys(proxyReqHeaders)) {
       if (key.startsWith(":")) {
@@ -1161,101 +1432,121 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     if (!proxyReqHeaders.host) {
       proxyReqHeaders.host = getRequestHost(req);
     }
+    // HTTP/2 frames the body itself, so a stream can carry DATA with no
+    // content-length. Node only adds chunked framing by default for methods
+    // that usually have a body, so a GET, DELETE or OPTIONS body would reach
+    // the backend unframed. On a keep-alive socket the backend would parse
+    // those bytes as a second request that skips the forwarding headers.
+    const h2Stream = getHttp2Stream(req);
+    if (h2Stream && !h2Stream.endAfterHeaders && proxyReqHeaders["content-length"] === undefined) {
+      proxyReqHeaders["transfer-encoding"] = "chunked";
+    }
 
-    const proxyReq = http.request(
-      {
-        agent: upstreamAgent,
-        port: route.port,
-        path: target.forwardTarget,
-        method: req.method,
-        headers: proxyReqHeaders,
-      },
-      (proxyRes) => {
-        const responseHeaders: http.OutgoingHttpHeaders = { ...proxyRes.headers };
-        if (reqTls) {
-          for (const h of HOP_BY_HOP_HEADERS) {
-            delete responseHeaders[h];
+    // Capture replay eligibility before forwarding can consume the incoming body.
+    const replayable =
+      !isReplay && REPLAYABLE_METHODS.has(req.method || "") && isBodylessRequest(req);
+    const clientGone = () =>
+      res.destroyed || (res as unknown as http2.Http2ServerResponse).stream?.destroyed;
+    const send = () => {
+      if (clientGone()) return;
+      const proxyReq = http.request(
+        {
+          agent: upstreamAgent,
+          port: route.port,
+          path: target.forwardTarget,
+          method: req.method,
+          headers: proxyReqHeaders,
+        },
+        (proxyRes) => {
+          const responseHeaders: http.OutgoingHttpHeaders = { ...proxyRes.headers };
+          // Connection-scoped headers belong to the backend hop, never to the
+          // client hop (RFC 9110 section 7.6.1). Strip them on both paths. HTTP/2
+          // also forbids transfer-encoding; HTTP/1.1 keeps it so chunked bodies
+          // stay framed as the backend sent them.
+          stripConnectionHeaders(responseHeaders);
+          for (const h of RESPONSE_HOP_BY_HOP_HEADERS) delete responseHeaders[h];
+          if (reqTls) {
+            for (const h of HOP_BY_HOP_HEADERS) {
+              delete responseHeaders[h];
+            }
           }
+          res.writeHead(proxyRes.statusCode || 502, responseHeaders);
+          // writeHead above already sent the status, so a failure here is always
+          // mid-stream: destroy instead of end to send RST_STREAM. Calling
+          // res.end() can cause a content-length mismatch that Chrome treats as
+          // a session error.
+          proxyRes.on("error", () => res.destroy());
+          proxyRes.pipe(res);
         }
-        res.writeHead(proxyRes.statusCode || 502, responseHeaders);
-        proxyRes.on("error", () => {
-          if (!res.headersSent) {
-            res.writeHead(502, { "Content-Type": "text/plain" });
-            res.end();
-          } else {
-            // Headers already sent (mid-stream): destroy instead of end to
-            // send RST_STREAM. Calling res.end() here can cause a
-            // content-length mismatch that Chrome treats as a session error.
-            res.destroy();
-          }
-        });
-        proxyRes.pipe(res);
-      }
-    );
+      );
 
-    proxyReq.on("error", (err) => {
-      const errWithCode = err as NodeJS.ErrnoException;
-      if (
-        !isReplay &&
-        proxyReq.reusedSocket &&
-        errWithCode.code === "ECONNRESET" &&
-        !res.headersSent &&
-        REPLAYABLE_METHODS.has(req.method || "") &&
-        isBodylessRequest(req)
-      ) {
-        req.unpipe(proxyReq);
-        handleRequest(req, res, true);
-        return;
-      }
-      onError(`Proxy error for ${getRequestHost(req)}: ${dialErrorMessage(err)}`);
-      if (!res.headersSent) {
-        const detail =
-          errWithCode.code === "ECONNREFUSED"
-            ? "The target app is not responding. It may have crashed."
-            : "The target app may not be running.";
-        if (!wantsHtml(req)) {
-          res.writeHead(502, { "Content-Type": "text/plain" });
-          res.end(
-            [
-              `Bad Gateway: ${detail}`,
-              `Target: 127.0.0.1:${route.port}`,
-              "Check active routes with: portless list",
-            ].join("\n") + "\n"
-          );
+      proxyReq.on("error", (err) => {
+        const errWithCode = err as NodeJS.ErrnoException;
+        if (
+          replayable &&
+          !clientGone() &&
+          !closing &&
+          proxyReq.reusedSocket &&
+          errWithCode.code === "ECONNRESET" &&
+          !res.headersSent
+        ) {
+          req.unpipe(proxyReq);
+          handleRequest(req, res, true);
           return;
         }
-        res.writeHead(502, { "Content-Type": "text/html" });
-        res.end(
-          renderPage(
-            502,
-            "Bad Gateway",
-            `<div class="content"><p class="desc">${escapeHtml(detail)}</p></div>`
-          )
-        );
-      }
-    });
+        // Drain whatever the client still sends so a kept-alive connection stays
+        // usable after the error response. This must come after the replay early
+        // return above, which still needs the request.
+        req.unpipe(proxyReq);
+        req.resume();
+        onError(`Proxy error for ${getRequestHost(req)}: ${dialErrorMessage(err)}`);
+        if (!res.headersSent) {
+          const detail =
+            errWithCode.code === "ECONNREFUSED"
+              ? "The target app is not responding. It may have crashed."
+              : "The target app may not be running.";
+          sendBadGateway(req, res, route, detail);
+        }
+      });
 
-    // Abort the outgoing request if the client disconnects
-    res.on("close", () => {
-      if (!proxyReq.destroyed) {
-        proxyReq.destroy();
-      }
-    });
+      // Abort the outgoing request if the client disconnects
+      res.on("close", () => {
+        if (!proxyReq.destroyed) {
+          proxyReq.destroy();
+        }
+      });
 
-    req.on("error", () => {
-      if (!proxyReq.destroyed) {
-        proxyReq.destroy();
-      }
-    });
+      req.on("error", () => {
+        if (!proxyReq.destroyed) {
+          proxyReq.destroy();
+        }
+      });
 
-    if (isReplay) {
-      proxyReq.end();
-    } else {
-      req.pipe(proxyReq);
-    }
+      if (isReplay) {
+        proxyReq.end();
+      } else {
+        req.pipe(proxyReq);
+      }
+    };
+    whenUpstreamReady(route.port, {
+      send,
+      fail: () => {
+        if (clientGone()) return;
+        req.resume();
+        if (res.headersSent) res.destroy();
+        else {
+          res.writeHead(503);
+          res.end();
+        }
+      },
+    });
   };
 
   const handleUpgrade = (req: http.IncomingMessage, socket: net.Socket, head: Buffer) => {
+    if (refusesPeer(socket.remoteAddress)) {
+      socket.destroy();
+      return;
+    }
     socket.on("error", () => socket.destroy());
 
     const hops = parseInt(req.headers[PORTLESS_HOPS_HEADER] as string, 10) || 0;
@@ -1278,6 +1569,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     const routes = getRoutes();
     const tunnelAliases = getTunnelAliases();
     const rawHost = getRequestHost(req);
+
     const host = rawHost.split(":")[0];
 
     // Reserved internal hosts have no WebSocket surface.
@@ -1308,7 +1600,14 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
         (selected ? members.find((m) => m.label === selected) : undefined) ??
         defaultMember(members);
     } else {
-      route = findRoute(routes, tunnelAliases, rawHost, requestPath, strict);
+      route = findRoute(
+        routes,
+        tunnelAliases,
+        rawHost,
+        requestPath,
+        strict,
+        readSelectionCookie(req)
+      );
     }
 
     if (!route) {
@@ -1349,8 +1648,26 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     // be reported as an HTTP response.
     let handshakeRelayed = false;
 
+    // Until the backend's 101 has been relayed, the client socket closing means
+    // nobody is waiting for this handshake any more. The post-upgrade cleanup
+    // below only covers the period after the answer arrives.
+    const abortPendingHandshake = () => {
+      if (!handshakeRelayed && !proxyReq.destroyed) proxyReq.destroy();
+    };
+    socket.on("close", abortPendingHandshake);
+    socket.on("end", abortPendingHandshake);
+
+    const handshakeTimer = setTimeout(() => {
+      if (handshakeRelayed) return;
+      onError(`WebSocket handshake timed out for ${getRequestHost(req)}`);
+      if (!proxyReq.destroyed) proxyReq.destroy();
+      socket.destroy();
+    }, WEBSOCKET_HANDSHAKE_TIMEOUT_MS);
+    handshakeTimer.unref?.();
+
     proxyReq.on("upgrade", (proxyRes, proxySocket, proxyHead) => {
       handshakeRelayed = true;
+      clearTimeout(handshakeTimer);
       // Forward the backend's actual 101 response including Sec-WebSocket-Accept,
       // subprotocol negotiation, and extension headers.
       let response = `HTTP/1.1 101 Switching Protocols\r\n`;
@@ -1381,6 +1698,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     });
 
     proxyReq.on("error", (err) => {
+      clearTimeout(handshakeTimer);
       onError(`WebSocket proxy error for ${getRequestHost(req)}: ${dialErrorMessage(err)}`);
       if (!handshakeRelayed && socket.writable) {
         socket.end(
@@ -1397,6 +1715,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
 
     proxyReq.on("response", (res) => {
       handshakeRelayed = true;
+      clearTimeout(handshakeTimer);
       // The backend responded with a normal HTTP response instead of upgrading.
       // Forward the rejection to the client.
       if (!socket.destroyed) {
@@ -1497,6 +1816,10 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     // Wrap both in a net.Server that peeks at the first byte to decide
     // whether the connection is TLS (0x16 = ClientHello) or plain HTTP.
     const wrapper = net.createServer((socket) => {
+      if (refusesPeer(socket.remoteAddress)) {
+        socket.destroy();
+        return;
+      }
       // Absorb connection errors (ECONNRESET, EPIPE, etc.) from abrupt
       // client disconnects (tab close, page reload, HMR) so they don't
       // bubble up as uncaught exceptions and crash the proxy (#111).
@@ -1523,8 +1846,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     // Proxy close() through to inner servers so tests and cleanup work.
     const origClose = wrapper.close.bind(wrapper);
     wrapper.close = function (cb?: (err?: Error) => void) {
-      closeH2cSessions(h2cSessions);
-      upstreamAgent.destroy();
+      closeUpstreams();
       h2Server.close();
       plainServer.close();
       return origClose(cb);
@@ -1535,20 +1857,22 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
 
   const httpServer = http.createServer(handleRequest);
   httpServer.on("upgrade", handleUpgrade);
-  httpServer.on("close", () => {
-    closeH2cSessions(h2cSessions);
-    upstreamAgent.destroy();
-  });
+  const origHttpClose = httpServer.close.bind(httpServer);
+  httpServer.close = function (cb?: (err?: Error) => void) {
+    closeUpstreams();
+    return origHttpClose(cb);
+  } as typeof httpServer.close;
+  httpServer.on("close", closeUpstreams);
 
-  return httpServer;
+  return loopbackOnly ? guardLoopbackOnly(httpServer) : httpServer;
 }
 
 /**
  * Create a minimal HTTP server that 302-redirects every request to HTTPS.
  * Meant to run on port 80 alongside an HTTPS proxy on port 443.
  */
-export function createHttpRedirectServer(httpsPort: number): http.Server {
-  return http.createServer((req, res) => {
+export function createHttpRedirectServer(httpsPort: number, loopbackOnly = false): net.Server {
+  const server = http.createServer((req, res) => {
     const authority = req.headers.host || "localhost";
     const host = authority.split(":")[0];
     const target = classifyRequestTarget(req.url || "/", req.method, authority, false);
@@ -1561,4 +1885,105 @@ export function createHttpRedirectServer(httpsPort: number): http.Server {
     res.writeHead(302, { Location: location, [PORTLESS_HEADER]: "1" });
     res.end();
   });
+  return loopbackOnly ? guardLoopbackOnly(server) : server;
+}
+
+/**
+ * Wrap `inner` in the server that actually listens, so a connection from a
+ * non-loopback peer is closed before the HTTP parser reads a byte. The inner
+ * server only ever receives sockets that passed the check.
+ */
+function guardLoopbackOnly(inner: http.Server): net.Server {
+  // Sockets handed over with emit("connection") are not in the inner
+  // server's connection list, so its close() cannot end their keep-alive
+  // idle time and the wrapper's close() would wait for them. Track them here.
+  const sockets = new Set<net.Socket>();
+  const wrapper = net.createServer((socket) => {
+    if (!isLoopbackPeer(socket.remoteAddress)) {
+      socket.destroy();
+      return;
+    }
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+    inner.emit("connection", socket);
+  });
+  const origClose = wrapper.close.bind(wrapper);
+  wrapper.close = function (cb?: (err?: Error) => void) {
+    inner.close();
+    for (const socket of sockets) {
+      socket.destroy();
+    }
+    return origClose(cb);
+  } as typeof wrapper.close;
+  return wrapper;
+}
+
+export const HOSTS_SYNC_PATH = "/.portless/hosts-sync";
+
+function isLoopbackPeer(address: string | undefined): boolean {
+  if (!address) return false;
+  const bare = address.startsWith("::ffff:") ? address.slice("::ffff:".length) : address;
+  return bare === "::1" || bare.startsWith("127.");
+}
+
+function hasValidPort(authority: string, hostname: string): boolean {
+  if (authority === hostname) return true;
+  const port = authority.slice(hostname.length + 1);
+  return parsePort(port) !== null;
+}
+
+function isLoopbackAuthority(authority: string): boolean {
+  if (authority === "127.0.0.1" || authority === "[::1]") return true;
+  if (authority.startsWith("127.0.0.1:")) return hasValidPort(authority, "127.0.0.1");
+  if (authority.startsWith("[::1]:")) return hasValidPort(authority, "[::1]");
+  return false;
+}
+
+function getSingleRawHeader(req: http.IncomingMessage, name: string): string | null {
+  const values = req.rawHeaders.reduce<string[]>((matches, value, index) => {
+    if (index % 2 === 0 && value.toLowerCase() === name) {
+      matches.push(req.rawHeaders[index + 1] ?? "");
+    }
+    return matches;
+  }, []);
+  return values.length === 1 ? values[0] : null;
+}
+
+function handleHostsSyncRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  onHostsSyncRequest: (() => "acted" | "disabled") | undefined,
+  hostsSyncToken: string | undefined
+): void {
+  if (!isLoopbackPeer(req.socket.remoteAddress)) {
+    res.writeHead(403, { "Content-Type": "text/plain" });
+    res.end("Forbidden");
+    return;
+  }
+  const suppliedToken = getSingleRawHeader(req, HOSTS_SYNC_AUTH_HEADER);
+  const authorized =
+    req.headers.origin === undefined &&
+    req.headers["sec-fetch-site"] === undefined &&
+    suppliedToken !== null &&
+    isValidHostsSyncToken(suppliedToken) &&
+    typeof hostsSyncToken === "string" &&
+    isValidHostsSyncToken(hostsSyncToken) &&
+    crypto.timingSafeEqual(Buffer.from(suppliedToken), Buffer.from(hostsSyncToken));
+  if (!authorized) {
+    res.writeHead(401, { "Content-Type": "text/plain" });
+    res.end("Unauthorized");
+    return;
+  }
+  if (!onHostsSyncRequest) {
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("Not Found");
+    return;
+  }
+  if (onHostsSyncRequest() === "disabled") {
+    res.writeHead(409, { "Content-Type": "text/plain" });
+    res.end("Hosts sync disabled");
+    return;
+  }
+  res.writeHead(204);
+  res.end();
 }

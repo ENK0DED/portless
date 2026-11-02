@@ -1,0 +1,366 @@
+import { spawn, spawnSync } from "node:child_process";
+import {
+  isWindows,
+  resolveWindowsCommandInvocation,
+  guardWindowsOrphans,
+  getProcessCommand,
+  killTree,
+} from "./cli-utils.js";
+
+const NGROK_BINARY = "ngrok";
+const NGROK_START_TIMEOUT_MS = 30_000;
+const NGROK_COMMAND_TIMEOUT_MS = 10_000;
+const OUTPUT_BUFFER_LIMIT = 16_384;
+
+export interface TunnelChildProcess {
+  pid?: number;
+  stdout: NodeJS.ReadableStream | null;
+  stderr: NodeJS.ReadableStream | null;
+  kill(signal?: NodeJS.Signals): boolean;
+  on(event: "error", listener: (err: Error) => void): this;
+  on(event: "exit", listener: (code: number | null, signal: NodeJS.Signals | null) => void): this;
+}
+
+export type TunnelSpawner = (args: string[]) => TunnelChildProcess;
+
+interface TunnelCommandResult {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+  error?: Error;
+}
+
+export type TunnelCommandRunner = (args: string[]) => TunnelCommandResult;
+
+export interface StartNgrokOptions {
+  hostHeader?: string | false;
+  domain?: string;
+  onExit?: (code: number | null, signal: NodeJS.Signals | null) => void;
+  spawner?: TunnelSpawner;
+  timeoutMs?: number;
+}
+
+export interface StartedNgrok {
+  url: string;
+  pid?: number;
+  child: TunnelChildProcess;
+}
+
+export interface TunnelProvider {
+  binary: string;
+  versionArgs: string[];
+  buildArgs(localPort: number, options: StartNgrokOptions): string[];
+  extractUrl(output: string): string | null;
+  formatOutputError(output: string): Error;
+  notFound: string;
+  timeout: string;
+}
+
+function defaultSpawner(binary: string, args: string[]): TunnelChildProcess {
+  const spawnedAt = Date.now();
+  const invocation = isWindows
+    ? resolveWindowsCommandInvocation(binary, args, process.env.PATH ?? process.env.Path ?? "")
+    : null;
+  const child = spawn(invocation?.command ?? binary, invocation?.args ?? args, {
+    ...(invocation?.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  guardWindowsOrphans(child, spawnedAt);
+  return child as TunnelChildProcess;
+}
+
+function defaultRunner(binary: string, args: string[]): TunnelCommandResult {
+  const invocation = isWindows
+    ? resolveWindowsCommandInvocation(binary, args, process.env.PATH ?? process.env.Path ?? "")
+    : null;
+  const result = spawnSync(invocation?.command ?? binary, invocation?.args ?? args, {
+    ...(invocation?.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+    encoding: "utf-8",
+    killSignal: "SIGKILL",
+    timeout: NGROK_COMMAND_TIMEOUT_MS,
+    windowsHide: true,
+  });
+  return {
+    status: result.status,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? "",
+    ...(result.error ? { error: result.error } : {}),
+  };
+}
+
+export function normalizeSpace(value: string): string {
+  return value.trim().replace(/\s+/g, " ");
+}
+
+function formatSpawnError(provider: TunnelProvider, error: Error): Error {
+  const errno = error as NodeJS.ErrnoException;
+  if (errno.code === "ENOENT") {
+    return new Error(provider.notFound);
+  }
+  return new Error(`Failed to start ${provider.binary}: ${error.message}`);
+}
+
+function formatOutputError(output: string): Error {
+  const details = normalizeSpace(output);
+  const lower = details.toLowerCase();
+  if (
+    lower.includes("authtoken") ||
+    lower.includes("authentication") ||
+    lower.includes("not logged in")
+  ) {
+    return new Error(
+      "ngrok could not start because authentication is not configured. Run `ngrok config add-authtoken <token>`, then run portless again."
+    );
+  }
+  return new Error(
+    `Failed to start ngrok tunnel: ${details || "ngrok exited before printing a public URL"}`
+  );
+}
+
+export function ensureTunnelAvailable(
+  provider: TunnelProvider,
+  runner: TunnelCommandRunner = (args) => defaultRunner(provider.binary, args)
+): void {
+  const result = runner(provider.versionArgs);
+  if (result.error) {
+    throw formatSpawnError(provider, result.error);
+  }
+  if (result.status !== 0) {
+    const details = normalizeSpace(result.stderr || result.stdout);
+    throw new Error(
+      `Failed to check ${provider.binary} version: ${details || `unknown ${provider.binary} error`}`
+    );
+  }
+}
+
+export function ensureNgrokAvailable(runner?: TunnelCommandRunner): void {
+  ensureTunnelAvailable(ngrok, runner);
+}
+
+function cleanUrl(value: string): string {
+  return value.replace(/[),.]+$/g, "");
+}
+
+export function extractNgrokUrl(output: string): string | null {
+  const urlMatches = output.matchAll(/https:\/\/[^\s"'<>]+/g);
+  for (const match of urlMatches) {
+    const raw = match[0];
+    const matchIndex = match.index ?? 0;
+    const before = output.slice(Math.max(0, matchIndex - 80), matchIndex).toLowerCase();
+    const looksLikeTunnel =
+      before.includes("forwarding") ||
+      before.includes("url=") ||
+      before.includes('"url"') ||
+      before.includes("started tunnel");
+    if (!looksLikeTunnel) continue;
+
+    const candidate = cleanUrl(raw);
+    try {
+      const parsed = new URL(candidate);
+      if (parsed.hostname === "ngrok.com" || parsed.hostname.endsWith(".ngrok.com")) {
+        continue;
+      }
+      return parsed.toString().replace(/\/$/, "");
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+export function buildNgrokArgs(
+  localPort: number,
+  hostHeader: string | false = "rewrite",
+  domain?: string
+): string[] {
+  return [
+    "http",
+    "--log=stdout",
+    "--log-format=logfmt",
+    ...(hostHeader === false ? [] : [`--host-header=${hostHeader}`]),
+    ...(domain ? [`--domain=${domain}`] : []),
+    `http://127.0.0.1:${localPort}`,
+  ];
+}
+
+export const ngrok: TunnelProvider = {
+  binary: NGROK_BINARY,
+  versionArgs: ["version"],
+  buildArgs: (localPort, options) => buildNgrokArgs(localPort, options.hostHeader, options.domain),
+  extractUrl: extractNgrokUrl,
+  formatOutputError,
+  notFound:
+    "ngrok CLI not found. Install ngrok (https://ngrok.com/download) and ensure `ngrok` is on PATH.",
+  timeout:
+    "Timed out waiting for ngrok to print a public URL. Check that ngrok is authenticated and can connect.",
+};
+
+export function startNgrok(
+  localPort: number,
+  options: StartNgrokOptions = {}
+): Promise<StartedNgrok> {
+  return startTunnel(ngrok, localPort, options);
+}
+
+export function startTunnel(
+  provider: TunnelProvider,
+  localPort: number,
+  options: StartNgrokOptions
+): Promise<StartedNgrok> {
+  const spawner = options.spawner ?? ((args) => defaultSpawner(provider.binary, args));
+  const timeoutMs = options.timeoutMs ?? NGROK_START_TIMEOUT_MS;
+  const args = provider.buildArgs(localPort, options);
+
+  let child: TunnelChildProcess;
+  try {
+    child = spawner(args);
+  } catch (err: unknown) {
+    const error = err instanceof Error ? err : new Error(String(err));
+    return Promise.reject(formatSpawnError(provider, error));
+  }
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let started = false;
+    let output = "";
+
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn();
+    };
+
+    const appendOutput = (chunk: Buffer | string) => {
+      if (settled) return;
+      output += chunk.toString();
+      if (output.length > OUTPUT_BUFFER_LIMIT) {
+        output = output.slice(-OUTPUT_BUFFER_LIMIT);
+      }
+      const url = provider.extractUrl(output);
+      if (url) {
+        settle(() => {
+          started = true;
+          resolve({ url, pid: child.pid, child });
+        });
+      }
+    };
+
+    const timer = setTimeout(() => {
+      terminateTunnelChild(child);
+      settle(() => reject(new Error(provider.timeout)));
+    }, timeoutMs);
+
+    child.stdout?.on("data", appendOutput);
+    child.stderr?.on("data", appendOutput);
+    child.on("error", (err) => {
+      settle(() => reject(formatSpawnError(provider, err)));
+    });
+    child.on("exit", (code, signal) => {
+      if (settled) {
+        if (started) options.onExit?.(code, signal);
+        return;
+      }
+      settle(() => {
+        const suffix = signal ? ` (signal ${signal})` : code !== null ? ` (exit ${code})` : "";
+        const error = provider.formatOutputError(output);
+        reject(new Error(`${error.message}${suffix}`));
+      });
+    });
+  });
+}
+
+/**
+ * Stop a tunnel child started by this process. On Windows a provider binary
+ * that resolves to a .cmd shim runs under cmd.exe, and child.kill() would end
+ * only that wrapper and leave the tunnel itself running and public, so the
+ * whole tree is killed there.
+ */
+function terminateTunnelChild(child: TunnelChildProcess): void {
+  try {
+    if (isWindows && child.pid) {
+      killTree(child as unknown as Parameters<typeof killTree>[0]);
+      return;
+    }
+    child.kill("SIGTERM");
+  } catch {
+    // Best-effort cleanup.
+  }
+}
+
+export function stopNgrokProcess(child: TunnelChildProcess | undefined): void {
+  if (!child) return;
+  terminateTunnelChild(child);
+}
+
+/**
+ * The command line of a Windows process, or null when it cannot be read.
+ * `pid` must already be a validated integer.
+ */
+function getWindowsCommandLine(pid: number): string | null {
+  const result = spawnSync(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      `(Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}').CommandLine`,
+    ],
+    { encoding: "utf-8", timeout: NGROK_COMMAND_TIMEOUT_MS, windowsHide: true }
+  );
+  return result.status === 0 ? result.stdout?.trim() || null : null;
+}
+
+/**
+ * True for the command line of the `cmd.exe` wrapper that runs an ngrok or
+ * cloudflared `.cmd` shim, as built by resolveWindowsCommandInvocation: the
+ * shim must be the command that `/c` runs, not an argument of something else.
+ */
+const WINDOWS_TUNNEL_SHIM_COMMAND =
+  /\/c\s+(?:""[^"\r\n]*[\\/]|"?(?:[^\s"]*[\\/])?)(?:ngrok|cloudflared)\.(?:cmd|bat)(?=["\s]|$)/i;
+
+export function isWindowsTunnelShimCommandLine(commandLine: string): boolean {
+  return WINDOWS_TUNNEL_SHIM_COMMAND.test(commandLine);
+}
+
+export function stopTunnelPid(pid: number | undefined): void {
+  if (!pid || !Number.isInteger(pid) || pid <= 1) return;
+  let binary = getProcessCommand(pid);
+  if (isWindows) {
+    const result = spawnSync("tasklist.exe", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], {
+      encoding: "utf-8",
+      timeout: NGROK_COMMAND_TIMEOUT_MS,
+      windowsHide: true,
+    });
+    binary =
+      result.status === 0
+        ? (result.stdout
+            ?.trimStart()
+            .match(/^"([^"\r\n]+)",/)?.[1]
+            ?.toLowerCase()
+            .replace(/\.exe$/, "") ?? null)
+        : null;
+    // A tunnel started from a .cmd shim runs under a cmd.exe wrapper, and that
+    // wrapper's pid is what gets persisted. Accept a cmd.exe only when its
+    // command line runs the ngrok or cloudflared shim, then end the whole tree
+    // so the tunnel itself does not survive the wrapper.
+    if (binary === "cmd") {
+      const commandLine = getWindowsCommandLine(pid);
+      if (commandLine && isWindowsTunnelShimCommandLine(commandLine)) {
+        spawnSync("taskkill", ["/T", "/F", "/PID", String(pid)], {
+          stdio: "ignore",
+          timeout: NGROK_COMMAND_TIMEOUT_MS,
+          windowsHide: true,
+        });
+      }
+      return;
+    }
+  }
+  if (binary !== "ngrok" && binary !== "cloudflared") return;
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {
+    // Process may already be gone, or may belong to another user.
+  }
+}

@@ -16,7 +16,7 @@ Do not use emojis anywhere in this repository (code, comments, output, docs).
 
 ## Dashes
 
-Never use `--` as a dash in prose, comments, or user-facing output. Use an em dash (\u2014) when a dash is needed, but prefer rephrasing to avoid dashes entirely. The only exception is CLI flags (e.g. `--port`).
+Never use `--` or em dashes as dashes in prose, comments, or user-facing output. Rephrase the sentence instead. The only exception is CLI flags (e.g. `--port`).
 
 ## Boolean Environment Variables
 
@@ -29,6 +29,11 @@ When a change affects how humans or agents use portless (new/changed/removed com
 1. `README.md` (user-facing documentation)
 2. `skills/portless/SKILL.md` (agent skill for using portless)
 3. `packages/portless/src/cli.ts` (`--help` output)
+4. `packages/portless/src/mcp.ts` (MCP tools and `portless mcp --help` output)
+
+## MCP Tools
+
+Any change to a CLI command, flag, output, or environment variable must update the MCP tools in `packages/portless/src/mcp.ts` in the same change. `mcp.test.ts` reads `portless --help` and each tool command's `--help`, and fails when a command or flag is neither handled by a tool nor listed as omitted.
 
 ## Releasing
 
@@ -40,8 +45,9 @@ To prepare a release:
 2. Bump the version in `packages/portless/package.json`
 3. Write the changelog entry in `CHANGELOG.md`, wrapped in `<!-- release:start -->` and `<!-- release:end -->` markers
 4. Remove the `<!-- release:start -->` and `<!-- release:end -->` markers from the previous release entry (only the latest release should have markers)
-5. Add a matching entry to `apps/docs/src/app/changelog/page.mdx`
-6. Open a PR and merge to `main`
+5. Add a matching entry to `apps/docs/content/docs/changelog.mdx`
+6. Build the docs, then run `bun run --cwd apps/docs update:baseline changelog` to refresh that page's hashes and headings in `apps/docs/tests/fixtures/docs-baseline.json`
+7. Open a PR and merge to `main`
 
 CI compares the version in `packages/portless/package.json` to what's on npm. If it differs, it builds, publishes, and creates the GitHub release automatically. The release body is extracted from the content between the markers.
 

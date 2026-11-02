@@ -5,6 +5,11 @@ import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import { ensureCerts, isCATrusted, trustCA } from "./certs.js";
 import {
+  findUserWritableLocation,
+  resolveOpensslBinary,
+  SERVICE_OPENSSL_ENV,
+} from "./openssl-path.js";
+import {
   buildProxyStartConfig,
   DEFAULT_TLD,
   discoverState,
@@ -15,7 +20,7 @@ import {
   SUFFIX_ENV,
 } from "./cli-utils.js";
 import { isMdnsSupported } from "./mdns.js";
-import { fixOwnership, resolveUserHome } from "./utils.js";
+import { fixOwnership, parsePort, resolveUserHome } from "./utils.js";
 
 const DEFAULT_SERVICE_PORT = getProtocolPort(true);
 const SERVICE_LABEL = "sh.portless.proxy";
@@ -68,6 +73,7 @@ type ServiceContext = {
   stateDir: string;
   user: UserContext;
   pathEnv: string;
+  opensslPath?: string;
   programData: string;
   config: NormalizedServiceConfig;
 };
@@ -85,6 +91,7 @@ export type ServiceInstallConfig = {
   tlds: string[];
   tldsExplicit: boolean;
   useWildcard: boolean;
+  unprivileged: boolean;
   extraEnv: Record<string, string>;
 };
 
@@ -104,6 +111,7 @@ const DEFAULT_SERVICE_CONFIG: ServiceInstallConfig = {
   tlds: [DEFAULT_TLD],
   tldsExplicit: false,
   useWildcard: false,
+  unprivileged: false,
   extraEnv: {},
 };
 
@@ -148,6 +156,14 @@ type ServiceStatus = {
   proxyRunning: boolean;
   config: NormalizedServiceConfig;
   details?: string;
+  /** The Node binary pinned in the installed service definition, when one is readable. */
+  node?: InstalledServiceNode;
+};
+
+/** The Node binary an installed service definition pins, and whether it still exists. */
+export type InstalledServiceNode = {
+  path: string;
+  exists: boolean;
 };
 
 export type ServiceUninstallResult = {
@@ -202,8 +218,8 @@ function parseBooleanEnv(value: string | undefined): boolean | null {
 }
 
 function parsePortValue(value: string, source: string): number {
-  const port = parseInt(value, 10);
-  if (isNaN(port) || port < 1 || port > 65535) {
+  const port = parsePort(value);
+  if (port === null) {
     throw new Error(`${source} must be a number between 1 and 65535.`);
   }
   return port;
@@ -279,6 +295,7 @@ function parseServiceInstallConfig(
   }
 
   const envHttps = parseBooleanEnv(env.PORTLESS_HTTPS);
+  let httpsExplicit = envHttps !== null;
   if (envHttps !== null) {
     config.useHttps = envHttps;
   }
@@ -306,6 +323,11 @@ function parseServiceInstallConfig(
     config.useWildcard = envWildcard;
   }
 
+  const envUnprivileged = parseBooleanEnv(env.PORTLESS_UNPRIVILEGED);
+  if (envUnprivileged !== null) {
+    config.unprivileged = envUnprivileged;
+  }
+
   if (env.PORTLESS_PORT) {
     config.proxyPort = parsePortValue(env.PORTLESS_PORT, "PORTLESS_PORT");
   } else {
@@ -325,9 +347,11 @@ function parseServiceInstallConfig(
         break;
       case "--https":
         config.useHttps = true;
+        httpsExplicit = true;
         break;
       case "--no-tls":
         config.useHttps = false;
+        httpsExplicit = true;
         break;
       case "--lan":
         config.lanMode = true;
@@ -356,14 +380,19 @@ function parseServiceInstallConfig(
       case "--wildcard":
         config.useWildcard = true;
         break;
+      case "--unprivileged":
+        config.unprivileged = true;
+        break;
       case "--cert":
         config.customCertPath = getFlagValue(tokens, i, token);
         config.useHttps = true;
+        httpsExplicit = true;
         i += 1;
         break;
       case "--key":
         config.customKeyPath = getFlagValue(tokens, i, token);
         config.useHttps = true;
+        httpsExplicit = true;
         i += 1;
         break;
       case "--state-dir":
@@ -386,6 +415,12 @@ function parseServiceInstallConfig(
     (!config.customCertPath && config.customKeyPath)
   ) {
     throw new Error("--cert and --key must be used together.");
+  }
+
+  // Match proxy start: unprivileged mode serves plain HTTP on 80 unless
+  // HTTPS was asked for.
+  if (config.unprivileged && !httpsExplicit) {
+    config.useHttps = false;
   }
 
   if (!env.PORTLESS_PORT && !tokens.includes("--port") && !tokens.includes("-p")) {
@@ -438,6 +473,7 @@ function buildProxyCommand(entryScript: string, serviceConfig: ServiceInstallCon
     tlds: serviceConfig.tlds,
     tldsExplicit: serviceConfig.tldsExplicit,
     useWildcard: serviceConfig.useWildcard,
+    unprivileged: serviceConfig.unprivileged,
     foreground: true,
     includePort: true,
     proxyPort: serviceConfig.proxyPort,
@@ -453,6 +489,7 @@ function buildServiceEnv(ctx: ServiceContext): Record<string, string> {
     PORTLESS_HTTPS: ctx.config.useHttps ? "1" : "0",
     PORTLESS_LAN: ctx.config.lanMode ? "1" : "0",
     PORTLESS_WILDCARD: ctx.config.useWildcard ? "1" : "0",
+    PORTLESS_UNPRIVILEGED: ctx.config.unprivileged ? "1" : "0",
     ...ctx.config.extraEnv,
   };
 
@@ -462,6 +499,12 @@ function buildServiceEnv(ctx: ServiceContext): Record<string, string> {
 
   if (ctx.config.lanMode || ctx.config.tlds.length > 1 || ctx.config.tld !== DEFAULT_TLD) {
     env.PORTLESS_SUFFIX = ctx.config.tlds.join(",");
+  }
+
+  // Pinned at install time so the root or SYSTEM proxy never looks `openssl`
+  // up through PATH. Set last so nothing else can override it.
+  if (ctx.opensslPath) {
+    env[SERVICE_OPENSSL_ENV] = ctx.opensslPath;
   }
 
   if (ctx.platform === "win32") {
@@ -607,6 +650,7 @@ export function buildServiceSpec(options: {
   username?: string;
   stateDir?: string;
   pathEnv?: string;
+  opensslPath?: string;
   programData?: string;
   installConfig?: Partial<ServiceInstallConfig>;
 }): ServiceSpec {
@@ -648,6 +692,7 @@ export function buildServiceSpec(options: {
       username: options.username,
     },
     pathEnv: options.pathEnv || "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    opensslPath: options.opensslPath,
     programData: options.programData || "C:\\ProgramData",
     config: normalizedConfig,
   };
@@ -703,7 +748,8 @@ export function buildServiceSpec(options: {
 
 function currentServiceSpec(
   entryScript: string,
-  installConfig?: ServiceInstallConfig
+  installConfig?: ServiceInstallConfig,
+  opensslPath?: string
 ): ServiceSpec {
   if (!isSupportedPlatform(process.platform)) {
     throw new Error(`Unsupported platform: ${process.platform}`);
@@ -729,6 +775,7 @@ function currentServiceSpec(
     username: user.username,
     stateDir,
     pathEnv: process.env.PATH,
+    opensslPath,
     programData: process.env.ProgramData,
     installConfig: config,
   });
@@ -851,6 +898,39 @@ function readInstalledServiceSnapshot(spec: ServiceSpec): InstalledServiceSnapsh
   }
 }
 
+/** Command to repair a service whose pinned Node binary is gone. */
+const SERVICE_REINSTALL_HINT = "re-run `portless service install`";
+
+function installedNodeFromSnapshot(
+  snapshot: InstalledServiceSnapshot | null,
+  fileExists: (filePath: string) => boolean = fs.existsSync
+): InstalledServiceNode | undefined {
+  const nodePath = snapshot?.command[0];
+  if (!nodePath) return undefined;
+  return { path: nodePath, exists: fileExists(nodePath) };
+}
+
+/**
+ * Read the installed service definition back and report the Node binary it
+ * pins. Returns undefined when no definition is installed or readable, or on a
+ * platform without service support. The service pins `process.execPath` at
+ * install time on purpose (a removed binary fails closed instead of falling
+ * through a PATH search as root or SYSTEM), so a missing binary is reported
+ * here instead of being papered over.
+ */
+export function inspectInstalledServiceNode(
+  options: { entryScript?: string; fileExists?: (filePath: string) => boolean } = {}
+): InstalledServiceNode | undefined {
+  try {
+    if (!isSupportedPlatform(process.platform)) return undefined;
+    // Only the definition paths are used, so the entry script is a placeholder.
+    const spec = currentServiceSpec(options.entryScript ?? "portless");
+    return installedNodeFromSnapshot(readInstalledServiceSnapshot(spec), options.fileExists);
+  } catch {
+    return undefined;
+  }
+}
+
 function installedConfigFromSnapshot(
   snapshot: InstalledServiceSnapshot,
   fallback: NormalizedServiceConfig
@@ -871,12 +951,6 @@ function installedConfigFromSnapshot(
   } catch {
     return null;
   }
-}
-
-function readInstalledServiceConfig(spec: ServiceSpec): NormalizedServiceConfig | null {
-  const snapshot = readInstalledServiceSnapshot(spec);
-  if (!snapshot) return null;
-  return installedConfigFromSnapshot(snapshot, spec.config);
 }
 
 function collectPortlessEnvArgs(
@@ -1030,6 +1104,7 @@ function prepareTrust(stateDir: string): void {
   const trustResult = trustCA(stateDir);
   if (trustResult.trusted) {
     console.log(colors.green("CA added to the system trust store."));
+    if (trustResult.warning) console.warn(colors.yellow(trustResult.warning));
     return;
   }
 
@@ -1051,6 +1126,22 @@ function ensureServiceConfigSupported(config: ServiceInstallConfig): void {
   );
 }
 
+function warnIfOpensslUserWritable(opensslPath: string): void {
+  const writable = findUserWritableLocation(opensslPath);
+  if (!writable) return;
+  console.warn(
+    colors.yellow(
+      `The service will run ${opensslPath} as ${process.platform === "win32" ? "SYSTEM" : "root"}, ` +
+        `but ${writable} can be changed by a non-privileged user.`
+    )
+  );
+  console.warn(
+    colors.gray(
+      "Install openssl in a system-owned location and re-run `portless service install` to pin that one."
+    )
+  );
+}
+
 async function installService(
   entryScript: string,
   runner: CommandRunner,
@@ -1059,7 +1150,12 @@ async function installService(
   const installConfig = normalizeServiceInstallPaths(parseServiceInstallConfig(args));
   ensureServiceConfigSupported(installConfig);
   requireUnixElevation([entryScript, ...args], runner);
-  const spec = currentServiceSpec(entryScript, installConfig);
+  const opensslPath = resolveOpensslBinary();
+  warnIfOpensslUserWritable(opensslPath);
+  // Certificate generation during this install must use the same binary the
+  // service will be pinned to.
+  process.env[SERVICE_OPENSSL_ENV] = opensslPath;
+  const spec = currentServiceSpec(entryScript, installConfig, opensslPath);
   prepareServiceState(spec.stateDir);
 
   if (spec.config.useHttps && !spec.config.customCertPath) {
@@ -1167,7 +1263,10 @@ async function getServiceStatus(
   runner: CommandRunner
 ): Promise<ServiceStatus> {
   const spec = currentServiceSpec(entryScript);
-  const installedConfig = readInstalledServiceConfig(spec) ?? spec.config;
+  const snapshot = readInstalledServiceSnapshot(spec);
+  const installedConfig =
+    (snapshot ? installedConfigFromSnapshot(snapshot, spec.config) : null) ?? spec.config;
+  const node = installedNodeFromSnapshot(snapshot);
   const proxyRunning = await isProxyRunning(installedConfig.proxyPort, installedConfig.useHttps);
 
   if (spec.platform === "darwin") {
@@ -1186,6 +1285,7 @@ async function getServiceStatus(
       proxyRunning,
       config: installedConfig,
       details: spec.plistPath,
+      node,
     };
   }
 
@@ -1201,6 +1301,7 @@ async function getServiceStatus(
       proxyRunning,
       config: installedConfig,
       details: spec.unitPath,
+      node,
     };
   }
 
@@ -1214,6 +1315,7 @@ async function getServiceStatus(
     proxyRunning,
     config: installedConfig,
     details: spec.taskName,
+    node,
   };
 }
 
@@ -1233,9 +1335,15 @@ async function printServiceStatus(entryScript: string, runner: CommandRunner): P
     console.log(`  LAN IP: ${config.lanIp}`);
   }
   console.log(`  Wildcard: ${config.useWildcard ? "yes" : "no"}`);
+  console.log(`  Unprivileged: ${config.unprivileged ? "yes" : "no"}`);
   console.log(`  State directory: ${config.stateDir}`);
   if (status.details) {
     console.log(`  Service entry: ${status.details}`);
+  }
+  if (status.node) {
+    console.log(
+      `  Node binary: ${status.node.path}${status.node.exists ? "" : ` (missing; ${SERVICE_REINSTALL_HINT})`}`
+    );
   }
 }
 
@@ -1248,7 +1356,7 @@ ${colors.bold("Usage:")}
   ${colors.cyan("portless service install --lan")}       Enable LAN mode for the startup service
   ${colors.cyan("portless service install -p 8443")}     Use a custom proxy port
   ${colors.cyan("portless service uninstall")}           Stop and remove the startup service
-  ${colors.cyan("portless service status")}              Show service and proxy status
+  ${colors.cyan("portless service status")}              Show service and proxy status, including the pinned Node binary
 
 ${colors.bold("Install options:")}
   -p, --port <number>              Port for the proxy service
@@ -1259,6 +1367,7 @@ ${colors.bold("Install options:")}
   --suffix <suffix>                Use a custom suffix, repeatable
   --tld <tld>                      Compatibility alias for --suffix
   --wildcard                       Allow subdomain fallback
+  --unprivileged                   Bind the wildcard address, loopback peers only, no elevation
   --cert <path>                    Use a custom TLS certificate
   --key <path>                     Use a custom TLS private key
   --state-dir <path>               Use a custom service state directory

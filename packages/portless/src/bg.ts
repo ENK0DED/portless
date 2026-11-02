@@ -3,7 +3,15 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import colors from "./colors.js";
-import { discoverState, isWindows, killTree } from "./cli-utils.js";
+import {
+  COMMAND_SHUTDOWN_FORCE_MS,
+  discoverState,
+  isWindows,
+  killOrphanedProcessGroup,
+  killTree,
+  parseAppPortRange,
+  parseAppPortStrategy,
+} from "./cli-utils.js";
 import {
   appendBgLifecycleLog,
   getBgLogPaths,
@@ -29,7 +37,7 @@ import { cleanupRouteSharing } from "./route-cleanup.js";
 import { RouteStore, type RouteMapping } from "./routes.js";
 import { TunnelAliasStore } from "./tunnel-aliases.js";
 import type { RouteProtocol, TunnelProviderName } from "./types.js";
-import { fixOwnership, normalizePathPrefix } from "./utils.js";
+import { fixOwnership, isProcessAlive, normalizePathPrefix, parsePort } from "./utils.js";
 
 export const DEFAULT_BG_WAIT_SECONDS = 30;
 
@@ -40,26 +48,55 @@ export interface ParsedBgStartArgs {
   json: boolean;
 }
 
+export interface BgRestartStartOptions {
+  force: boolean;
+  waitSeconds: number | undefined;
+  keep: boolean;
+  json: boolean;
+}
+
 interface ParsedRunIntent {
   intent: BgStartIntent;
   label: string;
 }
 
-interface BgCommandContext {
+export interface BgCommandContext {
   stateDir: string;
   store: BgStore;
   routeStore: RouteStore;
   tunnelAliasStore: TunnelAliasStore;
 }
 
-interface EntryView extends BgProcessEntry {
-  logs: BgLogPaths;
+/**
+ * How long `bg stop` waits after SIGTERM before giving up. `portless run`
+ * shuts its command down gracefully and escalates to SIGKILL after
+ * COMMAND_SHUTDOWN_FORCE_MS, so waiting a little longer lets it finish that
+ * work instead of being killed mid-shutdown with its command's group orphaned.
+ */
+export const BG_STOP_WAIT_MS = COMMAND_SHUTDOWN_FORCE_MS + 2000;
+
+export interface BgStopEntryOperations {
+  killChildGroup?: (pgid: number, startTime: string | undefined, signal: NodeJS.Signals) => boolean;
+  isProcessAlive?: (pid: number) => boolean;
+  signalProcessGroup?: (pid: number, signal: NodeJS.Signals) => void;
+  waitForProcessExit?: (pid: number, timeoutMs: number) => Promise<boolean>;
 }
+
+type EntryView = Omit<BgProcessEntry, "intent"> & {
+  intent: Omit<BgStartIntent, "sharing"> & {
+    sharing: Omit<BgStartIntent["sharing"], "netbirdPassword" | "netbirdPin"> & {
+      netbirdPasswordSet: boolean;
+      netbirdPinSet: boolean;
+    };
+  };
+  logs: BgLogPaths;
+};
 
 const RUN_VALUE_FLAGS = new Set([
   "--name",
   "--app-port",
   "--path",
+  "--worktree-prefix",
   "--tunnel",
   "--tunnel-hostname",
   "--tailscale-service-name",
@@ -69,14 +106,20 @@ const RUN_VALUE_FLAGS = new Set([
 ]);
 
 const RUN_BOOLEAN_FLAGS = new Set([
+  "--cloudflare",
   "--force",
   "--h2c",
+  "--no-worktree",
   "--tailscale",
+  "--tailscale-http",
   "--tailscale-service",
   "--funnel",
   "--ngrok",
   "--netbird",
 ]);
+
+/** Flags that belong to portless and must never reach the child command. */
+const BG_ONLY_FLAGS = new Set(["--no-wait", "--wait", "--keep", "--json"]);
 
 function printBgHelp(): void {
   console.log(`
@@ -113,16 +156,20 @@ ${colors.bold("Run options forwarded to portless run:")}
   --app-port <number>           Use a fixed app port
   --h2c                         Forward to an HTTP/2 cleartext upstream
   --path <prefix>               Scope route to a path prefix
+  --worktree-prefix <prefix>    Use this worktree prefix, in a linked worktree or not
+  --no-worktree                 Skip the worktree prefix
+  --cloudflare                 Alias of --tunnel cloudflare
   --tunnel <provider>           Share publicly via a managed tunnel
   --tunnel-hostname <hostname>  Request a stable tunnel hostname
   --tailscale                   Share on Tailscale
+  --tailscale-http              Share on Tailscale over plain HTTP (no MagicDNS needed)
   --tailscale-service           Share as a Tailscale Service
   --tailscale-service-name <n>  Use an explicit Tailscale Service name
   --funnel                      Share publicly via Tailscale Funnel
   --ngrok                       Share publicly via ngrok
   --netbird                     Share publicly via NetBird Peer Expose
-  --netbird-password <string>   Require a password for the NetBird public URL
-  --netbird-pin <code>          Require a PIN for the NetBird public URL
+  --netbird-password <string>   Require a password; PORTLESS_NETBIRD_PASSWORD keeps it out of process listings
+  --netbird-pin <code>          Require a PIN; PORTLESS_NETBIRD_PIN keeps it out of process listings
   --netbird-groups <csv>        Restrict the NetBird URL to user groups
 
 ${colors.bold("Background options:")}
@@ -143,9 +190,13 @@ ${colors.bold("Usage:")}
 
 ${colors.bold("Options:")}
   --path <prefix>               Resolve a path-scoped background route
-  --force                       Send SIGKILL after graceful stop and clean exact owned route state
+  --force                       Send SIGKILL to the app and the command it spawned, and clean exact
+                                owned route state
   --json                        Print machine-readable output
   --help, -h                    Show this help
+
+Without --force, bg stop sends SIGTERM and waits up to 12 seconds for the app to shut
+its command down (portless escalates to SIGKILL after 10 seconds on its own).
 `);
 }
 
@@ -264,13 +315,41 @@ function parseTunnelProviderForIntent(value: string): TunnelProviderName {
   throw new Error(`Unsupported tunnel provider "${value}"`);
 }
 
-function parseRunIntent(runArgs: string[], cwd: string): ParsedRunIntent {
+export function parseRunIntent(
+  runArgs: string[],
+  cwd: string,
+  env: NodeJS.ProcessEnv = process.env
+): ParsedRunIntent {
   let name: string | undefined;
   let force = false;
   let appPort: number | undefined;
   let protocol: RouteProtocol | undefined;
   let pathPrefix = "/";
-  let tunnel: BgManagedTunnelOptions | undefined;
+  // PORTLESS_WORKTREE_PREFIX is captured now so a restart from another shell
+  // replays the same decision; a flag overrides it in either direction.
+  const envWorktree = env.PORTLESS_WORKTREE_PREFIX;
+  let worktreePrefix: string | undefined = envWorktree?.trim() ? envWorktree : undefined;
+  let noWorktree = envWorktree !== undefined && !envWorktree.trim();
+  let flagWorktreePrefix = false;
+  let flagNoWorktree = false;
+  // The app port strategy and range are captured the same way: a restart from
+  // another shell replays what the app was started with. Invalid values fail
+  // the start instead of being saved.
+  const envStrategy = env.PORTLESS_APP_PORT_STRATEGY?.trim();
+  const envRange = env.PORTLESS_APP_PORT_RANGE?.trim();
+  const appPortStrategy = envStrategy ? parseAppPortStrategy(envStrategy) : undefined;
+  const appPortRange = envRange ? parseAppPortRange(envRange) : undefined;
+  const envProvider =
+    process.env.PORTLESS_TUNNEL ??
+    (["1", "true"].includes(process.env.PORTLESS_CLOUDFLARE ?? "") ? "cloudflare" : undefined);
+  let tunnel: BgManagedTunnelOptions | undefined = envProvider
+    ? {
+        provider: parseTunnelProviderForIntent(envProvider),
+        ...(process.env.PORTLESS_TUNNEL_HOSTNAME
+          ? { hostname: process.env.PORTLESS_TUNNEL_HOSTNAME }
+          : {}),
+      }
+    : undefined;
   const sharing: BgStartIntent["sharing"] = {
     tailscale: false,
     tailscaleService: false,
@@ -298,8 +377,8 @@ function parseRunIntent(runArgs: string[], cwd: string): ParsedRunIntent {
     } else if (token === "--force") {
       force = true;
     } else if (token === "--app-port") {
-      const value = Number(runArgs[++i]);
-      if (!Number.isInteger(value) || value < 1 || value > 65535) {
+      const value = parsePort(runArgs[++i] ?? "");
+      if (value === null) {
         throw new Error("--app-port requires a valid port number");
       }
       appPort = value;
@@ -307,6 +386,22 @@ function parseRunIntent(runArgs: string[], cwd: string): ParsedRunIntent {
       protocol = "h2c";
     } else if (token === "--path") {
       pathPrefix = normalizePathPrefix(runArgs[++i]);
+    } else if (token === "--worktree-prefix") {
+      const value = runArgs[++i];
+      if (!value?.trim()) {
+        throw new Error(
+          "--worktree-prefix requires a non-empty value. Use --no-worktree to turn the prefix off"
+        );
+      }
+      worktreePrefix = value;
+      noWorktree = false;
+      flagWorktreePrefix = true;
+    } else if (token === "--no-worktree") {
+      worktreePrefix = undefined;
+      noWorktree = true;
+      flagNoWorktree = true;
+    } else if (token === "--cloudflare") {
+      tunnel = { provider: "cloudflare" };
     } else if (token === "--tunnel") {
       tunnel = { ...(tunnel ?? {}), provider: parseTunnelProviderForIntent(runArgs[++i]) };
     } else if (token === "--tunnel-hostname") {
@@ -314,6 +409,8 @@ function parseRunIntent(runArgs: string[], cwd: string): ParsedRunIntent {
       tunnel = { ...tunnel, hostname: runArgs[++i] };
     } else if (token === "--tailscale") {
       sharing.tailscale = true;
+    } else if (token === "--tailscale-http") {
+      sharing.tailscaleHttp = true;
     } else if (token === "--tailscale-service") {
       sharing.tailscaleService = true;
     } else if (token === "--tailscale-service-name") {
@@ -338,6 +435,10 @@ function parseRunIntent(runArgs: string[], cwd: string): ParsedRunIntent {
     }
   }
 
+  if (flagWorktreePrefix && flagNoWorktree) {
+    throw new Error("--no-worktree cannot be combined with --worktree-prefix");
+  }
+
   const fallbackLabel = path.basename(cwd) || "app";
   const label = name ?? fallbackLabel;
   return {
@@ -351,6 +452,10 @@ function parseRunIntent(runArgs: string[], cwd: string): ParsedRunIntent {
       appPort,
       protocol,
       pathPrefix,
+      ...(worktreePrefix !== undefined ? { worktreePrefix } : {}),
+      ...(noWorktree ? { noWorktree } : {}),
+      ...(appPortStrategy !== undefined ? { appPortStrategy } : {}),
+      ...(appPortRange !== undefined ? { appPortRange } : {}),
       tunnel,
       sharing,
     },
@@ -417,19 +522,10 @@ function printStartResult(
   console.log(colors.gray(`Logs: ${logs.stdout}`));
 }
 
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 async function terminateChild(child: ChildProcess): Promise<void> {
   killTree(child, "SIGTERM");
-  await sleep(500);
-  if (child.pid && isProcessAlive(child.pid)) {
+  // Let `portless run` finish its own graceful-then-forced shutdown of the command.
+  if (child.pid && !(await waitForProcessExit(child.pid, BG_STOP_WAIT_MS))) {
     killTree(child, "SIGKILL");
   }
 }
@@ -533,43 +629,67 @@ function removeEntryLogs(stateDir: string, entryId: string): void {
   }
 }
 
-async function stopEntry(
+export async function stopEntry(
   context: BgCommandContext,
   entry: BgProcessEntry,
-  options: { force?: boolean; removeLogs?: boolean } = {}
+  options: { force?: boolean; removeLogs?: boolean } = {},
+  operations: BgStopEntryOperations = {}
 ): Promise<{ stopped: boolean; alreadyStopped: boolean }> {
-  const alive = isProcessAlive(entry.pid);
+  const isAlive = operations.isProcessAlive ?? isProcessAlive;
+  const signal = operations.signalProcessGroup ?? signalProcessGroup;
+  const wait = operations.waitForProcessExit ?? waitForProcessExit;
+  const killChildGroup = operations.killChildGroup ?? killOrphanedProcessGroup;
+  // The command portless spawned leads its own process group, so killing the
+  // wrapper's group alone leaves it running. Read the recorded group before the
+  // wrapper dies; only a forced stop kills it, a graceful one lets the wrapper
+  // shut the command down itself.
+  const ownRoute = options.force ? findExactRoute(context, entry) : undefined;
+  const childGroup =
+    ownRoute && ownRoute.pid === entry.pid && ownRoute.childPgid
+      ? { pgid: ownRoute.childPgid, startTime: ownRoute.childStartTime }
+      : undefined;
+  const alive = isAlive(entry.pid);
   if (alive) {
-    signalProcessGroup(entry.pid, options.force ? "SIGKILL" : "SIGTERM");
-    const exited = await waitForProcessExit(entry.pid, options.force ? 1000 : 5000);
+    signal(entry.pid, options.force ? "SIGKILL" : "SIGTERM");
+    const exited = await wait(entry.pid, options.force ? 1000 : BG_STOP_WAIT_MS);
     if (!exited && !options.force) {
       context.store.updateEntry(entry.id, { state: "unknown" });
       return { stopped: false, alreadyStopped: false };
     }
     if (!exited && options.force) {
-      signalProcessGroup(entry.pid, "SIGKILL");
-      await waitForProcessExit(entry.pid, 1000);
+      signal(entry.pid, "SIGKILL");
+      const killed = await wait(entry.pid, 1000);
+      if (!killed) {
+        context.store.updateEntry(entry.id, { state: "unknown" });
+        return { stopped: false, alreadyStopped: false };
+      }
     }
   }
 
+  if (childGroup) killChildGroup(childGroup.pgid, childGroup.startTime, "SIGKILL");
   cleanupExactRoute(context, entry);
   context.store.removeEntry(entry.id);
   if (options.removeLogs) removeEntryLogs(context.stateDir, entry.id);
   return { stopped: true, alreadyStopped: !alive };
 }
 
-function runArgsFromIntent(intent: BgStartIntent, force: boolean): string[] {
+export function runArgsFromIntent(intent: BgStartIntent, force: boolean): string[] {
   const args: string[] = [];
   if (intent.name) args.push("--name", intent.name);
   if (force || intent.force) args.push("--force");
   if (intent.appPort) args.push("--app-port", String(intent.appPort));
   if (intent.protocol === "h2c") args.push("--h2c");
   if (intent.pathPrefix && intent.pathPrefix !== "/") args.push("--path", intent.pathPrefix);
+  if (intent.noWorktree) args.push("--no-worktree");
+  else if (intent.worktreePrefix) args.push("--worktree-prefix", intent.worktreePrefix);
   if (intent.tunnel) {
     args.push("--tunnel", intent.tunnel.provider);
     if (intent.tunnel.hostname) args.push("--tunnel-hostname", intent.tunnel.hostname);
   }
-  if (intent.sharing.tailscale && !intent.sharing.funnel) args.push("--tailscale");
+  if (intent.sharing.tailscale && !intent.sharing.funnel && !intent.sharing.tailscaleHttp) {
+    args.push("--tailscale");
+  }
+  if (intent.sharing.tailscaleHttp) args.push("--tailscale-http");
   if (intent.sharing.tailscaleService) args.push("--tailscale-service");
   if (intent.sharing.tailscaleServiceName) {
     args.push("--tailscale-service-name", intent.sharing.tailscaleServiceName);
@@ -577,17 +697,43 @@ function runArgsFromIntent(intent: BgStartIntent, force: boolean): string[] {
   if (intent.sharing.funnel) args.push("--funnel");
   if (intent.sharing.ngrok) args.push("--ngrok");
   if (intent.sharing.netbird) args.push("--netbird");
-  if (intent.sharing.netbirdPassword)
-    args.push("--netbird-password", intent.sharing.netbirdPassword);
-  if (intent.sharing.netbirdPin) args.push("--netbird-pin", intent.sharing.netbirdPin);
   if (intent.sharing.netbirdGroups) args.push("--netbird-groups", intent.sharing.netbirdGroups);
-  if (intent.explicitCommand) args.push("--", ...intent.commandArgs);
   return args;
 }
 
+export function buildRestartStartArgs(
+  intent: BgStartIntent,
+  parsed: BgRestartStartOptions
+): string[] {
+  const runArgs = runArgsFromIntent(intent, parsed.force);
+  return [
+    ...runArgs,
+    ...(parsed.waitSeconds === undefined
+      ? ["--no-wait"]
+      : parsed.waitSeconds !== DEFAULT_BG_WAIT_SECONDS
+        ? ["--wait", String(parsed.waitSeconds)]
+        : []),
+    ...(parsed.keep ? ["--keep"] : []),
+    ...(parsed.json ? ["--json"] : []),
+    // The separator must stay last: parseBgStartArgs treats everything after
+    // it as the child command, so any portless flag placed later would be
+    // handed to the user's dev server instead.
+    ...(intent.explicitCommand ? ["--", ...intent.commandArgs] : []),
+  ];
+}
+
 function withLogs(stateDir: string, entry: BgProcessEntry): EntryView {
+  const { netbirdPassword, netbirdPin, ...sharing } = entry.intent.sharing;
   return {
     ...entry,
+    intent: {
+      ...entry.intent,
+      sharing: {
+        ...sharing,
+        netbirdPasswordSet: netbirdPassword !== undefined && netbirdPassword !== "",
+        netbirdPinSet: netbirdPin !== undefined && netbirdPin !== "",
+      },
+    },
     logs: getBgLogPaths(stateDir, entry.id),
   };
 }
@@ -953,18 +1099,23 @@ async function handleBgRestart(args: string[], options: { entryScript: string })
       console.error(colors.red(`Error: ${entry.label} did not exit after SIGTERM.`));
       process.exit(1);
     }
-    const runArgs = runArgsFromIntent(entry.intent, parsed.force);
-    const startArgs = [
-      ...runArgs,
-      ...(parsed.waitSeconds === undefined
-        ? ["--no-wait"]
-        : parsed.waitSeconds !== DEFAULT_BG_WAIT_SECONDS
-          ? ["--wait", String(parsed.waitSeconds)]
-          : []),
-      ...(parsed.keep ? ["--keep"] : []),
-      ...(parsed.json ? ["--json"] : []),
-    ];
-    await handleBgStart(startArgs, options, { cwd: entry.cwd });
+    const startArgs = buildRestartStartArgs(entry.intent, parsed);
+    await handleBgStart(startArgs, options, {
+      cwd: entry.cwd,
+      netbirdPassword: entry.intent.sharing.netbirdPassword,
+      netbirdPin: entry.intent.sharing.netbirdPin,
+      env: {
+        ...process.env,
+        ...(entry.intent.appPortStrategy
+          ? { PORTLESS_APP_PORT_STRATEGY: entry.intent.appPortStrategy }
+          : {}),
+        ...(entry.intent.appPortRange
+          ? {
+              PORTLESS_APP_PORT_RANGE: `${entry.intent.appPortRange[0]}-${entry.intent.appPortRange[1]}`,
+            }
+          : {}),
+      },
+    });
   } catch (err) {
     console.error(colors.red(`Error: ${(err as Error).message}`));
     process.exit(1);
@@ -1073,7 +1224,13 @@ export async function pruneBgEntriesForState(stateDir: string): Promise<{ remove
 async function handleBgStart(
   startArgs: string[],
   options: { entryScript: string },
-  startOptions: { cwd?: string } = {}
+  startOptions: {
+    cwd?: string;
+    netbirdPassword?: string;
+    netbirdPin?: string;
+    /** Environment the run intent is read from. Restarts overlay the saved values. */
+    env?: NodeJS.ProcessEnv;
+  } = {}
 ): Promise<void> {
   let parsed: ParsedBgStartArgs;
   try {
@@ -1092,7 +1249,22 @@ async function handleBgStart(
   const readyPath = getBgReadyPath(state.dir, id);
   const logs = getBgLogPaths(state.dir, id);
   const cwd = startOptions.cwd ?? process.cwd();
-  const { intent, label } = parseRunIntent(parsed.runArgs, cwd);
+  let parsedIntent: ParsedRunIntent;
+  try {
+    parsedIntent = parseRunIntent(parsed.runArgs, cwd, startOptions.env);
+  } catch (err) {
+    console.error(colors.red(`Error: ${(err as Error).message}`));
+    process.exit(1);
+  }
+  const label = parsedIntent.label;
+  const intent: BgStartIntent = {
+    ...parsedIntent.intent,
+    sharing: {
+      ...parsedIntent.intent.sharing,
+      ...(startOptions.netbirdPassword ? { netbirdPassword: startOptions.netbirdPassword } : {}),
+      ...(startOptions.netbirdPin ? { netbirdPin: startOptions.netbirdPin } : {}),
+    },
+  };
   const startedAt = new Date().toISOString();
   let entry: BgProcessEntry = {
     version: 1,
@@ -1115,15 +1287,34 @@ async function handleBgStart(
       ...process.env,
       [PORTLESS_BG_ID_ENV]: id,
       [PORTLESS_BG_READY_PATH_ENV]: readyPath,
+      ...(intent.appPortStrategy ? { PORTLESS_APP_PORT_STRATEGY: intent.appPortStrategy } : {}),
+      ...(intent.appPortRange
+        ? { PORTLESS_APP_PORT_RANGE: `${intent.appPortRange[0]}-${intent.appPortRange[1]}` }
+        : {}),
+      ...(intent.sharing.netbirdPassword
+        ? { PORTLESS_NETBIRD_PASSWORD: intent.sharing.netbirdPassword }
+        : {}),
+      ...(intent.sharing.netbirdPin ? { PORTLESS_NETBIRD_PIN: intent.sharing.netbirdPin } : {}),
     };
     delete childEnv.PORTLESS;
-    child = spawn(process.execPath, [options.entryScript, "run", ...parsed.runArgs], {
-      cwd,
-      detached: true,
-      env: childEnv,
-      stdio: ["ignore", stdoutFd, stderrFd],
-      windowsHide: true,
-    });
+    child = spawn(
+      process.execPath,
+      [
+        options.entryScript,
+        "run",
+        ...runArgsFromIntent(intent, false),
+        // runArgsFromIntent no longer appends the command tail, so restore the
+        // separator here; everything after it is the user's command.
+        ...(intent.explicitCommand ? ["--", ...intent.commandArgs] : []),
+      ],
+      {
+        cwd,
+        detached: true,
+        env: childEnv,
+        stdio: ["ignore", stdoutFd, stderrFd],
+        windowsHide: true,
+      }
+    );
   } catch (err) {
     closeLogFd(stdoutFd);
     closeLogFd(stderrFd);
@@ -1193,7 +1384,15 @@ export function parseBgStartArgs(tokens: string[]): ParsedBgStartArgs {
     const token = tokens[i];
 
     if (token === "--") {
-      runArgs.push(...tokens.slice(i));
+      const tail = tokens.slice(i);
+      const stray = tail.find((t) => BG_ONLY_FLAGS.has(t));
+      if (stray) {
+        throw new Error(
+          `Internal error: ${stray} was placed after the command separator. ` +
+            `Report this as a portless bug.`
+        );
+      }
+      runArgs.push(...tail);
       break;
     }
 
@@ -1208,6 +1407,11 @@ export function parseBgStartArgs(tokens: string[]): ParsedBgStartArgs {
     }
 
     if (RUN_VALUE_FLAGS.has(token)) {
+      if (token === "--worktree-prefix" && tokens[i + 1] === "") {
+        throw new Error(
+          "--worktree-prefix requires a non-empty value. Use --no-worktree to turn the prefix off"
+        );
+      }
       runArgs.push(token, requireForwardedValue(tokens, i));
       i++;
       continue;

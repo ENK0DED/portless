@@ -1,6 +1,6 @@
 import { applyWorktreePrefix, detectWorktreePrefix, resolveWorktreeFlat } from "./auto.js";
 import { discoverState } from "./cli-utils.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, resolveAppConfig, type WorktreeBranchMode } from "./config.js";
 import { formatUrl, normalizePathPrefix, parseHostname } from "./utils.js";
 
 export interface ServiceUrl {
@@ -26,8 +26,17 @@ export interface GetUrlOptions {
    * such as OAuth callbacks that must not vary by branch.
    */
   worktree?: boolean;
+  /**
+   * Use this label as the worktree prefix. It applies in a linked worktree,
+   * the main checkout, and outside git. Cannot be combined with
+   * `worktree: false`, and an empty string throws (use `worktree: false`).
+   * Takes precedence over `PORTLESS_WORKTREE_PREFIX`.
+   */
+  worktreePrefix?: string;
   /** Override the project worktreeFlat setting for this lookup. */
   worktreeFlat?: boolean;
+  /** Override the project worktreeBranch setting for this lookup. */
+  worktreeBranch?: WorktreeBranchMode;
   /** Working directory used for git worktree detection. */
   cwd?: string;
   /** Optional route path prefix to append to the resolved URL. */
@@ -43,9 +52,34 @@ export interface GetUrlOptions {
  */
 export async function getUrl(name: string, options: GetUrlOptions = {}): Promise<ServiceUrl> {
   const cwd = options.cwd ?? process.cwd();
-  const worktree = options.worktree === false ? null : detectWorktreePrefix(cwd);
-  const configuredFlat =
-    options.worktreeFlat ?? (worktree ? loadConfig(cwd)?.config.worktreeFlat : undefined);
+  if (options.worktree === false && options.worktreePrefix !== undefined) {
+    throw new Error("getUrl: worktree: false cannot be combined with worktreePrefix.");
+  }
+  if (options.worktreePrefix !== undefined && !options.worktreePrefix.trim()) {
+    throw new Error("getUrl: worktreePrefix must not be empty. Use worktree: false to skip it.");
+  }
+
+  // Config is read even when no worktree is detected: an explicit prefix
+  // applies outside linked worktrees and still needs the flat setting.
+  let configuredFlat: boolean | undefined;
+  let configuredBranch: WorktreeBranchMode | undefined;
+  if (
+    options.worktree !== false &&
+    (options.worktreeFlat === undefined || options.worktreeBranch === undefined)
+  ) {
+    const loaded = loadConfig(cwd);
+    if (loaded) {
+      const app = resolveAppConfig(loaded.config, loaded.configDir, cwd);
+      configuredFlat = app.worktreeFlat ?? loaded.config.worktreeFlat;
+      configuredBranch = app.worktreeBranch ?? loaded.config.worktreeBranch;
+    }
+  }
+
+  const worktree = detectWorktreePrefix(cwd, {
+    disabled: options.worktree === false,
+    prefix: options.worktreePrefix,
+    branch: options.worktreeBranch ?? configuredBranch,
+  });
   const effectiveName = applyWorktreePrefix(
     name,
     worktree,

@@ -37,7 +37,21 @@ describe("hasTurboConfig", () => {
     expect(hasTurboConfig(tmpDir)).toBe(true);
   });
 
-  it("returns false when turbo.json is missing", () => {
+  it("returns true when turbo.jsonc exists", () => {
+    fs.writeFileSync(
+      path.join(tmpDir, "turbo.jsonc"),
+      '{\n  // Turbo supports comments\n  "tasks": {}\n}\n'
+    );
+    expect(hasTurboConfig(tmpDir)).toBe(true);
+  });
+
+  it("returns true when both Turbo configuration files exist", () => {
+    fs.writeFileSync(path.join(tmpDir, "turbo.json"), "{}");
+    fs.writeFileSync(path.join(tmpDir, "turbo.jsonc"), "{\n  // Turbo supports comments\n}\n");
+    expect(hasTurboConfig(tmpDir)).toBe(true);
+  });
+
+  it("returns false when neither Turbo configuration file exists", () => {
     expect(hasTurboConfig(tmpDir)).toBe(false);
   });
 });

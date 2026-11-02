@@ -84,6 +84,77 @@ describe("BgStore", () => {
     expect(store.loadEntries().map((entry) => entry.id)).toEqual(["bg_02"]);
   });
 
+  it("persists the plain-HTTP tailnet flag and accepts entries written without it", () => {
+    const withHttp = sampleEntry({
+      intent: {
+        ...sampleEntry().intent,
+        sharing: { ...sampleEntry().intent.sharing, tailscale: true, tailscaleHttp: true },
+      },
+    });
+    store.upsertEntry(withHttp);
+    expect(store.loadEntries()).toEqual([withHttp]);
+    expect(sampleEntry().intent.sharing.tailscaleHttp).toBeUndefined();
+    store.removeEntry(withHttp.id);
+    store.upsertEntry(sampleEntry());
+    expect(store.loadEntries()).toEqual([sampleEntry()]);
+  });
+
+  it("rejects a non-boolean plain-HTTP tailnet flag", () => {
+    store.ensureDirs();
+    const bad = sampleEntry();
+    (bad.intent.sharing as Record<string, unknown>).tailscaleHttp = "yes";
+    fs.writeFileSync(store.getPaths().registryPath, JSON.stringify([bad]));
+    expect(store.loadEntries()).toEqual([]);
+  });
+
+  it("persists the worktree prefix decision and accepts entries written without it", () => {
+    const prefixed = sampleEntry({
+      intent: { ...sampleEntry().intent, worktreePrefix: "qa" },
+    });
+    const optedOut = sampleEntry({
+      id: "other",
+      intent: { ...sampleEntry().intent, noWorktree: true },
+    });
+    store.upsertEntry(prefixed);
+    store.upsertEntry(optedOut);
+    expect(store.loadEntries()).toEqual([prefixed, optedOut]);
+    expect(sampleEntry().intent.worktreePrefix).toBeUndefined();
+  });
+
+  it("rejects malformed worktree prefix fields", () => {
+    store.ensureDirs();
+    const badPrefix = sampleEntry();
+    (badPrefix.intent as unknown as Record<string, unknown>).worktreePrefix = 7;
+    const badFlag = sampleEntry({ id: "other" });
+    (badFlag.intent as unknown as Record<string, unknown>).noWorktree = "yes";
+    fs.writeFileSync(store.getPaths().registryPath, JSON.stringify([badPrefix, badFlag]));
+    expect(store.loadEntries()).toEqual([]);
+  });
+
+  it("persists the app port strategy and range and accepts entries written without them", () => {
+    const withPorts = sampleEntry({
+      intent: { ...sampleEntry().intent, appPortStrategy: "stable", appPortRange: [4200, 4999] },
+    });
+    store.upsertEntry(withPorts);
+    expect(store.loadEntries()).toEqual([withPorts]);
+    expect(sampleEntry().intent.appPortStrategy).toBeUndefined();
+  });
+
+  it("rejects malformed app port strategy fields", () => {
+    store.ensureDirs();
+    const badStrategy = sampleEntry();
+    (badStrategy.intent as unknown as Record<string, unknown>).appPortStrategy = "first";
+    const badRange = sampleEntry({ id: "other" });
+    (badRange.intent as unknown as Record<string, unknown>).appPortRange = [5000, 4000];
+    const shortRange = sampleEntry({ id: "short" });
+    (shortRange.intent as unknown as Record<string, unknown>).appPortRange = [5000];
+    fs.writeFileSync(
+      store.getPaths().registryPath,
+      JSON.stringify([badStrategy, badRange, shortRange])
+    );
+    expect(store.loadEntries()).toEqual([]);
+  });
+
   it("loads only valid entries from a mixed registry", () => {
     store.ensureDirs();
     fs.writeFileSync(
@@ -128,5 +199,51 @@ describe("BgStore", () => {
     );
 
     expect(store.loadEntries()).toHaveLength(10);
+  });
+
+  describe("corrupt registry", () => {
+    it("aborts a mutation on corrupt JSON without changing the file", () => {
+      store.ensureDirs();
+      const raw = "{ not json";
+      fs.writeFileSync(store.getPaths().registryPath, raw);
+
+      expect(() => store.upsertEntry(sampleEntry())).toThrow(
+        `Refusing to modify a corrupt background registry: ${store.getPaths().registryPath}`
+      );
+      expect(fs.readFileSync(store.getPaths().registryPath, "utf-8")).toBe(raw);
+    });
+
+    it("aborts a mutation on a non-array JSON document without changing the file", () => {
+      store.ensureDirs();
+      const raw = '{"a":1}';
+      fs.writeFileSync(store.getPaths().registryPath, raw);
+
+      expect(() => store.updateEntry("bg_01", { state: "ready" })).toThrow(
+        `Refusing to modify a corrupt background registry: ${store.getPaths().registryPath}`
+      );
+      expect(fs.readFileSync(store.getPaths().registryPath, "utf-8")).toBe(raw);
+    });
+
+    it("treats a missing registry file as a normal first run", () => {
+      store.upsertEntry(sampleEntry());
+
+      expect(store.loadEntries()).toEqual([sampleEntry()]);
+    });
+
+    it("keeps read paths fail-open for corrupt JSON", () => {
+      store.ensureDirs();
+      fs.writeFileSync(store.getPaths().registryPath, "{ not json");
+
+      expect(() => store.loadEntries()).not.toThrow();
+      expect(store.loadEntries()).toEqual([]);
+    });
+
+    it("leaves no temporary files after an atomic write", () => {
+      store.upsertEntry(sampleEntry());
+
+      expect(
+        fs.readdirSync(store.getPaths().rootDir).filter((file) => file.includes(".tmp-"))
+      ).toEqual([]);
+    });
   });
 });

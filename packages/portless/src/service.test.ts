@@ -4,6 +4,7 @@ import {
   buildServiceSpec,
   buildServiceUninstallSudoArgs,
   handleService,
+  inspectInstalledServiceNode,
   tryUninstallService,
 } from "./service.js";
 
@@ -39,6 +40,15 @@ vi.mock("./utils.js", async (importOriginal) => {
   };
 });
 
+vi.mock("./openssl-path.js", async (importOriginal) => {
+  const mod = await importOriginal<typeof import("./openssl-path.js")>();
+  return {
+    ...mod,
+    resolveOpensslBinary: vi.fn(() => "/opt/pinned/bin/openssl"),
+    findUserWritableLocation: vi.fn(() => null),
+  };
+});
+
 vi.mock("./mdns.js", () => ({
   isMdnsSupported: vi.fn(() => ({ supported: true })),
 }));
@@ -54,6 +64,7 @@ vi.mock("./cli-utils.js", async (importOriginal) => {
 
 const { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } = await import("node:fs");
 const { isMdnsSupported } = await import("./mdns.js");
+const { findUserWritableLocation, resolveOpensslBinary } = await import("./openssl-path.js");
 const { discoverState, isProxyRunning } = await import("./cli-utils.js");
 const actualCliUtils = await vi.importActual<typeof import("./cli-utils.js")>("./cli-utils.js");
 
@@ -89,6 +100,11 @@ afterEach(() => {
   vi.mocked(rmSync).mockRestore();
   vi.mocked(writeFileSync).mockRestore();
   vi.mocked(isMdnsSupported).mockReturnValue({ supported: true });
+  vi.mocked(resolveOpensslBinary).mockReset();
+  vi.mocked(resolveOpensslBinary).mockReturnValue("/opt/pinned/bin/openssl");
+  vi.mocked(findUserWritableLocation).mockReset();
+  vi.mocked(findUserWritableLocation).mockReturnValue(null);
+  delete process.env.PORTLESS_SERVICE_OPENSSL;
   vi.mocked(discoverState).mockReset();
   vi.mocked(discoverState).mockImplementation(actualCliUtils.discoverState);
   vi.mocked(isProxyRunning).mockReset();
@@ -343,6 +359,136 @@ describe("buildServiceSpec", () => {
     );
     expect(spec.unit).toContain('Environment=PORTLESS_SUFFIX="test,server01.acme.com,local"');
     expect(spec.unit).toContain('Environment=PORTLESS_LAN="1"');
+  });
+});
+
+describe("openssl pinning in service definitions", () => {
+  const base = {
+    nodePath: "/usr/bin/node",
+    entryScript: "/usr/lib/node_modules/@enk0ded/portless/dist/cli.js",
+    userHome: "/home/alice",
+  };
+  let exitSpy: ReturnType<typeof vi.spyOn>;
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  let errorSpy: ReturnType<typeof vi.spyOn>;
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    exitSpy = vi.spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("process.exit");
+    });
+    logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    exitSpy.mockRestore();
+    logSpy.mockRestore();
+    errorSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
+  it("pins openssl in the macOS LaunchDaemon environment", () => {
+    const spec = buildServiceSpec({
+      ...base,
+      platform: "darwin",
+      uid: "501",
+      gid: "20",
+      opensslPath: "/usr/bin/openssl",
+    });
+    if (spec.platform !== "darwin") throw new Error("Expected macOS service spec");
+    expect(spec.plist).toContain("<key>PORTLESS_SERVICE_OPENSSL</key>");
+    expect(spec.plist).toContain("<string>/usr/bin/openssl</string>");
+  });
+
+  it("pins openssl in the systemd unit", () => {
+    const spec = buildServiceSpec({
+      ...base,
+      platform: "linux",
+      opensslPath: "/usr/bin/openssl",
+    });
+    if (spec.platform !== "linux") throw new Error("Expected Linux service spec");
+    expect(spec.unit).toContain('Environment=PORTLESS_SERVICE_OPENSSL="/usr/bin/openssl"');
+  });
+
+  it("pins openssl in the Windows SYSTEM task startup script", () => {
+    const spec = buildServiceSpec({
+      ...base,
+      platform: "win32",
+      userHome: "C:\\Users\\Alice",
+      pathEnv: "C:\\Users\\Alice\\bin;C:\\Windows\\System32",
+      opensslPath: "C:\\Program Files\\Git\\mingw64\\bin\\openssl.exe",
+    });
+    if (spec.platform !== "win32") throw new Error("Expected Windows service spec");
+    expect(spec.script).toContain(
+      'set "PORTLESS_SERVICE_OPENSSL=C:\\Program Files\\Git\\mingw64\\bin\\openssl.exe"'
+    );
+  });
+
+  it("does not let extra environment override the pin", () => {
+    const spec = buildServiceSpec({
+      ...base,
+      platform: "linux",
+      opensslPath: "/usr/bin/openssl",
+      installConfig: { extraEnv: { PORTLESS_SERVICE_OPENSSL: "/tmp/evil/openssl" } },
+    });
+    if (spec.platform !== "linux") throw new Error("Expected Linux service spec");
+    expect(spec.unit).toContain('Environment=PORTLESS_SERVICE_OPENSSL="/usr/bin/openssl"');
+    expect(spec.unit).not.toContain("/tmp/evil/openssl");
+  });
+
+  it("omits the pin when no openssl path is given", () => {
+    const spec = buildServiceSpec({ ...base, platform: "linux" });
+    if (spec.platform !== "linux") throw new Error("Expected Linux service spec");
+    expect(spec.unit).not.toContain("PORTLESS_SERVICE_OPENSSL");
+  });
+
+  it("writes the resolved openssl into the systemd unit on install", async () => {
+    setPlatform("linux");
+    setGetuid(0);
+    vi.mocked(resolveOpensslBinary).mockReturnValue("/usr/bin/openssl");
+    const runner = vi.fn(() => ({ status: 0, stdout: "", stderr: "" }));
+
+    await handleService(["service", "install"], { entryScript: "/fake/cli.js", runner });
+
+    const unitWrite = vi
+      .mocked(writeFileSync)
+      .mock.calls.find(([file]) => file === "/etc/systemd/system/portless.service");
+    expect(unitWrite?.[1]).toContain('Environment=PORTLESS_SERVICE_OPENSSL="/usr/bin/openssl"');
+  });
+
+  it("fails the install before changing anything when openssl cannot be resolved", async () => {
+    setPlatform("linux");
+    setGetuid(0);
+    vi.mocked(resolveOpensslBinary).mockImplementation(() => {
+      throw new Error("The portless service needs a working openssl binary.");
+    });
+    const runner = vi.fn(() => ({ status: 0, stdout: "", stderr: "" }));
+
+    await expect(
+      handleService(["service", "install"], { entryScript: "/fake/cli.js", runner })
+    ).rejects.toThrow("process.exit");
+
+    expect(errorSpy.mock.calls.flat().join(" ")).toContain("working openssl binary");
+    expect(runner).not.toHaveBeenCalled();
+    expect(writeFileSync).not.toHaveBeenCalled();
+  });
+
+  it("warns, but still installs, when the resolved openssl is user-writable", async () => {
+    setPlatform("linux");
+    setGetuid(0);
+    vi.mocked(findUserWritableLocation).mockReturnValue("/home/alice/bin");
+    const runner = vi.fn(() => ({ status: 0, stdout: "", stderr: "" }));
+
+    await handleService(["service", "install"], { entryScript: "/fake/cli.js", runner });
+
+    expect(warnSpy.mock.calls.flat().join(" ")).toContain("/home/alice/bin");
+    expect(
+      vi
+        .mocked(writeFileSync)
+        .mock.calls.some(([file]) => file === "/etc/systemd/system/portless.service")
+    ).toBe(true);
   });
 });
 
@@ -961,5 +1107,73 @@ describe("handleService", () => {
     expect(output).toContain("LAN IP: 192.168.1.42");
     expect(output).toContain("Wildcard: yes");
     expect(output).toContain("State directory: /srv/portless");
+  });
+
+  describe("pinned Node binary", () => {
+    function installLinuxUnit(nodePath: string, nodeExists: boolean) {
+      setPlatform("linux");
+      setGetuid(0);
+      const installedSpec = buildServiceSpec({
+        platform: "linux",
+        nodePath,
+        entryScript: "/fake/cli.js",
+        userHome: "/home/alice",
+        installConfig: { stateDir: "/srv/portless", proxyPort: 8443, useHttps: false },
+      });
+      if (installedSpec.platform !== "linux") throw new Error("Expected Linux service spec");
+      vi.mocked(existsSync).mockImplementation(
+        (file) => file === installedSpec.unitPath || (nodeExists && file === nodePath)
+      );
+      vi.mocked(readFileSync).mockImplementation((file) =>
+        file === installedSpec.unitPath ? installedSpec.unit : ""
+      );
+    }
+
+    const statusRunner = vi.fn((command: string, args: string[]) => ({
+      status: command === "systemctl" && args[0] === "is-active" ? 1 : 0,
+      stdout: "",
+      stderr: "",
+    }));
+
+    it("reports a missing pinned Node binary in service status", async () => {
+      installLinuxUnit("/home/alice/.nvm/versions/node/v24.0.0/bin/node", false);
+
+      await handleService(["service", "status"], {
+        entryScript: "/fake/cli.js",
+        runner: statusRunner,
+      });
+
+      const output = logSpy.mock.calls.map((c: unknown[]) => c.join(" ")).join("\n");
+      expect(output).toContain(
+        "Node binary: /home/alice/.nvm/versions/node/v24.0.0/bin/node (missing; re-run `portless service install`)"
+      );
+    });
+
+    it("prints the pinned Node binary without a warning when it exists", async () => {
+      installLinuxUnit("/usr/bin/node", true);
+
+      await handleService(["service", "status"], {
+        entryScript: "/fake/cli.js",
+        runner: statusRunner,
+      });
+
+      const output = logSpy.mock.calls.map((c: unknown[]) => c.join(" ")).join("\n");
+      expect(output).toContain("Node binary: /usr/bin/node");
+      expect(output).not.toContain("missing");
+    });
+
+    it("inspectInstalledServiceNode reads the definition back", () => {
+      installLinuxUnit("/opt/node/bin/node", false);
+      expect(inspectInstalledServiceNode()).toEqual({ path: "/opt/node/bin/node", exists: false });
+
+      installLinuxUnit("/opt/node/bin/node", true);
+      expect(inspectInstalledServiceNode()).toEqual({ path: "/opt/node/bin/node", exists: true });
+    });
+
+    it("inspectInstalledServiceNode returns undefined when nothing is installed", () => {
+      setPlatform("linux");
+      vi.mocked(existsSync).mockImplementation(() => false);
+      expect(inspectInstalledServiceNode()).toBeUndefined();
+    });
   });
 });

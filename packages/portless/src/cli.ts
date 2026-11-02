@@ -7,16 +7,26 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
-import { createSNICallback, ensureCerts, isCATrusted, trustCA, untrustCA } from "./certs.js";
+import {
+  createSNICallback,
+  ensureCerts,
+  isCATrusted,
+  nssCertutilMissingWarning,
+  trustCA,
+  untrustCA,
+} from "./certs.js";
 import { createHttpRedirectServer, createProxyServer } from "./proxy.js";
 import type { RouteProtocol, TunnelAlias, TunnelProviderName } from "./types.js";
 import {
   fixOwnership,
+  formatUptime,
   formatUrl,
   isErrnoException,
+  isProcessAlive,
   normalizePathPrefix,
   parseHostname,
   parseHostnames,
+  parsePort,
 } from "./utils.js";
 import { getUrl } from "./api.js";
 import {
@@ -25,7 +35,18 @@ import {
   shouldAutoSyncHosts,
   deduplicateHostnames,
 } from "./hosts.js";
-import { FILE_MODE, RouteConflictError, RouteStore, type RouteMapping } from "./routes.js";
+import {
+  generateHostsSyncToken,
+  removeHostsSyncToken,
+  writeHostsSyncToken,
+} from "./hosts-sync-auth.js";
+import {
+  FILE_MODE,
+  RouteConflictError,
+  RouteStore,
+  hasDeadRouteOwner,
+  type RouteMapping,
+} from "./routes.js";
 import { TunnelAliasStore, normalizeTunnelHostname } from "./tunnel-aliases.js";
 import {
   ensureTunnelProviderAvailable,
@@ -44,6 +65,7 @@ import {
   registerServe,
   unregisterTailscale,
   buildTailscaleServiceName,
+  type ServeScheme,
 } from "./tailscale.js";
 import { ensureNgrokAvailable, startNgrok, stopNgrok, stopNgrokProcess } from "./ngrok.js";
 import {
@@ -55,17 +77,26 @@ import {
 import {
   inferProjectName,
   applyWorktreePrefix,
+  buildPeerUrlEnv,
   detectWorktreePrefix,
   resolveWorktreeFlat,
   truncateLabel,
   sanitizeForHostname,
+  WorktreePrefixError,
 } from "./auto.js";
+import type { WorktreePrefix } from "./auto.js";
 import {
   buildProxyStartConfig,
   buildSudoEnvArgs,
+  canBindProxyPort,
+  canBindWithoutRoot,
+  isUnprivilegedEnvEnabled,
+  readUnprivilegedMarker,
+  writeUnprivilegedMarker,
   BLOCKED_PORTS,
   DEFAULT_TLD,
   FALLBACK_PROXY_PORT,
+  getProxyStatus,
   INTERNAL_LAN_IP_ENV,
   INTERNAL_LAN_IP_FLAG,
   PRIVILEGED_PORT_THRESHOLD,
@@ -73,22 +104,31 @@ import {
   WAIT_FOR_PROXY_INTERVAL_MS,
   WAIT_FOR_PROXY_MAX_ATTEMPTS,
   discoverState,
+  readPortFromDir,
+  appPortKey,
   findFreePort,
+  resolveAppPortAllocation,
   findPidOnPort,
   findPidsOnPort,
+  findSelfDaemonizedListener,
   getConfiguredTldEnv,
   getDefaultPort,
+  caRegeneratedRestartHint,
   getDefaultTlds,
+  formatMdnsUnavailableWarning,
   getProxyBindTargets,
   hasConfiguredTldEnv,
   hasPlaceholders,
   injectPackageScriptFrameworkFlags,
   injectFrameworkFlags,
+  hasHelpFlag,
   isHttpsEnvDisabled,
   isPortListening,
   isWildcardEnvEnabled,
   isLanEnvEnabled,
   isProxyRunning,
+  isStateDirProxyRunning,
+  isExplicitStateDirEmpty,
   isWindows,
   killTree,
   listenOnProxyInterface,
@@ -106,6 +146,9 @@ import {
   replacePlaceholders,
   resolveFrameworkBasename,
   spawnCommand,
+  getProcessStartTime,
+  guardWindowsOrphans,
+  killOrphanedProcessGroup,
   augmentedPath,
   parseTldList,
   syncHostsWithWarning,
@@ -118,6 +161,7 @@ import {
   writeTlsMarker,
   writeWildcardMarker,
 } from "./cli-utils.js";
+import type { AppPortAllocation } from "./cli-utils.js";
 import {
   attemptCATrustRemovalForCleanup,
   collectStateDirsForCleanup,
@@ -134,6 +178,7 @@ import {
 import {
   loadConfig,
   resolveAppConfig,
+  withRootAppPortDefaults,
   resolveScriptCommand,
   hasScript,
   isServerCommand,
@@ -142,7 +187,7 @@ import {
   loadPackagePortlessConfig,
   ConfigValidationError,
 } from "./config.js";
-import type { AppConfig } from "./config.js";
+import type { AppConfig, WorktreeBranchMode } from "./config.js";
 import { findWorkspaceRoot, discoverWorkspacePackages } from "./workspace.js";
 import type { WorkspacePackage } from "./workspace.js";
 import {
@@ -155,8 +200,9 @@ import {
 import type { ManifestEntry } from "./turbo.js";
 import { formatViteAllowedHosts } from "./vite.js";
 import { buildServiceUninstallSudoArgs, handleService, tryUninstallService } from "./service.js";
+import { runMcp } from "./mcp.js";
 import { handleBg, pruneBgEntriesForState, stopBgEntriesForState } from "./bg.js";
-import { cleanupRouteSharing } from "./route-cleanup.js";
+import { DeadOwnerSharingStopper, cleanupRouteSharing } from "./route-cleanup.js";
 import { PORTLESS_BG_ID_ENV, PORTLESS_BG_READY_PATH_ENV, writeBgReadyFile } from "./bg-ready.js";
 import {
   collectDoctorSnapshot,
@@ -171,6 +217,7 @@ type LoadedAppConfig = {
   config: AppConfig;
   sourceLabel: string;
   worktreeFlat?: boolean;
+  worktreeBranch?: WorktreeBranchMode;
 };
 
 // ---------------------------------------------------------------------------
@@ -178,6 +225,8 @@ type LoadedAppConfig = {
 // ---------------------------------------------------------------------------
 
 /** Display-friendly hosts file path. */
+const WHOLE_APP_TUNNEL_NOTICE =
+  "  Notice: the tunnel exposes the whole app, including paths outside the route prefix.";
 const HOSTS_DISPLAY = isWindows ? "hosts file" : "/etc/hosts";
 
 /** Debounce delay (ms) for reloading routes after a file change. */
@@ -185,6 +234,13 @@ const DEBOUNCE_MS = 100;
 
 /** Polling interval (ms) when fs.watch is unavailable. */
 const POLL_INTERVAL_MS = 3000;
+
+/**
+ * Interval (ms) at which the proxy daemon checks whether the owner of any
+ * served route has died, so a killed owner stops being served within about a
+ * second even though the routes file did not change.
+ */
+const OWNER_CHECK_INTERVAL_MS = 1000;
 
 /** Default interval (seconds) for the proxy's background stale-route sweep. */
 const DEFAULT_ROUTES_CLEANUP_INTERVAL_SECONDS = 300;
@@ -202,6 +258,7 @@ type ProxyConfigExplicitness = {
   lanIp: boolean;
   tld: boolean;
   useWildcard: boolean;
+  unprivileged: boolean;
 };
 
 type ProxyConfig = {
@@ -215,6 +272,7 @@ type ProxyConfig = {
   tlds: string[];
   tldsExplicit: boolean;
   useWildcard: boolean;
+  unprivileged: boolean;
 };
 
 function normalizeTlds(tlds: readonly string[]): string[] {
@@ -256,6 +314,7 @@ function defaultProxyConfig(
     tlds: effectiveTlds,
     tldsExplicit,
     useWildcard: false,
+    unprivileged: false,
   };
 }
 
@@ -271,6 +330,7 @@ function resolveProxyConfig(options: {
   lanIp: string | null;
   tlds: string[];
   useWildcard: boolean;
+  unprivileged: boolean;
 }): ProxyConfig {
   const config = defaultProxyConfig(
     options.defaultTlds,
@@ -278,6 +338,8 @@ function resolveProxyConfig(options: {
     options.explicit.lanMode ? options.lanMode : options.persistedLanMode,
     options.explicit.tld
   );
+  config.unprivileged = options.unprivileged;
+  if (config.unprivileged && !options.explicit.useHttps) config.useHttps = false;
   config.useWildcard = options.explicit.useWildcard
     ? options.useWildcard
     : !!options.persistedUseWildcard;
@@ -358,6 +420,7 @@ function readCurrentProxyConfig(dir: string): ProxyConfig {
     tlds,
     tldsExplicit: true,
     useWildcard: readWildcardMarker(dir),
+    unprivileged: readUnprivilegedMarker(dir),
   };
 }
 
@@ -367,6 +430,10 @@ function getProxyConfigMismatchMessages(
   explicit: ProxyConfigExplicitness
 ): string[] {
   const messages: string[] = [];
+
+  if (explicit.unprivileged && desiredConfig.unprivileged !== actualConfig.unprivileged) {
+    messages.push("requested unprivileged mode differs from the running proxy");
+  }
 
   if (explicit.lanMode && desiredConfig.lanMode !== actualConfig.lanMode) {
     messages.push(
@@ -411,8 +478,23 @@ function getProxyConfigMismatchMessages(
   return messages;
 }
 
+function needsHostsPrivileges(config: ProxyConfig): boolean {
+  return (
+    shouldAutoSyncHosts(process.env.PORTLESS_SYNC_HOSTS) &&
+    config.tlds.some((suffix) => suffix !== DEFAULT_TLD && !(config.lanMode && suffix === "local"))
+  );
+}
+
+/** How to avoid sudo when only the file sync needs root, not the port. */
+function formatRootSkipHint(proxyPort: number): string {
+  return `(Port ${proxyPort} does not need root, so a different port will not skip sudo. To skip it, set PORTLESS_SYNC_HOSTS=0, pass --unprivileged, or use the default .${DEFAULT_TLD} suffix)`;
+}
+
 function formatProxyStartCommand(proxyPort: number, config: ProxyConfig): string {
-  const needsSudo = !isWindows && proxyPort < PRIVILEGED_PORT_THRESHOLD;
+  const needsSudo =
+    !config.unprivileged &&
+    !isWindows &&
+    (needsHostsPrivileges(config) || proxyPort < PRIVILEGED_PORT_THRESHOLD);
   const { args } = buildProxyStartConfig({
     useHttps: config.useHttps,
     customCertPath: config.customCertPath,
@@ -424,6 +506,7 @@ function formatProxyStartCommand(proxyPort: number, config: ProxyConfig): string
     tlds: config.tlds,
     tldsExplicit: config.tldsExplicit,
     useWildcard: config.useWildcard,
+    unprivileged: config.unprivileged,
     includePort: proxyPort !== getDefaultPort(config.useHttps),
     proxyPort,
   });
@@ -647,12 +730,120 @@ function removeRoutes(
   }
 }
 
+/**
+ * Stop dev servers left running by portless sessions that died without
+ * cleanup (SIGKILL, crash). Their routes keep the recorded process group, the
+ * only link to the orphaned tree; the group is signaled only while its leader
+ * still has the start time recorded at spawn. Called before a new route
+ * registers, because registration drops dead-owner routes.
+ */
+function stopOrphanedProcessGroups(store: RouteStore): void {
+  const seen = new Set<number>();
+  for (const route of store.loadOrphanedRoutes()) {
+    const pgid = route.childPgid;
+    if (!pgid || seen.has(pgid)) continue;
+    seen.add(pgid);
+    if (killOrphanedProcessGroup(pgid, route.childStartTime)) {
+      console.log(
+        colors.yellow(`Stopped orphaned dev server from a previous session (process group ${pgid})`)
+      );
+    }
+  }
+}
+
+/**
+ * Record the process group portless spawned for these routes, with its
+ * leader's start time, so a later `run` or `prune` can stop the tree if this
+ * process dies without cleanup. Unix only: Windows has no process groups.
+ */
+function recordChildProcessGroup(
+  store: RouteStore,
+  hostnames: readonly string[],
+  pgid: number,
+  options: Pick<RouteRegistrationOptions, "pathPrefix" | "label">
+): void {
+  if (isWindows) return;
+  const childStartTime = getProcessStartTime(pgid) ?? undefined;
+  for (const hostname of hostnames) {
+    try {
+      store.updateRoute(hostname, { childPgid: pgid, childStartTime }, options);
+    } catch {
+      // Without the group, prune falls back to the route port; non-fatal.
+    }
+  }
+}
+
+/** PIDs already listening on a port before a command is spawned. */
+async function findPreexistingListeners(port: number): Promise<number[]> {
+  return (await isPortListening(port)) ? findPidsOnPort(port) : [];
+}
+
+/**
+ * Keep routes served when the command self-daemonized: its launcher exited
+ * (on its own, not by a signal) but a new listener is on the assigned port,
+ * as `astro dev` does when it detects an agent. The routes move to that
+ * listener's pid, so the proxy keeps serving them and the owner check drops
+ * them when it exits. A listener that held the port before the command ran is
+ * not the command's daemon, so its routes are left to the normal cleanup.
+ * Nothing is signaled: identity is only "whoever listens on the port portless
+ * assigned", never a kill target. Sharing the exit cleanup tears down is
+ * cleared from the route (see RouteStore.transferRoute). Issue #411.
+ */
+async function transferRoutesToDaemon(
+  store: RouteStore,
+  hostnames: readonly string[],
+  port: number,
+  processGroupId: number | undefined,
+  preexistingPids: readonly number[],
+  exitedCleanly: boolean,
+  options: Pick<RouteRegistrationOptions, "pathPrefix" | "label"> = {}
+): Promise<void> {
+  const listenerPid = await findSelfDaemonizedListener(
+    port,
+    processGroupId,
+    EXIT_TIMEOUT_MS,
+    exitedCleanly,
+    preexistingPids
+  );
+  if (listenerPid === null) return;
+  let transferred = false;
+  let hadSharing = false;
+  for (const hostname of hostnames) {
+    try {
+      const result = store.transferRoute(hostname, process.pid, listenerPid, options);
+      if (result) {
+        transferred = true;
+        hadSharing = hadSharing || result.hadSharing;
+      }
+    } catch {
+      // Lock acquisition may fail during cleanup; the exit cleanup removes the route.
+    }
+  }
+  if (!transferred) return;
+  console.warn(
+    colors.yellow(
+      `Command exited but PID ${listenerPid} is still serving port ${port}. Keeping ${hostnames[0]} routed to it. Stop it with: kill ${listenerPid}`
+    )
+  );
+  if (hadSharing) {
+    console.warn(colors.yellow("Sharing stops with this command; the route is local only."));
+  }
+}
+
 /** Warn on this terminal when a registered route still has no resolution. */
-function reportHostsSyncHere(hostnames: string[], lanMode: boolean): Promise<void> {
-  return reportHostsSync(hostnames, lanMode, (message) => console.warn(colors.yellow(message)));
+function reportHostsSyncHere(
+  hostnames: string[],
+  port: number,
+  tls: boolean,
+  lanMode: boolean
+): Promise<void> {
+  return reportHostsSync(hostnames, port, tls, lanMode, (message) =>
+    console.warn(colors.yellow(message))
+  );
 }
 
 function resetProxyRuntimeMarkers(dir: string): void {
+  removeHostsSyncToken(dir);
   writeTlsMarker(dir, false);
   writeCustomCertMarker(dir, false);
   writeInternalPagesDisabledMarker(dir, false);
@@ -701,22 +892,30 @@ function startProxyServer(
   tlsOptions?: { cert: Buffer; key: Buffer },
   lanIp?: string | null,
   strict?: boolean,
-  lanMode = false,
-  customCert = false,
-  routesCleanupIntervalSeconds = DEFAULT_ROUTES_CLEANUP_INTERVAL_SECONDS
+  {
+    lanMode = false,
+    customCert = false,
+    unprivileged = false,
+    routesCleanupIntervalSeconds = DEFAULT_ROUTES_CLEANUP_INTERVAL_SECONDS,
+  }: {
+    lanMode?: boolean;
+    customCert?: boolean;
+    unprivileged?: boolean;
+    routesCleanupIntervalSeconds?: number;
+  } = {}
 ): void {
   store.ensureDir();
 
   const isTls = !!tlsOptions;
   const mdnsSupport = isMdnsSupported();
   let activeLanIp = lanIp && mdnsSupport.supported ? lanIp : null;
-  const bindTargets = getProxyBindTargets(lanMode);
+  const bindTargets = getProxyBindTargets(lanMode, unprivileged);
   const primaryBindTarget = bindTargets[0]!;
   const lanIpPinned = !!process.env.PORTLESS_LAN_IP;
   let lanMonitor: ReturnType<typeof startLanIpMonitor> | null = null;
   if (lanIp && !mdnsSupport.supported) {
     const reason = mdnsSupport.reason ?? "mDNS publishing is not supported on this platform.";
-    console.warn(chalk.yellow(`LAN mode disabled: ${reason}`));
+    console.warn(chalk.yellow(formatMdnsUnavailableWarning(reason)));
   }
 
   // Create empty routes file if it doesn't exist
@@ -732,20 +931,40 @@ function startProxyServer(
   fixOwnership(routesPath);
 
   // Cache routes in memory and reload on file change (debounced)
+  const tunnelAliasStore = new TunnelAliasStore(store.dir);
   let cachedRoutes = store.loadRoutes();
+  let cachedOrphanedRoutes = store.loadOrphanedRoutes();
+  let cachedTunnelAliases = tunnelAliasStore.loadAliases();
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;
   let watcher: fs.FSWatcher | null = null;
   let pollingInterval: ReturnType<typeof setInterval> | null = null;
   let routesCleanupInterval: ReturnType<typeof setInterval> | null = null;
-  const tunnelAliasStore = new TunnelAliasStore(store.dir);
+  let ownerCheckInterval: ReturnType<typeof setInterval> | null = null;
 
-  const autoSyncHosts = shouldAutoSyncHosts(process.env.PORTLESS_SYNC_HOSTS);
+  const autoSyncHosts = !unprivileged && shouldAutoSyncHosts(process.env.PORTLESS_SYNC_HOSTS);
+  const hostsSyncToken = generateHostsSyncToken();
   let hostsSyncWarned = false;
 
   const syncHostsAndLatch = (hostnames: string[]): void => {
     hostsSyncWarned = syncHostsWithWarning(hostnames, hostsSyncWarned, () =>
       console.warn(colors.yellow(`Could not write ${HOSTS_DISPLAY} for route hostnames.`))
     );
+  };
+
+  // Answers the authenticated hosts-sync endpoint: a registering CLI asks the
+  // daemon to write the managed block now instead of waiting for the watcher.
+  // Reads the routes file, not the cache, because the request can arrive before
+  // the debounced reload has run.
+  const onHostsSyncRequest = (): "acted" | "disabled" => {
+    if (!autoSyncHosts) return "disabled";
+    let hostnames: string[];
+    try {
+      hostnames = store.loadRoutes().map((route) => route.hostname);
+    } catch {
+      hostnames = cachedRoutes.map((route) => route.hostname);
+    }
+    syncHostsAndLatch(deduplicateHostnames(hostnames));
+    return "acted";
   };
 
   const onMdnsError = (msg: string) => console.warn(chalk.yellow(msg));
@@ -784,6 +1003,7 @@ function startProxyServer(
         deduplicateHostnames(cachedRoutes.map((route) => route.hostname))
       );
       cachedRoutes = store.loadRoutes();
+      cachedOrphanedRoutes = store.loadOrphanedRoutes();
       const currentHostnames = new Set(
         deduplicateHostnames(cachedRoutes.map((route) => route.hostname))
       );
@@ -808,8 +1028,17 @@ function startProxyServer(
     }
   };
 
+  const reloadTunnelAliases = () => {
+    try {
+      cachedTunnelAliases = tunnelAliasStore.loadAliases();
+    } catch {
+      // File may be mid-write; keep the existing cached aliases
+    }
+  };
+
   try {
     const routesFilename = path.basename(routesPath);
+    const aliasesFilename = path.basename(tunnelAliasStore.getAliasesPath());
     // Canonicalize the watched directory: on Windows, watching an 8.3
     // short-path spelling (e.g. RUNNER~1) makes libuv assert in fs-event.c
     // when events arrive under the long name, aborting the process.
@@ -820,21 +1049,51 @@ function startProxyServer(
       // Fall back to the configured spelling if the path cannot be resolved
     }
     watcher = fs.watch(watchDir, (_eventType, filename) => {
-      if (filename && filename.toString() !== routesFilename) return;
+      const name = filename?.toString();
+      if (name && name !== routesFilename && name !== aliasesFilename) return;
       if (debounceTimer) clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(reloadRoutes, DEBOUNCE_MS);
+      debounceTimer = setTimeout(() => {
+        reloadRoutes();
+        reloadTunnelAliases();
+      }, DEBOUNCE_MS);
     });
   } catch {
     // fs.watch may not be supported; fall back to periodic polling
     console.warn(colors.yellow("fs.watch unavailable; falling back to polling for route changes"));
-    pollingInterval = setInterval(reloadRoutes, POLL_INTERVAL_MS);
+    pollingInterval = setInterval(() => {
+      reloadRoutes();
+      reloadTunnelAliases();
+    }, POLL_INTERVAL_MS);
   }
+
+  // A SIGKILLed owner never touches the routes file, so no watcher event fires
+  // and the cache would keep serving its route. Probe each cached owner with
+  // signal 0 and reload the in-memory routes when one has died. loadRoutes
+  // drops the dead owner from the routable set, and loadOrphanedRoutes moves it
+  // to the dashboard's orphan list. An owner that exited cleanly took its
+  // sharing down itself; after a SIGKILL its tunnel, Tailscale serve and
+  // NetBird helpers would keep the route public, so stop them once per death.
+  // That signals sharing helpers only, never the dev server (the never-kill
+  // rule), and writes nothing, so the sweep below stays the only writer.
+  const deadOwnerSharing = new DeadOwnerSharingStopper((route) =>
+    cleanupRouteSharing(route, { tunnelAliasStore })
+  );
+  ownerCheckInterval = setInterval(() => {
+    if (!hasDeadRouteOwner(cachedRoutes)) return;
+    deadOwnerSharing.stopForDeadOwners(cachedRoutes);
+    reloadRoutes();
+  }, OWNER_CHECK_INTERVAL_MS).unref();
 
   if (routesCleanupIntervalSeconds > 0) {
     routesCleanupInterval = setInterval(() => {
       try {
-        const staleRoutes = store.pruneStaleRoutes();
+        // Never kill here. A dead-owner route whose spawned process group still
+        // runs stays on file, marked orphaned, until the next run or prune.
+        const staleRoutes = store.pruneStaleRoutes({ keepOrphaned: true });
         for (const route of staleRoutes) {
+          // The owner check already stopped this route's sharing; its pids may
+          // have been reused since, so do not signal them a second time.
+          if (deadOwnerSharing.consume(route)) continue;
           try {
             cleanupRouteSharing(route, { tunnelAliasStore });
           } catch {
@@ -886,15 +1145,19 @@ function startProxyServer(
   const createServer = () =>
     createProxyServer({
       getRoutes: () => cachedRoutes,
-      getTunnelAliases: () => new TunnelAliasStore(store.dir).loadAliases(),
+      getOrphanedRoutes: () => cachedOrphanedRoutes,
+      getTunnelAliases: () => cachedTunnelAliases,
       proxyPort,
       tld,
       tlds,
       strict,
+      loopbackOnly: unprivileged && !lanMode,
       onError: (msg) => console.error(colors.red(msg)),
       tls: tlsOptions,
       internalPages: process.env.PORTLESS_DASHBOARD !== "0",
       getCaTrusted,
+      onHostsSyncRequest,
+      hostsSyncToken,
     });
   const server = createServer();
   const additionalServers = new Set<ReturnType<typeof createProxyServer>>();
@@ -964,7 +1227,7 @@ function startProxyServer(
   // proxy on 443 still works; users just won't get automatic redirects).
   if (isTls && proxyPort !== 80) {
     for (const bindTarget of bindTargets) {
-      const redirectServer = createHttpRedirectServer(proxyPort);
+      const redirectServer = createHttpRedirectServer(proxyPort, unprivileged && !lanMode);
       redirectServers.add(redirectServer);
       redirectServer.on("error", () => {
         redirectServers.delete(redirectServer);
@@ -980,10 +1243,14 @@ function startProxyServer(
   }
 
   listenOnProxyInterface(server, proxyPort, primaryBindTarget, () => {
+    if (!writeHostsSyncToken(store.dir, hostsSyncToken)) {
+      console.warn(colors.yellow("Could not publish hosts sync authorization."));
+    }
     // Save PID and port once the server is actually listening
     fs.writeFileSync(store.pidPath, process.pid.toString(), { mode: FILE_MODE });
     fs.writeFileSync(store.portFilePath, proxyPort.toString(), { mode: FILE_MODE });
     writeTlsMarker(store.dir, isTls);
+    writeUnprivilegedMarker(store.dir, unprivileged);
     writeCustomCertMarker(store.dir, isTls && customCert);
     writeInternalPagesDisabledMarker(store.dir, process.env.PORTLESS_DASHBOARD === "0");
     writeTldsFile(store.dir, tlds);
@@ -1023,24 +1290,29 @@ function startProxyServer(
     if (debounceTimer) clearTimeout(debounceTimer);
     if (pollingInterval) clearInterval(pollingInterval);
     if (routesCleanupInterval) clearInterval(routesCleanupInterval);
+    if (ownerCheckInterval) clearInterval(ownerCheckInterval);
     if (lanMonitor) lanMonitor.stop();
     if (watcher) {
       watcher.close();
     }
     if (activeLanIp) cleanupMdns();
     closeAuxiliaryServers();
-    try {
-      fs.unlinkSync(store.pidPath);
-    } catch {
-      // PID file may already be removed; non-fatal
+    // Older versions let a second proxy take over this state directory. Leave
+    // the state alone when proxy.pid names that other proxy.
+    if ((readProxyPid(store.pidPath) ?? process.pid) === process.pid) {
+      try {
+        fs.unlinkSync(store.pidPath);
+      } catch {
+        // PID file may already be removed; non-fatal
+      }
+      try {
+        fs.unlinkSync(store.portFilePath);
+      } catch {
+        // Port file may already be removed; non-fatal
+      }
+      resetProxyRuntimeMarkers(store.dir);
+      if (autoSyncHosts) cleanHostsFile();
     }
-    try {
-      fs.unlinkSync(store.portFilePath);
-    } catch {
-      // Port file may already be removed; non-fatal
-    }
-    resetProxyRuntimeMarkers(store.dir);
-    if (autoSyncHosts) cleanHostsFile();
     server.close(() => process.exit(0));
     // Force exit after a short timeout in case connections don't drain
     setTimeout(() => process.exit(0), EXIT_TIMEOUT_MS).unref();
@@ -1077,25 +1349,61 @@ function sudoStopOrHint(port: number): void {
   }
 }
 
+function readProxyPid(pidPath: string): number | null {
+  try {
+    const pid = parseInt(fs.readFileSync(pidPath, "utf-8"), 10);
+    return isNaN(pid) ? null : pid;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Port of the live proxy that the state files track, when it is not `port`.
+ * That proxy owns the state files, so work on `port` must not touch them.
+ * A tracked proxy counts as live only when its PID is alive and its port is
+ * answering, so stale files cannot block a start or redirect a stop.
+ */
+async function findOtherTrackedProxyPort(store: RouteStore, port: number): Promise<number | null> {
+  const trackedPort = readPortFromDir(store.dir);
+  if (trackedPort === null || trackedPort === port) return null;
+  const pid = readProxyPid(store.pidPath);
+  if (pid === null || !isProcessAlive(pid)) return null;
+  const serving =
+    (await isProxyRunning(trackedPort)) ||
+    (!!process.env.PORTLESS_STATE_DIR && (await isPortListening(trackedPort)));
+  return serving ? trackedPort : null;
+}
+
 async function stopProxy(store: RouteStore, proxyPort: number, _tls: boolean): Promise<void> {
   const pidPath = store.pidPath;
+  const otherTrackedPort = await findOtherTrackedProxyPort(store, proxyPort);
 
-  if (!fs.existsSync(pidPath)) {
-    // PID file is missing; check whether something is still listening.
+  if (!fs.existsSync(pidPath) || otherTrackedPort !== null) {
+    // The PID file is missing or belongs to another proxy; check whether
+    // something is still listening on the requested port.
     // Use plain HTTP: the TLS proxy accepts it via byte-peeking, and this
     // avoids false negatives from TLS handshake timeouts.
     if (await isProxyRunning(proxyPort)) {
-      console.log(colors.yellow(`PID file is missing but port ${proxyPort} is still in use.`));
+      console.log(
+        colors.yellow(
+          otherTrackedPort === null
+            ? `PID file is missing but port ${proxyPort} is still in use.`
+            : `PID file tracks the proxy on port ${otherTrackedPort}; leaving it running.`
+        )
+      );
       const pid = findPidOnPort(proxyPort);
       if (pid !== null) {
         try {
           process.kill(pid, "SIGTERM");
-          try {
-            fs.unlinkSync(store.portFilePath);
-          } catch {
-            // Port file may already be absent; non-fatal
+          if (otherTrackedPort === null) {
+            try {
+              fs.unlinkSync(store.portFilePath);
+            } catch {
+              // Port file may already be absent; non-fatal
+            }
+            resetProxyRuntimeMarkers(store.dir);
           }
-          resetProxyRuntimeMarkers(store.dir);
           console.log(colors.green(`Killed process ${pid}. Proxy stopped.`));
         } catch (err: unknown) {
           if (isErrnoException(err) && err.code === "EPERM") {
@@ -1232,8 +1540,20 @@ function listRoutes(
   aliases: TunnelAlias[] = []
 ): void {
   const routes = store.loadRoutes();
+  const orphaned = store.loadOrphanedRoutes();
 
   if (asJson) {
+    const orphanPayload = orphaned.map((route) => ({
+      hostname: route.hostname,
+      url: formatUrl(route.hostname, proxyPort, tls, route.pathPrefix),
+      target_port: route.port,
+      path_prefix: normalizePathPrefix(route.pathPrefix),
+      upstream_protocol: route.protocol ?? "http1",
+      pid: route.pid,
+      kind: "orphan",
+      orphaned: true,
+      process_group: route.childPgid,
+    }));
     const payload = routes.map((route) => {
       const pathPrefix = normalizePathPrefix(route.pathPrefix);
       const routeAliases = aliasesForRoute(aliases, route.hostname, pathPrefix);
@@ -1245,6 +1565,7 @@ function listRoutes(
         upstream_protocol: route.protocol ?? "http1",
         pid: route.pid,
         kind: route.pid === 0 ? "alias" : "app",
+        ...(typeof route.registeredAt === "number" ? { registered_at: route.registeredAt } : {}),
         ...(route.tailscaleUrl
           ? { tailscale_url: formatSharedUrl(route.tailscaleUrl, pathPrefix) }
           : {}),
@@ -1267,14 +1588,14 @@ function listRoutes(
         ...(route.netbirdUrl ? { netbird_url: formatSharedUrl(route.netbirdUrl, pathPrefix) } : {}),
       };
     });
-    process.stdout.write(JSON.stringify(payload, null, 2) + "\n");
+    process.stdout.write(JSON.stringify([...payload, ...orphanPayload], null, 2) + "\n");
     return;
   }
 
   if (routes.length === 0) {
     console.log(colors.yellow("No active routes."));
     console.log(colors.gray("Start an app with: portless <name> <command>"));
-    if (aliases.length === 0) return;
+    if (aliases.length === 0 && orphaned.length === 0) return;
   } else {
     console.log(colors.blue.bold("\nActive routes:\n"));
   }
@@ -1283,13 +1604,18 @@ function listRoutes(
     const pathPrefix = normalizePathPrefix(route.pathPrefix);
     const url = formatUrl(route.hostname, proxyPort, tls, pathPrefix);
     const label = route.pid === 0 ? "(alias)" : `(pid ${route.pid})`;
+    const uptime = route.pid === 0 ? null : formatUptime(route.registeredAt, Date.now());
     const targetPath = pathPrefix === "/" ? "" : pathPrefix;
     const target = `localhost:${route.port}${targetPath}${route.protocol === "h2c" ? " (h2c)" : ""}`;
     console.log(
-      `  ${colors.cyan(url)}  ${colors.gray("->")}  ${colors.white(target)}  ${colors.gray(label)}`
+      `  ${colors.cyan(url)}  ${colors.gray("->")}  ${colors.white(target)}  ${colors.gray(label)}${uptime ? ` ${colors.gray(`up ${uptime}`)}` : ""}`
     );
     if (route.tailscaleUrl) {
-      const tsLabel = route.tailscaleFunnel ? "funnel" : "tailscale";
+      const tsLabel = route.tailscaleFunnel
+        ? "funnel"
+        : route.tailscaleHttp
+          ? "tailscale http"
+          : "tailscale";
       console.log(
         `    ${colors.gray(tsLabel + ":")} ${colors.green(formatSharedUrl(route.tailscaleUrl, pathPrefix))}`
       );
@@ -1315,6 +1641,19 @@ function listRoutes(
         `    ${colors.gray("netbird:")} ${colors.green(formatSharedUrl(route.netbirdUrl, pathPrefix))}`
       );
     }
+  }
+  if (orphaned.length > 0) {
+    console.log(colors.yellow("\nOrphaned (owner exited, dev server still running):\n"));
+    for (const route of orphaned) {
+      const pathPrefix = normalizePathPrefix(route.pathPrefix);
+      const url = formatUrl(route.hostname, proxyPort, tls, pathPrefix);
+      console.log(
+        `  ${colors.cyan(url)}  ${colors.gray("->")}  ${colors.white(`localhost:${route.port}`)}  ${colors.gray(`(was pid ${route.pid}, process group ${route.childPgid})`)}`
+      );
+    }
+    console.log(
+      colors.gray("  Run portless prune to stop them, or start the app again with portless run.")
+    );
   }
   if (aliases.length > 0) {
     console.log(colors.blue.bold("\nTunnel aliases:\n"));
@@ -1342,6 +1681,7 @@ function resolveProxyDesiredState(lanMode: boolean): ProxyDesiredState {
   const envTlds = getDefaultTlds();
   const explicit: ProxyConfigExplicitness = {
     useHttps: process.env.PORTLESS_HTTPS !== undefined,
+    unprivileged: process.env.PORTLESS_UNPRIVILEGED !== undefined,
     customCert: false,
     lanMode: process.env.PORTLESS_LAN !== undefined,
     lanIp: process.env.PORTLESS_LAN_IP !== undefined,
@@ -1359,6 +1699,10 @@ function resolveProxyDesiredState(lanMode: boolean): ProxyDesiredState {
     lanIp: process.env.PORTLESS_LAN_IP || null,
     tlds: envTlds,
     useWildcard: isWildcardEnvEnabled(),
+    unprivileged:
+      process.env.PORTLESS_UNPRIVILEGED !== undefined
+        ? isUnprivilegedEnvEnabled()
+        : readUnprivilegedMarker(resolveStateDir()),
   });
   return { explicit, desiredConfig, envTlds };
 }
@@ -1375,9 +1719,12 @@ async function ensureProxyRunning(
 ): Promise<EnsureProxyResult> {
   const { explicit, desiredConfig } = desired;
 
-  const proxyResponsive = await isProxyRunning(proxyPort, tls);
+  // An explicit state dir without a port file has no proxy; never probe the
+  // default port on its behalf.
+  const isolatedEmpty = isExplicitStateDirEmpty();
+  const proxyResponsive = !isolatedEmpty && (await isProxyRunning(proxyPort, tls));
   const proxyListeningFromStateDir =
-    !!process.env.PORTLESS_STATE_DIR && (await isPortListening(proxyPort));
+    !isolatedEmpty && !!process.env.PORTLESS_STATE_DIR && (await isPortListening(proxyPort));
 
   if (proxyResponsive || proxyListeningFromStateDir) {
     return { started: false };
@@ -1409,7 +1756,12 @@ async function ensureProxyRunning(
   }
 
   const effectivePort = startPort ?? getDefaultPort(startConfig.useHttps);
-  const needsSudo = !isWindows && effectivePort < PRIVILEGED_PORT_THRESHOLD;
+  const needsSudo =
+    !startConfig.unprivileged &&
+    !isWindows &&
+    (process.getuid?.() ?? -1) !== 0 &&
+    (needsHostsPrivileges(startConfig) ||
+      !(await canBindProxyPort(effectivePort, getProxyBindTargets(startConfig.lanMode))));
   const manualStartCommand = formatProxyStartCommand(effectivePort, startConfig);
   const fallbackStartCommand = formatProxyStartCommand(FALLBACK_PROXY_PORT, startConfig);
 
@@ -1440,6 +1792,7 @@ async function ensureProxyRunning(
     tlds: startConfig.tlds,
     tldsExplicit: startConfig.tldsExplicit,
     useWildcard: startConfig.useWildcard,
+    unprivileged: startConfig.unprivileged,
     includePort: startPort !== undefined,
     proxyPort: startPort,
     routesCleanupIntervalSeconds: resolveRoutesCleanupIntervalSeconds([]),
@@ -1496,7 +1849,8 @@ async function runApp(
   childEnv: Record<string, string> = {},
   protocol?: RouteProtocol,
   pathPrefix?: string,
-  tunnel?: ManagedTunnelOptions
+  tunnel?: ManagedTunnelOptions,
+  allocation: AppPortAllocation = resolveAppPortAllocation(null)
 ) {
   let store = initialStore;
   console.log(chalk.blue.bold(`\nportless\n`));
@@ -1508,6 +1862,25 @@ async function runApp(
     isEnabledEnv(process.env.PORTLESS_TAILSCALE_SERVICE) ||
     !!process.env.PORTLESS_TAILSCALE_SERVICE_NAME;
   const wantsPlainTailscale = isEnabledEnv(process.env.PORTLESS_TAILSCALE);
+  const wantsTailscaleHttp = isEnabledEnv(process.env.PORTLESS_TAILSCALE_HTTP);
+  if (wantsTailscaleHttp && wantsFunnel) {
+    console.error(colors.red("Error: --tailscale-http cannot be combined with --funnel."));
+    console.error(
+      colors.blue(
+        "Funnel serves the public internet over TLS and has no plain-HTTP mode. Use one or the other."
+      )
+    );
+    process.exit(1);
+  }
+  if (wantsTailscaleHttp && wantsTailscaleService) {
+    console.error(
+      colors.red("Error: --tailscale-http cannot be combined with --tailscale-service.")
+    );
+    console.error(
+      colors.blue("Tailscale Services are HTTPS-only and need MagicDNS. Use one or the other.")
+    );
+    process.exit(1);
+  }
   if (wantsTailscaleService && wantsFunnel) {
     console.error(colors.red("Error: --tailscale-service cannot be combined with --funnel."));
     process.exit(1);
@@ -1516,7 +1889,9 @@ async function runApp(
     console.error(colors.red("Error: --tailscale-service cannot be combined with --tailscale."));
     process.exit(1);
   }
-  const wantsTailscale = wantsFunnel || wantsPlainTailscale || wantsTailscaleService;
+  const wantsTailscale =
+    wantsFunnel || wantsPlainTailscale || wantsTailscaleService || wantsTailscaleHttp;
+  const tailscaleScheme: ServeScheme = wantsTailscaleHttp ? "http" : "https";
   const wantsNgrok = isEnabledEnv(process.env.PORTLESS_NGROK);
   const requestedTunnel = tunnel ?? tunnelFromEnv();
   const wantsNetbird = isEnabledEnv(process.env.PORTLESS_NETBIRD) || hasNetbirdConfigEnv();
@@ -1532,7 +1907,9 @@ async function runApp(
     try {
       const tsReady = ensureTailscaleReady({
         requireFunnel: wantsFunnel,
-        requireHttps: true,
+        requireService: wantsTailscaleService,
+        requireHttps: !wantsTailscaleHttp,
+        scheme: tailscaleScheme,
       });
       tsBaseUrl = tsReady.baseUrl;
       tsTailnetDnsSuffix = tsReady.tailnetDnsSuffix;
@@ -1541,7 +1918,10 @@ async function runApp(
       console.error(colors.red(`Error: ${message}`));
       if (message.includes("not found")) {
         console.error(colors.blue("Install Tailscale: https://tailscale.com/download"));
-      } else if (!message.includes("not enabled on your tailnet")) {
+      } else if (
+        !message.includes("not enabled on your tailnet") &&
+        !message.includes("MagicDNS is disabled")
+      ) {
         console.error(colors.blue("Make sure Tailscale is connected:"));
         console.error(colors.cyan("  tailscale up"));
       }
@@ -1639,10 +2019,6 @@ async function runApp(
     console.log(chalk.gray("-- Proxy is running"));
   }
 
-  const tunnelAliasStore = new TunnelAliasStore(stateDir, {
-    onWarning: (msg) => console.warn(colors.yellow(msg)),
-  });
-
   // Compute hostname after auto-start so tld reflects the running proxy
   // (e.g. --lan changes tld from "localhost" to "local")
   const hostnames = buildHostnames(name, tlds);
@@ -1677,17 +2053,30 @@ async function runApp(
     }
   }
 
-  const port = desiredPort ?? (await findFreePort());
+  const port =
+    desiredPort ??
+    (await findFreePort(allocation.range[0], allocation.range[1], {
+      strategy: allocation.strategy,
+      key: appPortKey(name, routePathPrefix),
+      exclude: registeredPorts(store, hostnames, routePathPrefix),
+    }));
   if (desiredPort) {
     console.log(colors.green(`-- Using port ${port} (fixed)`));
-  } else {
+  } else if (allocation.strategy === "random") {
     console.log(colors.green(`-- Using port ${port}`));
+  } else {
+    console.log(
+      colors.green(
+        `-- Using port ${port} (${allocation.strategy} in ${allocation.range[0]}-${allocation.range[1]})`
+      )
+    );
   }
 
   // Register route (--force kills the existing owner if any)
   for (const [index, configuredHostname] of hostnames.entries()) {
     assertNotReservedHostname(configuredHostname, tlds[index]!);
   }
+  stopOrphanedProcessGroups(store);
   let killedPids: number[];
   try {
     killedPids = addRoutes(store, hostnames, port, process.pid, force, {
@@ -1702,7 +2091,7 @@ async function runApp(
     }
     throw err;
   }
-  await reportHostsSyncHere(hostnames, lanMode);
+  await reportHostsSyncHere(hostnames, proxyPort, tls, lanMode);
   for (const killedPid of killedPids) {
     console.log(colors.yellow(`Killed existing process (PID ${killedPid})`));
   }
@@ -1732,7 +2121,6 @@ async function runApp(
   let ngrokProcess: Awaited<ReturnType<typeof startNgrok>> | undefined;
   let tunnelUrl: string | undefined;
   let managedTunnel: TunnelInstance | undefined;
-  let managedTunnelExternalHostname: string | undefined;
   let stoppingNetbird = false;
   let netbirdRouteReady = false;
   let netbirdExitHandled = false;
@@ -1836,13 +2224,6 @@ async function runApp(
     } catch {
       // Best-effort cleanup; non-fatal
     }
-    if (managedTunnelExternalHostname) {
-      try {
-        tunnelAliasStore.removeManagedAlias(managedTunnelExternalHostname, process.pid);
-      } catch {
-        // Best-effort cleanup; non-fatal
-      }
-    }
   };
 
   if (wantsTailscaleService && tsTailnetDnsSuffix) {
@@ -1890,12 +2271,16 @@ async function runApp(
     const maxAttempts = 3;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const usedPorts = getUsedServePorts();
-      tailscaleHttpsPort = findAvailableServePort(usedPorts, wantsFunnel ? "funnel" : "serve");
+      tailscaleHttpsPort = findAvailableServePort(
+        usedPorts,
+        wantsFunnel ? "funnel" : "serve",
+        tailscaleScheme
+      );
       try {
         if (wantsFunnel) {
           registerFunnel(port, tailscaleHttpsPort);
         } else {
-          registerServe(port, tailscaleHttpsPort);
+          registerServe(port, tailscaleHttpsPort, { scheme: tailscaleScheme });
         }
         break;
       } catch (err: unknown) {
@@ -1910,7 +2295,11 @@ async function runApp(
     // tailscaleHttpsPort is always assigned: the loop either breaks after
     // a successful register or exits the process on final failure.
     tailscaleUrl = formatTailscaleUrl(tsBaseUrl, tailscaleHttpsPort!);
-    const label = wantsFunnel ? "Funnel (public)" : "Tailscale";
+    const label = wantsFunnel
+      ? "Funnel (public)"
+      : wantsTailscaleHttp
+        ? "Tailscale (HTTP)"
+        : "Tailscale";
     console.log(chalk.green(`  ${label} -> ${formatSharedUrl(tailscaleUrl, routePathPrefix)}`));
     if (wantsFunnel) {
       console.log(chalk.gray("  (accessible from the public internet via Tailscale Funnel)\n"));
@@ -1925,6 +2314,7 @@ async function runApp(
           tailscaleUrl: tailscaleUrl,
           tailscaleHttpsPort,
           tailscaleFunnel: wantsFunnel || undefined,
+          tailscaleHttp: wantsTailscaleHttp || undefined,
         },
         { pathPrefix: routePathPrefix }
       );
@@ -1990,6 +2380,7 @@ async function runApp(
         unregisterTailscale({
           tailscaleHttpsPort,
           tailscaleFunnel: wantsFunnel || undefined,
+          tailscaleHttp: wantsTailscaleHttp || undefined,
           tailscaleServiceName,
         });
       } catch {
@@ -2011,6 +2402,7 @@ async function runApp(
         onExit: handleNgrokExit,
       });
       ngrokUrl = ngrokProcess.url;
+      if (routePathPrefix !== "/") console.log(colors.yellow(WHOLE_APP_TUNNEL_NOTICE));
       console.log(chalk.green(`  ngrok -> ${formatSharedUrl(ngrokUrl, routePathPrefix)}`));
       console.log(chalk.gray("  (accessible from the public internet via ngrok)\n"));
 
@@ -2047,6 +2439,7 @@ async function runApp(
         unregisterTailscale({
           tailscaleHttpsPort,
           tailscaleFunnel: wantsFunnel || undefined,
+          tailscaleHttp: wantsTailscaleHttp || undefined,
           tailscaleServiceName,
         });
       } catch {
@@ -2064,27 +2457,17 @@ async function runApp(
   if (requestedTunnel) {
     try {
       const provider = getTunnelProvider(requestedTunnel.provider);
-      managedTunnel = await provider.start(proxyPort, {
+      managedTunnel = await provider.start(port, {
+        hostHeader: hostname,
+        configPath: path.join(stateDir, "cloudflared.yml"),
         hostname: requestedTunnel.hostname,
         onExit: handleTunnelExit,
       });
       tunnelUrl = managedTunnel.url;
-      managedTunnelExternalHostname = managedTunnel.hostname;
-      tunnelAliasStore.setAlias({
-        externalHostname: managedTunnel.hostname,
-        targetHostname: hostname,
-        targetPathPrefix: routePathPrefix,
-        managed: true,
-        provider: managedTunnel.provider,
-        url: managedTunnel.url,
-        tunnelPid: managedTunnel.pid,
-        routeOwnerPid: process.pid,
-      });
+      if (routePathPrefix !== "/") console.log(colors.yellow(WHOLE_APP_TUNNEL_NOTICE));
       const label = managedTunnel.provider === "cloudflare" ? "Cloudflare Tunnel" : "ngrok tunnel";
       console.log(chalk.green(`  ${label} -> ${formatSharedUrl(tunnelUrl, routePathPrefix)}`));
-      console.log(
-        chalk.gray("  (accessible from the public internet through an exact tunnel alias)\n")
-      );
+      console.log(chalk.gray("  (accessible from the public internet directly at the app)\n"));
 
       try {
         store.updateRoute(
@@ -2115,17 +2498,11 @@ async function runApp(
       stopNetbirdExpose(netbirdProcess);
       stopNgrokProcess(ngrokProcess?.child);
       stopTunnelProcess(managedTunnel?.child);
-      if (managedTunnelExternalHostname) {
-        try {
-          tunnelAliasStore.removeManagedAlias(managedTunnelExternalHostname, process.pid);
-        } catch {
-          // Best-effort cleanup; non-fatal
-        }
-      }
       try {
         unregisterTailscale({
           tailscaleHttpsPort,
           tailscaleFunnel: wantsFunnel || undefined,
+          tailscaleHttp: wantsTailscaleHttp || undefined,
           tailscaleServiceName,
         });
       } catch {
@@ -2237,14 +2614,38 @@ async function runApp(
     )
   );
 
+  // A background entry is supervised by `portless bg`, which cleans up the
+  // exact route its `portless run` registered, so it keeps that route.
+  const preexistingListeners = bgId && bgReadyPath ? [] : await findPreexistingListeners(port);
   spawnCommand(commandArgs, {
+    onSpawn: (pid) =>
+      recordChildProcessGroup(store, hostnames, pid, {
+        pathPrefix: routePathPrefix,
+        label: multiplexLabelFromEnv(),
+      }),
+    onExit:
+      bgId && bgReadyPath
+        ? undefined
+        : (childPid, code) =>
+            transferRoutesToDaemon(
+              store,
+              hostnames,
+              port,
+              childPid,
+              preexistingListeners,
+              code === 0,
+              { pathPrefix: routePathPrefix, label: multiplexLabelFromEnv() }
+            ),
     env: {
       ...baseChildEnv,
       ...childEnv,
       PORT: port.toString(),
       ...(hostBind ? { HOST: hostBind } : {}),
       PORTLESS_URL: finalUrl,
-      __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: formatViteAllowedHosts(tlds, viteRouteMetadata),
+      __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: formatViteAllowedHosts(tlds, viteRouteMetadata, {
+        packageDir: scriptContext?.packageDir ?? process.cwd(),
+        onNotice: (message) => console.log(chalk.gray(message)),
+      }),
       // Note: EXPO_PACKAGER_PROXY_URL is not used — expo-dev-client removed
       // baked-in pinging, making this env var ineffective. Expo handles its
       // own LAN discovery natively.
@@ -2252,7 +2653,14 @@ async function runApp(
       ...(tailscaleUrl ? { PORTLESS_TAILSCALE_URL: tailscaleUrl } : {}),
       ...(tailscaleServiceUrl ? { PORTLESS_TAILSCALE_SERVICE_URL: tailscaleServiceUrl } : {}),
       ...(ngrokUrl ? { PORTLESS_NGROK_URL: ngrokUrl } : {}),
-      ...(tunnelUrl ? { PORTLESS_TUNNEL_URL: tunnelUrl } : {}),
+      ...(tunnelUrl
+        ? {
+            PORTLESS_TUNNEL_URL: tunnelUrl,
+            ...(managedTunnel?.provider === "cloudflare"
+              ? { PORTLESS_CLOUDFLARE_URL: tunnelUrl }
+              : {}),
+          }
+        : {}),
       ...(netbirdUrl ? { PORTLESS_NETBIRD_URL: netbirdUrl } : {}),
       ...caEnv,
     },
@@ -2263,17 +2671,11 @@ async function runApp(
       stopNetbirdExpose(netbirdProcess);
       stopNgrokProcess(ngrokProcess?.child);
       stopTunnelProcess(managedTunnel?.child);
-      if (managedTunnelExternalHostname) {
-        try {
-          tunnelAliasStore.removeManagedAlias(managedTunnelExternalHostname, process.pid);
-        } catch {
-          // Best-effort cleanup; non-fatal
-        }
-      }
       try {
         unregisterTailscale({
           tailscaleHttpsPort,
           tailscaleFunnel: wantsFunnel || undefined,
+          tailscaleHttp: wantsTailscaleHttp || undefined,
           tailscaleServiceName,
         });
       } catch {
@@ -2306,6 +2708,8 @@ interface ParsedRunArgs {
   pathPrefix?: string;
   /** Optional managed public tunnel provider. */
   tunnel?: ManagedTunnelOptions;
+  /** Worktree prefix flags (`--worktree-prefix`, `--no-worktree`). */
+  worktreeFlags?: WorktreeFlagState;
   /** The child command and its arguments, passed through untouched. */
   commandArgs: string[];
 }
@@ -2325,8 +2729,8 @@ function parseAppPort(value: string | undefined): number {
     console.error(colors.red("Error: --app-port requires a port number."));
     process.exit(1);
   }
-  const port = parseInt(value, 10);
-  if (isNaN(port) || port < 1 || port > 65535) {
+  const port = parsePort(value);
+  if (port === null) {
     console.error(colors.red(`Error: Invalid app port "${value}". Must be 1-65535.`));
     process.exit(1);
   }
@@ -2334,11 +2738,52 @@ function parseAppPort(value: string | undefined): number {
   return port;
 }
 
+/**
+ * Ports that live routes already own, so a new pick never doubles up on one
+ * whose app has not bound it yet. Routes on the app's own hostname and path are
+ * left out: a restart or `--force` replaces them, and a `stable` port must not
+ * move because its previous owner is still shutting down.
+ */
+function registeredPorts(
+  store: RouteStore,
+  ownHostnames: string[],
+  ownPathPrefix: string
+): Set<number> {
+  try {
+    const own = new Set(ownHostnames);
+    return new Set(
+      store
+        .loadRoutes()
+        .filter(
+          (route) =>
+            !(own.has(route.hostname) && normalizePathPrefix(route.pathPrefix) === ownPathPrefix)
+        )
+        .map((route) => route.port)
+    );
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * Resolve the app port strategy and range from the environment and the app's
+ * config, or exit with the error. Done before anything starts so a typo in
+ * `PORTLESS_APP_PORT_STRATEGY` fails fast.
+ */
+function appPortAllocationOrExit(config: AppConfig | null | undefined): AppPortAllocation {
+  try {
+    return resolveAppPortAllocation(config);
+  } catch (err) {
+    console.error(colors.red(`Error: ${(err as Error).message}`));
+    process.exit(1);
+  }
+}
+
 function appPortFromEnv(): number | undefined {
   const envVal = process.env.PORTLESS_APP_PORT;
   if (!envVal) return undefined;
-  const port = parseInt(envVal, 10);
-  if (isNaN(port) || port < 1 || port > 65535) {
+  const port = parsePort(envVal);
+  if (port === null) {
     console.error(colors.red(`Error: Invalid PORTLESS_APP_PORT="${envVal}". Must be 1-65535.`));
     process.exit(1);
   }
@@ -2379,9 +2824,14 @@ function parseTunnelHostname(value: string | undefined, source: string): string 
 }
 
 function tunnelFromEnv(): ManagedTunnelOptions | undefined {
-  if (process.env.PORTLESS_TUNNEL === undefined) return undefined;
+  if (process.env.PORTLESS_TUNNEL === undefined && !isEnabledEnv(process.env.PORTLESS_CLOUDFLARE))
+    return undefined;
   return {
-    provider: parseTunnelProvider(process.env.PORTLESS_TUNNEL, "PORTLESS_TUNNEL"),
+    provider: parseTunnelProvider(
+      process.env.PORTLESS_TUNNEL ??
+        (isEnabledEnv(process.env.PORTLESS_CLOUDFLARE) ? "cloudflare" : undefined),
+      "PORTLESS_TUNNEL"
+    ),
     ...(process.env.PORTLESS_TUNNEL_HOSTNAME !== undefined
       ? {
           hostname: parseTunnelHostname(
@@ -2404,6 +2854,67 @@ function parsePathPrefix(value: string | undefined, source: string): string {
   } catch (err) {
     console.error(colors.red(`Error: ${source}: ${(err as Error).message}`));
     process.exit(1);
+  }
+}
+
+/** Worktree prefix decision from `--worktree-prefix` / `--no-worktree`. */
+interface WorktreeFlagState {
+  /** Explicit prefix value. */
+  prefix?: string;
+  /** Skip worktree prefixing entirely. */
+  disabled?: boolean;
+}
+
+/**
+ * Worktree flags given before the subcommand, e.g. `portless --no-worktree`
+ * (bare mode) or `portless --worktree-prefix qa run next dev`. Run and get
+ * start from these and add their own.
+ */
+let globalWorktreeFlags: WorktreeFlagState = {};
+
+/**
+ * Consume `--worktree-prefix <value>` or `--no-worktree` at `args[i]` into
+ * `state`. Returns the index of the last consumed token, or null when
+ * `args[i]` is neither flag.
+ */
+function consumeWorktreeFlag(args: string[], i: number, state: WorktreeFlagState): number | null {
+  if (args[i] === "--no-worktree") {
+    state.disabled = true;
+    return i;
+  }
+  if (args[i] !== "--worktree-prefix") return null;
+  const value = args[i + 1];
+  if (value === undefined || (value !== "" && value.startsWith("-"))) {
+    console.error(colors.red("Error: --worktree-prefix requires a value."));
+    console.error(colors.cyan("  portless run --worktree-prefix <prefix> <command...>"));
+    process.exit(1);
+  }
+  if (!value.trim()) {
+    console.error(colors.red("Error: --worktree-prefix requires a non-empty value."));
+    console.error(colors.blue("To turn the worktree prefix off, use --no-worktree."));
+    process.exit(1);
+  }
+  state.prefix = value;
+  return i + 1;
+}
+
+/**
+ * Resolve the worktree prefix (flags, then PORTLESS_WORKTREE_PREFIX, then git
+ * detection), exiting with a readable error for a bad or conflicting setting.
+ */
+function resolveWorktree(
+  cwd: string,
+  flags: WorktreeFlagState,
+  branch?: WorktreeBranchMode
+): WorktreePrefix | null {
+  try {
+    return detectWorktreePrefix(cwd, { prefix: flags.prefix, disabled: flags.disabled, branch });
+  } catch (err) {
+    if (err instanceof WorktreePrefixError) {
+      console.error(colors.red(`Error: ${err.message}`));
+      process.exit(1);
+    }
+    throw err;
   }
 }
 
@@ -2468,6 +2979,10 @@ function applySharingFlag(flag: string): boolean {
   }
   if (flag === "--tailscale-service") {
     process.env.PORTLESS_TAILSCALE_SERVICE = "1";
+    return true;
+  }
+  if (flag === "--tailscale-http") {
+    process.env.PORTLESS_TAILSCALE_HTTP = "1";
     return true;
   }
   if (flag === "--funnel") {
@@ -2557,6 +3072,7 @@ function parseRunArgs(args: string[]): ParsedRunArgs {
   let protocol = routeProtocolFromEnv();
   let pathPrefix = pathPrefixFromEnv();
   let tunnel = tunnelFromEnv();
+  const worktreeFlags: WorktreeFlagState = { ...globalWorktreeFlags };
   let allowChildEnv = true;
   let i = 0;
 
@@ -2581,9 +3097,13 @@ ${colors.bold("Options:")}
   --app-port <number>    Use a fixed app port; browser-blocked ports are rejected
   --h2c                  Forward this route to an HTTP/2 cleartext upstream
   --path <prefix>        Scope the route to a path prefix, e.g. /api
+  --worktree-prefix <p>  Use this worktree prefix instead of the branch name
+  --no-worktree          Skip the worktree prefix
+  --cloudflare           Alias of --tunnel cloudflare
   --tunnel <provider>    Share publicly via a managed tunnel: cloudflare or ngrok
   --tunnel-hostname <h>  Request a provider-specific stable tunnel hostname
   --tailscale            Share the app on your Tailscale network (tailnet)
+  --tailscale-http       Share on the tailnet over plain HTTP (no MagicDNS needed)
   --tailscale-service    Share the app as a stable Tailscale Service
   --tailscale-service-name <name>
                          Use an explicit Tailscale Service name
@@ -2607,6 +3127,21 @@ ${colors.bold("Name inference (in order):")}
   Set PORTLESS_WORKTREE_FLAT=1 to join worktree and app names into one label
   (e.g. feature-auth-myapp.localhost). Use 0 to override a project setting.
 
+${colors.bold("Worktree prefix (flag, then environment, then git):")}
+  --worktree-prefix <p>  Use <p> as the prefix, in a linked worktree or not
+                         (e.g. qa.myapp.localhost). Empty values are rejected.
+  --no-worktree          Skip the prefix for this run
+  PORTLESS_WORKTREE_PREFIX=<p>  Same as --worktree-prefix for this shell
+  PORTLESS_WORKTREE_PREFIX=     (empty) turns the prefix off for this shell
+  "worktreeBranch": "full" in portless.json uses the whole branch name
+  (team-a/login becomes team-a-login) instead of the last segment.
+
+${colors.bold("App port (fixed port, then strategy):")}
+  --app-port, PORTLESS_APP_PORT or "appPort" fix the port. Otherwise it is picked
+  by PORTLESS_APP_PORT_STRATEGY (random, stable, sequential) and
+  PORTLESS_APP_PORT_RANGE (e.g. 4200-4999), which override "appPortStrategy"
+  and "appPortRange" in config. stable keys the port by app name and path.
+
 ${colors.bold("Command placeholders:")}
   {PORT}                 Assigned app port
   {HOST}                 Usually 127.0.0.1
@@ -2615,6 +3150,13 @@ ${colors.bold("Command placeholders:")}
   Placeholders are replaced only when they are whole arguments.
   When a placeholder is used, automatic framework flag injection is skipped.
 
+${colors.bold("Self-daemonizing commands:")}
+  If the command exits (without a signal) while a new server keeps listening
+  on the assigned port, as astro dev does when it detects an agent, the route
+  stays and follows that server's PID until it stops. A clean exit waits up to
+  2 seconds for a late bind. Sharing ends with the command; stop the server
+  with kill <pid>.
+
 ${colors.bold("Examples:")}
   portless run                        # Run dev script through proxy
   portless run next dev               # -> https://<project>.localhost
@@ -2622,6 +3164,9 @@ ${colors.bold("Examples:")}
   portless run vite dev               # -> https://<project>.localhost
   portless run --h2c grpc-server      # h2c or gRPC upstream
   portless run --path /api api-server # -> https://<project>.localhost/api
+  portless run --worktree-prefix qa next dev
+                                      # -> https://qa.<project>.localhost
+  portless run --no-worktree next dev # -> https://<project>.localhost (skip prefix)
   portless run --tunnel cloudflare next dev
                                       # -> also https://<random>.trycloudflare.com
   portless run my-server --port {PORT}
@@ -2638,6 +3183,8 @@ ${colors.bold("Examples:")}
     } else if (args[i] === "--path") {
       i++;
       pathPrefix = parsePathPrefix(args[i], "--path");
+    } else if (args[i] === "--cloudflare") {
+      tunnel = { provider: "cloudflare" };
     } else if (args[i] === "--tunnel") {
       i++;
       tunnel = { ...(tunnel ?? {}), provider: parseTunnelProvider(args[i], "--tunnel") };
@@ -2645,7 +3192,12 @@ ${colors.bold("Examples:")}
       i++;
       tunnel = {
         provider:
-          tunnel?.provider ?? parseTunnelProvider(process.env.PORTLESS_TUNNEL, "PORTLESS_TUNNEL"),
+          tunnel?.provider ??
+          parseTunnelProvider(
+            process.env.PORTLESS_TUNNEL ??
+              (isEnabledEnv(process.env.PORTLESS_CLOUDFLARE) ? "cloudflare" : undefined),
+            "PORTLESS_TUNNEL"
+          ),
         hostname: parseTunnelHostname(args[i], "--tunnel-hostname"),
       };
     } else if (args[i] === "--name") {
@@ -2662,14 +3214,16 @@ ${colors.bold("Examples:")}
       // handled
     } else {
       const consumedIndex =
-        applyTailscaleServiceValueFlag(args, i) ?? applyNetbirdValueFlag(args, i);
+        applyTailscaleServiceValueFlag(args, i) ??
+        applyNetbirdValueFlag(args, i) ??
+        consumeWorktreeFlag(args, i, worktreeFlags);
       if (consumedIndex !== null) {
         i = consumedIndex;
       } else {
         console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
         console.error(
           colors.blue(
-            "Known flags: --name, --force, --app-port, --h2c, --path, --tunnel, --tunnel-hostname, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups, --help"
+            "Known flags: --name, --force, --app-port, --h2c, --path, --worktree-prefix, --no-worktree, --cloudflare, --tunnel, --tunnel-hostname, --tailscale, --tailscale-http, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups, --help"
           )
         );
         process.exit(1);
@@ -2684,7 +3238,7 @@ ${colors.bold("Examples:")}
     ? splitLeadingChildEnv(args.slice(i))
     : { childEnv: {}, commandArgs: args.slice(i) };
 
-  return { force, appPort, name, protocol, pathPrefix, tunnel, ...parsedChild };
+  return { force, appPort, name, protocol, pathPrefix, tunnel, worktreeFlags, ...parsedChild };
 }
 
 /**
@@ -2719,6 +3273,8 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
     } else if (args[i] === "--path") {
       i++;
       pathPrefix = parsePathPrefix(args[i], "--path");
+    } else if (args[i] === "--cloudflare") {
+      tunnel = { provider: "cloudflare" };
     } else if (args[i] === "--tunnel") {
       i++;
       tunnel = { ...(tunnel ?? {}), provider: parseTunnelProvider(args[i], "--tunnel") };
@@ -2726,7 +3282,12 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
       i++;
       tunnel = {
         provider:
-          tunnel?.provider ?? parseTunnelProvider(process.env.PORTLESS_TUNNEL, "PORTLESS_TUNNEL"),
+          tunnel?.provider ??
+          parseTunnelProvider(
+            process.env.PORTLESS_TUNNEL ??
+              (isEnabledEnv(process.env.PORTLESS_CLOUDFLARE) ? "cloudflare" : undefined),
+            "PORTLESS_TUNNEL"
+          ),
         hostname: parseTunnelHostname(args[i], "--tunnel-hostname"),
       };
     } else if (args[i] === "--wildcard") {
@@ -2742,7 +3303,7 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
         console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
         console.error(
           colors.blue(
-            "Known flags: --force, --app-port, --h2c, --path, --tunnel, --tunnel-hostname, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups"
+            "Known flags: --force, --app-port, --h2c, --path, --cloudflare, --tunnel, --tunnel-hostname, --tailscale, --tailscale-http, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups"
           )
         );
         process.exit(1);
@@ -2771,6 +3332,8 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
     } else if (args[i] === "--path") {
       i++;
       pathPrefix = parsePathPrefix(args[i], "--path");
+    } else if (args[i] === "--cloudflare") {
+      tunnel = { provider: "cloudflare" };
     } else if (args[i] === "--tunnel") {
       i++;
       tunnel = { ...(tunnel ?? {}), provider: parseTunnelProvider(args[i], "--tunnel") };
@@ -2778,7 +3341,12 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
       i++;
       tunnel = {
         provider:
-          tunnel?.provider ?? parseTunnelProvider(process.env.PORTLESS_TUNNEL, "PORTLESS_TUNNEL"),
+          tunnel?.provider ??
+          parseTunnelProvider(
+            process.env.PORTLESS_TUNNEL ??
+              (isEnabledEnv(process.env.PORTLESS_CLOUDFLARE) ? "cloudflare" : undefined),
+            "PORTLESS_TUNNEL"
+          ),
         hostname: parseTunnelHostname(args[i], "--tunnel-hostname"),
       };
     } else if (args[i] === "--wildcard") {
@@ -2794,7 +3362,7 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
         console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
         console.error(
           colors.blue(
-            "Known flags: --force, --app-port, --h2c, --path, --tunnel, --tunnel-hostname, --tailscale, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups"
+            "Known flags: --force, --app-port, --h2c, --path, --cloudflare, --tunnel, --tunnel-hostname, --tailscale, --tailscale-http, --tailscale-service, --tailscale-service-name, --funnel, --ngrok, --netbird, --netbird-password, --netbird-pin, --netbird-groups"
           )
         );
         process.exit(1);
@@ -2848,6 +3416,7 @@ const TOP_LEVEL_COMPLETION_COMMANDS: CompletionCommand[] = [
   { name: "proxy", description: "Manage proxy lifecycle" },
   { name: "bg", description: "Manage portless apps running in the background" },
   { name: "service", description: "Manage startup service" },
+  { name: "mcp", description: "Start a stdio MCP server for agents" },
   { name: "completion", description: "Generate shell completion script" },
 ];
 
@@ -2858,6 +3427,10 @@ const GLOBAL_COMPLETION_FLAGS: CompletionFlag[] = [
   { name: "--script", description: "Run a specific package.json script", value: "script" },
   { name: "--port", short: "-p", description: "Proxy port", value: "port" },
   { name: "--no-tls", description: "Disable HTTPS" },
+  {
+    name: "--unprivileged",
+    description: "Bind without sudo, accepting loopback peers only unless LAN mode is enabled",
+  },
   { name: "--https", description: "Enable HTTPS" },
   { name: "--lan", description: "Enable LAN mode" },
   { name: "--ip", description: "Pin a specific LAN IP", value: "address" },
@@ -2878,9 +3451,13 @@ const GLOBAL_COMPLETION_FLAGS: CompletionFlag[] = [
   { name: "--multiplex", description: "Share the hostname with other apps (app picker)" },
   { name: "--label", description: "Label for this multiplexed app", value: "label" },
   { name: "--path", description: "Scope route to a path prefix", value: "prefix" },
+  { name: "--worktree-prefix", description: "Use this worktree prefix", value: "prefix" },
+  { name: "--no-worktree", description: "Skip the worktree prefix" },
+  { name: "--cloudflare", description: "Alias of --tunnel cloudflare" },
   { name: "--tunnel", description: "Share publicly via tunnel provider", value: "provider" },
   { name: "--tunnel-hostname", description: "Request stable tunnel hostname", value: "hostname" },
   { name: "--tailscale", description: "Share on Tailscale" },
+  { name: "--tailscale-http", description: "Share on Tailscale over plain HTTP" },
   { name: "--tailscale-service", description: "Share as a Tailscale Service" },
   {
     name: "--tailscale-service-name",
@@ -2906,9 +3483,13 @@ const RUN_COMPLETION_FLAGS = GLOBAL_COMPLETION_FLAGS.filter((flag) =>
     "--multiplex",
     "--label",
     "--path",
+    "--worktree-prefix",
+    "--no-worktree",
+    "--cloudflare",
     "--tunnel",
     "--tunnel-hostname",
     "--tailscale",
+    "--tailscale-http",
     "--tailscale-service",
     "--tailscale-service-name",
     "--funnel",
@@ -2928,9 +3509,11 @@ const APP_COMPLETION_FLAGS = GLOBAL_COMPLETION_FLAGS.filter((flag) =>
     "--multiplex",
     "--label",
     "--path",
+    "--cloudflare",
     "--tunnel",
     "--tunnel-hostname",
     "--tailscale",
+    "--tailscale-http",
     "--tailscale-service",
     "--tailscale-service-name",
     "--funnel",
@@ -2948,6 +3531,7 @@ const PROXY_START_COMPLETION_FLAGS = GLOBAL_COMPLETION_FLAGS.filter((flag) =>
     "--port",
     "--no-tls",
     "--https",
+    "--unprivileged",
     "--lan",
     "--ip",
     "--cert",
@@ -2967,6 +3551,7 @@ const SERVICE_INSTALL_COMPLETION_FLAGS = GLOBAL_COMPLETION_FLAGS.filter((flag) =
     "--port",
     "--no-tls",
     "--https",
+    "--unprivileged",
     "--lan",
     "--ip",
     "--suffix",
@@ -3052,7 +3637,7 @@ _portless_completions() {
       COMPREPLY=( $(compgen -W "${completionFlagWords(RUN_COMPLETION_FLAGS)} --" -- "$cur") )
       ;;
     get|url)
-      COMPREPLY=( $(compgen -W "--json --path --help -h" -- "$cur") )
+      COMPREPLY=( $(compgen -W "--json --path --worktree-prefix --no-worktree --help -h" -- "$cur") )
       ;;
     list|ls|status)
       COMPREPLY=( $(compgen -W "--json --help -h" -- "$cur") )
@@ -3077,14 +3662,19 @@ _portless_completions() {
     doctor|clean)
       COMPREPLY=( $(compgen -W "--help -h" -- "$cur") )
       ;;
+    mcp)
+      COMPREPLY=( $(compgen -W "--tools --help -h" -- "$cur") )
+      ;;
     prune)
       COMPREPLY=( $(compgen -W "--force --help -h" -- "$cur") )
       ;;
     proxy)
       if [[ $COMP_CWORD -eq 2 ]]; then
-        COMPREPLY=( $(compgen -W "start stop --help -h" -- "$cur") )
+        COMPREPLY=( $(compgen -W "start stop status --help -h" -- "$cur") )
       elif [[ "$subcmd" == "start" ]]; then
         COMPREPLY=( $(compgen -W "${completionFlagWords(PROXY_START_COMPLETION_FLAGS)}" -- "$cur") )
+      elif [[ "$subcmd" == "status" ]]; then
+        COMPREPLY=( $(compgen -W "--json --help -h" -- "$cur") )
       else
         COMPREPLY=( $(compgen -W "--help -h" -- "$cur") )
       fi
@@ -3147,7 +3737,7 @@ _portless() {
           _arguments ${RUN_COMPLETION_FLAGS.map(zshFlag).join(" ")}
           ;;
         get|url)
-          _arguments '--json[Print JSON]' '--path[Scope URL to path prefix]:prefix' '--help[Show help]' '-h[Show help]'
+          _arguments '--json[Print JSON]' '--path[Scope URL to path prefix]:prefix' '--worktree-prefix[Use this worktree prefix]:prefix' '--no-worktree[Skip the worktree prefix]' '--help[Show help]' '-h[Show help]'
           ;;
         list|ls|status)
           _arguments '--json[Print JSON]' '--help[Show help]' '-h[Show help]'
@@ -3168,12 +3758,17 @@ _portless() {
         doctor|clean)
           _arguments '--help[Show help]' '-h[Show help]'
           ;;
+        mcp)
+          _arguments '--tools[Tool profiles to expose]:profiles:' '--help[Show help]' '-h[Show help]'
+          ;;
         prune)
           _arguments '--force[Send SIGKILL]' '--help[Show help]' '-h[Show help]'
           ;;
         proxy)
           if (( CURRENT == 3 )); then
-            _values 'proxy command' start stop
+            _values 'proxy command' start stop status
+          elif [[ $words[3] == status ]]; then
+            _arguments '--json[Print JSON]' '--help[Show help]' '-h[Show help]'
           else
             _arguments ${PROXY_START_COMPLETION_FLAGS.map(zshFlag).join(" ")}
           fi
@@ -3223,9 +3818,11 @@ ${commandLines}
 
 ${fishFlagLines(GLOBAL_COMPLETION_FLAGS)}
 ${fishFlagLines(RUN_COMPLETION_FLAGS, "__fish_seen_subcommand_from run")}
-${fishFlagLines(APP_COMPLETION_FLAGS, "not __fish_seen_subcommand_from run get url list ls status doctor alias tunnel hosts clean prune proxy bg service completion")}
+${fishFlagLines(APP_COMPLETION_FLAGS, "not __fish_seen_subcommand_from run get url list ls status doctor alias tunnel hosts clean prune proxy bg service mcp completion")}
 complete -c portless -n "__fish_seen_subcommand_from get url list ls status" -l json -d "Print JSON"
 complete -c portless -n "__fish_seen_subcommand_from get url" -l path -d "Scope URL to path prefix" -r
+complete -c portless -n "__fish_seen_subcommand_from get url" -l worktree-prefix -d "Use this worktree prefix" -r
+complete -c portless -n "__fish_seen_subcommand_from get url" -l no-worktree -d "Skip the worktree prefix"
 complete -c portless -n "__fish_seen_subcommand_from alias" -l remove -d "Remove route"
 complete -c portless -n "__fish_seen_subcommand_from alias" -l force -d "Override existing route"
 complete -c portless -n "__fish_seen_subcommand_from alias" -l h2c -d "Forward to HTTP/2 cleartext upstream"
@@ -3238,8 +3835,11 @@ complete -c portless -n "__fish_seen_subcommand_from doctor" -l help -s h -d "Sh
 complete -c portless -n "__fish_seen_subcommand_from clean" -l help -s h -d "Show help"
 complete -c portless -n "__fish_seen_subcommand_from prune" -l force -d "Send SIGKILL"
 complete -c portless -n "__fish_seen_subcommand_from prune" -l help -s h -d "Show help"
-complete -c portless -n "__fish_seen_subcommand_from proxy; and __fish_is_nth_token 2" -a "start stop"
+complete -c portless -n "__fish_seen_subcommand_from mcp" -l tools -d "Tool profiles to expose" -r
+complete -c portless -n "__fish_seen_subcommand_from mcp" -l help -s h -d "Show help"
+complete -c portless -n "__fish_seen_subcommand_from proxy; and __fish_is_nth_token 2" -a "start stop status"
 ${fishFlagLines(PROXY_START_COMPLETION_FLAGS, "__fish_seen_subcommand_from proxy")}
+complete -c portless -n "__fish_seen_subcommand_from proxy; and __fish_seen_subcommand_from status" -l json -d "Print JSON"
 complete -c portless -n "__fish_seen_subcommand_from bg; and __fish_is_nth_token 2" -a "start stop restart status list logs clean"
 ${fishFlagLines(BG_START_COMPLETION_FLAGS, "__fish_seen_subcommand_from bg")}
 complete -c portless -n "__fish_seen_subcommand_from bg" -l tail -d "Number of log lines" -r
@@ -3301,6 +3901,7 @@ ${colors.bold("Usage:")}
   ${colors.cyan("portless <name> <cmd>")}            Run with an explicit app name
   ${colors.cyan("portless proxy start")}             Start the proxy (HTTPS on port 443, daemon); rarely needed since it auto-starts on first run
   ${colors.cyan("portless proxy stop")}              Stop the proxy
+  ${colors.cyan("portless proxy status [--json]")}   Show whether the proxy is running and its settings
   ${colors.cyan("portless service install")}         Start proxy automatically when the OS starts
   ${colors.cyan("portless bg start")}                Start an app in the background
   ${colors.cyan("portless bg status [name]")}        Show background app status
@@ -3315,7 +3916,7 @@ ${colors.bold("Usage:")}
   ${colors.cyan("portless alias <name> <port>")}     Register a static route (e.g. for Docker)
   ${colors.cyan("portless alias --remove <name>")}   Remove a static route
   ${colors.cyan("portless tunnel map <route> <host>")} Manage exact public tunnel aliases
-  ${colors.cyan("portless list")}                    Show active routes
+  ${colors.cyan("portless list")}                    Show active routes and uptime
   ${colors.cyan("portless list --json")}             Show active routes as JSON
   ${colors.cyan("portless ls")} / ${colors.cyan("portless status")}   Aliases for portless list
   ${colors.cyan("portless doctor")}                  Check local portless health
@@ -3323,6 +3924,7 @@ ${colors.bold("Usage:")}
   ${colors.cyan("portless clean")}                   Remove portless state, trust entry, and hosts block
   ${colors.cyan("portless prune")}                   Kill orphaned dev servers from crashed sessions
   ${colors.cyan("portless completion <shell>")}      Print shell completion script
+  ${colors.cyan("portless mcp")}                     Start a stdio MCP server for agents
   ${colors.cyan("portless hosts sync")}              Add routes to ${HOSTS_DISPLAY} (fixes Safari)
   ${colors.cyan("portless hosts clean")}             Remove portless entries from ${HOSTS_DISPLAY}
 
@@ -3340,6 +3942,9 @@ ${colors.bold("Examples:")}
   portless get backend                # -> https://backend.localhost
   portless get backend --json         # Service info for scripts and agents
   portless url backend                # Alias for get
+  portless run --worktree-prefix qa next dev
+                                      # -> https://qa.<project>.localhost
+  portless --no-worktree              # Bare mode without the worktree prefix
   portless doctor                     # Run read-only diagnostics
   portless myapp API_URL=1 next dev   # Pass API_URL only to the child command
   portless myapp --h2c grpc-server    # Proxy to an h2c or gRPC upstream
@@ -3347,6 +3952,7 @@ ${colors.bold("Examples:")}
   portless myapp --tunnel cloudflare next dev
                                      # -> also https://<random>.trycloudflare.com (public)
   portless myapp --tailscale next dev # -> also https://<node>.ts.net (tailnet)
+  portless myapp --tailscale-http next dev # -> also http://<node ip> (tailnet, no MagicDNS)
   portless myapp --tailscale-service next dev
                                      # -> also https://<service>.<tailnet>.ts.net
   portless myapp --funnel next dev    # -> also https://<node>.ts.net (public)
@@ -3361,9 +3967,12 @@ ${colors.bold("Configuration (portless.json or .config/portless.json):")}
   Override script: { "name": "myapp", "script": "start" }
   Route path:      { "name": "myapp", "path": "/api" }
   Flat worktree:   { "worktreeFlat": true }
+  Whole branch:    { "worktreeBranch": "full" }  (team-a/login -> team-a-login)
   Monorepo split:  { "apps": { "apps/web": { "name": "myapp", "path": "/" },
                                 "apps/api": { "name": "myapp", "path": "/api" } } }
   Path precedence: --path, then PORTLESS_PATH, then config
+  Worktree prefix: --worktree-prefix or --no-worktree, then PORTLESS_WORKTREE_PREFIX,
+                   then git detection (worktreeBranch picks last segment or full branch)
 
 ${colors.bold("In package.json:")}
   {
@@ -3382,10 +3991,18 @@ ${colors.bold("How it works:")}
   3. Access via https://<name>.localhost
   4. .localhost domains auto-resolve to 127.0.0.1
   5. Frameworks that ignore PORT (Vite, VitePlus, VitePress, Rsbuild, Astro,
-     React Router, Angular, Laravel, Expo, React Native, Wrangler) get --port and, when needed,
-     --host or --ip flags injected automatically; safe bun run, npm run, pnpm run, or yarn run
+     React Router, Angular, Laravel, Expo, React Native, Wrangler, vinext) get --port and, when needed,
+     --host, --hostname or --ip flags injected automatically; safe bun run, npm run, pnpm run, or yarn run
      scripts resolving directly to those server commands receive the same injection
+     Package runners are looked through too; npm exec and npm x get the flags
+     after a -- so npm does not read them. Commands run with your PATH first and
+     portless's own node directory last, so a version-manager node is not shadowed
   6. The proxy listens only on 127.0.0.1 and ::1 unless LAN mode is enabled
+  7. Errors from portless itself are HTML for browsers and JSON
+     {"error","upstream","message"} for other clients; hosts outside your suffixes get 421
+  8. Backend pooling permits 16 simultaneous dials per app and 64 idle sockets.
+     Connects time out after 10 seconds; established streams have no proxy timeout.
+     Queued requests receive 503 when the proxy shuts down
 
 ${colors.bold("Background apps:")}
   Use portless bg start for long-lived local servers that should keep running
@@ -3411,9 +4028,20 @@ ${colors.bold("HTTP/2 + HTTPS (default):")}
   On first use, portless generates a local CA and adds it to your
   system trust store. Generated certs are stored in the state directory
   and reused across restarts. In WSL, the CA is also added to the Windows
-  user trust store for Windows browsers. On NixOS and unrecognized Linux
+  user trust store for Windows browsers. Linux containers on a WSL2 host use
+  only the Linux trust store. On NixOS and unrecognized Linux
   distributions, portless prints manual CA setup guidance instead of using
   an unsupported trust-store layout. No browser warnings.
+  On Linux the CA also goes into the invoking user's existing Chrome/Chromium
+  NSS database (~/.pki/nssdb if present, else ~/.local/share/pki/nssdb), even
+  under sudo. This needs NSS certutil (Debian/Ubuntu: libnss3-tools). No
+  database is created: if neither exists, open Chrome once and rerun
+  portless trust. If NSS registration fails, system trust still succeeds with
+  a warning and Chrome may stay untrusted; install the tools and rerun
+  portless trust. Restart the browser afterwards. portless clean removes the
+  NSS entry too.
+  portless trust does nothing when every store it writes already has the CA
+  (both stores on WSL, plus NSS), so setup scripts can run it every time.
   Use --skip-trust to skip adding the CA to the trust store.
   Disable with --no-tls.
 
@@ -3448,14 +4076,24 @@ ${colors.bold("Tailscale sharing:")}
   Tailscale Funnel. Requires Tailscale CLI to be installed and connected,
   with MagicDNS and Tailscale HTTPS certificates enabled on the active tailnet.
   Funnel must also be enabled on your tailnet.
+  --tailscale, --tailscale-service, and --funnel exit early when the tailnet
+  reports MagicDNS as off, since no certificate can be issued.
+  Use --tailscale-http on tailnets without MagicDNS. It forwards a plain TCP
+  port (80, then 8080, 8081, etc.) straight to the app, addressed by the
+  node's tailnet IP (or its MagicDNS name when the tailnet has one), so no
+  certificate is needed. WireGuard still encrypts the traffic, but browsers
+  treat a plain-HTTP URL as an insecure context. It cannot be combined with
+  --funnel or --tailscale-service.
   ${colors.cyan("portless myapp --tailscale next dev")}
+  ${colors.cyan("portless myapp --tailscale-http next dev")}
   ${colors.cyan("portless myapp --tailscale-service next dev")}
   ${colors.cyan("portless myapp --tailscale-service --tailscale-service-name api next dev")}
   ${colors.cyan("portless myapp --funnel next dev")}
 
 ${colors.bold("Public tunnel sharing:")}
   Use --tunnel cloudflare or --tunnel ngrok to expose your dev server to
-  the public internet through the portless proxy with an exact tunnel alias.
+  the public internet directly at the app, with the route hostname as Host.
+  A path-prefixed route still exposes the whole app. --cloudflare aliases --tunnel cloudflare.
   Use portless tunnel map when you already have an external tunnel hostname.
   Requires cloudflared or ngrok to be installed.
   ${colors.cyan("portless myapp --tunnel cloudflare next dev")}
@@ -3495,8 +4133,10 @@ ${colors.bold("Options:")}
                                 Adds worktree prefix in git worktrees
   --script <name>               Run a specific package.json script (default: dev)
   -p, --port <number>           Port for the proxy (default: 443, or 80 with --no-tls)
-                                Standard ports auto-elevate with sudo on macOS/Linux
+                                Probe before sudo; failed sudo exits without changing ports
   --no-tls                      Disable HTTPS (use plain HTTP on port 80)
+  --unprivileged                Bind without sudo; HTTP by default, hosts sync off
+                                Wildcard listeners accept loopback peers only unless --lan
   --https                       Enable HTTPS (default, accepted for compatibility)
   --skip-trust                  Generate or reuse certs without adding the CA to trust
   --lan                         Enable LAN mode (mDNS .local, for real device testing)
@@ -3517,9 +4157,14 @@ ${colors.bold("Options:")}
   --multiplex                   Share this hostname with other apps (shows an app picker)
   --label <label>               Label for this multiplexed app (default: directory name)
   --path <prefix>               Scope this route to a path prefix, e.g. /api
+  --worktree-prefix <prefix>    Use this worktree prefix, in a linked worktree or not
+                                Works with run, get, bg start, and bare portless
+  --no-worktree                 Skip the worktree prefix (run, get, bg start, bare portless)
+  --cloudflare                  Alias of --tunnel cloudflare
   --tunnel <provider>           Share publicly via a managed tunnel: cloudflare or ngrok
   --tunnel-hostname <hostname>  Request a provider-specific stable tunnel hostname
   --tailscale                   Share the app on your Tailscale network (tailnet)
+  --tailscale-http              Share on the tailnet over plain HTTP (no MagicDNS needed)
   --tailscale-service           Share the app as a stable Tailscale Service
   --tailscale-service-name <n>  Use an explicit Tailscale Service name
   --funnel                      Share the app publicly via Tailscale Funnel
@@ -3532,7 +4177,7 @@ ${colors.bold("Options:")}
   bg start --no-wait            Return after spawning a background app
   bg start --keep               Keep a timed-out background app running
   bg logs --tail <lines>        Print the last N background log lines
-  bg stop --force               Force-stop the exact registered background app
+  bg stop --force               Force-stop the registered app and kill its recorded command group
   --force                       Kill the existing process and take over its route
   --name <name>                 Use <name> as the app name (bypasses subcommand dispatch)
   --                            Stop flag parsing; everything after is passed to the child
@@ -3540,13 +4185,21 @@ ${colors.bold("Options:")}
 ${colors.bold("Environment variables:")}
   PORTLESS_PORT=<number>        Override the default proxy port (e.g. in .bashrc)
   PORTLESS_APP_PORT=<number>    Use a fixed app port (same as --app-port)
+  PORTLESS_APP_PORT_STRATEGY=<s>
+                                How to pick an app port: random (default), stable (same
+                                name and path, same port), sequential (lowest free port)
+  PORTLESS_APP_PORT_RANGE=<a>-<b>
+                                Range to pick from, e.g. 4200-4999 (default 4000-4999,
+                                lowest allowed port 1024)
   PORTLESS_H2C=1                Forward app routes to HTTP/2 cleartext upstreams
   PORTLESS_MULTIPLEX=1          Share the hostname with other apps (same as --multiplex)
   PORTLESS_LABEL=<label>        Label for this multiplexed app (same as --label)
   PORTLESS_DASHBOARD=0          Disable the dashboard at portless.<suffix>
   PORTLESS_PATH=<prefix>        Scope app routes to a path prefix
+  PORTLESS_CLOUDFLARE=1         Alias of PORTLESS_TUNNEL=cloudflare
   PORTLESS_TUNNEL=<provider>    Share publicly via a managed tunnel provider
   PORTLESS_TUNNEL_HOSTNAME=<h>  Request a provider-specific stable tunnel hostname
+  PORTLESS_UNPRIVILEGED=1       Bind without sudo (0 disables); LAN mode permits remote peers
   PORTLESS_HTTPS=0              Disable HTTPS (same as --no-tls)
   PORTLESS_LAN=1                Enable LAN mode when set to 1 (set in .bashrc / .zshrc)
   PORTLESS_LAN_IP=<address>     Pin a specific LAN IP for LAN mode
@@ -3559,7 +4212,10 @@ ${colors.bold("Environment variables:")}
   PORTLESS_SYNC_HOSTS=0         Disable auto-sync of ${HOSTS_DISPLAY} (on by default)
   PORTLESS_WORKTREE_FLAT=1      Join worktree and app names into one DNS label
                                 Set to 0 to override worktreeFlat in project config
+  PORTLESS_WORKTREE_PREFIX=<p>  Use <p> as the worktree prefix (same as --worktree-prefix)
+                                Set to an empty value to turn the prefix off for the shell
   PORTLESS_TAILSCALE=1          Share apps on your Tailscale network (same as --tailscale)
+  PORTLESS_TAILSCALE_HTTP=1     Share on the tailnet over plain HTTP (same as --tailscale-http)
   PORTLESS_TAILSCALE_SERVICE=1  Share apps as Tailscale Services
   PORTLESS_TAILSCALE_SERVICE_NAME=<n>
                                 Use an explicit Tailscale Service name
@@ -3569,7 +4225,10 @@ ${colors.bold("Environment variables:")}
   PORTLESS_NETBIRD_PASSWORD=<s> Require a password for the NetBird public URL
   PORTLESS_NETBIRD_PIN=<code>   Require a PIN for the NetBird public URL
   PORTLESS_NETBIRD_GROUPS=<csv> Restrict the NetBird URL to user groups
-  PORTLESS_STATE_DIR=<path>     Override the state directory
+  PORTLESS_STATE_DIR=<path>     Override the state directory (no port file there means no
+                                proxy; the default port is not probed).
+                                One state dir tracks one proxy: proxy start on another
+                                port fails while that proxy is live
   PORTLESS=0                    Run command directly without proxy
 
 ${colors.bold("Child process environment:")}
@@ -3578,6 +4237,8 @@ ${colors.bold("Child process environment:")}
   PORT                          Ephemeral port the child should listen on
   HOST                          Usually 127.0.0.1 (omitted for Expo in LAN mode)
   PORTLESS_URL                  Public URL of the app (e.g. https://myapp.localhost)
+  PORTLESS_URL_<APP>            URL of each app in a monorepo run (see below)
+  PORTLESS_CLOUDFLARE_URL       Public URL from a managed Cloudflare tunnel
   PORTLESS_TUNNEL_URL           Public URL from a managed tunnel provider
   PORTLESS_LAN                  Set to 1 when proxy is in LAN mode
   PORTLESS_TAILSCALE_URL        Tailscale URL of the app (when --tailscale is active)
@@ -3586,6 +4247,29 @@ ${colors.bold("Child process environment:")}
   PORTLESS_NGROK_URL            ngrok URL of the app (when --ngrok is active)
   PORTLESS_NETBIRD_URL          NetBird URL of the app (when --netbird is active)
   NODE_EXTRA_CA_CERTS           Path to the portless CA (set when HTTPS is active)
+
+${colors.bold("Referencing another app (monorepo run):")}
+  A monorepo run gives every proxied app the URL of every other proxied app, and
+  its own, as PORTLESS_URL_<APP>. The name is the app name before any worktree
+  prefix, uppercased with dots and dashes as underscores (api.myrepo gives
+  PORTLESS_URL_API_MYREPO), so it is the same in every worktree while the URL
+  it holds carries the branch prefix. When several apps share one hostname at
+  different paths, the path is appended to all but the root one (an app at /api
+  on myrepo.localhost gives PORTLESS_URL_MYREPO_API, and the value includes
+  /api). Names that still collide keep the first app and warn about the rest.
+  Apps whose command is itself portless get none. Outside a monorepo run,
+  "portless get <name>" prints the same URL.
+
+${colors.bold("App port strategy:")}
+  The port an app gets is random in 4000-4999 unless a strategy says otherwise.
+  Set "appPortStrategy" (random, stable or sequential) and "appPortRange" ([min, max])
+  in portless.json or the package.json "portless" key, per app or at the top level,
+  or export PORTLESS_APP_PORT_STRATEGY and PORTLESS_APP_PORT_RANGE, which win over
+  the files. stable derives the port from the app name (worktree prefix included)
+  and path, so a checkout keeps its port; sequential takes the lowest free port.
+  A fixed port (--app-port, PORTLESS_APP_PORT or "appPort") always wins; "appPort"
+  next to "appPortStrategy" in one object is rejected. bg start saves the exported
+  values and bg restart replays them.
 
 ${colors.bold("Command placeholders:")}
   {PORT}                        Assigned app port
@@ -3614,7 +4298,7 @@ ${colors.bold("Skip portless:")}
   PORTLESS=0 bun dev            # Runs command directly without proxy
 
 ${colors.bold("Reserved names:")}
-  run, get, url, alias, tunnel, hosts, list, ls, status, doctor, trust, clean, prune, proxy, bg, service, completion are subcommands and
+  run, get, url, alias, tunnel, hosts, list, ls, status, doctor, trust, clean, prune, proxy, bg, service, mcp, completion are subcommands and
   cannot be used as app names directly. Use "portless run" to infer the name,
   or "portless --name <name>" to force any name including reserved ones.
 `);
@@ -3627,20 +4311,47 @@ function printVersion(): void {
 }
 
 async function handleTrust(): Promise<void> {
-  const { dir } = await discoverState();
+  const { dir, port, tls } = await discoverState();
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
   const { caGenerated } = ensureCerts(dir);
   if (caGenerated) {
     console.log(colors.gray("Generated local CA certificate."));
+    // A running proxy keeps the previous CA and the TLS contexts it already
+    // built in memory, so it presents the old chain until it restarts.
+    // An isolated state dir without a port file has no proxy to restart; never
+    // probe the default port on its behalf.
+    if (await isStateDirProxyRunning(port, tls)) {
+      const [notice, restart] = caRegeneratedRestartHint(port, tls);
+      console.log(colors.yellow(notice));
+      console.log(colors.blue(restart));
+    }
+  }
+  // Adding a CA that every store already holds asks for authorization again
+  // (a Keychain dialog on macOS, sudo on Linux), so scripts that run `trust`
+  // to be sure would prompt on every run. Ask the OS, not the marker: `trust`
+  // also repairs trust after the CA was removed from a store. On WSL both the
+  // Linux and the Windows store must have it, plus the NSS database on Linux.
+  if (isCATrusted(dir, { useMarker: false, everyStore: true })) {
+    console.log(colors.green("Local CA is already in the system trust store."));
+    // A Chrome NSS database without certutil counts as trusted (so this skip
+    // and `proxy start` do not retry every time) but is worth one warning.
+    const nssWarning = nssCertutilMissingWarning();
+    if (nssWarning) console.warn(colors.yellow(nssWarning));
+    return;
   }
   const result = trustCA(dir);
   if (result.trusted) {
     console.log(colors.green("Local CA added to system trust store."));
-    console.log(colors.gray("Browsers will now trust portless HTTPS certificates."));
     if (result.warning) {
       console.warn(colors.yellow(result.warning));
+    } else {
+      console.log(
+        colors.gray(
+          "Browsers will now trust portless HTTPS certificates. Restart your browser to pick up the change."
+        )
+      );
     }
     return;
   }
@@ -3843,7 +4554,13 @@ ${colors.bold("portless prune")} - Kill orphaned dev servers left behind by cras
 When portless is killed with SIGKILL (kill -9) or crashes, child dev servers
 may survive and continue holding their ports. This command finds those orphans
 by checking routes whose owning CLI process is dead but whose port is still in
-use, then terminates them and cleans up the stale route entries.
+use, then terminates them and cleans up the stale route entries. When the route
+recorded the command's process group and start time, the whole group is stopped
+(only while its leader still has that start time); otherwise the process on the
+route port is stopped. portless run does the same for orphans before it starts.
+The proxy never kills orphans: it keeps their routes, and portless list shows
+them as orphaned until you run or prune. It stops serving an orphaned route
+within about a second of its owner dying (404) and writes nothing to do so.
 
 ${colors.bold("Usage:")}
   ${colors.cyan("portless prune")}
@@ -3912,8 +4629,23 @@ ${colors.bold("Options:")}
   }
 
   let killed = 0;
+  const signal = forceKill ? "SIGKILL" : "SIGTERM";
+  const killedGroups = new Set<number>();
+  for (const route of stale) {
+    const pgid = route.childPgid;
+    if (!pgid || killedGroups.has(pgid)) continue;
+    if (killOrphanedProcessGroup(pgid, route.childStartTime, signal)) {
+      killedGroups.add(pgid);
+      killed++;
+      console.log(
+        colors.gray(`  ${formatRouteLabel(route)} - killed process group ${pgid} (${signal})`)
+      );
+    }
+  }
+
   for (const route of stale) {
     const routeLabel = formatRouteLabel(route);
+    if (route.childPgid && killedGroups.has(route.childPgid)) continue;
     const pids = findPidsOnPort(route.port);
     if (pids.length === 0) {
       console.log(
@@ -3921,7 +4653,6 @@ ${colors.bold("Options:")}
       );
       continue;
     }
-    const signal = forceKill ? "SIGKILL" : "SIGTERM";
     for (const pid of pids) {
       try {
         process.kill(pid, signal);
@@ -3965,7 +4696,8 @@ ${colors.bold("Usage:")}
 
 Checks Node.js, state and sudo handoff, ordered and dotted suffixes, proxy bind
 mode, routes, generated or custom certificates, cert.<suffix> pages, hosts sync,
-mDNS tooling, background apps, tunnel providers, Tailscale, and NetBird.
+mDNS tooling, background apps, the Node binary pinned by an installed
+startup service, tunnel providers, Tailscale, and NetBird.
 
 Doctor never starts, stops, trusts, syncs, prunes, cleans, or modifies portless
 state.
@@ -4035,7 +4767,10 @@ ${colors.bold("JSON fields:")}
   path_prefix            Route path prefix
   upstream_protocol      "http1" or "h2c"
   pid                    Owning process PID (0 for alias)
-  kind                   "app" or "alias"
+  kind                   "app", "alias", or "orphan"
+  orphaned               true on orphan entries: the owner exited but its dev server
+                         still runs; "portless prune" stops it
+  registered_at          Epoch milliseconds when the route was registered (absent on routes from older versions)
 `);
       process.exit(0);
     } else {
@@ -4056,7 +4791,7 @@ ${colors.bold("JSON fields:")}
 }
 
 async function handleGet(args: string[]): Promise<void> {
-  if (args[1] === "--help" || args[1] === "-h") {
+  if (hasHelpFlag(args.slice(1))) {
     console.log(`
 ${colors.bold("portless get")} - Print the URL for a service.
 
@@ -4064,6 +4799,7 @@ ${colors.bold("Usage:")}
   ${colors.cyan("portless get <name>")}
   ${colors.cyan("portless url <name>")}
   ${colors.cyan("portless get <name> --json")}
+  ${colors.cyan("portless get <name> --worktree-prefix <prefix>")}
 
 Constructs the URL using the same hostname and worktree logic as
 "portless run", then prints it to stdout. Useful for wiring services
@@ -4073,7 +4809,11 @@ together:
 
 With --json, prints a JSON object suitable for scripts and agents.
 
+The worktree prefix is chosen by flag, then PORTLESS_WORKTREE_PREFIX (empty
+turns it off), then git detection, the same as "portless run".
+
 ${colors.bold("Options:")}
+  --worktree-prefix <p>  Use <p> as the worktree prefix, in a linked worktree or not
   --no-worktree          Skip worktree prefix detection
   --path <prefix>        Append a route path prefix, e.g. /api
   --json                 Output a JSON object to stdout
@@ -4084,6 +4824,8 @@ ${colors.bold("Examples:")}
   portless url backend                  # -> https://backend.localhost
   portless get backend                  # in worktree -> https://auth.backend.localhost
   portless get backend --no-worktree    # -> https://backend.localhost (skip worktree)
+  portless get backend --worktree-prefix qa
+                                        # -> https://qa.backend.localhost
   portless get backend --path /api      # -> https://backend.localhost/api
   portless get backend --json           # -> {"name":"backend",...}
 
@@ -4099,14 +4841,15 @@ ${colors.bold("JSON fields:")}
     process.exit(0);
   }
 
-  let skipWorktree = false;
+  const worktreeFlags: WorktreeFlagState = { ...globalWorktreeFlags };
   let asJson = false;
   let pathPrefix = pathPrefixFromEnv();
   const positional: string[] = [];
 
   for (let i = 1; i < args.length; i++) {
-    if (args[i] === "--no-worktree") {
-      skipWorktree = true;
+    const consumedWorktree = consumeWorktreeFlag(args, i, worktreeFlags);
+    if (consumedWorktree !== null) {
+      i = consumedWorktree;
     } else if (args[i] === "--json") {
       asJson = true;
     } else if (args[i] === "--path") {
@@ -4114,7 +4857,9 @@ ${colors.bold("JSON fields:")}
       pathPrefix = parsePathPrefix(args[i], "--path");
     } else if (args[i].startsWith("-")) {
       console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
-      console.error(colors.blue("Known flags: --no-worktree, --path, --json, --help"));
+      console.error(
+        colors.blue("Known flags: --worktree-prefix, --no-worktree, --path, --json, --help")
+      );
       process.exit(1);
     } else {
       positional.push(args[i]);
@@ -4132,10 +4877,24 @@ ${colors.bold("JSON fields:")}
 
   const name = positional[0];
   const normalizedPathPrefix = normalizePathPrefix(pathPrefix);
-  const serviceUrl = await getUrl(name, {
-    worktree: !skipWorktree,
-    pathPrefix: normalizedPathPrefix,
-  });
+  if (worktreeFlags.disabled && worktreeFlags.prefix !== undefined) {
+    console.error(colors.red("Error: --no-worktree cannot be combined with --worktree-prefix."));
+    process.exit(1);
+  }
+  let serviceUrl: Awaited<ReturnType<typeof getUrl>>;
+  try {
+    serviceUrl = await getUrl(name, {
+      worktree: !worktreeFlags.disabled,
+      worktreePrefix: worktreeFlags.prefix,
+      pathPrefix: normalizedPathPrefix,
+    });
+  } catch (err) {
+    if (err instanceof WorktreePrefixError || err instanceof ConfigValidationError) {
+      console.error(colors.red(`Error: ${err.message}`));
+      process.exit(1);
+    }
+    throw err;
+  }
   if (asJson) {
     process.stdout.write(
       JSON.stringify(
@@ -4288,7 +5047,7 @@ ${colors.bold("Examples:")}
 }
 
 async function handleAlias(args: string[]): Promise<void> {
-  if (args[1] === "--help" || args[1] === "-h") {
+  if (hasHelpFlag(args.slice(1))) {
     console.log(`
 ${colors.bold("portless alias")} - Register a static route for services not managed by portless.
 
@@ -4310,7 +5069,7 @@ ${colors.bold("Examples:")}
     process.exit(0);
   }
 
-  const { dir, tlds, lanMode } = await discoverState();
+  const { dir, port: proxyPort, tls, tlds, lanMode } = await discoverState();
   const store = new RouteStore(dir, {
     onWarning: (msg) => console.warn(colors.yellow(msg)),
   });
@@ -4368,8 +5127,8 @@ ${colors.bold("Examples:")}
 
   const hostnames = buildHostnames(aliasName, tlds);
   const hostname = hostnames[0]!;
-  const port = parseInt(aliasPort, 10);
-  if (isNaN(port) || port < 1 || port > 65535) {
+  const port = parsePort(aliasPort);
+  if (port === null) {
     console.error(colors.red(`Error: Invalid port "${aliasPort}". Must be 1-65535.`));
     process.exit(1);
   }
@@ -4405,7 +5164,7 @@ ${colors.bold("Examples:")}
       `Alias registered: ${label} (${hostnames.length} suffix${hostnames.length === 1 ? "" : "es"}) -> 127.0.0.1:${port}${suffix}`
     )
   );
-  await reportHostsSyncHere(hostnames, lanMode);
+  await reportHostsSyncHere(hostnames, proxyPort, tls, lanMode);
 }
 
 async function handleHosts(args: string[]): Promise<void> {
@@ -4418,6 +5177,7 @@ subdomains. This command adds entries to ${HOSTS_DISPLAY} as a workaround.
 
 ${colors.bold("Usage:")}
   ${colors.cyan("portless hosts sync")}    Add current routes to ${HOSTS_DISPLAY}
+                         (removes stale entries; with no routes it clears them)
   ${colors.cyan("portless hosts clean")}   Remove portless entries from ${HOSTS_DISPLAY}
 
 ${colors.bold("Auto-sync:")}
@@ -4483,12 +5243,14 @@ ${colors.bold("Usage: portless hosts <command>")}
   });
 
   const routes = store.loadRoutes();
-  if (routes.length === 0) {
-    console.log(colors.yellow("No active routes to sync."));
-    return;
-  }
   const hostnames = deduplicateHostnames(routes.map((route) => route.hostname));
+  // With no routes, syncing clears a stale managed block left by a proxy that
+  // was killed before it could clean up. It is a no-op when none exists.
   if (syncHostsFile(hostnames)) {
+    if (hostnames.length === 0) {
+      console.log(colors.yellow(`No active routes. ${HOSTS_DISPLAY} has no portless entries.`));
+      return;
+    }
     console.log(colors.green(`Synced ${hostnames.length} hostname(s) to ${HOSTS_DISPLAY}:`));
     for (const h of hostnames) {
       console.log(colors.cyan(`  127.0.0.1 ${h}`));
@@ -4547,17 +5309,116 @@ function resolveRoutesCleanupIntervalSeconds(args: string[]): number {
   return seconds;
 }
 
+/** `portless proxy status [--json]`: report the proxy without starting, stopping, or elevating anything. */
+async function handleProxyStatus(args: string[]): Promise<void> {
+  const rest = args.slice(2);
+  if (hasHelpFlag(rest)) {
+    console.log(`
+${colors.bold("portless proxy status")} - Show whether the proxy is running and how it is configured.
+
+Read-only: it never starts, stops, or elevates the proxy. This is not
+${colors.cyan("portless status")}, which is an alias of ${colors.cyan("portless list")} and shows routes.
+
+${colors.bold("Usage:")}
+  ${colors.cyan("portless proxy status")}           Human-readable summary
+  ${colors.cyan("portless proxy status --json")}    One line of JSON for scripts and launchers
+
+${colors.bold("JSON fields:")}
+  running        true when a portless proxy answers on its port
+  pid            Proxy process id, or null when unreadable
+  port           Proxy port
+  tls            true when the proxy serves HTTPS
+  tlds           Suffixes the proxy serves, e.g. ["localhost"]
+  lan            true in LAN mode
+  unprivileged   true when started with --unprivileged
+  stateDir       State directory (holds ca.pem when HTTPS is on)
+  wildcard       true when unregistered subdomains fall back to the parent (fork field)
+  lanIp          LAN IP recorded for LAN mode, or null (fork field)
+
+Every field is always present. While the proxy is not running, everything
+except running and stateDir is null. The command exits 0 either way; read
+running.
+
+${colors.bold("Options:")}
+  --json                 Print JSON instead of text
+  --help, -h             Show this help
+`);
+    process.exit(0);
+  }
+
+  const unknown = rest.find((arg) => arg !== "--json");
+  if (unknown !== undefined) {
+    console.error(colors.red(`Error: Unknown argument "${unknown}".`));
+    console.error(colors.cyan("  portless proxy status --help"));
+    process.exit(1);
+  }
+
+  const status = await getProxyStatus();
+  if (rest.includes("--json")) {
+    console.log(JSON.stringify(status));
+    return;
+  }
+
+  console.log(colors.bold("portless proxy"));
+  console.log(`  Running: ${status.running ? "yes" : "no"}`);
+  if (status.running) {
+    if (status.pid !== null) console.log(`  PID: ${status.pid}`);
+    console.log(`  Port: ${status.port}`);
+    console.log(`  HTTPS: ${status.tls ? "yes" : "no"}`);
+    console.log(`  Suffixes: ${formatTldList(status.tlds ?? [])}`);
+    console.log(`  LAN mode: ${status.lan ? "yes" : "no"}`);
+    if (status.lanIp !== null) console.log(`  LAN IP: ${status.lanIp}`);
+    console.log(`  Unprivileged: ${status.unprivileged ? "yes" : "no"}`);
+    console.log(`  Wildcard: ${status.wildcard ? "yes" : "no"}`);
+  }
+  console.log(`  State directory: ${status.stateDir}`);
+}
+
 async function handleProxy(args: string[]): Promise<void> {
+  if (args[1] === "status") {
+    await handleProxyStatus(args);
+    return;
+  }
+
   if (args[1] === "stop") {
+    if (hasHelpFlag(args.slice(2))) {
+      console.log(`
+${colors.bold("portless proxy stop")} - Stop the proxy.
+
+${colors.bold("Usage:")}
+  ${colors.cyan("portless proxy stop")}             Stop the discovered proxy
+  ${colors.cyan("portless proxy stop -p 1355")}     Stop the proxy on a specific port
+
+${colors.bold("Options:")}
+  --port, -p <port>      Port of the proxy to stop
+  --help, -h             Show this help
+`);
+      process.exit(0);
+    }
+
     let explicitPort: number | undefined;
-    const portIdx = args.indexOf("--port") !== -1 ? args.indexOf("--port") : args.indexOf("-p");
-    if (portIdx !== -1) {
-      const portValue = args[portIdx + 1];
-      if (portValue && !portValue.startsWith("-")) {
-        const parsed = parseInt(portValue, 10);
-        if (!isNaN(parsed) && parsed >= 1 && parsed <= 65535) {
-          explicitPort = parsed;
+    for (let i = 2; i < args.length; i++) {
+      const arg = args[i]!;
+      if (arg === "--port" || arg === "-p") {
+        const portValue = args[i + 1];
+        if (portValue === undefined || portValue.startsWith("-")) {
+          console.error(colors.red(`Error: ${arg} requires a port number.`));
+          process.exit(1);
         }
+        const parsed = parsePort(portValue);
+        if (parsed === null) {
+          console.error(colors.red(`Error: Invalid port number: ${portValue}`));
+          console.error(colors.blue("Port must be between 1 and 65535."));
+          process.exit(1);
+        }
+        explicitPort = parsed;
+        i++;
+      } else {
+        // Refuse anything else instead of stopping the proxy: a mistyped flag
+        // or a probe such as `--help` must never take the proxy down.
+        console.error(colors.red(`Error: Unknown argument "${arg}".`));
+        console.error(colors.blue("Known flags: --port, -p, --help"));
+        process.exit(1);
       }
     }
 
@@ -4567,6 +5428,11 @@ async function handleProxy(args: string[]): Promise<void> {
         onWarning: (msg) => console.warn(colors.yellow(msg)),
       });
       await stopProxy(store, explicitPort, false);
+    } else if (isExplicitStateDirEmpty()) {
+      // An isolated state dir without a port file has no proxy of its own.
+      // Probing the default port would reach (and could stop) another proxy
+      // on this machine, so report it as not running.
+      console.log(colors.yellow("Proxy is not running."));
     } else {
       const { dir, port, tls } = await discoverState();
       const store = new RouteStore(dir, {
@@ -4593,9 +5459,13 @@ ${colors.bold("Usage:")}
   ${colors.cyan("portless proxy start --suffix test --suffix local.example.com")}
                          Serve every app under both suffixes
   ${colors.cyan("portless proxy start --tld test")}     Compatibility alias for --suffix
+  ${colors.cyan("portless proxy start --unprivileged")} Bind without sudo; HTTP by default, hosts sync off
   ${colors.cyan("portless proxy start --wildcard")}     Allow unregistered subdomains to fall back to parent (local only)
   ${colors.cyan("portless proxy start --routes-cleanup-interval 60")}  Sweep dead routes every 60s (default 300, 0 disables)
+  ${colors.cyan("portless proxy status")}               Show whether the proxy is running and its settings
+  ${colors.cyan("portless proxy status --json")}        The same as one line of JSON, for scripts
   ${colors.cyan("portless proxy stop")}                 Stop the proxy
+  ${colors.cyan("portless proxy stop -p 1355")}         Stop the proxy on a specific port
 
 ${colors.bold("LAN mode (--lan):")}
   Without LAN mode, the proxy listens only on 127.0.0.1 and ::1.
@@ -4662,12 +5532,13 @@ ${colors.bold("LAN mode (--lan):")}
       console.error(colors.cyan("  portless proxy start -p 8080"));
       process.exit(1);
     }
-    proxyPort = parseInt(portValue, 10);
-    if (isNaN(proxyPort) || proxyPort < 1 || proxyPort > 65535) {
+    const parsedPort = parsePort(portValue);
+    if (parsedPort === null) {
       console.error(colors.red(`Error: Invalid port number: ${portValue}`));
       console.error(colors.blue("Port must be between 1 and 65535."));
       process.exit(1);
     }
+    proxyPort = parsedPort;
     hasExplicitPort = true;
   }
 
@@ -4719,6 +5590,8 @@ ${colors.bold("LAN mode (--lan):")}
     lanIp: process.env.PORTLESS_LAN_IP !== undefined,
     tld: tldFlagValues.length > 0 || hasConfiguredTldEnv(),
     useWildcard: args.includes("--wildcard") || process.env.PORTLESS_WILDCARD !== undefined,
+    unprivileged:
+      args.includes("--unprivileged") || process.env.PORTLESS_UNPRIVILEGED !== undefined,
   };
 
   // Resolve state directory based on the port
@@ -4729,8 +5602,9 @@ ${colors.bold("LAN mode (--lan):")}
     const currentState = await discoverState();
     persistedLanMode = currentState.lanMode;
     if (
-      (await isProxyRunning(currentState.port)) ||
-      (!!process.env.PORTLESS_STATE_DIR && (await isPortListening(currentState.port)))
+      !isExplicitStateDirEmpty() &&
+      ((await isProxyRunning(currentState.port)) ||
+        (!!process.env.PORTLESS_STATE_DIR && (await isPortListening(currentState.port))))
     ) {
       runningPort = currentState.port;
       proxyPort = currentState.port;
@@ -4749,6 +5623,11 @@ ${colors.bold("LAN mode (--lan):")}
     lanIp: process.env.PORTLESS_LAN_IP || null,
     tlds,
     useWildcard,
+    unprivileged:
+      args.includes("--unprivileged") ||
+      (process.env.PORTLESS_UNPRIVILEGED !== undefined
+        ? isUnprivilegedEnvEnabled()
+        : readUnprivilegedMarker(stateDir)),
   });
   const lanMode = desiredConfig.lanMode;
   useHttps = desiredConfig.useHttps;
@@ -4757,12 +5636,33 @@ ${colors.bold("LAN mode (--lan):")}
   const tld = desiredConfig.tld;
   tlds = desiredConfig.tlds;
   const desiredWildcard = desiredConfig.useWildcard;
-  let lanIp: string | null = desiredConfig.lanIpExplicit ? desiredConfig.lanIp : null;
+  const unprivileged = desiredConfig.unprivileged;
+  if (
+    unprivileged &&
+    (process.env.PORTLESS_SYNC_HOSTS === "1" || process.env.PORTLESS_SYNC_HOSTS === "true")
+  ) {
+    console.error(
+      colors.red("Error: --unprivileged cannot be combined with PORTLESS_SYNC_HOSTS=1.")
+    );
+    process.exit(1);
+  }
 
   if (!hasExplicitPort && runningPort === null) {
     proxyPort = getDefaultPort(useHttps);
     stateDir = resolveStateDir(proxyPort);
   }
+
+  if (unprivileged) {
+    const permission = canBindWithoutRoot(proxyPort);
+    if (!permission.ok) {
+      console.error(colors.red(permission.reason));
+      console.error(
+        colors.cyan(`  sudo sysctl -w net.ipv4.ip_unprivileged_port_start=${proxyPort}`)
+      );
+      process.exit(1);
+    }
+  }
+  let lanIp: string | null = desiredConfig.lanIpExplicit ? desiredConfig.lanIp : null;
 
   if (lanMode && desiredWildcard) {
     console.warn(
@@ -4783,24 +5683,30 @@ ${colors.bold("LAN mode (--lan):")}
 
   const syncDisabled =
     process.env.PORTLESS_SYNC_HOSTS === "0" || process.env.PORTLESS_SYNC_HOSTS === "false";
-  const nonDefaultTlds = tlds.filter((configuredTld) => configuredTld !== DEFAULT_TLD);
-  if (nonDefaultTlds.length > 0 && !lanMode && syncDisabled) {
+  const nonDefaultTlds = tlds.filter(
+    (configuredTld) => configuredTld !== DEFAULT_TLD && !(lanMode && configuredTld === "local")
+  );
+  if (nonDefaultTlds.length > 0 && (unprivileged || (!lanMode && syncDisabled))) {
     console.warn(
       colors.yellow(
         `Warning: ${formatTldList(nonDefaultTlds)} domains require ${HOSTS_DISPLAY} entries to resolve to 127.0.0.1.`
       )
     );
     console.warn(colors.yellow("Hosts sync is disabled. To add entries manually, run:"));
-    console.warn(colors.cyan("  portless hosts sync"));
+    console.warn(colors.cyan("  sudo portless hosts sync"));
   }
 
-  let store = new RouteStore(stateDir, {
+  const store = new RouteStore(stateDir, {
     onWarning: (msg) => console.warn(colors.yellow(msg)),
   });
 
   // Check if already running. Plain HTTP check detects both TLS and non-TLS
   // proxies because the TLS-enabled proxy accepts plain HTTP via byte-peeking.
-  const proxyRunning = runningPort !== null || (await isProxyRunning(proxyPort));
+  // Without --port, an explicit state dir that has no port file never means the
+  // default port's proxy; probing it could reach an unrelated system proxy.
+  const proxyRunning =
+    runningPort !== null ||
+    (!(!hasExplicitPort && isExplicitStateDirEmpty()) && (await isProxyRunning(proxyPort)));
   if (proxyRunning) {
     const runningConfig = readCurrentProxyConfig(stateDir);
     const mismatchMessages = getProxyConfigMismatchMessages(desiredConfig, runningConfig, explicit);
@@ -4816,6 +5722,21 @@ ${colors.bold("LAN mode (--lan):")}
       colors.blue(`To restart: portless proxy stop${portFlag} && portless proxy start${portFlag}`)
     );
     return;
+  }
+
+  // One state directory tracks one proxy. Starting a second would overwrite
+  // proxy.pid and proxy.port and leave the first running untracked.
+  const otherTrackedPort = await findOtherTrackedProxyPort(store, proxyPort);
+  if (otherTrackedPort !== null) {
+    console.error(colors.red(`Error: A proxy is already running on port ${otherTrackedPort}.`));
+    console.error(colors.blue("To move it, stop it first:"));
+    console.error(
+      colors.cyan(
+        `  portless proxy stop -p ${otherTrackedPort} && portless proxy start -p ${proxyPort}`
+      )
+    );
+    console.error(colors.blue("To run a second proxy, give it its own PORTLESS_STATE_DIR."));
+    process.exit(1);
   }
 
   if (lanMode) {
@@ -4864,11 +5785,15 @@ ${colors.bold("LAN mode (--lan):")}
     tlds,
     tldsExplicit: desiredConfig.tldsExplicit,
     useWildcard: desiredWildcard,
+    unprivileged,
   };
 
-  // Privileged ports require root on Unix. Auto-elevate with sudo when
-  // possible, falling back to the unprivileged port when sudo is unavailable.
-  if (!isWindows && proxyPort < PRIVILEGED_PORT_THRESHOLD && (process.getuid?.() ?? -1) !== 0) {
+  // Probe the selected listeners; hosts synchronization can also require root.
+  const canElevate = !unprivileged && !isWindows && (process.getuid?.() ?? -1) !== 0;
+  const hostsNeedRoot = canElevate && needsHostsPrivileges(resolvedConfig);
+  const portNeedsRoot =
+    canElevate && !(await canBindProxyPort(proxyPort, getProxyBindTargets(lanMode)));
+  if (hostsNeedRoot || portNeedsRoot) {
     const startArgs = [
       process.execPath,
       getEntryScript(),
@@ -4885,6 +5810,7 @@ ${colors.bold("LAN mode (--lan):")}
         tlds,
         tldsExplicit: desiredConfig.tldsExplicit,
         useWildcard: desiredWildcard,
+        unprivileged,
         foreground: isForeground,
         includePort: true,
         proxyPort,
@@ -4895,11 +5821,28 @@ ${colors.bold("LAN mode (--lan):")}
     const fallbackCommand = formatProxyStartCommand(FALLBACK_PROXY_PORT, resolvedConfig);
     const currentCommand = formatProxyStartCommand(proxyPort, resolvedConfig);
 
-    console.log(
-      colors.yellow(`Port ${proxyPort} requires elevated privileges. Requesting sudo...`)
-    );
-    if (!hasExplicitPort) {
-      console.log(colors.gray(`(To skip sudo, use an unprivileged port: ${fallbackCommand})`));
+    if (portNeedsRoot) {
+      console.log(
+        colors.yellow(`Port ${proxyPort} requires elevated privileges. Requesting sudo...`)
+      );
+      if (!hasExplicitPort) {
+        console.log(
+          colors.gray(
+            `(To skip sudo, use an unprivileged port: ${fallbackCommand}, or pass --unprivileged)`
+          )
+        );
+      }
+    } else {
+      const hostsSuffixes = resolvedConfig.tlds
+        .filter((suffix) => suffix !== DEFAULT_TLD && !(lanMode && suffix === "local"))
+        .map((suffix) => `.${suffix}`)
+        .join(", ");
+      console.log(
+        colors.yellow(
+          `Syncing ${HOSTS_DISPLAY} entries for ${hostsSuffixes} requires elevated privileges. Requesting sudo...`
+        )
+      );
+      console.log(colors.gray(formatRootSkipHint(proxyPort)));
     }
     const result = spawnSync(
       "sudo",
@@ -4929,36 +5872,10 @@ ${colors.bold("LAN mode (--lan):")}
       process.exit(1);
     }
 
-    // sudo failed: fall back to the unprivileged port if the user didn't
-    // explicitly request a privileged one.
-    if (!hasExplicitPort) {
-      proxyPort = FALLBACK_PROXY_PORT;
-      console.log(colors.yellow(`Falling back to port ${proxyPort}.`));
-      console.log(
-        colors.blue(`For clean URLs without port numbers, re-run and accept the sudo prompt:`)
-      );
-      console.log(colors.cyan(`  ${fallbackCommand}`));
-
-      if (await isProxyRunning(proxyPort)) {
-        console.log(colors.yellow(`Proxy is already running on port ${proxyPort}.`));
-        return;
-      }
-
-      // Re-initialize state for the fallback port and fall through to the
-      // normal startup path below.
-      stateDir = resolveStateDir(proxyPort);
-      store = new RouteStore(stateDir, {
-        onWarning: (msg: string) => console.warn(colors.yellow(msg)),
-      });
-    } else {
-      // Explicit port was requested but sudo failed; error out.
-      console.error(
-        colors.red(`Error: Port ${proxyPort} requires elevated privileges and sudo failed.`)
-      );
-      console.error(colors.blue("Try again (portless will prompt for sudo):"));
-      console.error(colors.cyan(`  ${currentCommand}`));
-      process.exit(1);
-    }
+    console.error(colors.red("Error: sudo failed. The proxy was not started."));
+    console.error(colors.blue("Try again in a terminal:"));
+    console.error(colors.cyan(`  ${currentCommand}`));
+    process.exit(1);
   }
 
   // Prepare TLS options if HTTPS is requested
@@ -4998,15 +5915,17 @@ ${colors.bold("LAN mode (--lan):")}
         console.log(colors.green("Generated local CA certificate."));
       }
 
-      if (!skipTrust && !isCATrusted(stateDir)) {
+      if (!unprivileged && !skipTrust && !isCATrusted(stateDir)) {
         console.log(colors.yellow("Adding CA to system trust store..."));
         const trustResult = trustCA(stateDir);
         if (trustResult.trusted) {
-          console.log(
-            colors.green("CA added to system trust store. Browsers will trust portless certs.")
-          );
           if (trustResult.warning) {
+            console.log(colors.green("CA added to system trust store."));
             console.warn(colors.yellow(trustResult.warning));
+          } else {
+            console.log(
+              colors.green("CA added to system trust store. Browsers will trust portless certs.")
+            );
           }
         } else {
           console.warn(colors.yellow("Could not add CA to system trust store."));
@@ -5043,9 +5962,12 @@ ${colors.bold("LAN mode (--lan):")}
       tlsOptions,
       lanIp,
       desiredWildcard ? false : undefined,
-      lanMode,
-      !!(customCertPath && customKeyPath),
-      routesCleanupIntervalSeconds
+      {
+        lanMode,
+        unprivileged,
+        customCert: !!(customCertPath && customKeyPath),
+        routesCleanupIntervalSeconds,
+      }
     );
     return;
   }
@@ -5077,6 +5999,7 @@ ${colors.bold("LAN mode (--lan):")}
         tlds,
         tldsExplicit: desiredConfig.tldsExplicit,
         useWildcard: desiredWildcard,
+        unprivileged,
         foreground: true,
         includePort: true,
         proxyPort,
@@ -5131,11 +6054,15 @@ function loadAppConfig(cwd: string = process.cwd()): LoadedAppConfig | null {
   try {
     const loaded = loadConfig(cwd);
     if (!loaded) return null;
-    const config = resolveAppConfig(loaded.config, loaded.configDir, cwd);
+    const config = withRootAppPortDefaults(
+      resolveAppConfig(loaded.config, loaded.configDir, cwd),
+      loaded.config
+    );
     return {
       config,
       sourceLabel: configSourceLabel(loaded.sourcePath, cwd),
       worktreeFlat: config.worktreeFlat ?? loaded.config.worktreeFlat,
+      worktreeBranch: config.worktreeBranch ?? loaded.config.worktreeBranch,
     };
   } catch (err) {
     if (err instanceof ConfigValidationError) {
@@ -5224,7 +6151,7 @@ async function handleDefaultSingle(
     nameSource = inferred.source;
   }
 
-  const worktree = detectWorktreePrefix(cwd);
+  const worktree = resolveWorktree(cwd, globalWorktreeFlags, appConfig?.worktreeBranch);
   const effectiveName = applyWorktreePrefix(
     baseName,
     worktree,
@@ -5251,7 +6178,9 @@ async function handleDefaultSingle(
     { scriptName, packageDir: cwd },
     {},
     undefined,
-    pathPrefixFromEnv() ?? appConfig?.config.path
+    pathPrefixFromEnv() ?? appConfig?.config.path,
+    undefined,
+    appPortAllocationOrExit(appConfig?.config)
   );
 }
 
@@ -5263,15 +6192,72 @@ interface MultiAppEntry {
   pkg: WorkspacePackage;
   /** Portless hostname (e.g. "web.json-render") */
   name: string;
+  /** Hostname before any worktree prefix, which names this app's peer URL variable */
+  baseName: string;
   /** Human-readable package label for display (e.g. "web") */
   label: string;
   commandArgs: string[];
   appPort?: number;
+  allocation: AppPortAllocation;
   path?: string;
   proxied: boolean;
 }
 
+/** Pick a port for a multi-app entry with its own strategy, keyed by its name and path. */
+function pickAppPort(
+  app: MultiAppEntry,
+  store: RouteStore,
+  hostnames: string[],
+  pathPrefix: string
+): Promise<number> {
+  return findFreePort(app.allocation.range[0], app.allocation.range[1], {
+    strategy: app.allocation.strategy,
+    key: appPortKey(app.name, pathPrefix),
+    exclude: registeredPorts(store, hostnames, pathPrefix),
+  });
+}
+
+/**
+ * Peer URLs handed to every proxied app in a multi-app run. An app URL depends
+ * only on its name, path prefix, the proxy port and the TLDs, never on the
+ * app's own port, so the whole map is known before the first app is spawned.
+ *
+ * Apps that run their own `portless` are left out: they register their own
+ * routes, so this process does not own their URL.
+ */
+function buildPeerUrls(
+  proxiedApps: MultiAppEntry[],
+  proxyPort: number,
+  tls: boolean,
+  tlds: string[]
+): Record<string, string> {
+  const peers = proxiedApps
+    .filter((app) => app.commandArgs[0] !== "portless")
+    .map((app) => {
+      const pathPrefix = normalizePathPrefix(pathPrefixFromEnv() ?? app.path);
+      return {
+        baseName: app.baseName,
+        hostname: app.name,
+        pathPrefix,
+        url: formatUrl(buildHostnames(app.name, tlds)[0]!, proxyPort, tls, pathPrefix),
+      };
+    });
+
+  return buildPeerUrlEnv(peers, (msg) => console.warn(colors.yellow(msg)));
+}
+
 function spawnChildProcess(
+  commandArgs: string[],
+  env: Record<string, string | undefined>,
+  cwd: string
+): ReturnType<typeof spawn> {
+  const spawnedAt = Date.now();
+  const child = spawnUnguardedChildProcess(commandArgs, env, cwd);
+  guardWindowsOrphans(child, spawnedAt);
+  return child;
+}
+
+function spawnUnguardedChildProcess(
   commandArgs: string[],
   env: Record<string, string | undefined>,
   cwd: string
@@ -5344,11 +6330,15 @@ async function spawnProxiedApp(
   tls: boolean,
   tlds: string[],
   lanMode: boolean,
-  exitCodes: Map<string, number | null>
+  exitCodes: Map<string, number | null>,
+  lifecycle: { stopping: boolean },
+  peerUrls: Record<string, string>
 ): Promise<{
   child: ReturnType<typeof spawn>;
   displayUrl: string;
   route: { store: RouteStore; hostnames: string[]; pathPrefix: string } | null;
+  /** Resolves once the app exited and its route was kept or removed. */
+  settled: Promise<void>;
 }> {
   const usesPortless = app.commandArgs[0] === "portless";
 
@@ -5370,30 +6360,35 @@ async function spawnProxiedApp(
       onWarning: (msg) => console.warn(colors.yellow(`[${app.name}] ${msg}`)),
     });
 
-    const appPort = app.appPort ?? (await findFreePort());
-    assignedAppPort = appPort;
     routePathPrefix = normalizePathPrefix(pathPrefixFromEnv() ?? app.path);
     hostnames = buildHostnames(app.name, tlds);
+    const appPort = app.appPort ?? (await pickAppPort(app, store, hostnames, routePathPrefix));
+    assignedAppPort = appPort;
     const url = formatUrl(hostnames[0]!, proxyPort, tls, routePathPrefix);
     displayUrl = url;
 
     for (const [index, hostname] of hostnames.entries()) {
       assertNotReservedHostname(hostname, tlds[index]!);
     }
+    stopOrphanedProcessGroups(store);
     addRoutes(store, hostnames, appPort, process.pid, false, {
       protocol: routeProtocolFromEnv(),
       pathPrefix: routePathPrefix,
       label: multiplexLabelFromEnv(),
     });
-    await reportHostsSyncHere(hostnames, lanMode);
+    await reportHostsSyncHere(hostnames, proxyPort, tls, lanMode);
     const viteRouteMetadata = loadViteRouteMetadata(store, hostnames, routePathPrefix);
 
     env = {
       ...pkgEnv,
+      ...peerUrls,
       PORT: String(appPort),
       HOST: "127.0.0.1",
       PORTLESS_URL: url,
-      __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: formatViteAllowedHosts(tlds, viteRouteMetadata),
+      __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: formatViteAllowedHosts(tlds, viteRouteMetadata, {
+        packageDir: app.pkg.dir,
+        onNotice: (message) => console.log(colors.gray(`[${app.name}] ${message}`)),
+      }),
     };
 
     if (tls) {
@@ -5409,31 +6404,66 @@ async function spawnProxiedApp(
     injectFrameworkFlags(app.commandArgs, assignedAppPort);
   }
 
+  const preexistingListeners =
+    assignedAppPort === undefined ? [] : await findPreexistingListeners(assignedAppPort);
   const child = spawnChildProcess(app.commandArgs, env, app.pkg.dir);
   pipeOutput(child, chalk.cyan(`[${app.name}]`));
+  if (store && hostnames && routePathPrefix && child.pid) {
+    recordChildProcessGroup(store, hostnames, child.pid, {
+      pathPrefix: routePathPrefix,
+      label: multiplexLabelFromEnv(),
+    });
+  }
 
   const capturedStore = store;
   const capturedHostnames = hostnames;
   const capturedPathPrefix = routePathPrefix;
-  child.on("exit", (code, signal) => {
-    exitCodes.set(app.name, code);
-    if (code !== 0 && code !== null) {
-      console.error(colors.red(`[${app.name}] exited with code ${code}`));
-    } else if (signal) {
-      console.error(colors.yellow(`[${app.name}] killed by ${signal}`));
-    }
-    if (capturedStore && capturedHostnames) {
-      removeRoutes(capturedStore, capturedHostnames, process.pid, {
+  const settled = new Promise<void>((resolve) => {
+    child.on("exit", (code, signal) => {
+      exitCodes.set(app.name, code);
+      if (code !== 0 && code !== null) {
+        console.error(colors.red(`[${app.name}] exited with code ${code}`));
+      } else if (signal) {
+        console.error(colors.yellow(`[${app.name}] killed by ${signal}`));
+      }
+      if (!capturedStore || !capturedHostnames || assignedAppPort === undefined) {
+        resolve();
+        return;
+      }
+      const routeOptions = {
         pathPrefix: capturedPathPrefix ?? undefined,
-      });
-    }
+        label: multiplexLabelFromEnv(),
+      };
+      // A signal or a shutdown in progress means the app was stopped on
+      // purpose, so its route is removed rather than handed to a survivor.
+      const transfer =
+        signal || lifecycle.stopping
+          ? Promise.resolve()
+          : transferRoutesToDaemon(
+              capturedStore,
+              capturedHostnames,
+              assignedAppPort,
+              child.pid,
+              preexistingListeners,
+              code === 0,
+              routeOptions
+            );
+      transfer
+        .catch(() => {
+          // Best-effort; the routes are removed below when still ours.
+        })
+        .finally(() => {
+          removeRoutes(capturedStore, capturedHostnames, process.pid, routeOptions);
+          resolve();
+        });
+    });
   });
 
   const route =
     store && hostnames && routePathPrefix
       ? { store, hostnames, pathPrefix: routePathPrefix }
       : null;
-  return { child, displayUrl, route };
+  return { child, displayUrl, route, settled };
 }
 
 function spawnTaskApp(
@@ -5510,7 +6540,16 @@ async function handleDefaultMulti(
     }
   }
 
-  const worktree = detectWorktreePrefix(wsRoot);
+  // Detection runs once per branch derivation mode; a package or app entry may
+  // override the top-level worktreeBranch.
+  const worktreeByMode = new Map<WorktreeBranchMode | undefined, WorktreePrefix | null>();
+  const worktreeFor = (mode: WorktreeBranchMode | undefined): WorktreePrefix | null => {
+    if (!worktreeByMode.has(mode)) {
+      worktreeByMode.set(mode, resolveWorktree(wsRoot, globalWorktreeFlags, mode));
+    }
+    return worktreeByMode.get(mode) ?? null;
+  };
+  worktreeFor(loaded?.config.worktreeBranch);
   const worktreeFlat = resolveWorktreeFlat(loaded?.config.worktreeFlat);
   const apps: MultiAppEntry[] = [];
 
@@ -5533,7 +6572,10 @@ async function handleDefaultMulti(
       ...Object.fromEntries(Object.entries(rootOverride ?? {}).filter(([, v]) => v !== undefined)),
       ...Object.fromEntries(Object.entries(pkgConfig ?? {}).filter(([, v]) => v !== undefined)),
     };
+    // A top-level port strategy is the repo-wide default for apps that do not fix a port.
+    const portConfig = loaded ? withRootAppPortDefaults(appOverride, loaded.config) : appOverride;
 
+    const worktree = worktreeFor(appOverride.worktreeBranch ?? loaded?.config.worktreeBranch);
     const effectiveScript = appOverride.script ?? scriptName;
     const scriptValue = pkg.scripts[effectiveScript];
     if (!scriptValue) continue;
@@ -5547,9 +6589,10 @@ async function handleDefaultMulti(
     const proxied = appOverride.proxy ?? isServerCommand(rawScript);
 
     let name: string;
+    let baseName: string;
     let label: string;
     if (appOverride.name) {
-      const baseName = appOverride.name
+      baseName = appOverride.name
         .split(".")
         .map((l) => truncateLabel(l))
         .join(".");
@@ -5563,7 +6606,7 @@ async function handleDefaultMulti(
       } else {
         pkgLabel = rel.replace(/\//g, "-");
       }
-      const baseName = pkgLabel === projectName ? projectName : `${pkgLabel}.${projectName}`;
+      baseName = pkgLabel === projectName ? projectName : `${pkgLabel}.${projectName}`;
       name = applyWorktreePrefix(baseName, worktree, worktreeFlat);
       label = pkg.scope ? `@${pkg.scope}/${pkg.name}` : (pkg.name ?? rel);
     }
@@ -5571,9 +6614,11 @@ async function handleDefaultMulti(
     apps.push({
       pkg,
       name,
+      baseName,
       label,
       commandArgs,
       appPort: appOverride.appPort,
+      allocation: appPortAllocationOrExit(portConfig),
       path: appOverride.path,
       proxied,
     });
@@ -5656,6 +6701,7 @@ async function runWithTurbo(
   const manifest: Record<string, ManifestEntry> = {};
   const routes: { hostnames: string[]; pathPrefix: string }[] = [];
   const appUrls: { label: string; url: string }[] = [];
+  const peerUrls = buildPeerUrls(proxiedApps, proxyPort, tls, tlds);
 
   for (const app of proxiedApps) {
     const usesPortless = app.commandArgs[0] === "portless";
@@ -5664,29 +6710,34 @@ async function runWithTurbo(
       continue;
     }
 
-    const appPort = app.appPort ?? (await findFreePort());
     const routePathPrefix = normalizePathPrefix(pathPrefixFromEnv() ?? app.path);
     const hostnames = buildHostnames(app.name, tlds);
+    const appPort = app.appPort ?? (await pickAppPort(app, store, hostnames, routePathPrefix));
     const url = formatUrl(hostnames[0]!, proxyPort, tls, routePathPrefix);
     appUrls.push({ label: app.label, url });
 
     for (const [index, hostname] of hostnames.entries()) {
       assertNotReservedHostname(hostname, tlds[index]!);
     }
+    stopOrphanedProcessGroups(store);
     addRoutes(store, hostnames, appPort, process.pid, false, {
       protocol: routeProtocolFromEnv(),
       pathPrefix: routePathPrefix,
       label: multiplexLabelFromEnv(),
     });
-    await reportHostsSyncHere(hostnames, lanMode);
+    await reportHostsSyncHere(hostnames, proxyPort, tls, lanMode);
     const viteRouteMetadata = loadViteRouteMetadata(store, hostnames, routePathPrefix);
     routes.push({ hostnames, pathPrefix: routePathPrefix });
 
     const entry: ManifestEntry = {
+      ...peerUrls,
       PORT: String(appPort),
       HOST: "127.0.0.1",
       PORTLESS_URL: url,
-      __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: formatViteAllowedHosts(tlds, viteRouteMetadata),
+      __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: formatViteAllowedHosts(tlds, viteRouteMetadata, {
+        packageDir: app.pkg.dir,
+        onNotice: (message) => console.log(colors.gray(`[${app.name}] ${message}`)),
+      }),
     };
     if (tls) {
       const caPath = path.join(stateDir, "ca.pem");
@@ -5697,8 +6748,8 @@ async function runWithTurbo(
     manifest[app.pkg.dir] = entry;
   }
 
-  ensureEnvLoader();
-  writeManifest(manifest);
+  ensureEnvLoader(stateDir);
+  writeManifest(manifest, stateDir);
 
   if (appUrls.length > 0) {
     const maxLabel = Math.max(...appUrls.map((a) => a.label.length));
@@ -5719,15 +6770,26 @@ async function runWithTurbo(
         ? ["bunx", "turbo", "run", scriptName, ...extraArgs]
         : [pm, "exec", "turbo", "run", scriptName, ...extraArgs];
 
+  const turboSpawnedAt = Date.now();
   const turboChild = spawn(turboArgs[0], turboArgs.slice(1), {
     stdio: "inherit",
     cwd: wsRoot,
     env: {
       ...process.env,
-      NODE_OPTIONS: buildNodeOptions(),
+      NODE_OPTIONS: buildNodeOptions(stateDir),
     },
     ...(isWindows ? {} : { detached: true }),
   });
+  guardWindowsOrphans(turboChild, turboSpawnedAt);
+  if (turboChild.pid) {
+    // Turbo's apps share its process group, so one record covers every route.
+    for (const { hostnames, pathPrefix } of routes) {
+      recordChildProcessGroup(store, hostnames, turboChild.pid, {
+        pathPrefix,
+        label: multiplexLabelFromEnv(),
+      });
+    }
+  }
 
   const SIGKILL_TIMEOUT_MS = 5_000;
 
@@ -5746,7 +6808,7 @@ async function runWithTurbo(
     for (const { hostnames, pathPrefix } of routes) {
       removeRoutes(store, hostnames, process.pid, { pathPrefix });
     }
-    removeManifest();
+    removeManifest(stateDir);
   };
 
   process.on("SIGHUP", cleanup);
@@ -5777,20 +6839,26 @@ async function runWithDirectSpawn(
   const exitCodes = new Map<string, number | null>();
   const appUrls: { label: string; url: string }[] = [];
   const routeEntries: { store: RouteStore; hostnames: string[]; pathPrefix: string }[] = [];
+  const routeSettlements: Promise<void>[] = [];
+  const lifecycle = { stopping: false };
+  const peerUrls = buildPeerUrls(proxiedApps, proxyPort, tls, tlds);
 
   // Sequential: each spawnProxiedApp calls findFreePort() which binds/releases
   // a port, so parallel spawning could cause port collisions.
   for (const app of proxiedApps) {
-    const { child, displayUrl, route } = await spawnProxiedApp(
+    const { child, displayUrl, route, settled } = await spawnProxiedApp(
       app,
       stateDir,
       proxyPort,
       tls,
       tlds,
       lanMode,
-      exitCodes
+      exitCodes,
+      lifecycle,
+      peerUrls
     );
     children.push(child);
+    routeSettlements.push(settled);
     if (route) routeEntries.push(route);
     appUrls.push({ label: app.label, url: displayUrl });
   }
@@ -5817,6 +6885,7 @@ async function runWithDirectSpawn(
   const cleanup = () => {
     if (cleanedUp) return;
     cleanedUp = true;
+    lifecycle.stopping = true;
 
     for (const child of children) {
       killTree(child, "SIGTERM");
@@ -5846,6 +6915,7 @@ async function runWithDirectSpawn(
         })
     )
   );
+  await Promise.all(routeSettlements);
 
   const failed = [...exitCodes.entries()].filter(([, code]) => code !== 0 && code !== null);
   if (failed.length > 0) {
@@ -5910,7 +6980,11 @@ async function handleRunMode(args: string[], globalScript?: string): Promise<voi
   }
   parsed.pathPrefix ??= appConfig?.config.path;
 
-  const worktree = detectWorktreePrefix();
+  const worktree = resolveWorktree(
+    process.cwd(),
+    parsed.worktreeFlags ?? globalWorktreeFlags,
+    appConfig?.worktreeBranch
+  );
   const effectiveName = applyWorktreePrefix(
     baseName,
     worktree,
@@ -5938,7 +7012,8 @@ async function handleRunMode(args: string[], globalScript?: string): Promise<voi
     parsed.childEnv,
     parsed.protocol,
     parsed.pathPrefix,
-    parsed.tunnel
+    parsed.tunnel,
+    appPortAllocationOrExit(appConfig?.config)
   );
 }
 
@@ -5988,7 +7063,8 @@ async function handleNamedMode(args: string[]): Promise<void> {
     parsed.childEnv,
     parsed.protocol,
     parsed.pathPrefix,
-    parsed.tunnel
+    parsed.tunnel,
+    appPortAllocationOrExit(appConfig?.config)
   );
 }
 
@@ -6008,6 +7084,10 @@ async function main() {
   }
 
   const args = process.argv.slice(2);
+  if (args[0] === "mcp") {
+    await runMcp(args.slice(1));
+    return;
+  }
 
   // Block one-off npx / pnpm dlx downloads. Running "sudo npx" is unsafe
   // because it performs package resolution and downloads as root. When
@@ -6073,6 +7153,9 @@ async function main() {
   if (stripGlobalFlag("--tailscale", false)) {
     process.env.PORTLESS_TAILSCALE = "1";
   }
+  if (stripGlobalFlag("--tailscale-http", false)) {
+    process.env.PORTLESS_TAILSCALE_HTTP = "1";
+  }
   if (stripGlobalFlag("--tailscale-service", false)) {
     process.env.PORTLESS_TAILSCALE_SERVICE = "1";
   }
@@ -6109,6 +7192,7 @@ async function main() {
   } else if (typeof pathResult === "string") {
     process.env.PORTLESS_PATH = parsePathPrefix(pathResult, "--path");
   }
+  if (stripGlobalFlag("--cloudflare", false)) process.env.PORTLESS_TUNNEL = "cloudflare";
   const tunnelResult = stripGlobalFlag("--tunnel", true);
   if (tunnelResult === false) {
     console.error(colors.red("Error: --tunnel requires a tunnel provider."));
@@ -6159,6 +7243,31 @@ async function main() {
     process.exit(1);
   }
   const globalScript = typeof scriptResult === "string" ? scriptResult : undefined;
+
+  // Leading --worktree-prefix / --no-worktree apply to whatever follows
+  // (bare mode, run, get): `portless --no-worktree`.
+  {
+    const leading: WorktreeFlagState = {};
+    let consumed = 0;
+    for (;;) {
+      const next = consumeWorktreeFlag(args, consumed, leading);
+      if (next === null) break;
+      consumed = next + 1;
+    }
+    if (consumed > 0) {
+      const rest = args[consumed];
+      const accepts =
+        rest === undefined || rest === "--" || rest === "run" || rest === "get" || rest === "url";
+      if (!accepts) {
+        console.error(
+          colors.red("Error: --worktree-prefix and --no-worktree apply to run, get, and bare mode.")
+        );
+        process.exit(1);
+      }
+      args.splice(0, consumed);
+      globalWorktreeFlags = leading;
+    }
+  }
 
   // --name flag: treat the next arg as an explicit app name, bypassing
   // subcommand dispatch. Useful when the app name collides with a reserved

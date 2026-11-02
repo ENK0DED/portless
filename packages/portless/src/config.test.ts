@@ -13,8 +13,10 @@ import {
   splitCommand,
   isServerCommand,
   loadPackagePortlessConfig,
+  withRootAppPortDefaults,
   ConfigValidationError,
 } from "./config.js";
+import type { AppConfig } from "./config.js";
 
 function createTmpDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "portless-config-test-"));
@@ -294,6 +296,92 @@ describe("loadConfig validation", () => {
     expect(() => loadConfig(tmpDir)).toThrow(ConfigValidationError);
   });
 
+  it.each(["random", "stable", "sequential"])("accepts appPortStrategy %s", (strategy) => {
+    fs.writeFileSync(
+      path.join(tmpDir, "portless.json"),
+      JSON.stringify({ appPortStrategy: strategy, appPortRange: [4200, 4999] })
+    );
+    expect(loadConfig(tmpDir)?.config).toEqual({
+      appPortStrategy: strategy,
+      appPortRange: [4200, 4999],
+    });
+  });
+
+  it("throws when appPortStrategy is unknown", () => {
+    fs.writeFileSync(
+      path.join(tmpDir, "portless.json"),
+      JSON.stringify({ appPortStrategy: "first-free" })
+    );
+    expect(() => loadConfig(tmpDir)).toThrow(/"appPortStrategy".*"random", "stable", "sequential"/);
+  });
+
+  it.each([
+    [[4200]],
+    [[4200, 4999, 5000]],
+    [["4200", "4999"]],
+    [[0, 4999]],
+    [[4999, 4200]],
+    [[80, 90]],
+  ])("throws when appPortRange is %j", (range) => {
+    fs.writeFileSync(path.join(tmpDir, "portless.json"), JSON.stringify({ appPortRange: range }));
+    expect(() => loadConfig(tmpDir)).toThrow(/"appPortRange"/);
+  });
+
+  it("rejects appPort next to appPortStrategy or appPortRange in the same object", () => {
+    fs.writeFileSync(
+      path.join(tmpDir, "portless.json"),
+      JSON.stringify({ appPort: 4200, appPortStrategy: "sequential" })
+    );
+    expect(() => loadConfig(tmpDir)).toThrow(/"appPort" fixes the port/);
+
+    fs.writeFileSync(
+      path.join(tmpDir, "portless.json"),
+      JSON.stringify({ apps: { "apps/web": { appPort: 4200, appPortRange: [4300, 4400] } } })
+    );
+    expect(() => loadConfig(tmpDir)).toThrow(/"apps\.apps\/web\.appPort" fixes the port/);
+  });
+
+  it("validates the port keys inside apps entries and package.json too", () => {
+    fs.writeFileSync(
+      path.join(tmpDir, "portless.json"),
+      JSON.stringify({ apps: { "apps/web": { appPortRange: [2000, 1000] } } })
+    );
+    expect(() => loadConfig(tmpDir)).toThrow(/"apps\.apps\/web\.appPortRange"/);
+
+    fs.rmSync(path.join(tmpDir, "portless.json"));
+    fs.writeFileSync(
+      path.join(tmpDir, "package.json"),
+      JSON.stringify({ name: "x", portless: { appPortStrategy: "nope" } })
+    );
+    expect(() => loadPackagePortlessConfig(tmpDir)).toThrow(/"portless\.appPortStrategy"/);
+  });
+
+  it("passes the top-level strategy to a single app and keeps it off apps entries", () => {
+    fs.writeFileSync(
+      path.join(tmpDir, "portless.json"),
+      JSON.stringify({ appPortStrategy: "stable", appPortRange: [5000, 5100] })
+    );
+    const loaded = loadConfig(tmpDir)!;
+    expect(resolveAppConfig(loaded.config, tmpDir, tmpDir)).toMatchObject({
+      appPortStrategy: "stable",
+      appPortRange: [5000, 5100],
+    });
+  });
+
+  it("fills a strategy from the top level for apps that do not fix a port", () => {
+    const root: AppConfig = { appPortStrategy: "sequential", appPortRange: [5000, 5100] };
+    expect(withRootAppPortDefaults({ name: "web" }, root)).toEqual({
+      name: "web",
+      appPortStrategy: "sequential",
+      appPortRange: [5000, 5100],
+    });
+    expect(withRootAppPortDefaults({ appPortStrategy: "stable" }, root)).toEqual({
+      appPortStrategy: "stable",
+      appPortRange: [5000, 5100],
+    });
+    expect(withRootAppPortDefaults({ appPort: 7000 }, root)).toEqual({ appPort: 7000 });
+  });
+
   it("throws when appPort is out of range", () => {
     fs.writeFileSync(path.join(tmpDir, "portless.json"), JSON.stringify({ appPort: 99999 }));
     expect(() => loadConfig(tmpDir)).toThrow(ConfigValidationError);
@@ -354,6 +442,47 @@ describe("loadConfig validation", () => {
   it("throws when worktreeFlat is not a boolean", () => {
     fs.writeFileSync(path.join(tmpDir, "portless.json"), JSON.stringify({ worktreeFlat: "yes" }));
     expect(() => loadConfig(tmpDir)).toThrow(ConfigValidationError);
+  });
+
+  it("accepts worktreeBranch last-segment and full at the top level and per app", () => {
+    fs.writeFileSync(
+      path.join(tmpDir, "portless.json"),
+      JSON.stringify({
+        worktreeBranch: "full",
+        apps: { "apps/web": { name: "web", worktreeBranch: "last-segment" } },
+      })
+    );
+    const result = loadConfig(tmpDir);
+    expect(result?.config.worktreeBranch).toBe("full");
+    expect(result?.config.apps?.["apps/web"].worktreeBranch).toBe("last-segment");
+  });
+
+  it("rejects an invalid worktreeBranch and lists the accepted values", () => {
+    fs.writeFileSync(path.join(tmpDir, "portless.json"), JSON.stringify({ worktreeBranch: "all" }));
+    expect(() => loadConfig(tmpDir)).toThrow(/"last-segment", "full"/);
+
+    fs.writeFileSync(
+      path.join(tmpDir, "portless.json"),
+      JSON.stringify({ apps: { "apps/web": { worktreeBranch: true } } })
+    );
+    expect(() => loadConfig(tmpDir)).toThrow(/apps\.apps\/web\.worktreeBranch/);
+  });
+
+  it("does not warn that worktreeBranch is an unknown key", () => {
+    const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    fs.writeFileSync(
+      path.join(tmpDir, "portless.json"),
+      JSON.stringify({ name: "test", worktreeBranch: "full" })
+    );
+    loadConfig(tmpDir);
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
+  it("carries worktreeBranch through resolveAppConfig for a single-app config", () => {
+    expect(
+      resolveAppConfig({ name: "web", worktreeBranch: "full" }, "/repo", "/repo").worktreeBranch
+    ).toBe("full");
   });
 
   it("throws when turbo is not a boolean", () => {

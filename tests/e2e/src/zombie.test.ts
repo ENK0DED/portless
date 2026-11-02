@@ -97,8 +97,46 @@ function findPidsOnPort(port: number): number[] {
   }
 }
 
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForPidToExit(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isAlive(pid)) return true;
+    await sleep(50);
+  }
+  return !isAlive(pid);
+}
+
 async function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+async function waitForPortToClose(port: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (findPidsOnPort(port).length === 0) return true;
+    await sleep(50);
+  }
+  return findPidsOnPort(port).length === 0;
+}
+
+async function waitForChildToExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return true;
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => resolve(false), timeoutMs);
+    child.once("exit", () => {
+      clearTimeout(timeout);
+      resolve(true);
+    });
+  });
 }
 
 interface TestState {
@@ -108,10 +146,11 @@ interface TestState {
 }
 
 async function cleanupTestState(state: TestState): Promise<void> {
-  if (state.cliChild && !state.cliChild.killed) {
+  if (state.cliChild && state.cliChild.exitCode === null && state.cliChild.signalCode === null) {
     state.cliChild.kill("SIGTERM");
-    await sleep(1000);
-    if (!state.cliChild.killed) state.cliChild.kill("SIGKILL");
+    if (!(await waitForChildToExit(state.cliChild, 1000))) {
+      state.cliChild.kill("SIGKILL");
+    }
   }
   if (state.appPort) killPort(state.appPort);
 
@@ -141,9 +180,10 @@ async function cleanupTestState(state: TestState): Promise<void> {
 async function startCliApp(
   appName: string,
   state: TestState,
-  script = "server.js"
+  script = "server.js",
+  extraEnv: Record<string, string> = {}
 ): Promise<{ hostname: string; appPort: number }> {
-  state.stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-e2e-zombie-"));
+  state.stateDir ??= fs.mkdtempSync(path.join(os.tmpdir(), "portless-e2e-zombie-"));
 
   const baseEnv = {
     ...process.env,
@@ -157,17 +197,23 @@ async function startCliApp(
   spawnSync(
     process.execPath,
     [CLI_PATH, "proxy", "start", "--no-tls", "-p", PROXY_PORT.toString()],
-    { env: baseEnv, timeout: 15_000 }
+    { env: { ...baseEnv, ...extraEnv }, timeout: 15_000 }
   );
 
   state.cliChild = spawn(process.execPath, [CLI_PATH, appName, "node", script], {
     cwd: FIXTURE_DIR,
-    env: { ...baseEnv, APP_NAME: appName },
+    env: { ...baseEnv, APP_NAME: appName, ...extraEnv },
     stdio: ["ignore", "pipe", "pipe"],
   });
 
-  state.cliChild.stdout!.on("data", () => {});
-  state.cliChild.stderr!.on("data", () => {});
+  let stdout = "";
+  let stderr = "";
+  state.cliChild.stdout!.on("data", (chunk: Buffer) => {
+    stdout += chunk.toString();
+  });
+  state.cliChild.stderr!.on("data", (chunk: Buffer) => {
+    stderr += chunk.toString();
+  });
 
   const hostname = `${appName}.localhost`;
   const deadline = Date.now() + 30_000;
@@ -199,7 +245,7 @@ async function startCliApp(
     }
     await sleep(500);
   }
-  expect(ready).toBe(true);
+  expect(ready, `CLI did not become ready.\nstdout:\n${stdout}\nstderr:\n${stderr}`).toBe(true);
 
   const routesPath = path.join(state.stateDir, "routes.json");
   const routes: Array<{ hostname: string; port: number; pid: number }> = JSON.parse(
@@ -293,6 +339,115 @@ describe("zombie process prevention", () => {
     await sleep(1000);
     const pidsAfterPrune = findPidsOnPort(appPort);
     expect(pidsAfterPrune).toEqual([]);
+  });
+});
+
+describe("orphaned process groups", () => {
+  const state: TestState = {};
+  let sidecarPid: number | undefined;
+
+  afterEach(async () => {
+    if (sidecarPid && isAlive(sidecarPid)) process.kill(sidecarPid, "SIGKILL");
+    sidecarPid = undefined;
+    await cleanupTestState(state);
+    state.stateDir = undefined;
+    state.cliChild = undefined;
+    state.appPort = undefined;
+  });
+
+  async function startAndCrash(
+    appName: string,
+    extraEnv: Record<string, string> = {}
+  ): Promise<number> {
+    const pidFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "portless-sidecar-")), "pid");
+    await startCliApp(appName, state, "sidecar-wrapper.js", {
+      SIDECAR_PID_FILE: pidFile,
+      ...extraEnv,
+    });
+    sidecarPid = parseInt(fs.readFileSync(pidFile, "utf-8"), 10);
+
+    state.cliChild!.kill("SIGKILL");
+    await waitForChildToExit(state.cliChild!, 5000);
+    await sleep(500);
+    expect(isAlive(sidecarPid)).toBe(true);
+    return sidecarPid;
+  }
+
+  it("prune kills the whole process group, not only the route port", async () => {
+    if (isWindows) return;
+
+    const pid = await startAndCrash("orphan-prune");
+
+    const pruneResult = spawnSync(process.execPath, [CLI_PATH, "prune"], {
+      env: {
+        ...process.env,
+        PORTLESS_PORT: PROXY_PORT.toString(),
+        PORTLESS_HTTPS: "0",
+        PORTLESS_STATE_DIR: state.stateDir,
+        NO_COLOR: "1",
+      },
+      encoding: "utf-8",
+      timeout: 10_000,
+    });
+    expect(pruneResult.stdout).toContain("killed process group");
+
+    expect(await waitForPidToExit(pid, 5000)).toBe(true);
+    expect(await waitForPortToClose(state.appPort!, 5000)).toBe(true);
+  });
+
+  it("the proxy sweep keeps an orphaned route and never kills its group", async () => {
+    if (isWindows) return;
+
+    const pid = await startAndCrash("orphan-sweep", { PORTLESS_ROUTES_CLEANUP_INTERVAL: "1" });
+
+    // Several sweeps run while the owner is dead and the group is alive.
+    await sleep(3500);
+
+    expect(isAlive(pid)).toBe(true);
+    const routes: Array<{ hostname: string }> = JSON.parse(
+      fs.readFileSync(path.join(state.stateDir!, "routes.json"), "utf-8")
+    );
+    expect(routes.map((r) => r.hostname)).toContain("orphan-sweep.localhost");
+
+    const env = {
+      ...process.env,
+      PORTLESS_PORT: PROXY_PORT.toString(),
+      PORTLESS_HTTPS: "0",
+      PORTLESS_STATE_DIR: state.stateDir,
+      NO_COLOR: "1",
+    };
+    const list = spawnSync(process.execPath, [CLI_PATH, "list", "--json"], {
+      env,
+      encoding: "utf-8",
+      timeout: 10_000,
+    });
+    const listed: Array<{ hostname: string; kind: string; orphaned?: boolean }> = JSON.parse(
+      list.stdout
+    );
+    expect(listed.length).toBeGreaterThan(0);
+    expect(listed.every((r) => r.kind === "orphan" && r.orphaned === true)).toBe(true);
+    expect(listed.map((r) => r.hostname)).toContain("orphan-sweep.localhost");
+
+    // The kill is left to the user: prune stops the group.
+    const prune = spawnSync(process.execPath, [CLI_PATH, "prune"], {
+      env,
+      encoding: "utf-8",
+      timeout: 10_000,
+    });
+    expect(prune.stdout).toContain("killed process group");
+    expect(await waitForPidToExit(pid, 5000)).toBe(true);
+  });
+
+  it("run stops the orphaned process group of a crashed session", async () => {
+    if (isWindows) return;
+
+    const pid = await startAndCrash("orphan-restart");
+    const oldPort = state.appPort!;
+
+    await startCliApp("orphan-restart", state, "server.js");
+
+    expect(await waitForPidToExit(pid, 5000)).toBe(true);
+    expect(await waitForPortToClose(oldPort, 5000)).toBe(true);
   });
 });
 

@@ -25,10 +25,16 @@ export interface RouteInfo {
   tailscaleUrl?: string;
   tailscaleServiceUrl?: string;
   tailscaleFunnel?: boolean;
+  /** True when the Tailscale share is a plain-HTTP forward (`--tailscale-http`). */
+  tailscaleHttp?: boolean;
   ngrokUrl?: string;
   tunnelUrl?: string;
   tunnelProvider?: TunnelProviderName;
   netbirdUrl?: string;
+  /** Epoch milliseconds when the route was registered. Absent on routes from older versions. */
+  registeredAt?: number;
+  /** Owning process id. Static aliases use 0. */
+  pid?: number;
 }
 
 export interface TunnelAlias {
@@ -53,6 +59,12 @@ export interface TunnelAlias {
 export interface ProxyServerOptions {
   /** Called on each request to get the current route table. */
   getRoutes: () => RouteInfo[];
+  /**
+   * Routes whose owning portless process exited while the command it spawned
+   * still runs. They are not routable; the dashboard lists them so the user
+   * can see what `portless prune` would stop.
+   */
+  getOrphanedRoutes?: () => RouteInfo[];
   /** Called on each request to get exact public tunnel aliases. */
   getTunnelAliases?: () => TunnelAlias[];
   /** The port the proxy is listening on (used to build correct URLs). */
@@ -67,6 +79,12 @@ export interface ProxyServerOptions {
    * Defaults to true.
    */
   strict?: boolean;
+  /**
+   * When true, refuse every connection whose peer is not a loopback address:
+   * at accept time, and again per request and per upgrade. Set when the proxy
+   * binds the wildcard address only to take a privileged port without root.
+   */
+  loopbackOnly?: boolean;
   /** Optional error logger; defaults to console.error. */
   onError?: (message: string) => void;
   /**
@@ -82,6 +100,9 @@ export interface ProxyServerOptions {
    * called per internal-page request. Return undefined when unknown.
    */
   getCaTrusted?: () => boolean | undefined;
+  /** Run the daemon-owned hosts sync for the current route table. */
+  onHostsSyncRequest?: () => "acted" | "disabled";
+  hostsSyncToken?: string;
   /** When provided, enables HTTP/2 over TLS (HTTPS). */
   tls?: {
     cert: Buffer;

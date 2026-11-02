@@ -1,0 +1,69 @@
+---
+title: "HTTPS"
+---
+
+HTTP/2 + TLS is enabled by default for faster dev server page loads. Browsers limit HTTP/1.1 to 6 connections per host, which bottlenecks dev servers serving many unbundled files. HTTP/2 multiplexes all requests over a single connection.
+
+First run generates a local CA and server certs, then adds the CA to your system trust store. Generated CA and server certificates are stored in the resolved state directory and reused across proxy restarts and machine reboots. They are regenerated only when removed or cleaned. After the CA is trusted, there are no prompts and no browser warnings.
+
+In WSL, portless also installs the CA into the Windows CurrentUser Root store so Windows browsers trust portless HTTPS URLs served from WSL.
+
+On Linux, portless also trusts the CA in the invoking user's existing Chrome/Chromium NSS database (also under `sudo`): `~/.pki/nssdb` if present, otherwise `~/.local/share/pki/nssdb` (Chromium M146+). This needs NSS `certutil`: install `libnss3-tools` on Debian/Ubuntu, `nss-tools` on Fedora/RHEL, `nss` on Arch, or `mozilla-nss-tools` on openSUSE, then run `portless trust` and restart the browser. No NSS database is created; if neither path exists, open Chrome once and rerun `portless trust`. In WSL the NSS database is updated as well, whichever of the Linux and Windows stores succeeded. `portless clean` removes the CA from the active NSS database too.
+
+If NSS registration fails (including when `certutil` is missing), the system trust that succeeded is kept and `portless trust` exits successfully with a browser-trust warning. Chrome may still reject the certificate until you install the NSS tools and rerun `portless trust`. `portless doctor` reports incomplete trust until the NSS entry verifies. If NSS removal fails during `portless clean`, the CA certificate and key are kept for a retry.
+
+`portless trust` does nothing when every store it writes already has the CA (both the Linux and Windows stores on WSL, plus the NSS database on Linux when one exists), so setup scripts can run it every time without a prompt. It checks the stores themselves rather than the trust marker, so it still repairs a CA that was removed.
+
+Modern browser HMR WebSockets over HTTPS use HTTP/2 Extended CONNECT. Portless supports that path, including negotiated WebSocket subprotocols such as Vite's `vite-hmr`, so Next.js Turbopack, Vite, Nuxt, and similar dev servers can keep hot reloading while HTTPS and HTTP/2 stay enabled.
+
+## Custom certificates
+
+Use your own certs (e.g., from mkcert):
+
+```bash
+portless proxy start --cert ./cert.pem --key ./key.pem
+```
+
+## Trust the CA later
+
+If you skipped the trust prompt on first run:
+
+```bash
+portless trust
+```
+
+To generate or reuse certificates without adding the CA to the trust store:
+
+```bash
+portless proxy start --skip-trust
+```
+
+## Trust the CA on other devices
+
+`portless trust` handles your own machine automatically. For other devices where the CLI is not available (phones, other computers, other browsers), the running proxy serves a certificate trust page at `https://cert.localhost` (or `https://cert.<suffix>` for a custom suffix).
+
+The page offers only the public CA certificate at `/portless-ca.pem`, shows its SHA-256 fingerprint, and lists per-OS install steps for macOS, Linux, Windows, and Firefox. Open it from the target device and follow the steps for that OS.
+
+In [LAN mode](/commands), devices reach this page over your local network using the proxy's `.local` hostname, which is the common case for trusting the CA on a phone.
+
+Security: the trust page never exposes the private key, only the public certificate is downloadable. Install it only on machines you control.
+
+## Disable HTTPS
+
+Use `--no-tls` to run with plain HTTP on port 80:
+
+```bash
+portless proxy start --no-tls
+```
+
+## h2c and gRPC upstreams
+
+By default, portless forwards each route to the local app with HTTP/1.1. Use `--h2c` only when the upstream app expects HTTP/2 cleartext (h2c), such as a local gRPC service:
+
+```bash
+portless grpc --h2c bun run grpc-server
+portless alias grpc 50051 --h2c
+PORTLESS_H2C=1 portless run bun run grpc-server
+```
+
+`--h2c` changes only the loopback connection from portless to the local app. Browser-facing HTTPS, route names, sharing modes, and loopback-only child app binding keep their defaults. There is no automatic protocol probing. See [Commands](/commands) for how h2c routes appear in `list`.

@@ -1,3 +1,4 @@
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as https from "node:https";
@@ -5,16 +6,43 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
-import { execSync, spawn } from "node:child_process";
-import { resolveScript, resolveScriptRaw } from "./config.js";
-import { LOOPBACK_DIAL_OPTIONS, PORTLESS_HEADER, PORTLESS_LISTENER_PORT_HEADER } from "./proxy.js";
+import { execFileSync, execSync, spawn } from "node:child_process";
+import {
+  APP_PORT_STRATEGIES,
+  MIN_ASSIGNABLE_APP_PORT,
+  resolveScript,
+  resolveScriptRaw,
+} from "./config.js";
+import type { AppConfig, AppPortStrategy } from "./config.js";
+import {
+  HOSTS_SYNC_PATH,
+  LOOPBACK_DIAL_OPTIONS,
+  PORTLESS_HEADER,
+  PORTLESS_LISTENER_PORT_HEADER,
+} from "./proxy.js";
 import {
   checkHostResolution,
   getManagedHostnames,
   shouldAutoSyncHosts,
   syncHostsFile,
 } from "./hosts.js";
-import { resolveUserHome } from "./utils.js";
+import { isProcessAlive, normalizePathPrefix, parsePort, resolveUserHome } from "./utils.js";
+
+export {
+  getProcessStartTime,
+  isRecordedProcessGroupAlive,
+  killOrphanedProcessGroup,
+} from "./process-group.js";
+
+import {
+  HOSTS_SYNC_AUTH_CHALLENGE_HEADER,
+  HOSTS_SYNC_AUTH_HEADER,
+  HOSTS_SYNC_AUTH_PROOF_HEADER,
+  createHostsSyncProof,
+  generateHostsSyncChallenge,
+  isValidHostsSyncToken,
+  readHostsSyncToken,
+} from "./hosts-sync-auth.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -99,6 +127,96 @@ export const SIGNAL_CODES: Record<string, number> = {
   SIGTERM: 15,
 };
 
+const COMMAND_SHUTDOWN_GRACE_MS = 5000;
+export const COMMAND_SHUTDOWN_FORCE_MS = 10_000;
+const COMMAND_SHUTDOWN_POLL_MS = 50;
+
+type TrackedProcess = {
+  pid: number;
+  pgid: number;
+};
+
+function trackProcessTree(rootPid: number, tracked: Map<number, TrackedProcess>): void {
+  tracked.set(rootPid, { pid: rootPid, pgid: rootPid });
+  if (isWindows) {
+    return;
+  }
+
+  try {
+    const output = execFileSync("ps", ["-axo", "pid=,ppid=,pgid="], {
+      encoding: "utf-8",
+      timeout: PID_LOOKUP_TIMEOUT_MS,
+    });
+    const rows = output
+      .trim()
+      .split("\n")
+      .map((line) => {
+        const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)$/);
+        if (!match) return null;
+        return {
+          pid: parseInt(match[1], 10),
+          ppid: parseInt(match[2], 10),
+          pgid: parseInt(match[3], 10),
+        };
+      })
+      .filter((row): row is { pid: number; ppid: number; pgid: number } => row !== null);
+
+    const descendants = new Set([rootPid]);
+    let foundDescendant = true;
+    while (foundDescendant) {
+      foundDescendant = false;
+      for (const row of rows) {
+        if (descendants.has(row.ppid) && !descendants.has(row.pid)) {
+          descendants.add(row.pid);
+          foundDescendant = true;
+        }
+      }
+    }
+
+    for (const row of rows) {
+      if (descendants.has(row.pid)) {
+        tracked.set(row.pid, { pid: row.pid, pgid: row.pgid });
+      }
+    }
+  } catch {
+    // Fall back to the root process group that was already tracked.
+  }
+}
+
+function isProcessRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function hasRunningProcesses(tracked: Map<number, TrackedProcess>): boolean {
+  return [...tracked.keys()].some(isProcessRunning);
+}
+
+function signalTrackedProcesses(
+  tracked: Map<number, TrackedProcess>,
+  signal: NodeJS.Signals
+): void {
+  if (isWindows) {
+    for (const { pid } of tracked.values()) {
+      killWindowsTree(pid);
+    }
+    return;
+  }
+
+  const groups = new Set([...tracked.values()].map(({ pgid }) => pgid));
+  for (const pgid of groups) {
+    try {
+      process.kill(-pgid, signal);
+    } catch {
+      // Already dead
+    }
+  }
+}
+
 /** Listener address used when the proxy is only accessible from this machine. */
 export const IPV4_LOOPBACK_PROXY_HOST = "127.0.0.1";
 
@@ -116,11 +234,83 @@ export type ProxyBindTarget = {
   ipv6Only?: boolean;
 };
 
+/**
+ * Warning printed when LAN mode is requested but mDNS publishing is unavailable.
+ * LAN mode still binds every interface, so the proxy stays reachable from the
+ * network; only the `.local` name publishing is off.
+ */
+export function formatMdnsUnavailableWarning(reason: string): string {
+  const detail = reason.trim().replace(/\.$/, "");
+  return (
+    `mDNS publishing is off: ${detail}. ` +
+    "The proxy is still reachable from the network on all interfaces; " +
+    "only publishing of .local names is disabled."
+  );
+}
+
 /** Return explicit IPv4 and IPv6 listener targets for the effective proxy mode. */
-export function getProxyBindTargets(lanMode: boolean): ProxyBindTarget[] {
-  return lanMode
+export function getProxyBindTargets(lanMode: boolean, unprivileged = false): ProxyBindTarget[] {
+  return lanMode || unprivileged
     ? [{ host: IPV4_LAN_PROXY_HOST }, { host: IPV6_LAN_PROXY_HOST, ipv6Only: true }]
     : [{ host: IPV4_LOOPBACK_PROXY_HOST }, { host: IPV6_LOOPBACK_PROXY_HOST, ipv6Only: true }];
+}
+
+/**
+ * Check whether this process may bind `port` on every target without root.
+ * Resolves false only when a bind fails with EACCES (or EPERM), so callers can
+ * elevate for that case alone. Any other outcome, such as EADDRINUSE, resolves
+ * true and is left for the real listen to report.
+ */
+export async function canBindProxyPort(
+  port: number,
+  targets: readonly ProxyBindTarget[]
+): Promise<boolean> {
+  for (const target of targets) {
+    const code = await new Promise<string | null>((resolve) => {
+      const probe = net.createServer();
+      probe.once("error", (err: NodeJS.ErrnoException) => resolve(err.code ?? "UNKNOWN"));
+      probe.listen({ port, host: target.host, ipv6Only: target.ipv6Only, exclusive: true }, () =>
+        probe.close(() => resolve(null))
+      );
+    });
+    if (code === "EACCES" || code === "EPERM") return false;
+  }
+  return true;
+}
+
+/**
+ * Whether this process can bind `port` without root on `platform`. macOS
+ * allows any port on the wildcard address since Mojave. Linux moves the
+ * boundary with `net.ipv4.ip_unprivileged_port_start`. Windows has none.
+ */
+export function canBindWithoutRoot(
+  port: number,
+  platform: NodeJS.Platform = process.platform,
+  readUnprivilegedPortStart: () => string = () =>
+    fs.readFileSync("/proc/sys/net/ipv4/ip_unprivileged_port_start", "utf-8")
+): { ok: true } | { ok: false; reason: string } {
+  if (port >= PRIVILEGED_PORT_THRESHOLD || platform === "darwin" || platform === "win32") {
+    return { ok: true };
+  }
+  if (platform !== "linux") {
+    return {
+      ok: false,
+      reason: `Binding port ${port} without root is not supported on ${platform}.`,
+    };
+  }
+  let start: number;
+  try {
+    start = parseInt(readUnprivilegedPortStart().trim(), 10);
+  } catch {
+    return { ok: false, reason: "Could not read net.ipv4.ip_unprivileged_port_start." };
+  }
+  if (!Number.isNaN(start) && port >= start) {
+    return { ok: true };
+  }
+  return {
+    ok: false,
+    reason: `Port ${port} is below net.ipv4.ip_unprivileged_port_start (${Number.isNaN(start) ? "unreadable" : start}).`,
+  };
 }
 
 /** Start a proxy listener on the selected interface and port. */
@@ -134,10 +324,119 @@ export function listenOnProxyInterface(
 }
 
 /**
+ * Kill a process and all of its descendants on Windows. Windows has no process
+ * groups, and child.kill() only terminates the cmd.exe wrapper, which leaves
+ * the dev server running and attached to the console.
+ */
+function killWindowsTree(pid: number): void {
+  try {
+    execFileSync("taskkill", ["/T", "/F", "/PID", String(pid)], {
+      stdio: "ignore",
+      timeout: PID_LOOKUP_TIMEOUT_MS,
+      windowsHide: true,
+    });
+  } catch {
+    // Already dead
+  }
+}
+
+/**
+ * Kill the command's descendants if this process dies without running its own
+ * cleanup, such as when it is terminated with `taskkill /F`. Windows does not
+ * end children with their parent, and the cmd.exe wrapper can exit alongside
+ * us, so a detached watcher walks ParentProcessId links from the wrapper pid
+ * (which survive the parent's exit) and checks creation times so a reused pid
+ * is never killed.
+ */
+/**
+ * Pids from `[pid, parentPid, createdAtMs]` rows that belong to the tree rooted
+ * at `root`. A pid is only ours if its creation time fits the lineage: the root
+ * was created before the watcher started, and every descendant after its
+ * parent. A process holding the root pid that was created later is a reuse; it
+ * and anything created after it are left alone. Runs inside the watcher script,
+ * so it must stay self-contained.
+ */
+export function ownedProcessIds(
+  rows: ReadonlyArray<readonly [number, number, number]>,
+  root: number,
+  watcherStartedAt: number
+): number[] {
+  const rootRow = rows.find(([pid]) => pid === root);
+  const impostorAt = rootRow && rootRow[2] > watcherStartedAt ? rootRow[2] : Infinity;
+  const created = new Map<number, number>();
+  if (rootRow && impostorAt === Infinity) created.set(root, rootRow[2]);
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const [pid, ppid, at] of rows) {
+      if (created.has(pid) || pid === root) continue;
+      const parentAt = created.get(ppid);
+      const ok = ppid === root ? at < impostorAt : parentAt !== undefined && at >= parentAt;
+      if (ok) {
+        created.set(pid, at);
+        grew = true;
+      }
+    }
+  }
+  return [...created.keys()];
+}
+
+function watchParentOnWindows(
+  childPid: number,
+  spawnedAt: number
+): ReturnType<typeof spawn> | undefined {
+  const script = `
+    const { spawnSync } = require("child_process");
+    const [parent, root, since] = process.argv.slice(1).map(Number);
+    const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    const watcherStartedAt = Date.now();
+    const ownedProcessIds = ${ownedProcessIds.toString()};
+    const descendants = () => {
+      const ps = "Get-CimInstance Win32_Process | ForEach-Object { '{0} {1} {2}' -f $_.ProcessId, $_.ParentProcessId, ([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds() }";
+      const out = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", ps], { encoding: "utf8", windowsHide: true, timeout: ${PID_LOOKUP_TIMEOUT_MS} }).stdout || "";
+      const rows = out.trim().split(/\\r?\\n/).map((l) => l.trim().split(" ").map(Number)).filter((r) => r.length === 3 && r[2] >= since);
+      return ownedProcessIds(rows, root, watcherStartedAt);
+    };
+    const timer = setInterval(() => {
+      if (alive(parent)) {
+        if (!alive(root)) process.exit(0);
+        return;
+      }
+      clearInterval(timer);
+      for (const pid of descendants()) spawnSync("taskkill", ["/F", "/PID", String(pid)], { stdio: "ignore", windowsHide: true, timeout: ${PID_LOOKUP_TIMEOUT_MS} });
+      process.exit(0);
+    }, 500);
+  `;
+  try {
+    // Run outside the user's cwd so the watcher never holds that directory open.
+    const watcher = spawn(
+      process.execPath,
+      ["-e", script, String(process.pid), String(childPid), String(spawnedAt)],
+      { cwd: path.dirname(process.execPath), detached: true, stdio: "ignore", windowsHide: true }
+    );
+    watcher.unref();
+    return watcher;
+  } catch {
+    // Best effort; normal shutdown still kills the tree.
+    return undefined;
+  }
+}
+
+/**
+ * On Windows, kill `child`'s tree if portless is force-killed before cleanup
+ * runs. `spawnedAt` is taken just before spawning `child`. No-op elsewhere.
+ * The watcher is only needed if we die without cleanup; it stops on a normal
+ * exit.
+ */
+export function guardWindowsOrphans(child: { pid?: number }, spawnedAt: number): void {
+  const watcher = isWindows && child.pid ? watchParentOnWindows(child.pid, spawnedAt) : undefined;
+  if (watcher) process.once("exit", () => watcher.kill());
+}
+
+/**
  * Kill a child process and its entire process tree. On Unix, when the child
  * was spawned with `detached: true`, it leads its own process group and
- * process.kill(-pid) reaches every descendant. Falls back to killing just
- * the child on Windows or when the group kill fails.
+ * process.kill(-pid) reaches every descendant. On Windows, taskkill /T walks
+ * the tree. Falls back to killing just the child when neither is possible.
  */
 export function killTree(
   child: ReturnType<typeof spawn>,
@@ -147,13 +446,15 @@ export function killTree(
     child.kill(signal);
     return;
   }
-  if (!isWindows) {
-    try {
-      process.kill(-child.pid, signal);
-      return;
-    } catch {
-      // Process group may already be gone; fall through
-    }
+  if (isWindows) {
+    killWindowsTree(child.pid);
+    return;
+  }
+  try {
+    process.kill(-child.pid, signal);
+    return;
+  } catch {
+    // Process group may already be gone; fall through
   }
   try {
     child.kill(signal);
@@ -183,10 +484,23 @@ export function getProtocolPort(tls: boolean): number {
 export function getDefaultPort(tls?: boolean): number {
   const envPort = process.env.PORTLESS_PORT;
   if (envPort) {
-    const port = parseInt(envPort, 10);
-    if (!isNaN(port) && port >= 1 && port <= 65535) return port;
+    const port = parsePort(envPort);
+    if (port !== null) return port;
   }
   return tls === undefined ? FALLBACK_PROXY_PORT : getProtocolPort(tls);
+}
+
+/**
+ * Lines telling the user to restart a running proxy after the CA was
+ * regenerated: the proxy keeps the previous CA and the TLS contexts it already
+ * built in memory, so it presents the old chain until it restarts.
+ */
+export function caRegeneratedRestartHint(port: number, tls: boolean): [string, string] {
+  const portFlag = port !== getDefaultPort(tls) ? ` -p ${port}` : "";
+  return [
+    "The running proxy still serves certificates from the previous CA.",
+    `Restart it: portless proxy stop${portFlag} && portless proxy start${portFlag}`,
+  ];
 }
 
 // ---------------------------------------------------------------------------
@@ -230,6 +544,32 @@ export function readTlsMarker(dir: string): boolean {
 /** Write or remove the TLS marker in the state directory. */
 export function writeTlsMarker(dir: string, enabled: boolean): void {
   const markerPath = path.join(dir, TLS_MARKER_FILE);
+  if (enabled) {
+    fs.writeFileSync(markerPath, "1", { mode: 0o644 });
+  } else {
+    try {
+      fs.unlinkSync(markerPath);
+    } catch {
+      // Marker may already be absent; non-fatal
+    }
+  }
+}
+
+/** Name of the marker file that remembers unprivileged mode across proxy restarts. */
+const UNPRIVILEGED_MARKER_FILE = "proxy.unprivileged";
+
+/** Read the unprivileged-mode marker from a state directory. */
+export function readUnprivilegedMarker(dir: string): boolean {
+  try {
+    return fs.existsSync(path.join(dir, UNPRIVILEGED_MARKER_FILE));
+  } catch {
+    return false;
+  }
+}
+
+/** Write or remove the unprivileged-mode marker in the state directory. */
+export function writeUnprivilegedMarker(dir: string, enabled: boolean): void {
+  const markerPath = path.join(dir, UNPRIVILEGED_MARKER_FILE);
   if (enabled) {
     fs.writeFileSync(markerPath, "1", { mode: 0o644 });
   } else {
@@ -619,6 +959,15 @@ export function isLanEnvEnabled(): boolean {
 }
 
 /**
+ * Return whether unprivileged mode is requested via the PORTLESS_UNPRIVILEGED
+ * env var: bind the wildcard address, accept loopback peers only, never sudo.
+ */
+export function isUnprivilegedEnvEnabled(): boolean {
+  const val = process.env.PORTLESS_UNPRIVILEGED;
+  return val === "1" || val === "true";
+}
+
+/**
  * Read the last-known proxy configuration from the state directory on disk.
  * Unlike {@link discoverState}, this does not check whether the proxy is
  * actually running. It simply reads whatever state files exist so a
@@ -633,6 +982,7 @@ export function readPersistedProxyState(): {
   tlds: string[];
   lanMode: boolean;
   useWildcard: boolean;
+  unprivileged: boolean;
 } | null {
   const dir = process.env.PORTLESS_STATE_DIR || USER_STATE_DIR;
   const port = readPortFromDir(dir);
@@ -641,7 +991,15 @@ export function readPersistedProxyState(): {
     const tlds = readTldsFromDir(dir);
     const tld = tlds[0] ?? DEFAULT_TLD;
     const useWildcard = readWildcardMarker(dir);
-    return { port, tls, tld, tlds, lanMode: hasLanMarker(dir), useWildcard };
+    return {
+      port,
+      tls,
+      tld,
+      tlds,
+      lanMode: hasLanMarker(dir),
+      unprivileged: readUnprivilegedMarker(dir),
+      useWildcard,
+    };
   }
 
   return null;
@@ -684,6 +1042,7 @@ export function buildProxyStartConfig(options: {
   tlds?: string[];
   tldsExplicit?: boolean;
   useWildcard?: boolean;
+  unprivileged?: boolean;
   foreground?: boolean;
   includePort?: boolean;
   proxyPort?: number;
@@ -739,6 +1098,10 @@ export function buildProxyStartConfig(options: {
     args.push("--wildcard");
   }
 
+  if (options.unprivileged) {
+    args.push("--unprivileged");
+  }
+
   if (options.skipTrust) {
     args.push("--skip-trust");
   }
@@ -748,6 +1111,26 @@ export function buildProxyStartConfig(options: {
   }
 
   return { effectiveTld, effectiveTlds, args };
+}
+
+/**
+ * True when PORTLESS_STATE_DIR is set but holds no port file. Such an isolated
+ * state dir has no proxy yet, so callers must not probe the default port: it
+ * would reach whatever proxy listens there (for example a system-wide one).
+ */
+export function isExplicitStateDirEmpty(): boolean {
+  const dir = process.env.PORTLESS_STATE_DIR;
+  return !!dir && readPortFromDir(dir) === null;
+}
+
+/**
+ * Like {@link isProxyRunning}, but for the proxy of the current state dir: an
+ * explicit state dir without a port file has no proxy, so this answers false
+ * without opening a connection to the default port.
+ */
+export async function isStateDirProxyRunning(port: number, tls = false): Promise<boolean> {
+  if (isExplicitStateDirEmpty()) return false;
+  return isProxyRunning(port, tls);
 }
 
 /**
@@ -768,9 +1151,13 @@ export async function discoverState(): Promise<{
   // Env var override
   if (process.env.PORTLESS_STATE_DIR) {
     const dir = process.env.PORTLESS_STATE_DIR;
-    const port = readPortFromDir(dir) ?? getDefaultPort();
+    const filePort = readPortFromDir(dir);
+    const port = filePort ?? getDefaultPort();
     const lanIp = readLanMarker(dir);
-    if ((await isProxyRunning(port)) || (await isPortListening(port))) {
+    // Without a port file this state dir has no proxy of its own. Probing the
+    // default port would reach whatever proxy listens there, so report it as
+    // not running instead.
+    if (filePort !== null && ((await isProxyRunning(port)) || (await isPortListening(port)))) {
       const tls = readTlsMarker(dir);
       const tlds = readTldsFromDir(dir);
       const tld = tlds[0] ?? DEFAULT_TLD;
@@ -863,13 +1250,186 @@ export async function discoverState(): Promise<{
   };
 }
 
+/** Read the proxy pid from a given state directory. Returns null if unreadable. */
+export function readPidFromDir(dir: string): number | null {
+  try {
+    const raw = fs.readFileSync(path.join(dir, "proxy.pid"), "utf-8").trim();
+    const pid = parseInt(raw, 10);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Proxy state printed by `portless proxy status --json`. The first eight keys
+ * match upstream portless so launchers stay portable; `wildcard` and `lanIp`
+ * are fork additions. Every key is always present; all but `running` and
+ * `stateDir` are null while the proxy is not running.
+ */
+export interface ProxyStatus {
+  running: boolean;
+  /** Process id of the running proxy, or null when it cannot be read. */
+  pid: number | null;
+  port: number | null;
+  tls: boolean | null;
+  /** Suffix list the proxy serves (the fork's multi-suffix list). */
+  tlds: string[] | null;
+  /** Whether the proxy is in LAN mode (mDNS, `.local`). */
+  lan: boolean | null;
+  /** Whether the proxy was started with `--unprivileged`. */
+  unprivileged: boolean | null;
+  stateDir: string;
+  /** Whether unregistered subdomains fall back to their parent route. */
+  wildcard: boolean | null;
+  /** LAN IP recorded for LAN mode, or null outside LAN mode or when unknown. */
+  lanIp: string | null;
+}
+
+/**
+ * Describe the proxy `portless` would talk to. Read-only: it probes the port
+ * and reads the state markers, and never starts, stops, or elevates anything.
+ */
+export async function getProxyStatus(): Promise<ProxyStatus> {
+  const state = await discoverState();
+  if (!(await isProxyRunning(state.port))) {
+    return {
+      running: false,
+      pid: null,
+      port: null,
+      tls: null,
+      tlds: null,
+      lan: null,
+      unprivileged: null,
+      stateDir: state.dir,
+      wildcard: null,
+      lanIp: null,
+    };
+  }
+  const pid = readPidFromDir(state.dir);
+  return {
+    running: true,
+    pid: pid !== null && isProcessAlive(pid) ? pid : null,
+    port: state.port,
+    tls: state.tls,
+    tlds: state.tlds,
+    lan: state.lanMode,
+    unprivileged: readUnprivilegedMarker(state.dir),
+    stateDir: state.dir,
+    wildcard: readWildcardMarker(state.dir),
+    lanIp: state.lanMode ? state.lanIp : null,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Port utilities
 // ---------------------------------------------------------------------------
 
 /**
+ * Addresses an app port must be free on. A bind on one address does not see a
+ * listener on another (on macOS a hostless bind succeeds while 127.0.0.1 or
+ * 0.0.0.0 holds the port), and the proxy dials apps on both loopbacks.
+ */
+const APP_PORT_PROBE_HOSTS = ["127.0.0.1", "::1", "0.0.0.0", "::"];
+
+/** How an app port is picked and from where, resolved from config and environment. */
+export interface AppPortAllocation {
+  strategy: AppPortStrategy;
+  range: [number, number];
+}
+
+export const DEFAULT_APP_PORT_RANGE: readonly [number, number] = [MIN_APP_PORT, MAX_APP_PORT];
+
+/** Parse `PORTLESS_APP_PORT_STRATEGY`. */
+export function parseAppPortStrategy(
+  value: string,
+  source = "PORTLESS_APP_PORT_STRATEGY"
+): AppPortStrategy {
+  const normalized = value.trim().toLowerCase();
+  if ((APP_PORT_STRATEGIES as readonly string[]).includes(normalized)) {
+    return normalized as AppPortStrategy;
+  }
+  throw new Error(
+    `Invalid ${source}="${value}". Must be one of: ${APP_PORT_STRATEGIES.join(", ")}.`
+  );
+}
+
+/** Parse `PORTLESS_APP_PORT_RANGE`, written as `min-max` (e.g. `4200-4999`). */
+export function parseAppPortRange(
+  value: string,
+  source = "PORTLESS_APP_PORT_RANGE"
+): [number, number] {
+  const match = value.trim().match(/^(\d+)-(\d+)$/);
+  const min = match ? Number(match[1]) : NaN;
+  const max = match ? Number(match[2]) : NaN;
+  const isPort = (port: number) => Number.isInteger(port) && port >= 1 && port <= 65535;
+  if (!match || !isPort(min) || !isPort(max) || min > max) {
+    throw new Error(
+      `Invalid ${source}="${value}". Must be min-max with ports between 1 and 65535, e.g. 4200-4999.`
+    );
+  }
+  if (min < MIN_ASSIGNABLE_APP_PORT) {
+    throw new Error(
+      `Invalid ${source}="${value}". The range must start at ${MIN_ASSIGNABLE_APP_PORT} or higher, because apps cannot bind lower ports without privileges.`
+    );
+  }
+  return [min, max];
+}
+
+/**
+ * Resolve how to pick an app port: the environment beats the config, which
+ * beats the defaults. A fixed `appPort` (flag, `PORTLESS_APP_PORT` or config)
+ * is handled by the callers and wins over any strategy, since a fixed port
+ * needs no picking.
+ */
+export function resolveAppPortAllocation(
+  config: Pick<AppConfig, "appPortStrategy" | "appPortRange"> | null | undefined,
+  env: NodeJS.ProcessEnv = process.env
+): AppPortAllocation {
+  const envStrategy = env.PORTLESS_APP_PORT_STRATEGY?.trim();
+  const envRange = env.PORTLESS_APP_PORT_RANGE?.trim();
+  return {
+    strategy: envStrategy
+      ? parseAppPortStrategy(envStrategy)
+      : (config?.appPortStrategy ?? "random"),
+    range: envRange
+      ? parseAppPortRange(envRange)
+      : (config?.appPortRange ?? [DEFAULT_APP_PORT_RANGE[0], DEFAULT_APP_PORT_RANGE[1]]),
+  };
+}
+
+/**
+ * Key that makes a `stable` port repeatable: the app name (worktree prefix
+ * included, TLD excluded) plus its route path prefix when it has one, so
+ * path-routed apps on one hostname start their scan at different offsets.
+ */
+export function appPortKey(name: string, pathPrefix?: string): string {
+  const normalized = normalizePathPrefix(pathPrefix);
+  return normalized === "/" ? name : `${name}${normalized}`;
+}
+
+/** FNV-1a over the key, so `stable` picks the same offset on every machine. */
+function hashKey(key: string): number {
+  let hash = 0x811c9dc5;
+  for (const char of key) {
+    hash ^= char.codePointAt(0)!;
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash;
+}
+
+/**
  * Find a free port in the given range (default 4000-4999).
- * Tries random ports first for speed, then falls back to sequential scan.
+ *
+ * `random` tries random ports first for speed, then falls back to a scan.
+ * `sequential` scans from the bottom, so the first app gets the bottom port.
+ * `stable` starts at an offset derived from `key` and scans forward with
+ * wraparound, so one app keeps its port across restarts while different apps
+ * spread across the range.
+ *
+ * `exclude` holds ports other routes already own. Their apps may not have
+ * bound yet, and a bottom-first strategy would otherwise hand the same port to
+ * two apps started together.
  *
  * Note: There is an inherent TOCTOU race between verifying a port is free
  * and the child process actually binding to it. The random-first strategy
@@ -877,33 +1437,52 @@ export async function discoverState(): Promise<{
  */
 export async function findFreePort(
   minPort = MIN_APP_PORT,
-  maxPort = MAX_APP_PORT
+  maxPort = MAX_APP_PORT,
+  options: { strategy?: AppPortStrategy; key?: string; exclude?: ReadonlySet<number> } = {}
 ): Promise<number> {
   if (minPort > maxPort) {
     throw new Error(`minPort (${minPort}) must be <= maxPort (${maxPort})`);
   }
+  const { strategy = "random", key = "", exclude = new Set<number>() } = options;
+  const skip = (port: number) => BLOCKED_PORTS.has(port) || exclude.has(port);
 
-  const tryPort = (port: number): Promise<boolean> => {
+  const isFreeOn = (port: number, host: string): Promise<boolean> => {
     return new Promise((resolve) => {
       const server = net.createServer();
-      server.listen(port, "127.0.0.1", () => {
+      server.once("error", (err: NodeJS.ErrnoException) => {
+        resolve(err.code === "EADDRNOTAVAIL" || err.code === "EAFNOSUPPORT");
+      });
+      server.listen(port, host, () => {
         server.close(() => resolve(true));
       });
-      server.on("error", () => resolve(false));
     });
   };
 
-  // Try random ports first
-  for (let i = 0; i < RANDOM_PORT_ATTEMPTS; i++) {
-    const port = minPort + Math.floor(Math.random() * (maxPort - minPort + 1));
-    if (!BLOCKED_PORTS.has(port) && (await tryPort(port))) {
-      return port;
+  // Probe sequentially: a dual-stack `::` bind collides with a concurrent `0.0.0.0` one.
+  const tryPort = async (port: number): Promise<boolean> => {
+    for (const host of APP_PORT_PROBE_HOSTS) {
+      if (!(await isFreeOn(port, host))) return false;
+    }
+    return true;
+  };
+
+  const size = maxPort - minPort + 1;
+
+  if (strategy === "random") {
+    for (let i = 0; i < RANDOM_PORT_ATTEMPTS; i++) {
+      const port = minPort + Math.floor(Math.random() * size);
+      if (!skip(port) && (await tryPort(port))) {
+        return port;
+      }
     }
   }
 
-  // Fall back to sequential
-  for (let port = minPort; port <= maxPort; port++) {
-    if (!BLOCKED_PORTS.has(port) && (await tryPort(port))) {
+  // Scan the whole range once. Sequential and the random fallback start at the
+  // bottom; stable starts at the key's offset and wraps around.
+  const start = strategy === "stable" ? hashKey(key) % size : 0;
+  for (let i = 0; i < size; i++) {
+    const port = minPort + ((start + i) % size);
+    if (!skip(port) && (await tryPort(port))) {
       return port;
     }
   }
@@ -968,23 +1547,119 @@ export function hostsUnresolvedMessage(hostnames: string[]): string {
   return `${hostnames.join(", ")} will not resolve. Run: portless hosts sync`;
 }
 
-/** Maximum time to wait for the daemon's routes watcher to publish its block. */
+const HOSTS_SYNC_TRIGGER_TIMEOUT_MS = 500;
+
+export type HostsSyncTrigger = "acted" | "absent" | "disabled" | "mute";
+
+function probeHostsSyncAuth(
+  port: number,
+  tls: boolean,
+  token: string | null,
+  challenge: string,
+  signal: AbortSignal
+): Promise<"available" | "absent" | "mute"> {
+  return new Promise((resolve) => {
+    const requestFn = tls ? https.request : http.request;
+    const req = requestFn(
+      {
+        hostname: "127.0.0.1",
+        port,
+        path: "/",
+        method: "HEAD",
+        headers: { [HOSTS_SYNC_AUTH_CHALLENGE_HEADER]: challenge },
+        signal,
+        ...(tls ? { rejectUnauthorized: false } : {}),
+      },
+      (res) => {
+        const expectedProof = token ? createHostsSyncProof(token, challenge) : null;
+        const suppliedProof = res.headers[HOSTS_SYNC_AUTH_PROOF_HEADER];
+        const available =
+          res.headers[PORTLESS_HEADER.toLowerCase()] === "1" &&
+          typeof suppliedProof === "string" &&
+          expectedProof !== null &&
+          isValidHostsSyncToken(suppliedProof) &&
+          crypto.timingSafeEqual(Buffer.from(suppliedProof), Buffer.from(expectedProof));
+        res.resume();
+        res.on("end", () => resolve(available ? "available" : "mute"));
+        res.on("error", () => resolve("mute"));
+      }
+    );
+    req.on("error", (err: NodeJS.ErrnoException) => {
+      resolve(err.code === "ECONNREFUSED" || err.code === "ENOTFOUND" ? "absent" : "mute");
+    });
+    req.end();
+  });
+}
+
+export async function triggerHostsSync(
+  port: number,
+  tls = false,
+  stateDir = resolveStateDir(port)
+): Promise<HostsSyncTrigger> {
+  const signal = AbortSignal.timeout(HOSTS_SYNC_TRIGGER_TIMEOUT_MS);
+  const token = readHostsSyncToken(stateDir);
+  const challenge = generateHostsSyncChallenge();
+  const capability = await probeHostsSyncAuth(port, tls, token, challenge, signal);
+  if (capability !== "available") return capability;
+  if (!token) return Promise.resolve("mute");
+  return new Promise((resolve) => {
+    const requestFn = tls ? https.request : http.request;
+    const req = requestFn(
+      {
+        hostname: "127.0.0.1",
+        port,
+        path: HOSTS_SYNC_PATH,
+        method: "POST",
+        headers: { [HOSTS_SYNC_AUTH_HEADER]: token },
+        signal,
+        ...(tls ? { rejectUnauthorized: false } : {}),
+      },
+      (res) => {
+        const result =
+          res.statusCode === 204 ? "acted" : res.statusCode === 409 ? "disabled" : "mute";
+        res.resume();
+        res.on("end", () => resolve(result));
+        res.on("error", () => resolve("mute"));
+      }
+    );
+    req.on("error", (err: NodeJS.ErrnoException) => {
+      resolve(err.code === "ECONNREFUSED" || err.code === "ENOTFOUND" ? "absent" : "mute");
+    });
+    req.end();
+  });
+}
+
+/**
+ * How long to wait for a daemon that cannot be asked to sync (an older proxy
+ * without the authenticated endpoint) to publish the managed block through its
+ * own routes watcher.
+ */
 export const HOSTS_SYNC_POLL_CEILING_MS = 3500;
 const HOSTS_SYNC_POLL_INTERVAL_MS = 100;
 
 /**
- * Wait for the daemon to publish the managed hosts block, then check each
- * hostname once through the system resolver. Polling the block avoids repeated
- * resolver calls, which can preserve a negative DNS result after the block is
- * written.
+ * Warn if a route hostname will not resolve. Issue #364.
+ *
+ * Reports resolution, not whether the file was written. `.localhost` resolves
+ * without a hosts entry on current macOS and glibc, so a skipped write there is
+ * invisible; a custom suffix resolves on neither.
+ *
+ * Asks the daemon to sync first (the authenticated hosts-sync endpoint). When it
+ * answers, the block is already written, so the resolver is checked once. An
+ * older daemon that cannot be asked is waited on by reading the hosts file, not
+ * by re-querying the resolver, because a negative lookup can be cached and a name
+ * that is about to resolve would stay negative.
  */
 export async function reportHostsSync(
   hostnames: string[],
+  port: number,
+  tls: boolean,
   lanMode: boolean,
   onWarn: (message: string) => void,
+  trigger: (port: number, tls: boolean) => Promise<HostsSyncTrigger> = triggerHostsSync,
   resolves: (hostname: string) => Promise<boolean> = checkHostResolution,
-  readManaged: () => string[] = getManagedHostnames,
   ceilingMs = HOSTS_SYNC_POLL_CEILING_MS,
+  readManaged: () => string[] = getManagedHostnames,
   sleep: (delayMs: number) => Promise<void> = (delayMs) =>
     new Promise<void>((resolve) => setTimeout(resolve, delayMs))
 ): Promise<void> {
@@ -994,10 +1669,24 @@ export async function reportHostsSync(
     : uniqueHostnames;
   if (checkedHostnames.length === 0) return;
 
+  const unresolved = async () => {
+    const checked = await Promise.all(checkedHostnames.map((hostname) => resolves(hostname)));
+    return checkedHostnames.filter((_, index) => !checked[index]);
+  };
+  const warnUnresolved = async () => {
+    const missing = await unresolved();
+    if (missing.length > 0) onWarn(hostsUnresolvedMessage(missing));
+  };
+
+  // Nothing will write the block, so there is nothing to wait for.
   if (!shouldAutoSyncHosts(process.env.PORTLESS_SYNC_HOSTS)) {
-    const results = await Promise.all(checkedHostnames.map((hostname) => resolves(hostname)));
-    const unresolved = checkedHostnames.filter((_, index) => !results[index]);
-    if (unresolved.length > 0) onWarn(hostsUnresolvedMessage(unresolved));
+    await warnUnresolved();
+    return;
+  }
+
+  const found = await trigger(port, tls);
+  if (found !== "mute") {
+    await warnUnresolved();
     return;
   }
 
@@ -1010,10 +1699,7 @@ export async function reportHostsSync(
     if (remaining <= 0) break;
     await sleep(Math.min(HOSTS_SYNC_POLL_INTERVAL_MS, remaining));
   }
-
-  const results = await Promise.all(checkedHostnames.map((hostname) => resolves(hostname)));
-  const unresolved = checkedHostnames.filter((_, index) => !results[index]);
-  if (unresolved.length > 0) onWarn(hostsUnresolvedMessage(unresolved));
+  await warnUnresolved();
 }
 
 /**
@@ -1089,6 +1775,7 @@ export function findPidsOnPort(port: number): number[] {
       const output = execSync("netstat -ano -p tcp", {
         encoding: "utf-8",
         timeout: PID_LOOKUP_TIMEOUT_MS,
+        windowsHide: true,
       });
       const pid = parsePidFromNetstat(output, port);
       return pid === null ? [] : [pid];
@@ -1108,31 +1795,69 @@ export function findPidsOnPort(port: number): number[] {
   }
 }
 
+/** Whether any process of a process group is alive (EPERM counts as alive). */
+function isProcessGroupAlive(groupId: number): boolean {
+  try {
+    process.kill(-groupId, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * Find the listener a command left on `port` after its launcher exited, for
+ * commands that self-daemonize (print an address and exit while the server
+ * keeps running). Listeners in `excludePids` held the port before the command
+ * ran, so they are not its daemon. The wait lasts up to `timeoutMs` while
+ * processes from the launcher's process group are alive, or after a clean
+ * exit, since a detached daemon leaves the group and may bind later. A failed
+ * foreground exit with an empty group returns at once. Windows has no process
+ * group to watch, so only a clean exit waits there. Read-only: it never
+ * signals anything but the group liveness probe (signal 0).
+ */
+export async function findSelfDaemonizedListener(
+  port: number,
+  processGroupId: number | undefined,
+  timeoutMs: number,
+  exitedCleanly: boolean,
+  excludePids: readonly number[] = []
+): Promise<number | null> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await isPortListening(port)) {
+      const pid = findPidsOnPort(port).find((candidate) => !excludePids.includes(candidate));
+      if (pid !== undefined) return pid;
+    }
+    const groupAlive =
+      !isWindows && processGroupId !== undefined && isProcessGroupAlive(processGroupId);
+    if (!groupAlive && !exitedCleanly) return null;
+    if (Date.now() >= deadline) return null;
+    await new Promise((resolve) => setTimeout(resolve, COMMAND_SHUTDOWN_POLL_MS));
+  }
+}
+
+/** Read the executable name of a process. Returns null on Windows or when it cannot be read. */
+export function getProcessCommand(pid: number): string | null {
+  if (isWindows || !Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    const output = execFileSync("ps", ["-o", "comm=", "-p", String(pid)], {
+      encoding: "utf-8",
+      timeout: PID_LOOKUP_TIMEOUT_MS,
+    });
+    return path.basename(output.trim()) || null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Try to find the PID of a process listening on the given TCP port.
  * Uses lsof on macOS/Linux and netstat on Windows.
  * Returns null if the PID cannot be determined.
  */
 export function findPidOnPort(port: number): number | null {
-  try {
-    if (isWindows) {
-      const output = execSync("netstat -ano -p tcp", {
-        encoding: "utf-8",
-        timeout: PID_LOOKUP_TIMEOUT_MS,
-      });
-      return parsePidFromNetstat(output, port);
-    }
-
-    const output = execSync(`lsof -ti tcp:${port} -sTCP:LISTEN`, {
-      encoding: "utf-8",
-      timeout: PID_LOOKUP_TIMEOUT_MS,
-    });
-    // lsof may return multiple PIDs (one per line); take the first
-    const pid = parseInt(output.trim().split("\n")[0], 10);
-    return isNaN(pid) ? null : pid;
-  } catch {
-    return null;
-  }
+  return findPidsOnPort(port)[0] ?? null;
 }
 
 /**
@@ -1180,7 +1905,8 @@ function collectBinPaths(cwd: string): string[] {
 }
 
 /**
- * Build a PATH string with `node_modules/.bin` directories prepended.
+ * Build a PATH string with `node_modules/.bin` directories prepended and the
+ * running node's directory appended as a fallback. Empty segments are dropped.
  */
 export function augmentedPath(env: NodeJS.ProcessEnv | undefined, cwd?: string): string {
   const source = env ?? process.env;
@@ -1188,12 +1914,12 @@ export function augmentedPath(env: NodeJS.ProcessEnv | undefined, cwd?: string):
   // process.env but case-sensitive in plain objects created via spread).
   const base = source.PATH ?? source.Path ?? "";
   const bins = collectBinPaths(cwd ?? process.cwd());
-  // Windows .cmd wrappers in node_modules/.bin need node.exe to be discoverable.
-  // On Unix, do not shadow the user's version-manager-selected Node binary.
-  if (isWindows) {
-    bins.push(path.dirname(process.execPath));
-  }
-  return bins.join(path.delimiter) + path.delimiter + base;
+  // node's own directory goes last, on every platform, as a fallback for
+  // Windows .cmd wrappers in node_modules/.bin ("node not recognized").
+  // Ahead of the caller's PATH it would shadow the node a version manager
+  // (asdf, nvm, fnm, mise, nvm-windows, volta) chose.
+  const nodeBin = path.dirname(process.execPath);
+  return [...bins, base, nodeBin].filter(Boolean).join(path.delimiter);
 }
 
 export function resolveWindowsExecutable(cmd: string, pathStr: string): string | null {
@@ -1329,6 +2055,13 @@ export function spawnCommand(
   options?: {
     env?: NodeJS.ProcessEnv;
     onCleanup?: () => void;
+    /**
+     * Awaited after the command exits on its own (not after a signal), before
+     * cleanup runs and the process exits. Best-effort: failures are ignored.
+     */
+    onExit?: (childPid: number | undefined, code: number | null) => Promise<void>;
+    /** Called with the child's PID, which is also its process group on Unix. */
+    onSpawn?: (pid: number) => void;
   }
 ): void {
   if (commandArgs.length === 0) {
@@ -1353,6 +2086,8 @@ export function spawnCommand(
       }
     }
   }
+
+  const spawnedAt = Date.now();
 
   // On Unix, spawn detached so the child gets its own process group. This
   // lets us kill the entire tree (shell + grandchild dev server) with a
@@ -1389,21 +2124,60 @@ export function spawnCommand(
     });
   }
 
+  guardWindowsOrphans(child, spawnedAt);
+  if (!isWindows && child.pid) options?.onSpawn?.(child.pid);
+
   let exiting = false;
+  let shutdownSignal: NodeJS.Signals | undefined;
+  let childExited = false;
+  const trackedProcesses = new Map<number, TrackedProcess>();
+  let graceTimer: NodeJS.Timeout | undefined;
+  let forceTimer: NodeJS.Timeout | undefined;
+  let shutdownPoll: NodeJS.Timeout | undefined;
 
   const cleanup = () => {
+    if (graceTimer) clearTimeout(graceTimer);
+    if (forceTimer) clearTimeout(forceTimer);
+    if (shutdownPoll) clearInterval(shutdownPoll);
     process.removeListener("SIGHUP", onSigHup);
     process.removeListener("SIGINT", onSigInt);
     process.removeListener("SIGTERM", onSigTerm);
     options?.onCleanup?.();
   };
 
-  const handleSignal = (signal: NodeJS.Signals) => {
+  const finish = (code: number) => {
     if (exiting) return;
     exiting = true;
-    killTree(child, signal);
     cleanup();
-    process.exit(128 + (SIGNAL_CODES[signal] || 15));
+    process.exit(code);
+  };
+
+  const finishShutdownIfComplete = () => {
+    if (!shutdownSignal || !childExited || hasRunningProcesses(trackedProcesses)) return;
+    finish(128 + (SIGNAL_CODES[shutdownSignal] || 15));
+  };
+
+  const handleSignal = (signal: NodeJS.Signals) => {
+    if (shutdownSignal) {
+      if (child.pid) trackProcessTree(child.pid, trackedProcesses);
+      signalTrackedProcesses(trackedProcesses, signal);
+      return;
+    }
+    shutdownSignal = signal;
+    if (child.pid) trackProcessTree(child.pid, trackedProcesses);
+    killTree(child, signal);
+
+    graceTimer = setTimeout(() => {
+      if (child.pid) trackProcessTree(child.pid, trackedProcesses);
+      signalTrackedProcesses(trackedProcesses, "SIGTERM");
+    }, COMMAND_SHUTDOWN_GRACE_MS);
+
+    forceTimer = setTimeout(() => {
+      if (child.pid) trackProcessTree(child.pid, trackedProcesses);
+      signalTrackedProcesses(trackedProcesses, "SIGKILL");
+    }, COMMAND_SHUTDOWN_FORCE_MS);
+
+    shutdownPoll = setInterval(finishShutdownIfComplete, COMMAND_SHUTDOWN_POLL_MS);
   };
 
   const onSigHup = () => handleSignal("SIGHUP");
@@ -1415,24 +2189,35 @@ export function spawnCommand(
   process.on("SIGTERM", onSigTerm);
 
   child.on("error", (err) => {
-    if (exiting) return;
-    exiting = true;
+    if (exiting || shutdownSignal) return;
     console.error(`Failed to run command: ${err.message}`);
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {
       console.error(`Is "${commandArgs[0]}" installed and in your PATH?`);
     }
-    cleanup();
-    process.exit(1);
+    finish(1);
   });
 
   child.on("exit", (code, signal) => {
     if (exiting) return;
-    exiting = true;
-    cleanup();
-    if (signal) {
-      process.exit(128 + (SIGNAL_CODES[signal] || 15));
+    childExited = true;
+    if (shutdownSignal) {
+      finishShutdownIfComplete();
+      return;
     }
-    process.exit(code ?? 1);
+    if (signal) {
+      finish(128 + (SIGNAL_CODES[signal] || 15));
+      return;
+    }
+    const onExit = options?.onExit;
+    if (!onExit) {
+      finish(code ?? 1);
+      return;
+    }
+    onExit(child.pid, code)
+      .catch(() => {
+        // Exit hooks are best-effort.
+      })
+      .finally(() => finish(code ?? 1));
   });
 }
 
@@ -1494,8 +2279,9 @@ const FRAMEWORKS_NEEDING_PORT: Record<string, FrameworkSpec> = {
   vp: { strictPort: true, serverSubcommands: ["dev"], defaultIsServer: false },
   vitepress: {
     strictPort: true,
-    serverSubcommands: ["dev", "preview"],
-    defaultIsServer: false,
+    serverSubcommands: ["dev", "serve", "preview"],
+    nonServerSubcommands: ["build", "init"],
+    defaultIsServer: true,
   },
   "react-router": { strictPort: true, serverSubcommands: ["dev"], defaultIsServer: false },
   rsbuild: {
@@ -1523,7 +2309,22 @@ const FRAMEWORKS_NEEDING_PORT: Record<string, FrameworkSpec> = {
       "--root",
     ],
   },
-  astro: { strictPort: false, serverSubcommands: ["dev", "preview"], defaultIsServer: false },
+  astro: {
+    strictPort: false,
+    serverSubcommands: ["dev", "preview"],
+    defaultIsServer: false,
+    valueFlags: [
+      "--base",
+      "--config",
+      "--host",
+      "--mode",
+      "--open",
+      "--outDir",
+      "--port",
+      "--root",
+      "--site",
+    ],
+  },
   ng: {
     strictPort: false,
     serverSubcommands: ["serve", "dev", "s"],
@@ -1546,16 +2347,35 @@ const FRAMEWORKS_NEEDING_PORT: Record<string, FrameworkSpec> = {
     serverSubcommands: ["dev"],
     defaultIsServer: false,
   },
+  // `vinext dev` proxies to Vite (`--host`) and ignores PORT. `vinext start`
+  // honors PORT but binds 0.0.0.0 unless given `--hostname`.
+  vinext: {
+    strictPort: false,
+    serverSubcommands: ["dev", "start"],
+    nonServerSubcommands: ["init", "build", "check", "lint"],
+    defaultIsServer: false,
+  },
 };
 
 type PackageRunnerSpec = {
   subcommands: string[];
   valueFlags?: string[];
+  /**
+   * The runner reads options anywhere on the line unless they follow `--`, so
+   * injected flags must go after a separator or the runner swallows them.
+   */
+  separatorRequired?: boolean;
 };
 
 /** Known package runners. Values list subcommands that run a package. */
 const PACKAGE_RUNNERS: Record<string, PackageRunnerSpec> = {
-  npm: { subcommands: ["exec"], valueFlags: ["-p", "--package"] },
+  // In npm, `-p` is the boolean `--parseable`, not `--package`, so it is not a
+  // value flag here. `npm exec` needs a `--` before the flags portless injects.
+  npm: {
+    subcommands: ["exec", "x"],
+    valueFlags: ["-c", "--call", "--package", "-w", "--workspace", "--prefix"],
+    separatorRequired: true,
+  },
   npx: {
     subcommands: [],
     valueFlags: ["-c", "--call", "-p", "--package", "-w", "--workspace", "--allow-scripts"],
@@ -1572,8 +2392,11 @@ type FrameworkInvocation = {
   basename: string;
   framework: FrameworkSpec;
   frameworkIndex: number;
-  frameworkArgs: string[];
+  /** Null when npm parses the options after the framework and one may consume the next argument. */
+  frameworkArgs: string[] | null;
   insertionIndex: number;
+  /** Inserted before the injected flags when the runner would otherwise read them. */
+  separator?: string;
 };
 
 /**
@@ -1603,6 +2426,8 @@ function parseFrameworkInvocation(commandArgs: string[]): FrameworkInvocation | 
   }
 
   let frameworkIndex: number | null = FRAMEWORKS_NEEDING_PORT[first] ? 0 : null;
+  let runnerSeparator = false;
+  let needsSeparator = false;
 
   if (frameworkIndex === null) {
     const runner = PACKAGE_RUNNERS[first];
@@ -1613,7 +2438,10 @@ function parseFrameworkInvocation(commandArgs: string[]): FrameworkInvocation | 
       while (i < commandArgs.length && commandArgs[i]!.startsWith("-")) {
         const option = commandArgs[i]!;
         i++;
-        if (option === "--") break;
+        if (option === "--") {
+          runnerSeparator = true;
+          break;
+        }
         if (!option.includes("=") && runner.valueFlags?.includes(option)) i++;
       }
     };
@@ -1635,6 +2463,10 @@ function parseFrameworkInvocation(commandArgs: string[]): FrameworkInvocation | 
       const name = path.basename(commandArgs[i]!);
       frameworkIndex = FRAMEWORKS_NEEDING_PORT[name] ? i : null;
     }
+
+    if (frameworkIndex !== null) {
+      needsSeparator = Boolean(runner.separatorRequired) && !runnerSeparator;
+    }
   }
 
   if (frameworkIndex === null) return null;
@@ -1642,13 +2474,40 @@ function parseFrameworkInvocation(commandArgs: string[]): FrameworkInvocation | 
   const framework = FRAMEWORKS_NEEDING_PORT[basename];
   if (!framework) return null;
   const optionEnd = commandArgs.indexOf("--", frameworkIndex + 1);
-  const insertionIndex = optionEnd === -1 ? commandArgs.length : optionEnd;
+  const insertionIndex = needsSeparator || optionEnd === -1 ? commandArgs.length : optionEnd;
+  let frameworkArgs: string[] | null;
+  if (needsSeparator) {
+    // npm reads every option before its own `--`, so only what follows the
+    // separator reaches the framework. Which npm flags take a value depends on
+    // npm's config; when a flag without `=` is followed by a bare word, leave
+    // the command alone instead of guessing.
+    const beforeSeparator =
+      optionEnd === -1
+        ? commandArgs.slice(frameworkIndex + 1)
+        : commandArgs.slice(frameworkIndex + 1, optionEnd);
+    const npmMayConsumeValue = beforeSeparator.some(
+      (arg, index) =>
+        arg.startsWith("-") &&
+        !arg.includes("=") &&
+        index + 1 < beforeSeparator.length &&
+        !beforeSeparator[index + 1]!.startsWith("-")
+    );
+    frameworkArgs = npmMayConsumeValue
+      ? null
+      : [
+          ...beforeSeparator.filter((arg) => !arg.startsWith("-")),
+          ...(optionEnd === -1 ? [] : commandArgs.slice(optionEnd + 1)),
+        ];
+  } else {
+    frameworkArgs = commandArgs.slice(frameworkIndex + 1, insertionIndex);
+  }
   return {
     basename,
     framework,
     frameworkIndex,
-    frameworkArgs: commandArgs.slice(frameworkIndex + 1, insertionIndex),
+    frameworkArgs,
     insertionIndex,
+    ...(needsSeparator && optionEnd === -1 ? { separator: "--" } : {}),
   };
 }
 
@@ -1739,19 +2598,29 @@ export function replacePlaceholders(commandArgs: string[], vars: PlaceholderVars
 export function injectFrameworkFlags(commandArgs: string[], port: number): string[] {
   const invocation = parseFrameworkInvocation(commandArgs);
   if (!invocation) return [];
-  const { basename, framework, frameworkArgs, insertionIndex } = invocation;
+  const { basename, framework, frameworkArgs, insertionIndex, separator } = invocation;
 
-  if (!invokesFrameworkServer(frameworkArgs, framework)) return [];
+  if (!frameworkArgs || !invokesFrameworkServer(frameworkArgs, framework)) return [];
+
+  // `vinext start` has its own parser (`-p`, `-H`, `--hostname`), while
+  // `vinext dev` hands everything to Vite (`--host`, and it rejects the short
+  // flags as retired).
+  const vinextStart =
+    basename === "vinext" && frameworkPositionals(frameworkArgs, framework)?.[0] === "start";
 
   const flags: string[] = [];
-  if (!hasCliOption(frameworkArgs, "--port")) {
+  if (
+    !hasCliOption(frameworkArgs, "--port") &&
+    !(vinextStart && hasCliOption(frameworkArgs, "-p"))
+  ) {
     flags.push("--port", port.toString());
     if (framework.strictPort) flags.push("--strictPort");
   }
 
-  const hostFlag = framework.hostFlag ?? "--host";
+  const hostFlag = vinextStart ? "--hostname" : (framework.hostFlag ?? "--host");
   const hasHostChoice =
     hasCliOption(frameworkArgs, hostFlag) ||
+    (vinextStart && hasCliOption(frameworkArgs, "-H")) ||
     (basename === "expo" &&
       ["--localhost", "--lan", "--tunnel"].some((option) => hasCliOption(frameworkArgs, option)));
   if (!hasHostChoice) {
@@ -1761,8 +2630,9 @@ export function injectFrameworkFlags(commandArgs: string[], port: number): strin
     }
   }
 
-  commandArgs.splice(insertionIndex, 0, ...flags);
-  return flags;
+  const inserted = separator && flags.length > 0 ? [separator, ...flags] : flags;
+  commandArgs.splice(insertionIndex, 0, ...inserted);
+  return inserted;
 }
 
 /** Package managers whose `run` command delegates to package.json scripts. */
@@ -1816,6 +2686,15 @@ function isUnsafeToAppendArgs(command: string): boolean {
   return false;
 }
 
+/**
+ * True when `--help` or `-h` appears anywhere in `args`. Commands that reject
+ * unknown flags use this first so a trailing help flag prints help instead of
+ * an error, and commands with side effects (`proxy stop`) never run on a probe.
+ */
+export function hasHelpFlag(args: readonly string[]): boolean {
+  return args.some((arg) => arg === "--help" || arg === "-h");
+}
+
 function hasCliOption(args: string[], option: string): boolean {
   return args.some((arg) => arg === option || arg.startsWith(`${option}=`));
 }
@@ -1839,7 +2718,11 @@ function isSafeToInjectIntoScript(
 ): boolean {
   const rawScriptText = resolveScriptRaw(scriptName, packageDir);
   if (rawScriptText && isUnsafeToAppendArgs(rawScriptText)) return false;
-  if (rawScript.includes("--")) return false;
+  // A `--` after the framework name ends its option list, so appended flags
+  // would arrive as positional data. A `--` before it (`npm exec -- vite dev`)
+  // belongs to the runner and is fine.
+  const invocation = parseFrameworkInvocation(rawScript);
+  if (invocation && rawScript.includes("--", invocation.frameworkIndex + 1)) return false;
   return true;
 }
 

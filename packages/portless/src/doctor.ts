@@ -9,24 +9,27 @@ import {
   findPidOnPort,
   getDefaultPort,
   getProxyBindTargets,
+  isExplicitStateDirEmpty,
   isHttpsEnvDisabled,
   isPortListening,
   isProxyRunning,
   LEGACY_SYSTEM_STATE_DIR,
   readCustomCertMarker,
+  readUnprivilegedMarker,
   readInternalPagesDisabledMarker,
   resolveStateDir,
   resolveWindowsCommandInvocation,
   validateTld,
 } from "./cli-utils.js";
-import { isCATrusted } from "./certs.js";
+import { isCATrusted, nssCertutilMissingWarning } from "./certs.js";
 import { checkHostResolution, getManagedHostnames } from "./hosts.js";
 import { isMdnsSupported } from "./mdns.js";
 import { ensureNetbirdReady } from "./netbird.js";
 import { RouteStore, type RouteMapping } from "./routes.js";
+import { inspectInstalledServiceNode } from "./service.js";
 import { ensureTailscaleReady } from "./tailscale.js";
 import type { TunnelProviderName } from "./types.js";
-import { resolveUserHome } from "./utils.js";
+import { isProcessAlive, resolveUserHome } from "./utils.js";
 
 export type DoctorStatus = "ok" | "warn" | "fail" | "info";
 
@@ -84,6 +87,7 @@ export interface DoctorSnapshot {
     pid?: number;
     pidAlive?: boolean;
     portPid?: number | null;
+    unprivileged: boolean;
     lanMode: boolean;
     lanIp: string | null;
     configuredBindTargets: string[];
@@ -108,6 +112,11 @@ export interface DoctorSnapshot {
   mdns: {
     available: boolean;
     reason?: string;
+  };
+  /** Node binary pinned by the installed system service, absent when no service is installed. */
+  service?: {
+    nodePath: string;
+    nodeExists: boolean;
   };
   tools: {
     openssl: DoctorToolStatus;
@@ -152,25 +161,17 @@ export interface DoctorDependencies {
   managedHostnames: () => string[];
   resolvesHostname: (hostname: string) => Promise<boolean>;
   isCATrusted: (stateDir: string) => boolean;
+  nssCertutilMissingWarning: () => string | undefined;
   certPageResponds: (port: number, tls: boolean, suffix: string) => Promise<boolean>;
   mdnsSupport: () => { supported: boolean; reason?: string };
   probeTool: (name: DoctorToolName, required: boolean) => DoctorToolStatus;
+  installedServiceNode: () => { path: string; exists: boolean } | undefined;
 }
 
 export interface CollectDoctorOptions {
   version: string;
   state?: DiscoveredState;
   dependencies?: Partial<DoctorDependencies>;
-}
-
-function processIsAlive(pid: number): boolean {
-  if (pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
 }
 
 export function resolveDoctorCommandInvocation(
@@ -284,13 +285,15 @@ const DEFAULT_DEPENDENCIES: DoctorDependencies = {
   isProxyRunning,
   isPortListening,
   findPidOnPort,
-  isProcessAlive: processIsAlive,
+  isProcessAlive,
   managedHostnames: getManagedHostnames,
   resolvesHostname: checkHostResolution,
   isCATrusted,
+  nssCertutilMissingWarning,
   certPageResponds: requestCertPage,
   mdnsSupport: isMdnsSupported,
   probeTool: probeDoctorTool,
+  installedServiceNode: () => inspectInstalledServiceNode(),
 };
 
 export function modeAllowsIdentityAccess(
@@ -427,6 +430,7 @@ function routeHasTailscale(route: RouteMapping): boolean {
     route.tailscaleUrl ||
     route.tailscaleHttpsPort ||
     route.tailscaleFunnel ||
+    route.tailscaleHttp ||
     route.tailscaleServiceName ||
     route.tailscaleServiceUrl
   );
@@ -448,6 +452,7 @@ function backgroundSharing(entry: BgProcessEntry): DoctorBackgroundSnapshot["sha
   }
   if (
     entry.intent.sharing.tailscale ||
+    entry.intent.sharing.tailscaleHttp ||
     entry.intent.sharing.tailscaleService ||
     entry.intent.sharing.funnel
   ) {
@@ -494,7 +499,13 @@ export async function collectDoctorSnapshot(
   }
 
   const hasPortFile = fs.existsSync(path.join(state.dir, "proxy.port"));
-  const stateProxyRunning = await dependencies.isProxyRunning(state.port, state.tls);
+  // An explicit state dir without a port file has no proxy of its own. Probing
+  // the default port would reach whatever proxy listens there (for example a
+  // system-wide one), so report it as not running without opening a connection.
+  const isolatedEmpty = isExplicitStateDirEmpty();
+  const stateProxyRunning = isolatedEmpty
+    ? false
+    : await dependencies.isProxyRunning(state.port, state.tls);
   const proxyTls = stateProxyRunning || hasPortFile ? state.tls : !isHttpsEnvDisabled();
   const proxyPort = stateProxyRunning || hasPortFile ? state.port : getDefaultPort(proxyTls);
 
@@ -502,11 +513,13 @@ export async function collectDoctorSnapshot(
   const bgStore = new BgStore(state.dir, { onWarning: (warning) => warnings.push(warning) });
   const rawRoutes = routeStore.loadRoutesRaw();
   const bgEntries = bgStore.loadEntries();
-  const proxyRunning =
-    stateProxyRunning && proxyPort === state.port
+  const proxyRunning = isolatedEmpty
+    ? false
+    : stateProxyRunning && proxyPort === state.port
       ? true
       : await dependencies.isProxyRunning(proxyPort, proxyTls);
-  const portListening = proxyRunning || (await dependencies.isPortListening(proxyPort));
+  const portListening =
+    proxyRunning || (!isolatedEmpty && (await dependencies.isPortListening(proxyPort)));
   const pid = readPidFile(state.dir, warnings);
   const managedHostnames = new Set(dependencies.managedHostnames());
 
@@ -559,6 +572,9 @@ export async function collectDoctorSnapshot(
   const customCert = readCustomCertMarker(state.dir);
   const internalPages = !readInternalPagesDisabledMarker(state.dir);
   const ca = fs.existsSync(path.join(state.dir, "ca.pem"));
+  // A Chrome NSS database without certutil is a warning, never incomplete trust.
+  const nssWarning = ca ? dependencies.nssCertutilMissingWarning() : undefined;
+  if (nssWarning) warnings.push(nssWarning);
   const certPages: Record<string, boolean> = {};
   for (const suffix of state.tlds) {
     certPages[suffix] =
@@ -570,6 +586,7 @@ export async function collectDoctorSnapshot(
   const requiredTools = requiredSharingTools(routes, background);
 
   const mdns = dependencies.mdnsSupport();
+  const serviceNode = dependencies.installedServiceNode();
   return {
     version: options.version,
     nodeVersion: process.versions.node,
@@ -588,8 +605,12 @@ export async function collectDoctorSnapshot(
       ...(pid !== undefined ? { pid, pidAlive: dependencies.isProcessAlive(pid) } : {}),
       portPid: portListening ? dependencies.findPidOnPort(proxyPort) : null,
       lanMode: state.lanMode,
+      unprivileged: readUnprivilegedMarker(state.dir),
       lanIp: state.lanIp,
-      configuredBindTargets: getProxyBindTargets(state.lanMode).map((target) => target.host),
+      configuredBindTargets: getProxyBindTargets(
+        state.lanMode,
+        readUnprivilegedMarker(state.dir)
+      ).map((target) => target.host),
     },
     suffixes: persistedSuffixDiagnostics(state.dir, state.tlds),
     certificates: {
@@ -605,6 +626,9 @@ export async function collectDoctorSnapshot(
     routes,
     background,
     mdns: { available: mdns.supported, ...(mdns.reason ? { reason: mdns.reason } : {}) },
+    ...(serviceNode
+      ? { service: { nodePath: serviceNode.path, nodeExists: serviceNode.exists } }
+      : {}),
     tools: {
       openssl: dependencies.probeTool("openssl", proxyTls && !customCert),
       cloudflared: dependencies.probeTool("cloudflared", requiredTools.cloudflared),
@@ -758,6 +782,11 @@ export function evaluateDoctor(snapshot: DoctorSnapshot): DoctorReport {
         `mDNS tooling is unavailable${snapshot.mdns.reason ? `: ${snapshot.mdns.reason}` : "."}`
       );
     }
+  } else if (
+    snapshot.proxy.unprivileged &&
+    hasExactBindTargets(snapshot.proxy.configuredBindTargets, ["0.0.0.0", "::"])
+  ) {
+    add("ok", "Unprivileged mode binds wildcard addresses with a loopback-only peer guard.");
   } else if (hasExactBindTargets(snapshot.proxy.configuredBindTargets, ["127.0.0.1", "::1"])) {
     add("ok", "Configured local mode binds only to 127.0.0.1 and ::1.");
   } else {
@@ -823,9 +852,13 @@ export function evaluateDoctor(snapshot: DoctorSnapshot): DoctorReport {
     }
     if (snapshot.certificates.ca) {
       if (snapshot.certificates.trusted) {
-        add("ok", "Generated CA is trusted by the OS trust store.");
+        add("ok", "Generated CA is trusted by the required trust stores.");
       } else {
-        add("warn", "Generated CA is not trusted by the OS trust store.", "Run: portless trust");
+        add(
+          "warn",
+          "Generated CA is not trusted by all required trust stores.",
+          "Run: portless trust"
+        );
       }
     }
   } else if (snapshot.proxy.tls) {
@@ -943,6 +976,18 @@ export function evaluateDoctor(snapshot: DoctorSnapshot): DoctorReport {
   addToolFinding(findings, "ngrok", snapshot.tools.ngrok, requiredTools.ngrok);
   addToolFinding(findings, "Tailscale", snapshot.tools.tailscale, requiredTools.tailscale);
   addToolFinding(findings, "NetBird", snapshot.tools.netbird, requiredTools.netbird);
+
+  if (snapshot.service) {
+    if (snapshot.service.nodeExists) {
+      add("ok", `Installed service Node binary exists: ${snapshot.service.nodePath}.`);
+    } else {
+      add(
+        "warn",
+        `Installed service pins a Node binary that no longer exists: ${snapshot.service.nodePath}.`,
+        "The service cannot start until it is reinstalled. Run: portless service install"
+      );
+    }
+  }
 
   for (const warning of snapshot.warnings) add("warn", warning);
 

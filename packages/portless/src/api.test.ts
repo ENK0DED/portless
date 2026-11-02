@@ -175,10 +175,14 @@ describe("getUrl worktree behavior", { timeout: 15_000 }, () => {
       PORTLESS_STATE_DIR: process.env.PORTLESS_STATE_DIR,
       PORTLESS_SUFFIX: process.env.PORTLESS_SUFFIX,
       PORTLESS_TLD: process.env.PORTLESS_TLD,
+      PORTLESS_WORKTREE_PREFIX: process.env.PORTLESS_WORKTREE_PREFIX,
+      PORTLESS_WORKTREE_FLAT: process.env.PORTLESS_WORKTREE_FLAT,
     };
     process.env.PORTLESS_STATE_DIR = stateDir;
     delete process.env.PORTLESS_SUFFIX;
     delete process.env.PORTLESS_TLD;
+    delete process.env.PORTLESS_WORKTREE_PREFIX;
+    delete process.env.PORTLESS_WORKTREE_FLAT;
     writeStateMarkers(stateDir, { port: 443, tls: true });
   });
 
@@ -276,5 +280,100 @@ describe("getUrl worktree behavior", { timeout: 15_000 }, () => {
     );
 
     expect(result.hostname).toBe(`${expectedName}.localhost`);
+  });
+
+  it.skipIf(!gitAvailable())("applies an explicit prefix in a plain checkout", async () => {
+    const repo = path.join(tmpDir, "repo");
+    initRepoWithCommit(repo);
+
+    const result = await getUrl("myapp", { cwd: repo, worktreePrefix: "qa" });
+
+    expect(result.hostname).toBe("qa.myapp.localhost");
+    expect((await getUrl("myapp", { cwd: repo })).hostname).toBe("myapp.localhost");
+  });
+
+  it("applies an explicit prefix outside git and reads flat mode from config", async () => {
+    const dir = path.join(tmpDir, "plain");
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(dir, "portless.json"), JSON.stringify({ worktreeFlat: true }));
+
+    const result = await getUrl("web", { cwd: dir, worktreePrefix: "qa" });
+
+    expect(result.hostname).toBe("qa-web.localhost");
+  });
+
+  it("reads PORTLESS_WORKTREE_PREFIX, lets the option win, and turns off when empty", async () => {
+    const dir = path.join(tmpDir, "plain");
+    fs.mkdirSync(dir);
+
+    process.env.PORTLESS_WORKTREE_PREFIX = "staging";
+    expect((await getUrl("web", { cwd: dir })).hostname).toBe("staging.web.localhost");
+    expect((await getUrl("web", { cwd: dir, worktreePrefix: "qa" })).hostname).toBe(
+      "qa.web.localhost"
+    );
+    expect((await getUrl("web", { cwd: dir, worktree: false })).hostname).toBe("web.localhost");
+
+    process.env.PORTLESS_WORKTREE_PREFIX = "";
+    expect((await getUrl("web", { cwd: dir })).hostname).toBe("web.localhost");
+    expect((await getUrl("web", { cwd: dir, worktreePrefix: "qa" })).hostname).toBe(
+      "qa.web.localhost"
+    );
+  });
+
+  it("rejects contradictory, empty, and unusable prefix options", async () => {
+    const dir = path.join(tmpDir, "plain");
+    fs.mkdirSync(dir);
+
+    await expect(
+      getUrl("web", { cwd: dir, worktree: false, worktreePrefix: "qa" })
+    ).rejects.toThrow(/cannot be combined/);
+    await expect(getUrl("web", { cwd: dir, worktreePrefix: "" })).rejects.toThrow(
+      /worktree: false/
+    );
+    await expect(getUrl("web", { cwd: dir, worktreePrefix: "///" })).rejects.toThrow(
+      /no usable hostname characters/
+    );
+  });
+
+  it.skipIf(!gitAvailable())(
+    "derives the whole branch from worktreeBranch config, with an API override",
+    async () => {
+      const repo = path.join(tmpDir, "repo");
+      initRepoWithCommit(repo);
+      runGit(repo, ["branch", "team-a/login"]);
+      const wtDir = path.join(tmpDir, "wt-team-a-login");
+      runGit(repo, ["worktree", "add", wtDir, "team-a/login"]);
+
+      expect((await getUrl("web", { cwd: wtDir })).hostname).toBe("login.web.localhost");
+
+      fs.writeFileSync(
+        path.join(wtDir, "portless.json"),
+        JSON.stringify({ worktreeBranch: "full" })
+      );
+      expect((await getUrl("web", { cwd: wtDir })).hostname).toBe("team-a-login.web.localhost");
+      expect((await getUrl("web", { cwd: wtDir, worktreeBranch: "last-segment" })).hostname).toBe(
+        "login.web.localhost"
+      );
+      expect((await getUrl("web", { cwd: wtDir, worktree: false })).hostname).toBe("web.localhost");
+    }
+  );
+
+  it.skipIf(!gitAvailable())("lets a per-app worktreeBranch override the top level", async () => {
+    const repo = path.join(tmpDir, "repo");
+    initRepoWithCommit(repo);
+    runGit(repo, ["branch", "team-a/login"]);
+    const wtDir = path.join(tmpDir, "wt-team-a-login");
+    runGit(repo, ["worktree", "add", wtDir, "team-a/login"]);
+    fs.mkdirSync(path.join(wtDir, "apps", "web"), { recursive: true });
+    fs.writeFileSync(
+      path.join(wtDir, "portless.json"),
+      JSON.stringify({
+        worktreeBranch: "full",
+        apps: { "apps/web": { name: "web", worktreeBranch: "last-segment" } },
+      })
+    );
+
+    const perApp = await getUrl("web", { cwd: path.join(wtDir, "apps", "web") });
+    expect(perApp.hostname).toBe("login.web.localhost");
   });
 });

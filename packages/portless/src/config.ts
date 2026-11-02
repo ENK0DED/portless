@@ -9,13 +9,40 @@ export class ConfigValidationError extends Error {
   }
 }
 
+/** How a linked worktree's branch name becomes its hostname prefix. */
+export type WorktreeBranchMode = "last-segment" | "full";
+
+export const WORKTREE_BRANCH_MODES: readonly WorktreeBranchMode[] = ["last-segment", "full"];
+
+/**
+ * How an app's port is chosen when `appPort` does not fix it.
+ *   - `random`: any free port in the range (default).
+ *   - `stable`: a port derived from the app's hostname and path, so a checkout
+ *     keeps its port across restarts and different checkouts land elsewhere.
+ *   - `sequential`: the lowest free port in the range.
+ */
+export type AppPortStrategy = "random" | "stable" | "sequential";
+
+export const APP_PORT_STRATEGIES: readonly AppPortStrategy[] = ["random", "stable", "sequential"];
+
+/**
+ * Lowest port an automatically picked app port may use. Below it an app
+ * cannot bind without privileges, so a range down there would fail on every
+ * port instead of picking one.
+ */
+export const MIN_ASSIGNABLE_APP_PORT = 1024;
+
 export interface AppConfig {
   name?: string;
   script?: string;
   appPort?: number;
+  appPortStrategy?: AppPortStrategy;
+  /** Inclusive `[min, max]` the strategy picks from. Defaults to 4000 to 4999. */
+  appPortRange?: [number, number];
   path?: string;
   proxy?: boolean;
   worktreeFlat?: boolean;
+  worktreeBranch?: WorktreeBranchMode;
 }
 
 export interface PortlessConfig extends AppConfig {
@@ -50,6 +77,22 @@ function loadConfigFromFile(configPath: string, configDir: string): LoadedConfig
     }
     throw err;
   }
+}
+
+/**
+ * Fill an app's missing port strategy and range from the file's top level, so
+ * a repo-wide default applies to every app in an `apps` map. An app that fixes
+ * its own `appPort` keeps it and takes no strategy.
+ */
+export function withRootAppPortDefaults(app: AppConfig, root: AppConfig): AppConfig {
+  if (app.appPort !== undefined) return app;
+  const appPortStrategy = app.appPortStrategy ?? root.appPortStrategy;
+  const appPortRange = app.appPortRange ?? root.appPortRange;
+  return {
+    ...app,
+    ...(appPortStrategy !== undefined ? { appPortStrategy } : {}),
+    ...(appPortRange !== undefined ? { appPortRange } : {}),
+  };
 }
 
 /**
@@ -144,9 +187,12 @@ export function resolveAppConfig(
     name: config.name,
     script: config.script,
     appPort: config.appPort,
+    ...(config.appPortStrategy !== undefined ? { appPortStrategy: config.appPortStrategy } : {}),
+    ...(config.appPortRange !== undefined ? { appPortRange: config.appPortRange } : {}),
     path: config.path,
     proxy: config.proxy,
     ...(config.worktreeFlat !== undefined ? { worktreeFlat: config.worktreeFlat } : {}),
+    ...(config.worktreeBranch !== undefined ? { worktreeBranch: config.worktreeBranch } : {}),
   };
 }
 
@@ -337,13 +383,88 @@ const KNOWN_TOP_KEYS = new Set([
   "name",
   "script",
   "appPort",
+  "appPortStrategy",
+  "appPortRange",
   "path",
   "proxy",
   "worktreeFlat",
+  "worktreeBranch",
   "apps",
   "turbo",
 ]);
-const KNOWN_APP_KEYS = new Set(["name", "script", "appPort", "path", "proxy", "worktreeFlat"]);
+const KNOWN_APP_KEYS = new Set([
+  "name",
+  "script",
+  "appPort",
+  "appPortStrategy",
+  "appPortRange",
+  "path",
+  "proxy",
+  "worktreeFlat",
+  "worktreeBranch",
+]);
+
+function validateWorktreeBranch(obj: Record<string, unknown>, key: string, configPath: string) {
+  if (obj.worktreeBranch === undefined) return;
+  if (!WORKTREE_BRANCH_MODES.includes(obj.worktreeBranch as WorktreeBranchMode)) {
+    throw new ConfigValidationError(
+      `"${key}" in ${configPath} must be one of: ${WORKTREE_BRANCH_MODES.map((m) => `"${m}"`).join(", ")}.`
+    );
+  }
+}
+
+/**
+ * Validate the port-picking keys. `appPort` fixes the port outright, so a
+ * strategy or range next to it in the same object has nothing to decide and is
+ * rejected rather than silently ignored.
+ */
+function validateAppPortKeys(
+  obj: Record<string, unknown>,
+  prefix: string,
+  configPath: string
+): void {
+  if (obj.appPortStrategy !== undefined) {
+    if (
+      typeof obj.appPortStrategy !== "string" ||
+      !(APP_PORT_STRATEGIES as readonly string[]).includes(obj.appPortStrategy)
+    ) {
+      throw new ConfigValidationError(
+        `"${prefix}appPortStrategy" in ${configPath} must be one of: ${APP_PORT_STRATEGIES.map((s) => `"${s}"`).join(", ")}.`
+      );
+    }
+  }
+
+  if (obj.appPortRange !== undefined) {
+    const range = obj.appPortRange;
+    const isPort = (value: unknown): value is number =>
+      typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 65535;
+    if (!Array.isArray(range) || range.length !== 2 || !isPort(range[0]) || !isPort(range[1])) {
+      throw new ConfigValidationError(
+        `"${prefix}appPortRange" in ${configPath} must be [min, max] with integers between 1 and 65535.`
+      );
+    }
+    if (range[0] > range[1]) {
+      throw new ConfigValidationError(
+        `"${prefix}appPortRange" in ${configPath} must have min <= max.`
+      );
+    }
+    if (range[0] < MIN_ASSIGNABLE_APP_PORT) {
+      throw new ConfigValidationError(
+        `"${prefix}appPortRange" in ${configPath} must start at ${MIN_ASSIGNABLE_APP_PORT} or higher, because apps cannot bind lower ports without privileges.`
+      );
+    }
+  }
+
+  if (
+    obj.appPort !== undefined &&
+    (obj.appPortStrategy !== undefined || obj.appPortRange !== undefined)
+  ) {
+    const other = obj.appPortStrategy !== undefined ? "appPortStrategy" : "appPortRange";
+    throw new ConfigValidationError(
+      `"${prefix}appPort" fixes the port, so "${prefix}${other}" has nothing to decide; set one of them in ${configPath}.`
+    );
+  }
+}
 
 function validatePathConfig(obj: Record<string, unknown>, key: string, configPath: string): void {
   if (obj.path === undefined) return;
@@ -389,6 +510,7 @@ function validateConfig(config: unknown, configPath: string): asserts config is 
     }
   }
 
+  validateAppPortKeys(obj, "", configPath);
   validatePathConfig(obj, "path", configPath);
 
   if (obj.proxy !== undefined) {
@@ -402,6 +524,8 @@ function validateConfig(config: unknown, configPath: string): asserts config is 
       throw new ConfigValidationError(`"worktreeFlat" in ${configPath} must be a boolean.`);
     }
   }
+
+  validateWorktreeBranch(obj, "worktreeBranch", configPath);
 
   if (obj.turbo !== undefined) {
     if (typeof obj.turbo !== "boolean") {
@@ -451,6 +575,7 @@ function validateAppConfig(obj: Record<string, unknown>, prefix: string, configP
       );
     }
   }
+  validateAppPortKeys(obj, `${prefix}.`, configPath);
   validatePathConfig(obj, `${prefix}.path`, configPath);
   if (obj.proxy !== undefined) {
     if (typeof obj.proxy !== "boolean") {
@@ -465,6 +590,8 @@ function validateAppConfig(obj: Record<string, unknown>, prefix: string, configP
       );
     }
   }
+
+  validateWorktreeBranch(obj, `${prefix}.worktreeBranch`, configPath);
 
   warnUnknownKeys(obj, KNOWN_APP_KEYS, configPath, prefix);
 }

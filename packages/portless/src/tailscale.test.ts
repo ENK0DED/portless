@@ -168,6 +168,132 @@ describe("tailscale", () => {
       expect(ready.baseUrl).toBe("https://devbox.example.ts.net");
     });
 
+    it("fails fast when MagicDNS is disabled, pointing at --tailscale-http", () => {
+      const runner = createRunner({
+        version: { status: 0 },
+        "status --json": {
+          status: 0,
+          stdout: JSON.stringify({
+            Self: { DNSName: "devbox.example.ts.net.", Capabilities: ["https"] },
+            CurrentTailnet: { MagicDNSEnabled: false },
+          }),
+        },
+      });
+      expect(() => ensureTailscaleReady({ requireHttps: true, runner })).toThrow(
+        /MagicDNS is disabled.*--tailscale-http/
+      );
+    });
+
+    it("does not suggest --tailscale-http for Funnel or Service when MagicDNS is disabled", () => {
+      const runner = createRunner({
+        version: { status: 0 },
+        "status --json": {
+          status: 0,
+          stdout: JSON.stringify({
+            Self: { DNSName: "devbox.example.ts.net." },
+            CurrentTailnet: { MagicDNSEnabled: false },
+          }),
+        },
+      });
+      expect(() => ensureTailscaleReady({ requireFunnel: true, runner })).toThrow(
+        /MagicDNS is disabled.*Enable MagicDNS/
+      );
+      expect(() => ensureTailscaleReady({ requireService: true, runner })).toThrow(
+        /MagicDNS is disabled.*Enable MagicDNS/
+      );
+      try {
+        ensureTailscaleReady({ requireFunnel: true, runner });
+      } catch (err) {
+        expect((err as Error).message).not.toContain("--tailscale-http");
+      }
+    });
+
+    it("ignores an absent MagicDNSEnabled field from an older tailscaled", () => {
+      const runner = createRunner({
+        version: { status: 0 },
+        "status --json": {
+          status: 0,
+          stdout: JSON.stringify({
+            Self: { DNSName: "devbox.example.ts.net." },
+            CurrentTailnet: { MagicDNSSuffix: "example.ts.net" },
+          }),
+        },
+      });
+      expect(ensureTailscaleReady({ runner }).baseUrl).toBe("https://devbox.example.ts.net");
+    });
+
+    it("plain HTTP uses the tailnet IP when MagicDNS is disabled", () => {
+      const runner = createRunner({
+        version: { status: 0 },
+        "status --json": {
+          status: 0,
+          stdout: JSON.stringify({
+            Self: {
+              DNSName: "devbox.example.ts.net.",
+              TailscaleIPs: ["fd7a:115c:a1e0::1", "100.101.102.103"],
+            },
+            CurrentTailnet: { MagicDNSEnabled: false },
+          }),
+        },
+      });
+      const ready = ensureTailscaleReady({ scheme: "http", runner });
+      expect(ready.host).toBe("100.101.102.103");
+      expect(ready.baseUrl).toBe("http://100.101.102.103");
+      expect(ready.dnsName).toBeUndefined();
+    });
+
+    it("plain HTTP brackets an IPv6-only tailnet address", () => {
+      const runner = createRunner({
+        version: { status: 0 },
+        "status --json": {
+          status: 0,
+          stdout: JSON.stringify({ Self: { TailscaleIPs: ["fd7a:115c:a1e0::1"] } }),
+        },
+      });
+      expect(ensureTailscaleReady({ scheme: "http", runner }).baseUrl).toBe(
+        "http://[fd7a:115c:a1e0::1]"
+      );
+    });
+
+    it("plain HTTP uses the MagicDNS name when the tailnet has MagicDNS", () => {
+      const runner = createRunner({
+        version: { status: 0 },
+        "status --json": {
+          status: 0,
+          stdout: JSON.stringify({
+            Self: { DNSName: "devbox.example.ts.net.", TailscaleIPs: ["100.101.102.103"] },
+            CurrentTailnet: { MagicDNSEnabled: true },
+          }),
+        },
+      });
+      const ready = ensureTailscaleReady({ scheme: "http", runner });
+      expect(ready.baseUrl).toBe("http://devbox.example.ts.net");
+      expect(ready.host).toBe("devbox.example.ts.net");
+    });
+
+    it("plain HTTP needs neither HTTPS capability nor MagicDNS", () => {
+      const runner = createRunner({
+        version: { status: 0 },
+        "status --json": {
+          status: 0,
+          stdout: JSON.stringify({ Self: { TailscaleIPs: ["100.64.0.5"] } }),
+        },
+      });
+      expect(() =>
+        ensureTailscaleReady({ scheme: "http", requireHttps: false, runner })
+      ).not.toThrow();
+    });
+
+    it("plain HTTP fails when the node has no tailnet address", () => {
+      const runner = createRunner({
+        version: { status: 0 },
+        "status --json": { status: 0, stdout: JSON.stringify({ Self: {} }) },
+      });
+      expect(() => ensureTailscaleReady({ scheme: "http", runner })).toThrow(
+        "Could not determine this node's Tailscale IP"
+      );
+    });
+
     it("throws when tailscale CLI is missing", () => {
       const enoent = Object.assign(new Error("spawn tailscale ENOENT"), {
         code: "ENOENT",
@@ -242,6 +368,27 @@ describe("tailscale", () => {
       expect(ports).toEqual(new Set([22, 443]));
     });
 
+    it("includes ports held by foreground serve or funnel sessions", () => {
+      const runner = createRunner({
+        "serve status --json": {
+          status: 0,
+          stdout: JSON.stringify({
+            TCP: { "8443": { HTTPS: true } },
+            Web: { "devbox.example.ts.net:8443": { Handlers: {} } },
+            Foreground: {
+              df16b397a48601e8: {
+                TCP: { "443": { HTTPS: true } },
+                Web: { "devbox.example.ts.net:443": { Handlers: {} } },
+                AllowFunnel: { "devbox.example.ts.net:443": true },
+              },
+            },
+          }),
+        },
+      });
+      const ports = getUsedServePorts(runner);
+      expect(ports).toEqual(new Set([443, 8443]));
+    });
+
     it("returns empty set on command failure", () => {
       const runner = createRunner({
         "serve status --json": { status: 1, stderr: "error" },
@@ -289,6 +436,17 @@ describe("tailscale", () => {
       expect(findAvailableServePort(all)).toBe(8451);
     });
 
+    it("plain HTTP starts at port 80, then 8080", () => {
+      expect(findAvailableServePort(new Set(), "serve", "http")).toBe(80);
+      expect(findAvailableServePort(new Set([80]), "serve", "http")).toBe(8080);
+      expect(findAvailableServePort(new Set([80, 8080]), "serve", "http")).toBe(8081);
+    });
+
+    it("plain HTTP extends past its preferred list", () => {
+      const used = new Set([80, 8080, 8081, 8082, 8083, 8084, 8085, 8086, 8087]);
+      expect(findAvailableServePort(used, "serve", "http")).toBe(8088);
+    });
+
     it("returns 443 for funnel when nothing is in use", () => {
       expect(findAvailableServePort(new Set(), "funnel")).toBe(443);
     });
@@ -324,6 +482,28 @@ describe("tailscale", () => {
       registerServe(4123, 443, { runner });
       expect(calls).toHaveLength(1);
       expect(calls[0]).toEqual(["serve", "--bg", "--yes", "--https=443", "http://127.0.0.1:4123"]);
+    });
+
+    it("registers plain HTTP as a raw TCP forward to 127.0.0.1", () => {
+      const calls: string[][] = [];
+      const runner = createRunner(
+        { "serve --bg --yes --tcp=80 tcp://127.0.0.1:4123": { status: 0 } },
+        calls
+      );
+      registerServe(4123, 80, { scheme: "http", runner });
+      expect(calls).toEqual([["serve", "--bg", "--yes", "--tcp=80", "tcp://127.0.0.1:4123"]]);
+    });
+
+    it("reports a plain HTTP port conflict as HTTP", () => {
+      const runner = createRunner({
+        "serve --bg --yes --tcp=80 tcp://127.0.0.1:4123": {
+          status: 1,
+          stderr: "port already in use",
+        },
+      });
+      expect(() => registerServe(4123, 80, { scheme: "http", runner })).toThrow(
+        "HTTP port 80 is already in use"
+      );
     });
 
     it("uses custom HTTPS port", () => {
@@ -582,6 +762,30 @@ describe("tailscale", () => {
       expect(calls[0]).toEqual(["funnel", "--yes", "--https=8443", "off"]);
     });
 
+    it("removes a plain HTTP route with --tcp", () => {
+      const calls: string[][] = [];
+      const runner = createRunner({ "serve --yes --tcp=8080 off": { status: 0 } }, calls);
+      unregisterTailscale({ tailscaleHttpsPort: 8080, tailscaleHttp: true }, { runner });
+      expect(calls).toEqual([["serve", "--yes", "--tcp=8080", "off"]]);
+    });
+
+    it("keeps https cleanup when tailscaleHttp is absent", () => {
+      const calls: string[][] = [];
+      const runner = createRunner({ "serve --yes --https=443 off": { status: 0 } }, calls);
+      unregisterTailscale({ tailscaleHttpsPort: 443 }, { runner });
+      expect(calls).toEqual([["serve", "--yes", "--https=443", "off"]]);
+    });
+
+    it("never uses --tcp for a funnel route", () => {
+      const calls: string[][] = [];
+      const runner = createRunner({ "funnel --yes --https=443 off": { status: 0 } }, calls);
+      unregisterTailscale(
+        { tailscaleHttpsPort: 443, tailscaleFunnel: true, tailscaleHttp: true },
+        { runner }
+      );
+      expect(calls).toEqual([["funnel", "--yes", "--https=443", "off"]]);
+    });
+
     it("is a no-op when tailscaleHttpsPort is undefined", () => {
       expect(() => unregisterTailscale({})).not.toThrow();
     });
@@ -606,6 +810,16 @@ describe("tailscale", () => {
     it("omits port for 443", () => {
       expect(formatTailscaleUrl("https://devbox.example.ts.net", 443)).toBe(
         "https://devbox.example.ts.net"
+      );
+    });
+
+    it("omits port 80 for plain HTTP", () => {
+      expect(formatTailscaleUrl("http://100.101.102.103", 80)).toBe("http://100.101.102.103");
+    });
+
+    it("includes a non-default plain HTTP port", () => {
+      expect(formatTailscaleUrl("http://100.101.102.103", 8080)).toBe(
+        "http://100.101.102.103:8080"
       );
     });
 

@@ -1,0 +1,1246 @@
+/**
+ * Stdio MCP server for portless: a thin translator that runs the portless CLI
+ * for each tool call.
+ *
+ * Intentionally omitted: run, <name> <cmd>, --name, and zero-arg mode
+ * (foreground dev servers with no detached form), proxy start --foreground
+ * (blocks), bg logs --follow (blocks), trust, clean, hosts sync, hosts clean,
+ * and service (may prompt for sudo or need a TTY), tunnel and the sharing flags
+ * (public exposure is not typed into any tool), plus mcp and --help (the server
+ * itself and human help).
+ */
+
+/** Commands in `portless --help` that deliberately have no MCP tool. */
+export const OMITTED_COMMANDS: Record<string, string> = {
+  portless: "zero-arg and named mode run foreground dev servers",
+  "portless run": "runs a foreground dev server",
+  "portless mcp": "the MCP server itself",
+  "portless service install": "may prompt for sudo",
+  "portless trust": "may prompt for sudo",
+  "portless clean": "may prompt for sudo",
+  "portless hosts sync": "may prompt for sudo",
+  "portless hosts clean": "may prompt for sudo",
+  "portless bg clean": "deletes background app entries and their private logs; run it from a shell",
+  "portless url": "alias of get; use the get tool",
+  "portless ls": "alias of list; use the list tool",
+  "portless list --json": "covered by the json argument of the list tool",
+  "portless tunnel map": "public tunnel aliases are a sharing mode and are not exposed over MCP",
+  "portless completion": "prints a shell script for humans to source",
+};
+
+/** Sharing flags on bg start. They are not typed, and extraArgs rejects them. */
+const SHARING_FLAGS = [
+  "--cloudflare",
+  "--tunnel",
+  "--tunnel-hostname",
+  "--tailscale",
+  "--tailscale-http",
+  "--tailscale-service",
+  "--tailscale-service-name",
+  "--funnel",
+  "--ngrok",
+  "--netbird",
+  "--netbird-password",
+  "--netbird-pin",
+  "--netbird-groups",
+];
+
+/** Flags in a tool's `--help` that have no typed argument. Keyed by tool name. */
+export const OMITTED_FLAGS: Record<string, Record<string, string>> = {
+  proxy_start: {
+    "--tld": "compatibility alias of --suffix; use the suffix argument",
+  },
+  bg_start: Object.fromEntries(
+    SHARING_FLAGS.map((flag) => [flag, "sharing modes are not typed into MCP tools"])
+  ),
+};
+
+declare const __VERSION__: string;
+
+import { spawn } from "node:child_process";
+import { createInterface } from "node:readline";
+import { stripVTControlCharacters } from "node:util";
+import colors from "./colors.js";
+import { isWindows, killTree } from "./cli-utils.js";
+
+const VERSION = typeof __VERSION__ === "string" ? __VERSION__ : "0.0.0";
+
+const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+const DEFAULT_TIMEOUT_MS = 120000;
+const PAGE_SIZE = 64;
+
+const SHARED_PROPERTIES: Record<string, unknown> = {
+  cwd: {
+    type: "string",
+    description:
+      "Working directory for the command (decides the app name and worktree prefix). Defaults to the server's working directory.",
+  },
+  extraArgs: {
+    type: "array",
+    items: { type: "string" },
+    description:
+      "Arguments appended verbatim after the typed arguments. Public sharing flags (tunnels, Tailscale, ngrok, NetBird) are rejected.",
+  },
+  timeoutMs: {
+    type: "integer",
+    minimum: 1,
+    maximum: 2147483647,
+    default: DEFAULT_TIMEOUT_MS,
+    description: "Timeout in milliseconds.",
+  },
+};
+
+const SHARED_FIELDS = Object.keys(SHARED_PROPERTIES);
+
+export class McpError extends Error {
+  constructor(
+    public code: number,
+    message: string
+  ) {
+    super(message);
+    this.name = "McpError";
+  }
+}
+
+export interface ToolDef {
+  name: string;
+  title: string;
+  description: string;
+  inputSchema: {
+    type: "object";
+    properties: Record<string, unknown>;
+    required?: string[];
+    additionalProperties: false;
+  };
+  annotations: {
+    readOnlyHint: boolean;
+    destructiveHint: boolean;
+    idempotentHint: boolean;
+    openWorldHint: boolean;
+  };
+}
+
+function tool(
+  name: string,
+  title: string,
+  description: string,
+  properties: Record<string, unknown>,
+  required: string[],
+  annotations: ToolDef["annotations"],
+  inProcess = false
+): ToolDef {
+  const inputSchema: ToolDef["inputSchema"] = {
+    type: "object",
+    properties: inProcess ? { ...properties } : { ...properties, ...SHARED_PROPERTIES },
+    additionalProperties: false,
+  };
+  if (required.length > 0) inputSchema.required = required;
+  return {
+    name,
+    title,
+    description,
+    inputSchema,
+    annotations,
+  };
+}
+
+const NAME_PROPERTY = { type: "string", description: "App or alias name." };
+const JSON_PROPERTY = { type: "boolean", description: "Print machine-readable JSON." };
+const PATH_PROPERTY = {
+  type: "string",
+  description: "Route path prefix, for example /api. Starts with a slash.",
+};
+const WORKTREE_PROPERTIES = {
+  worktreePrefix: {
+    type: "string",
+    description:
+      "Use this worktree prefix instead of the detected branch name. Applies in a linked worktree or not. Cannot be combined with noWorktree.",
+  },
+  noWorktree: {
+    type: "boolean",
+    description: "Skip the worktree prefix.",
+  },
+};
+const BG_NAME_PROPERTY = {
+  type: "string",
+  description:
+    "Background app name. Optional when the working directory identifies exactly one background app.",
+};
+const BG_PATH_PROPERTY = {
+  type: "string",
+  description: "Resolve a path-scoped background route, for example /api.",
+};
+const WAIT_PROPERTIES = {
+  wait: {
+    type: "integer",
+    minimum: 1,
+    description: "Seconds to wait for readiness before returning (CLI default 30).",
+  },
+  noWait: {
+    type: "boolean",
+    description: "Return right after spawning without waiting for readiness.",
+  },
+  keep: {
+    type: "boolean",
+    description: "Keep a child that timed out waiting for readiness running.",
+  },
+};
+const READ_ONLY = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+};
+const PORT_PROPERTY = {
+  type: "integer",
+  minimum: 1,
+  maximum: 65535,
+  description: "Port number.",
+};
+
+/** Every tool, in tools/list order. */
+export const TOOLS: ToolDef[] = [
+  tool(
+    "list",
+    "List routes",
+    "List active routes with their URLs, ports, PIDs, and uptime. Routes whose owner exited while the dev server still runs are marked orphaned; prune stops them. With json, each route has kind app, alias, or orphan.",
+    { json: JSON_PROPERTY },
+    [],
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    }
+  ),
+  tool(
+    "get",
+    "Get app URL",
+    "Print the URL for an app name, using the same hostname and worktree logic as portless run. The app does not need to be running.",
+    {
+      name: NAME_PROPERTY,
+      ...WORKTREE_PROPERTIES,
+      path: PATH_PROPERTY,
+      json: JSON_PROPERTY,
+    },
+    ["name"],
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    }
+  ),
+  tool(
+    "alias_add",
+    "Add alias",
+    "Register a static route for a service portless does not run, such as a database.",
+    {
+      name: NAME_PROPERTY,
+      port: PORT_PROPERTY,
+      path: PATH_PROPERTY,
+      h2c: {
+        type: "boolean",
+        description: "Forward to an HTTP/2 cleartext (h2c or gRPC) upstream.",
+      },
+      force: {
+        type: "boolean",
+        description:
+          "Replace an existing route with the same name. If a running app owns it, that app is stopped.",
+      },
+    },
+    ["name", "port"],
+    {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false,
+    }
+  ),
+  tool(
+    "alias_remove",
+    "Remove alias",
+    "Remove a static route registered with alias add.",
+    { name: NAME_PROPERTY },
+    ["name"],
+    {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    }
+  ),
+  tool(
+    "tools_profiles",
+    "Show tool profiles",
+    "Show the active tool profiles and other profiles you can enable.",
+    {},
+    [],
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    true
+  ),
+  tool(
+    "proxy_start",
+    "Start proxy",
+    "Start the shared portless proxy as a background daemon. Backend pooling permits 16 simultaneous dials per app and 64 idle sockets; connects have a 10-second deadline, established streams have no proxy timeout, and shutdown rejects queued requests with 503. Without port, HTTPS uses 443; listener probes and enabled hosts sync determine whether sudo is needed. A failed sudo exits without changing ports; MCP cannot answer a sudo prompt, so pass unprivileged for a port below 1024 without sudo, or port (for example 1355). HTTPS may show an OS dialog to trust the local CA; pass skipTrust to skip it. A state directory tracks one proxy: starting on another port fails while a live proxy is tracked, so stop it first.",
+    {
+      port: PORT_PROPERTY,
+      noTls: { type: "boolean", description: "Serve plain HTTP instead of HTTPS." },
+      lan: { type: "boolean", description: "Expose the proxy on the local network." },
+      suffix: {
+        type: "array",
+        items: { type: "string" },
+        minItems: 1,
+        description: "One or more route suffixes to serve, for example test or local.example.com.",
+      },
+      skipTrust: {
+        type: "boolean",
+        description: "Generate or reuse certificates without adding the CA to the trust store.",
+      },
+      routesCleanupInterval: {
+        type: "integer",
+        minimum: 0,
+        description: "Seconds between dead route sweeps (CLI default 300, 0 disables).",
+      },
+      wildcard: {
+        type: "boolean",
+        description: "Allow unregistered subdomains to fall back to their parent route.",
+      },
+      unprivileged: {
+        type: "boolean",
+        description:
+          "Take a port below 1024 without sudo: bind the wildcard address and accept loopback peers only. Serves plain HTTP on port 80 unless HTTPS is requested, and turns off hosts sync.",
+      },
+    },
+    [],
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    }
+  ),
+  tool(
+    "proxy_stop",
+    "Stop proxy",
+    "Stop the shared portless proxy. Pass port when the proxy runs on a non-default port; a proxy on another port than the tracked one is stopped without clearing the tracked proxy's state.",
+    { port: PORT_PROPERTY },
+    [],
+    {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    }
+  ),
+  tool(
+    "proxy_status",
+    "Proxy status",
+    "Report whether the shared portless proxy is running and its pid, port, HTTPS, suffixes (tlds), LAN mode and IP, unprivileged mode, wildcard mode, and state directory, read from the proxy and its state files. Read-only: never starts, stops, or elevates the proxy, and exits 0 whether or not it is running. Pass json for one line of JSON with every field always present; everything except running and stateDir is null while the proxy is stopped.",
+    { json: { type: "boolean", description: "Print JSON instead of text." } },
+    [],
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    }
+  ),
+  tool(
+    "doctor",
+    "Run doctor",
+    "Check local portless health, including the proxy, certificates, and routes.",
+    {},
+    [],
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    }
+  ),
+  tool(
+    "prune",
+    "Prune servers",
+    "Stop orphaned dev servers left by crashed sessions. When the route recorded the command's process group, the whole verified group is stopped; otherwise the process on the route port is. Removes the stale routes.",
+    {
+      force: {
+        type: "boolean",
+        description: "Send SIGKILL instead of SIGTERM.",
+      },
+    },
+    [],
+    {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    }
+  ),
+  tool(
+    "bg_list",
+    "List background apps",
+    "List apps started with bg start, with their state.",
+    { json: JSON_PROPERTY },
+    [],
+    READ_ONLY
+  ),
+  tool(
+    "bg_status",
+    "Background app status",
+    "Show the status of one background app: state, PID, URL, and log locations.",
+    { name: BG_NAME_PROPERTY, path: BG_PATH_PROPERTY, json: JSON_PROPERTY },
+    [],
+    READ_ONLY
+  ),
+  tool(
+    "bg_logs",
+    "Background app logs",
+    "Print the last lines of a background app's logs. Streaming is not available.",
+    {
+      name: BG_NAME_PROPERTY,
+      path: BG_PATH_PROPERTY,
+      tail: {
+        type: "integer",
+        minimum: 0,
+        description: "Number of trailing lines (CLI default 100).",
+      },
+      all: { type: "boolean", description: "Print the whole selected log." },
+      errors: { type: "boolean", description: "Print the stderr log." },
+      lifecycle: { type: "boolean", description: "Print the portless lifecycle log." },
+    },
+    [],
+    READ_ONLY
+  ),
+  tool(
+    "bg_start",
+    "Start background app",
+    "Start a long-lived dev server in the background through portless, in the working directory. Without command, the project dev script runs. Public sharing flags are not typed into this tool. Waits up to 30 seconds for the route to become ready.",
+    {
+      command: {
+        type: "array",
+        items: { type: "string" },
+        minItems: 1,
+        description: 'Command and arguments to run, for example ["bun", "run", "dev"].',
+      },
+      name: { type: "string", description: "Explicit app name." },
+      path: PATH_PROPERTY,
+      appPort: { ...PORT_PROPERTY, description: "Fixed app port." },
+      h2c: { type: "boolean", description: "Forward to an HTTP/2 cleartext upstream." },
+      ...WORKTREE_PROPERTIES,
+      force: {
+        type: "boolean",
+        description: "Take over an existing route owned by portless.",
+      },
+      ...WAIT_PROPERTIES,
+      json: JSON_PROPERTY,
+    },
+    [],
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    }
+  ),
+  tool(
+    "bg_stop",
+    "Stop background app",
+    "Stop a background app. Sends SIGTERM and waits up to 12 seconds. With force, the app and the command it spawned get SIGKILL (the verified process group) and its route state is cleaned.",
+    {
+      name: BG_NAME_PROPERTY,
+      path: BG_PATH_PROPERTY,
+      force: { type: "boolean", description: "SIGKILL the app and its recorded process group." },
+      json: JSON_PROPERTY,
+    },
+    [],
+    {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    }
+  ),
+  tool(
+    "bg_restart",
+    "Restart background app",
+    "Stop a background app and start it again with its saved settings, including any sharing flags it was started with.",
+    {
+      name: BG_NAME_PROPERTY,
+      path: BG_PATH_PROPERTY,
+      force: { type: "boolean", description: "SIGKILL the app and its recorded process group." },
+      ...WAIT_PROPERTIES,
+      json: JSON_PROPERTY,
+    },
+    [],
+    {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false,
+    }
+  ),
+  tool("version", "Print version", "Print the portless version.", {}, [], {
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  }),
+];
+
+/** Profile name -> description and tool names. `all` has tools: "all". Aliases are not keys here. */
+export const PROFILES: Record<string, { description: string; tools: string[] | "all" }> = {
+  core: {
+    description:
+      "Route lookup, static aliases, read-only background app status and logs, and proxy status.",
+    tools: [
+      "list",
+      "get",
+      "alias_add",
+      "alias_remove",
+      "bg_list",
+      "bg_status",
+      "bg_logs",
+      "proxy_status",
+      "tools_profiles",
+    ],
+  },
+  background: {
+    description: "Start, stop, and restart background apps.",
+    tools: ["bg_start", "bg_stop", "bg_restart"],
+  },
+  proxy: {
+    description: "Start, stop, and inspect the shared portless proxy.",
+    tools: ["proxy_start", "proxy_stop", "proxy_status"],
+  },
+  diagnostics: {
+    description: "Health checks, cleanup, and version information.",
+    tools: ["doctor", "prune", "version"],
+  },
+  all: {
+    description: "Every available tool.",
+    tools: "all",
+  },
+};
+
+const PROFILE_ALIASES: Record<string, string> = { default: "core", full: "all" };
+
+const VALID_PROFILES =
+  "core, background, proxy, diagnostics, all (aliases: default = core, full = all)";
+
+/** Parse a --tools value into canonical profile names (aliases resolved). */
+export function parseToolsFlag(value: string): string[] {
+  const requested = value
+    .split(",")
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0);
+  if (requested.length === 0) {
+    throw new Error(`No tools profiles given. Valid profiles: ${VALID_PROFILES}.`);
+  }
+  const resolved: string[] = [];
+  const unknown: string[] = [];
+  for (const name of requested) {
+    const canonical = PROFILE_ALIASES[name] ?? name;
+    if (!(canonical in PROFILES)) {
+      unknown.push(name);
+      continue;
+    }
+    if (!resolved.includes(canonical)) resolved.push(canonical);
+  }
+  if (unknown.length > 0) {
+    throw new Error(
+      `Unknown tools profile: ${unknown.join(", ")}. Valid profiles: ${VALID_PROFILES}.`
+    );
+  }
+  return resolved;
+}
+
+function fail(message: string): never {
+  throw new McpError(-32602, message);
+}
+
+function readString(
+  args: Record<string, unknown>,
+  key: string,
+  required: boolean
+): string | undefined {
+  const value = args[key];
+  if (value === undefined || value === null) {
+    if (required) fail(`${key} is required`);
+    return undefined;
+  }
+  if (typeof value !== "string") fail(`${key} must be a string`);
+  return value;
+}
+
+function readRequiredName(args: Record<string, unknown>, key: string): string {
+  const value = readString(args, key, true);
+  if (value === undefined || value.length === 0) fail(`${key} must not be empty`);
+  if (value.startsWith("-")) fail(`${key} must not start with "-"`);
+  return value;
+}
+
+function readBoolean(args: Record<string, unknown>, key: string): boolean | undefined {
+  const value = args[key];
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "boolean") fail(`${key} must be a boolean`);
+  return value;
+}
+
+function readPort(
+  args: Record<string, unknown>,
+  key: string,
+  required: boolean
+): number | undefined {
+  const value = args[key];
+  if (value === undefined || value === null) {
+    if (required) fail(`${key} is required`);
+    return undefined;
+  }
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 65535) {
+    fail(`${key} must be an integer between 1 and 65535`);
+  }
+  return value;
+}
+
+/** An optional name or path value that must not be mistaken for a CLI flag. */
+function readOptionalWord(args: Record<string, unknown>, key: string): string | undefined {
+  const value = readString(args, key, false);
+  if (value === undefined) return undefined;
+  if (value.length === 0) fail(`${key} must not be empty`);
+  if (value.startsWith("-")) fail(`${key} must not start with "-"`);
+  return value;
+}
+
+function readInteger(
+  args: Record<string, unknown>,
+  key: string,
+  min: number,
+  max: number
+): number | undefined {
+  const value = args[key];
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < min || value > max) {
+    fail(`${key} must be an integer between ${min} and ${max}`);
+  }
+  return value;
+}
+
+function readStringArray(
+  args: Record<string, unknown>,
+  key: "extraArgs" | "suffix" | "command"
+): string[] {
+  const value = args[key];
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value) || (key !== "extraArgs" && value.length === 0)) {
+    fail(key === "extraArgs" ? "extraArgs must be an array" : `${key} must not be empty`);
+  }
+  return value.map((item, index) => {
+    if (typeof item !== "string") fail(`${key}[${index}] must be a string`);
+    return item;
+  });
+}
+
+function validateShared(args: Record<string, unknown>): string[] {
+  const cwd = readString(args, "cwd", false);
+  if (cwd !== undefined && cwd.length === 0) fail("cwd must not be empty");
+  const extraArgs = readStringArray(args, "extraArgs");
+  for (const arg of extraArgs) {
+    const flag = arg.split("=", 1)[0];
+    if (SHARING_FLAGS.includes(flag)) {
+      fail(`extraArgs must not include ${flag} because MCP tools do not open public URLs`);
+    }
+  }
+  const timeout = args.timeoutMs;
+  if (timeout !== undefined && timeout !== null) {
+    if (
+      typeof timeout !== "number" ||
+      !Number.isInteger(timeout) ||
+      timeout < 1 ||
+      timeout > 2147483647
+    ) {
+      fail("timeoutMs must be a positive integer up to 2147483647");
+    }
+  }
+  return extraArgs;
+}
+
+/** Push --worktree-prefix and --no-worktree; the CLI rejects the combination. */
+function pushWorktree(argv: string[], args: Record<string, unknown>): void {
+  const prefix = readOptionalWord(args, "worktreePrefix");
+  if (prefix !== undefined) argv.push("--worktree-prefix", prefix);
+  if (readBoolean(args, "noWorktree") === true) argv.push("--no-worktree");
+}
+
+/** The optional app name and path scope shared by the bg tools that target one app. */
+function pushBgTarget(argv: string[], args: Record<string, unknown>): void {
+  const name = readOptionalWord(args, "name");
+  if (name !== undefined) argv.push(name);
+  const path = readOptionalWord(args, "path");
+  if (path !== undefined) argv.push("--path", path);
+}
+
+function pushBgWait(argv: string[], args: Record<string, unknown>): void {
+  const wait = readInteger(args, "wait", 1, 2147483647);
+  if (wait !== undefined) argv.push("--wait", String(wait));
+  if (readBoolean(args, "noWait") === true) argv.push("--no-wait");
+  if (readBoolean(args, "keep") === true) argv.push("--keep");
+}
+
+/** Build the CLI argv (without node/script path, without cwd/timeoutMs) for a child-run tool. */
+export function buildArgv(toolName: string, args: Record<string, unknown>): string[] {
+  const extraArgs = validateShared(args);
+  const argv: string[] = [];
+
+  switch (toolName) {
+    case "list":
+      argv.push("list");
+      if (readBoolean(args, "json") === true) argv.push("--json");
+      break;
+    case "get": {
+      const name = readRequiredName(args, "name");
+      argv.push("get", name);
+      pushWorktree(argv, args);
+      const path = readOptionalWord(args, "path");
+      if (path !== undefined) argv.push("--path", path);
+      if (readBoolean(args, "json") === true) argv.push("--json");
+      break;
+    }
+    case "alias_add": {
+      const name = readRequiredName(args, "name");
+      const port = readPort(args, "port", true);
+      argv.push("alias", name, String(port));
+      const path = readOptionalWord(args, "path");
+      if (path !== undefined) argv.push("--path", path);
+      if (readBoolean(args, "h2c") === true) argv.push("--h2c");
+      if (readBoolean(args, "force") === true) argv.push("--force");
+      break;
+    }
+    case "alias_remove": {
+      const name = readRequiredName(args, "name");
+      argv.push("alias", "--remove", name);
+      break;
+    }
+    case "tools_profiles":
+      break;
+    case "proxy_start": {
+      const port = readPort(args, "port", false);
+      if (extraArgs.includes("--foreground")) {
+        fail(
+          "extraArgs must not include --foreground because the foreground proxy would block the call"
+        );
+      }
+      argv.push("proxy", "start");
+      if (port !== undefined) argv.push("-p", String(port));
+      if (readBoolean(args, "noTls") === true) argv.push("--no-tls");
+      if (readBoolean(args, "lan") === true) argv.push("--lan");
+      for (const suffix of readStringArray(args, "suffix")) argv.push("--suffix", suffix);
+      if (readBoolean(args, "wildcard") === true) argv.push("--wildcard");
+      if (readBoolean(args, "unprivileged") === true) argv.push("--unprivileged");
+      if (readBoolean(args, "skipTrust") === true) argv.push("--skip-trust");
+      const interval = readInteger(args, "routesCleanupInterval", 0, 2147483647);
+      if (interval !== undefined) argv.push("--routes-cleanup-interval", String(interval));
+      break;
+    }
+    case "proxy_stop": {
+      const port = readPort(args, "port", false);
+      argv.push("proxy", "stop");
+      if (port !== undefined) argv.push("-p", String(port));
+      break;
+    }
+    case "proxy_status":
+      argv.push("proxy", "status");
+      if (readBoolean(args, "json") === true) argv.push("--json");
+      break;
+    case "doctor":
+      argv.push("doctor");
+      break;
+    case "prune":
+      argv.push("prune");
+      if (readBoolean(args, "force") === true) argv.push("--force");
+      break;
+    case "bg_list":
+      argv.push("bg", "list");
+      if (readBoolean(args, "json") === true) argv.push("--json");
+      break;
+    case "bg_status": {
+      argv.push("bg", "status");
+      pushBgTarget(argv, args);
+      if (readBoolean(args, "json") === true) argv.push("--json");
+      break;
+    }
+    case "bg_logs": {
+      if (extraArgs.includes("--follow")) {
+        fail("extraArgs must not include --follow because streaming logs would block the call");
+      }
+      argv.push("bg", "logs");
+      pushBgTarget(argv, args);
+      const tail = readInteger(args, "tail", 0, 2147483647);
+      if (tail !== undefined) argv.push("--tail", String(tail));
+      if (readBoolean(args, "all") === true) argv.push("--all");
+      if (readBoolean(args, "errors") === true) argv.push("--errors");
+      if (readBoolean(args, "lifecycle") === true) argv.push("--bg");
+      break;
+    }
+    case "bg_start": {
+      argv.push("bg", "start");
+      const name = readOptionalWord(args, "name");
+      if (name !== undefined) argv.push("--name", name);
+      const path = readOptionalWord(args, "path");
+      if (path !== undefined) argv.push("--path", path);
+      const appPort = readPort(args, "appPort", false);
+      if (appPort !== undefined) argv.push("--app-port", String(appPort));
+      if (readBoolean(args, "h2c") === true) argv.push("--h2c");
+      pushWorktree(argv, args);
+      if (readBoolean(args, "force") === true) argv.push("--force");
+      pushBgWait(argv, args);
+      if (readBoolean(args, "json") === true) argv.push("--json");
+      // extraArgs must come before the command tail or they would run as part of the command.
+      argv.push(...extraArgs);
+      const command = readStringArray(args, "command");
+      if (command.length > 0) argv.push("--", ...command);
+      return argv;
+    }
+    case "bg_stop": {
+      argv.push("bg", "stop");
+      pushBgTarget(argv, args);
+      if (readBoolean(args, "force") === true) argv.push("--force");
+      if (readBoolean(args, "json") === true) argv.push("--json");
+      break;
+    }
+    case "bg_restart": {
+      argv.push("bg", "restart");
+      pushBgTarget(argv, args);
+      if (readBoolean(args, "force") === true) argv.push("--force");
+      pushBgWait(argv, args);
+      if (readBoolean(args, "json") === true) argv.push("--json");
+      break;
+    }
+    case "version":
+      argv.push("--version");
+      break;
+    default:
+      fail(`Unknown tool: ${toolName}`);
+  }
+
+  argv.push(...extraArgs);
+  return argv;
+}
+
+export function toToolResult(run: { exitCode: number | null; stdout: string; stderr: string }): {
+  content: { type: "text"; text: string }[];
+  structuredContent: { exitCode: number | null; stdout: string; stderr: string };
+  isError: boolean;
+} {
+  const stdout = run.stdout.trim();
+  const stderr = run.stderr.trim();
+  let text = stdout;
+  if (stderr.length > 0)
+    text = text.length > 0 ? `${text}\n\nstderr:\n${stderr}` : `stderr:\n${stderr}`;
+  if (text.length === 0) text = "(no output)";
+  return {
+    content: [{ type: "text", text }],
+    structuredContent: { exitCode: run.exitCode, stdout: run.stdout, stderr: run.stderr },
+    isError: run.exitCode !== 0,
+  };
+}
+
+function runChild(
+  argv: string[],
+  cwd: string,
+  timeoutMs: number
+): Promise<{ exitCode: number | null; stdout: string; stderr: string } | { spawnError: string }> {
+  return new Promise((resolve) => {
+    const env: NodeJS.ProcessEnv = { ...process.env, NO_COLOR: "1" };
+    delete env.FORCE_COLOR;
+    delete env.PORTLESS;
+
+    const child = spawn(process.execPath, [process.argv[1], ...argv], {
+      cwd,
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: !isWindows,
+      windowsHide: true,
+    });
+
+    const out: Buffer[] = [];
+    const err: Buffer[] = [];
+    let settled = false;
+    let timedOut = false;
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killTree(child, "SIGKILL");
+      finish(null);
+    }, timeoutMs);
+
+    const finish = (code: number | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const stdout = stripVTControlCharacters(Buffer.concat(out).toString("utf8"));
+      let stderr = stripVTControlCharacters(Buffer.concat(err).toString("utf8"));
+      if (timedOut) {
+        const note = `portless command timed out after ${timeoutMs}ms`;
+        stderr = stderr.trim().length > 0 ? `${stderr.trimEnd()}\n${note}` : note;
+      }
+      resolve({ exitCode: timedOut ? null : code, stdout, stderr });
+    };
+
+    child.stdout.on("data", (chunk: Buffer) => out.push(chunk));
+    child.stderr.on("data", (chunk: Buffer) => err.push(chunk));
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ spawnError: error.message });
+    });
+    child.on("close", finish);
+  });
+}
+
+function toolErrorResult(message: string): {
+  content: { type: "text"; text: string }[];
+  isError: true;
+} {
+  return { content: [{ type: "text", text: message }], isError: true };
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function errorResponse(id: unknown, code: number, message: string): Record<string, unknown> {
+  return { jsonrpc: "2.0", id, error: { code, message } };
+}
+
+function resultResponse(id: unknown, result: Record<string, unknown>): Record<string, unknown> {
+  return { jsonrpc: "2.0", id, result };
+}
+
+/** A server for the given canonical profile names. */
+export function createServer(profiles: string[]): {
+  handleLine(line: string): Promise<Record<string, unknown> | Record<string, unknown>[] | null>;
+  readonly shutdown: boolean;
+} {
+  let shutdown = false;
+  const enabled = new Set<string>();
+  for (const profileName of profiles) {
+    const profile = PROFILES[profileName];
+    if (!profile) continue;
+    if (profile.tools === "all") {
+      for (const def of TOOLS) enabled.add(def.name);
+    } else {
+      for (const name of profile.tools) enabled.add(name);
+    }
+  }
+
+  async function handleRequest(
+    message: Record<string, unknown>
+  ): Promise<Record<string, unknown> | null> {
+    const id = message.id;
+    const hasId = Object.prototype.hasOwnProperty.call(message, "id");
+    const method = message.method;
+    if (typeof method !== "string") {
+      return hasId ? errorResponse(id, -32600, "Invalid request: missing method") : null;
+    }
+    if (!hasId) return null;
+
+    const params = message.params;
+
+    switch (method) {
+      case "initialize": {
+        if (params !== undefined && !isObject(params)) {
+          return errorResponse(id, -32602, "params must be an object");
+        }
+        const requested = params?.protocolVersion;
+        if (requested !== undefined && typeof requested !== "string") {
+          return errorResponse(id, -32602, "protocolVersion must be a string");
+        }
+        const version =
+          typeof requested === "string" && PROTOCOL_VERSIONS.includes(requested)
+            ? requested
+            : PROTOCOL_VERSIONS[0];
+        const lookup: string[] = [];
+        if (enabled.has("get")) lookup.push("the get tool to find an app's URL");
+        if (enabled.has("list")) lookup.push("the list tool to see active routes");
+        const instructions = [
+          `Portless MCP server. Active profiles: ${profiles.join(", ")}.`,
+          lookup.length > 0 ? `Use ${lookup.join(", ")}.` : "",
+          enabled.has("bg_start")
+            ? "Use the bg_start tool for long-lived servers; foreground dev servers still start with `portless run <cmd>` in a shell."
+            : "Start dev servers with `portless run <cmd>` in a shell; MCP does not run them.",
+          enabled.has("tools_profiles")
+            ? "Call the tools_profiles tool to see other tool profiles, such as background for starting and stopping background apps."
+            : "",
+        ]
+          .filter((part) => part.length > 0)
+          .join(" ");
+        return resultResponse(id, {
+          protocolVersion: version,
+          capabilities: { tools: {} },
+          serverInfo: { name: "portless", title: "Portless", version: VERSION },
+          instructions,
+        });
+      }
+      case "ping":
+        return resultResponse(id, {});
+      case "tools/list": {
+        if (params !== undefined && !isObject(params)) {
+          return errorResponse(id, -32602, "params must be an object");
+        }
+        const cursor = params?.cursor;
+        const page = TOOLS.filter((def) => enabled.has(def.name));
+        let start = 0;
+        if (cursor !== undefined && cursor !== null) {
+          if (typeof cursor !== "string" || !/^\d+$/.test(cursor)) {
+            return errorResponse(id, -32602, "Invalid tools/list cursor");
+          }
+          start = Number(cursor);
+          if (start > page.length) {
+            return errorResponse(id, -32602, "Invalid tools/list cursor");
+          }
+        }
+        const slice = page.slice(start, start + PAGE_SIZE);
+        const result: Record<string, unknown> = { tools: slice };
+        if (start + PAGE_SIZE < page.length) result.nextCursor = String(start + PAGE_SIZE);
+        return resultResponse(id, result);
+      }
+      case "tools/call": {
+        if (!isObject(params)) {
+          return errorResponse(id, -32602, "params must be an object");
+        }
+        if (typeof params.name !== "string") {
+          return errorResponse(id, -32602, "params.name must be a string");
+        }
+        const toolName = params.name;
+        const rawArgs = params.arguments;
+        if (rawArgs !== undefined && rawArgs !== null && !isObject(rawArgs)) {
+          return errorResponse(id, -32602, "tool arguments must be an object");
+        }
+        const args = rawArgs ?? {};
+        const def = TOOLS.find((tool) => tool.name === toolName);
+        if (!def) return errorResponse(id, -32602, `Unknown tool: ${toolName}`);
+        if (!enabled.has(toolName)) {
+          return resultResponse(
+            id,
+            toolErrorResult(
+              `Tool ${toolName} is not enabled. Restart with portless mcp --tools all or add a profile that includes it.`
+            )
+          );
+        }
+
+        const accepted = Object.keys(def.inputSchema.properties);
+        const unknown = Object.keys(args)
+          .filter((key) => !accepted.includes(key))
+          .sort();
+        if (unknown.length > 0) {
+          const own = accepted.filter((key) => !SHARED_FIELDS.includes(key)).join(", ") || "none";
+          return resultResponse(
+            id,
+            toolErrorResult(
+              `Unknown argument(s) for ${toolName}: ${unknown.join(", ")}. Tool arguments: ${own}.`
+            )
+          );
+        }
+
+        try {
+          if (toolName === "tools_profiles") {
+            const summaries = Object.entries(PROFILES).map(([name, profile]) => ({
+              name,
+              description: profile.description,
+              toolCount: profile.tools === "all" ? TOOLS.length : profile.tools.length,
+              usage: `portless mcp --tools ${name}`,
+            }));
+            const text = [
+              `Active profiles: ${profiles.join(", ")}`,
+              ...summaries.map(
+                (profile) =>
+                  `${profile.name}: ${profile.description} (${profile.toolCount} tools), ${profile.usage}`
+              ),
+            ].join("\n");
+            return resultResponse(id, {
+              content: [{ type: "text", text }],
+              structuredContent: { activeProfiles: profiles, profiles: summaries },
+              isError: false,
+            });
+          }
+          const argv = buildArgv(toolName, args);
+          const cwd = typeof args.cwd === "string" ? args.cwd : process.cwd();
+          const timeoutMs =
+            typeof args.timeoutMs === "number" ? args.timeoutMs : DEFAULT_TIMEOUT_MS;
+          const run = await runChild(argv, cwd, timeoutMs);
+          if ("spawnError" in run) {
+            return resultResponse(
+              id,
+              toolErrorResult(`Failed to run portless in ${cwd}: ${run.spawnError}`)
+            );
+          }
+          return resultResponse(id, toToolResult(run));
+        } catch (error) {
+          if (error instanceof McpError && error.code === -32602) {
+            return resultResponse(id, toolErrorResult(error.message));
+          }
+          if (error instanceof McpError) {
+            return errorResponse(id, error.code, error.message);
+          }
+          return errorResponse(id, -32603, `Failed to run portless: ${(error as Error).message}`);
+        }
+      }
+      case "shutdown": {
+        shutdown = true;
+        return resultResponse(id, {});
+      }
+      default:
+        return errorResponse(id, -32601, `Method not found: ${method}`);
+    }
+  }
+
+  return {
+    async handleLine(
+      line: string
+    ): Promise<Record<string, unknown> | Record<string, unknown>[] | null> {
+      if (line.trim().length === 0) return null;
+      let message: unknown;
+      try {
+        message = JSON.parse(line);
+      } catch (error) {
+        return errorResponse(null, -32700, `Parse error: ${(error as Error).message}`);
+      }
+      if (Array.isArray(message)) {
+        if (message.length === 0) {
+          return errorResponse(null, -32600, "Invalid Request");
+        }
+        const responses: Record<string, unknown>[] = [];
+        for (const item of message) {
+          if (!isObject(item)) {
+            responses.push(errorResponse(null, -32600, "Invalid Request"));
+            continue;
+          }
+          const response = await handleRequest(item);
+          if (response !== null) responses.push(response);
+        }
+        return responses.length > 0 ? responses : null;
+      }
+      if (!isObject(message)) {
+        return null;
+      }
+      return handleRequest(message);
+    },
+    get shutdown() {
+      return shutdown;
+    },
+  };
+}
+
+export function printMcpHelp(): void {
+  process.stdout.write(
+    [
+      "Usage: portless mcp [--tools <profiles>]",
+      "",
+      "Start a Model Context Protocol server over stdio. The client launches this",
+      "process and exchanges newline-delimited JSON-RPC messages on stdin/stdout;",
+      "stdout carries only protocol messages and diagnostics go to stderr.",
+      "",
+      "Profiles:",
+      ...Object.entries(PROFILES).map(
+        ([name, profile]) => `  ${name.padEnd(13)}${profile.description}`
+      ),
+      "",
+      "Common tools:",
+      "  list            List active routes (orphaned dev servers are marked).",
+      "  get             Print an app URL.",
+      "  alias_add       Register a static route.",
+      "  bg_list         List background apps (also bg_status and bg_logs).",
+      "  bg_start        Start a background app (background profile; also bg_stop, bg_restart).",
+      "  tools_profiles  Show active and available profiles.",
+      "",
+      "Backend pooling: 16 concurrent dials per app, 64 idle sockets, 10-second connect",
+      "deadline, no timeout on established streams; shutdown rejects queued requests with 503.",
+      "",
+      "Pass --tools with a comma separated list of profiles. The default is core,",
+      "which is read-only for background apps. Add background to start, stop, and",
+      "restart them. Public sharing (tunnels, Tailscale, ngrok, NetBird) is not typed",
+      "into any tool; start shared apps from a shell.",
+      "Aliases: default = core, full = all. Use the extraArgs argument on any tool",
+      "to append CLI flags that are not typed into the tool schema; sharing flags are rejected.",
+      "",
+      "Environment:",
+      "  PORTLESS_STATE_DIR  Directory for portless state.",
+      "  PORTLESS_PORT       Default proxy port.",
+      "  PORTLESS_SUFFIX     Default suffix or comma separated suffix list.",
+      "  PORTLESS_TLD        Compatibility alias for PORTLESS_SUFFIX.",
+      "  PORTLESS_APP_PORT_STRATEGY, PORTLESS_APP_PORT_RANGE",
+      "                      How apps get a port (random, stable, sequential; min-max).",
+      "                      Read from this server's environment by the CLI each tool runs,",
+      "                      and saved by bg_start so bg_restart replays them. The",
+      "                      appPortStrategy and appPortRange config keys need no tool support.",
+      "",
+      "Client config:",
+      '  {"mcpServers":{"portless":{"command":"portless","args":["mcp"]}}}',
+      '  {"mcpServers":{"portless":{"command":"portless","args":["mcp","--tools","all"]}}}',
+      "",
+    ].join("\n")
+  );
+}
+
+export async function runMcp(args: string[]): Promise<void> {
+  let toolsValue: string | undefined;
+
+  const usageError = (message: string): void => {
+    console.error(colors.red(`Error: ${message}`));
+    console.error("Usage: portless mcp [--tools <profiles>]");
+    process.exit(1);
+  };
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--help" || arg === "-h") {
+      printMcpHelp();
+      return;
+    }
+    if (arg === "--tools") {
+      if (index + 1 >= args.length) usageError("--tools requires a value");
+      toolsValue = args[index + 1];
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--tools=")) {
+      toolsValue = arg.slice("--tools=".length);
+      continue;
+    }
+    usageError(`Unknown argument: ${arg}`);
+  }
+
+  let profiles: string[];
+  try {
+    profiles = toolsValue === undefined ? ["core"] : parseToolsFlag(toolsValue);
+  } catch (error) {
+    usageError((error as Error).message);
+    return;
+  }
+
+  const server = createServer(profiles);
+  const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
+  const onStreamError = (): void => rl.close();
+  process.stdout.on("error", onStreamError);
+
+  for await (const line of rl) {
+    const response = await server.handleLine(line);
+    if (response !== null) {
+      try {
+        process.stdout.write(`${JSON.stringify(response)}\n`);
+      } catch {
+        break;
+      }
+    }
+    if (server.shutdown) break;
+  }
+  rl.close();
+  process.stdout.off("error", onStreamError);
+}

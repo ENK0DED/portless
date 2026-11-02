@@ -4,7 +4,8 @@ import * as crypto from "node:crypto";
 import * as tls from "node:tls";
 import { execFile as execFileCb, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
-import { fixOwnership } from "./utils.js";
+import { fixOwnership, resolveUserHome } from "./utils.js";
+import { SERVICE_OPENSSL_ENV } from "./openssl-path.js";
 import {
   isWSL,
   isWindowsCATrusted,
@@ -27,6 +28,19 @@ const CA_COMMON_NAME = "portless Local CA";
 
 /** openssl command timeout (ms). */
 const OPENSSL_TIMEOUT_MS = 30_000;
+
+/** The openssl executable to run: the service-pinned absolute path, or `openssl`. */
+function opensslCommand(): string {
+  const pinned = process.env[SERVICE_OPENSSL_ENV];
+  if (!pinned) return "openssl";
+  if (!path.isAbsolute(pinned)) {
+    throw new Error(
+      `${SERVICE_OPENSSL_ENV} must be an absolute path (got "${pinned}"). ` +
+        "Re-run `portless service install`."
+    );
+  }
+  return pinned;
+}
 
 /**
  * Timeout for non-interactive macOS `security` commands (verify-cert, etc.).
@@ -59,6 +73,8 @@ const SERVER_KEY_FILE = "server-key.pem";
 const SERVER_CERT_FILE = "server.pem";
 const CA_TRUST_MARKER = "ca.trusted";
 const CA_TRUST_REFRESH_PENDING = "ca.trust-refresh-pending";
+/** Directory within state dir where per-hostname certs are cached. */
+const HOST_CERTS_DIR = "host-certs";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -165,6 +181,13 @@ function getOpensslEnv(): Record<string, string> | undefined {
 }
 
 function opensslErrorMessage(): string {
+  const pinned = process.env[SERVICE_OPENSSL_ENV];
+  if (pinned) {
+    return (
+      `The installed service pins openssl to ${pinned}. ` +
+      "If it was moved or removed, re-run `portless service install` to pin a new one."
+    );
+  }
   if (process.platform === "win32") {
     return (
       "Make sure openssl is installed and working.\n" +
@@ -205,6 +228,19 @@ function isCertSansComplete(certPath: string): boolean {
 }
 
 /**
+ * Check whether a certificate has a wildcard SAN directly under a bare TLD
+ * (such as "*.localhost"). Apple platforms reject such certificates outright.
+ */
+function hasTldWildcardSan(certPath: string): boolean {
+  try {
+    const cert = new crypto.X509Certificate(fs.readFileSync(certPath));
+    return /DNS:\*\.[^.,\s]+(,|$)/.test(cert.subjectAltName ?? "");
+  } catch {
+    return true;
+  }
+}
+
+/**
  * Check whether a certificate uses a strong signature algorithm.
  * Reject SHA-1 signatures to avoid OpenSSL "ca md too weak" failures.
  *
@@ -226,16 +262,44 @@ function isCertSignatureStrong(certPath: string): boolean {
 }
 
 /**
+ * Check whether a certificate lists the same X.509v3 extension more than once.
+ * RFC 5280 requires extensions to be unique, and macOS's Security framework
+ * rejects every chain through a CA that violates this ("Unknown critical cert
+ * extension") regardless of trust settings.
+ *
+ * Earlier portless releases could emit such a CA when the ambient openssl.cnf
+ * set `x509_extensions = v3_ca` for `req` (see #429). An existing CA that trips
+ * this check is regenerated so affected users recover on upgrade.
+ *
+ * Parses the `openssl x509 -text` output: inside the `X509v3 extensions:`
+ * block each extension name sits on its own line at a fixed indent, optionally
+ * followed by `critical`, while values are indented one level deeper.
+ */
+function hasDuplicateExtensions(certPath: string): boolean {
+  try {
+    const text = openssl(["x509", "-in", certPath, "-noout", "-text"]);
+    const block = text.split(/^\s*X509v3 extensions:\s*$/m)[1];
+    if (!block) return false;
+    const body = block.split(/^\s*Signature Algorithm:/m)[0];
+    const names = [...body.matchAll(/^ {12}(\S.*?):(?: critical)?\s*$/gm)].map((m) => m[1]);
+    return new Set(names).size !== names.length;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Run openssl and return stdout. Throws on non-zero exit.
  */
 function openssl(args: string[], options?: { input?: string }): string {
   try {
     const extraEnv = getOpensslEnv();
-    return execFileSync("openssl", args, {
+    return execFileSync(opensslCommand(), args, {
       encoding: "utf-8",
       timeout: OPENSSL_TIMEOUT_MS,
       input: options?.input,
       stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
       ...(extraEnv && Object.keys(extraEnv).length > 0
         ? { env: { ...process.env, ...extraEnv } }
         : {}),
@@ -244,6 +308,33 @@ function openssl(args: string[], options?: { input?: string }): string {
     const message = err instanceof Error ? err.message : String(err);
     throw new Error(`openssl failed: ${message}\n\n${opensslErrorMessage()}`, { cause: err });
   }
+}
+
+const NOT_BEFORE_SKEW_MS = 5 * 60 * 1000;
+
+let notBeforeSupported: boolean | undefined;
+
+/** Whether `openssl x509 -req` accepts `-not_before` for the given `openssl version` output. */
+export function opensslSupportsNotBefore(version: string): boolean {
+  const match = /^OpenSSL (\d+)\.(\d+)/.exec(version.trim());
+  if (!match) return false;
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  return major > 3 || (major === 3 && minor >= 4);
+}
+
+/** `-not_before` args that backdate a signed cert, or none if unsupported. */
+function backdatedNotBeforeArgs(): string[] {
+  if (notBeforeSupported === undefined) {
+    try {
+      notBeforeSupported = opensslSupportsNotBefore(openssl(["version"]));
+    } catch {
+      notBeforeSupported = false;
+    }
+  }
+  if (!notBeforeSupported) return [];
+  const start = new Date(Date.now() - NOT_BEFORE_SKEW_MS).toISOString();
+  return ["-not_before", start.replace(/[-:T]/g, "").slice(0, 14) + "Z"];
 }
 
 const execFileAsync = promisify(execFileCb);
@@ -256,9 +347,10 @@ const execFileAsync = promisify(execFileCb);
 async function opensslAsync(args: string[]): Promise<string> {
   try {
     const extraEnv = getOpensslEnv();
-    const { stdout } = await execFileAsync("openssl", args, {
+    const { stdout } = await execFileAsync(opensslCommand(), args, {
       encoding: "utf-8",
       timeout: OPENSSL_TIMEOUT_MS,
+      windowsHide: true,
       ...(extraEnv && Object.keys(extraEnv).length > 0
         ? { env: { ...process.env, ...extraEnv } }
         : {}),
@@ -268,6 +360,18 @@ async function opensslAsync(args: string[]): Promise<string> {
     const message = err instanceof Error ? err.message : String(err);
     throw new Error(`openssl failed: ${message}\n\n${opensslErrorMessage()}`, { cause: err });
   }
+}
+
+/** Async version of backdatedNotBeforeArgs. */
+async function backdatedNotBeforeArgsAsync(): Promise<string[]> {
+  if (notBeforeSupported === undefined) {
+    try {
+      notBeforeSupported = opensslSupportsNotBefore(await opensslAsync(["version"]));
+    } catch {
+      notBeforeSupported = false;
+    }
+  }
+  return backdatedNotBeforeArgs();
 }
 
 // ---------------------------------------------------------------------------
@@ -281,35 +385,76 @@ async function opensslAsync(args: string[]): Promise<string> {
 function generateCA(stateDir: string): { certPath: string; keyPath: string } {
   const keyPath = path.join(stateDir, CA_KEY_FILE);
   const certPath = path.join(stateDir, CA_CERT_FILE);
+  const reqConfigPath = path.join(stateDir, `ca-req-${process.pid}-${crypto.randomUUID()}.cnf`);
 
   // Generate EC private key
   openssl(["ecparam", "-genkey", "-name", "prime256v1", "-noout", "-out", keyPath]);
 
-  // Generate self-signed CA certificate
-  openssl([
-    "req",
-    "-new",
-    "-x509",
-    "-sha256",
-    "-key",
-    keyPath,
-    "-out",
-    certPath,
-    "-days",
-    CA_VALIDITY_DAYS.toString(),
-    "-subj",
-    `/CN=${CA_COMMON_NAME}`,
-    "-addext",
-    "basicConstraints=critical,CA:TRUE",
-    "-addext",
-    "keyUsage=critical,keyCertSign,cRLSign",
-  ]);
+  // Generate self-signed CA certificate.
+  //
+  // `-config` is passed explicitly (a minimal config with no
+  // `x509_extensions` default) instead of relying on the environment's
+  // ambient openssl.cnf. Some openssl builds ship the stock upstream
+  // template, which sets `x509_extensions = v3_ca` under `[ req ]`; combined
+  // with `-addext basicConstraints=...` below that produces a certificate
+  // with the Basic Constraints extension listed twice. That's invalid per
+  // RFC 5280 (extensions must be unique) and macOS's Security framework
+  // rejects the whole chain with "Unknown critical cert extension",
+  // regardless of trust settings, so every *.localhost site looks
+  // untrusted even after `portless trust` succeeds.
+  //
+  // The subject lives in the config rather than in `-subj`: LibreSSL (the
+  // openssl shipped with macOS) refuses a `prompt = no` request whose
+  // distinguished_name section is empty, even when `-subj` is given.
+  fs.writeFileSync(
+    reqConfigPath,
+    [
+      "[req]",
+      "distinguished_name = req_distinguished_name",
+      "prompt = no",
+      "[req_distinguished_name]",
+      `CN = ${CA_COMMON_NAME}`,
+      "",
+    ].join("\n")
+  );
+  try {
+    openssl([
+      "req",
+      "-new",
+      "-x509",
+      "-sha256",
+      "-key",
+      keyPath,
+      "-out",
+      certPath,
+      ...backdatedNotBeforeArgs(),
+      "-days",
+      CA_VALIDITY_DAYS.toString(),
+      "-config",
+      reqConfigPath,
+      "-addext",
+      "basicConstraints=critical,CA:TRUE",
+      "-addext",
+      "keyUsage=critical,keyCertSign,cRLSign",
+      "-addext",
+      "subjectKeyIdentifier=hash",
+      "-addext",
+      "authorityKeyIdentifier=keyid:always",
+    ]);
+  } finally {
+    fs.rmSync(reqConfigPath, { force: true });
+  }
 
   fs.chmodSync(keyPath, 0o600);
   fs.chmodSync(certPath, 0o644);
   fixOwnership(keyPath, certPath);
 
   clearTrustMarker(stateDir);
+
+  // Per-hostname certificates issued by the previous CA no longer chain to
+  // this one, and the SNI callback serves cached certs from disk without
+  // checking their issuer, so drop them to be re-issued on demand.
+  fs.rmSync(path.join(stateDir, HOST_CERTS_DIR), { recursive: true, force: true });
 
   return { certPath, keyPath };
 }
@@ -376,6 +521,7 @@ function generateServerCert(stateDir: string): { certPath: string; keyPath: stri
     srlPath,
     "-out",
     serverCertPath,
+    ...backdatedNotBeforeArgs(),
     "-days",
     SERVER_VALIDITY_DAYS.toString(),
     "-extfile",
@@ -423,7 +569,8 @@ export function ensureCerts(stateDir: string): {
     !fileExists(caCertPath) ||
     !fileExists(caKeyPath) ||
     !isCertValid(caCertPath) ||
-    !isCertSignatureStrong(caCertPath);
+    !isCertSignatureStrong(caCertPath) ||
+    hasDuplicateExtensions(caCertPath);
 
   if (caMissing) {
     generateCA(stateDir);
@@ -449,18 +596,42 @@ export function ensureCerts(stateDir: string): {
   };
 }
 
+export type IsCATrustedOptions = {
+  /**
+   * Answer from the trust marker left by an earlier successful trust when it
+   * matches (default true). Pass false to always ask the OS: the marker still
+   * matches after the user removes the CA from a store.
+   */
+  useMarker?: boolean;
+  /**
+   * On WSL, require every store `trustCA` writes (the Linux store and the
+   * Windows CurrentUser Root store) instead of either one. Elsewhere this is
+   * the same as the default.
+   */
+  everyStore?: boolean;
+};
+
 /**
  * Check if the portless CA is already installed in the system trust store.
+ *
+ * On Linux this also covers the invoking user's Chrome/Chromium NSS database
+ * when one exists (it is per-user and changes independently of the marker, so
+ * the marker never answers on Linux). On WSL either the Linux store or the
+ * Windows user store is enough by default, because that is the gap the WSL
+ * integration closes for Windows browsers; `everyStore` asks for both.
  */
-export function isCATrusted(stateDir: string): boolean {
+export function isCATrusted(
+  stateDir: string,
+  { useMarker = true, everyStore = false }: IsCATrustedOptions = {}
+): boolean {
   const caCertPath = path.join(stateDir, CA_CERT_FILE);
   if (!fileExists(caCertPath)) return false;
 
   // Fast path: if we previously trusted this exact CA, skip the OS check.
-  // On WSL, keep checking the Windows user store so older Linux-only markers
-  // do not suppress browser trust setup.
-  const marker = readTrustMarker(stateDir);
-  if (marker && !(process.platform === "linux" && isWSL())) {
+  // On Linux (including WSL) the Windows user store and the NSS database can
+  // change independently, so a marker never answers there.
+  const marker = useMarker && process.platform !== "linux" ? readTrustMarker(stateDir) : null;
+  if (marker) {
     const fp = caFingerprint(stateDir);
     const expected = fp && isWSL() ? `wsl:${fp}` : fp;
     if (expected && marker === expected) return true;
@@ -470,12 +641,15 @@ export function isCATrusted(stateDir: string): boolean {
     return isCATrustedMacOS(caCertPath);
   } else if (process.platform === "linux") {
     const trustedLinux = isCATrustedLinux(stateDir);
-    if (!isWSL()) return trustedLinux;
+    if (!isWSL()) return trustedLinux && isCATrustedNSS(caCertPath);
+    let trustedWindows = false;
     try {
-      return trustedLinux || isWindowsCATrusted(caCertPath, wslWindowsCAStoreOptions());
+      trustedWindows = isWindowsCATrusted(caCertPath, wslWindowsCAStoreOptions());
     } catch {
-      return trustedLinux;
+      // Treat an unreadable Windows store as untrusted.
     }
+    const stores = everyStore ? trustedLinux && trustedWindows : trustedLinux || trustedWindows;
+    return stores && isCATrustedNSS(caCertPath);
   } else if (process.platform === "win32") {
     return isWindowsCATrusted(caCertPath);
   }
@@ -642,12 +816,148 @@ function isCATrustedLinux(
   }
 }
 
+/** Chromium prefers the legacy DB when present, otherwise the M146+ location. */
+function linuxNSSDatabase(): string | undefined {
+  const home = resolveUserHome();
+  const legacy = path.join(home, ".pki", "nssdb");
+  if (fs.existsSync(legacy)) return legacy;
+  const current = path.join(home, ".local", "share", "pki", "nssdb");
+  return fs.existsSync(current) ? current : undefined;
+}
+
+/** Thrown when the NSS `certutil` tool is not installed. */
+class NssCertutilMissingError extends Error {
+  constructor(database: string, cause: unknown) {
+    super(
+      `Chrome/Chromium keep their certificates in an NSS database (${database}) and need ` +
+        "`certutil` to trust the portless CA, but `certutil` is not installed. " +
+        "Install it (Debian/Ubuntu: sudo apt install libnss3-tools; " +
+        "Fedora/RHEL: sudo dnf install nss-tools; Arch: sudo pacman -S nss; " +
+        "openSUSE: sudo zypper install mozilla-nss-tools), then run `portless trust`.",
+      { cause }
+    );
+    this.name = "NssCertutilMissingError";
+  }
+}
+
+function nssCertutil(database: string, args: string[], input?: string): string {
+  const commandArgs = ["-d", `sql:${database}`, ...args];
+  const sudoUser = process.getuid?.() === 0 ? process.env.SUDO_USER : undefined;
+  const dropPrivileges = Boolean(sudoUser && sudoUser !== "root");
+  try {
+    // Drop privileges, not just HOME, so NSS never creates root-owned user files.
+    // Pass the public CA on stdin because the state directory may be root-only.
+    return execFileSync(
+      dropPrivileges ? "sudo" : "certutil",
+      dropPrivileges ? ["-u", sudoUser!, "--", "certutil", ...commandArgs] : commandArgs,
+      { encoding: "utf-8", stdio: "pipe", timeout: 15_000, input }
+    );
+  } catch (err) {
+    // Directly, a missing certutil is ENOENT. Under `sudo -u`, sudo itself
+    // reports "command not found" on stderr and exits non-zero.
+    const missing = dropPrivileges
+      ? /command not found/i.test(String((err as { stderr?: unknown } | undefined)?.stderr ?? ""))
+      : (err as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
+    if (missing) throw new NssCertutilMissingError(database, err);
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `Chrome/Chromium NSS trust failed (${database}): ${message}\n` +
+        "Ensure NSS certutil is installed (Debian/Ubuntu: sudo apt install libnss3-tools; " +
+        "Fedora/RHEL: sudo dnf install nss-tools; Arch: sudo pacman -S nss; " +
+        "openSUSE: sudo zypper install mozilla-nss-tools), then retry.",
+      { cause: err }
+    );
+  }
+}
+
+/**
+ * A warning when the user's Chrome/Chromium NSS database exists but `certutil`
+ * is not installed, so portless cannot read or write that database. Callers
+ * only warn: it is never incomplete trust (see isCATrustedNSS).
+ */
+export function nssCertutilMissingWarning(): string | undefined {
+  if (process.platform !== "linux") return undefined;
+  const database = linuxNSSDatabase();
+  if (!database) return undefined;
+  try {
+    nssCertutil(database, ["-L"]);
+  } catch (err) {
+    if (err instanceof NssCertutilMissingError) return err.message;
+  }
+  return undefined;
+}
+
+function nssNickname(caCertPath: string): string {
+  const cert = new crypto.X509Certificate(fs.readFileSync(caCertPath));
+  // NSS interprets colons in nicknames as token separators.
+  return `${CA_COMMON_NAME} ${cert.fingerprint256.replace(/:/g, "")}`;
+}
+
+function nssTrustFlags(database: string, nickname: string): string | undefined {
+  const listing = nssCertutil(database, ["-L"]);
+  for (const line of listing.split("\n")) {
+    const match = line.trim().match(/^(.*?)\s+([^\s,]*,[^\s,]*,[^\s,]*)$/);
+    if (match?.[1] === nickname) return match[2];
+  }
+  return undefined;
+}
+
+/**
+ * Whether the user's Chrome/Chromium NSS database trusts the CA for SSL.
+ * True when no database exists (portless never creates one). Also true when a
+ * database exists but `certutil` is missing: trust cannot be checked or fixed
+ * from here, and counting it as untrusted would defeat the `trust` skip and
+ * retry trust on every `proxy start`. That state is a warning instead
+ * (nssCertutilMissingWarning).
+ */
+function isCATrustedNSS(caCertPath: string): boolean {
+  if (process.platform !== "linux") return true;
+  const database = linuxNSSDatabase();
+  if (!database) return true;
+  try {
+    const nickname = nssNickname(caCertPath);
+    const flags = nssTrustFlags(database, nickname);
+    if (!flags?.split(",")[0].includes("C")) return false;
+    const installed = nssCertutil(database, ["-L", "-n", nickname, "-a"]);
+    return (
+      new crypto.X509Certificate(installed).fingerprint256 ===
+      new crypto.X509Certificate(fs.readFileSync(caCertPath)).fingerprint256
+    );
+  } catch (err) {
+    return err instanceof NssCertutilMissingError;
+  }
+}
+
+/** Add (or remove) the CA in the user's existing NSS database. Throws on failure. */
+function updateCATrustNSS(caCertPath: string, remove = false): void {
+  const database = linuxNSSDatabase();
+  if (!database) return;
+  const nickname = nssNickname(caCertPath);
+  if (remove) {
+    // Listing distinguishes an absent certificate from an inaccessible database.
+    if (nssTrustFlags(database, nickname) !== undefined) {
+      nssCertutil(database, ["-D", "-n", nickname]);
+    }
+  } else {
+    nssCertutil(
+      database,
+      ["-A", "-n", nickname, "-t", "C,,"],
+      fs.readFileSync(caCertPath, "utf-8")
+    );
+  }
+}
+
+function nssWarning(err: unknown): string {
+  if (err instanceof NssCertutilMissingError) return err.message;
+  return (
+    "Chrome/Chromium may still show certificate warnings. " +
+    (err instanceof Error ? err.message : String(err))
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Per-hostname certificate generation (SNI)
 // ---------------------------------------------------------------------------
-
-/** Directory within state dir where per-hostname certs are cached. */
-const HOST_CERTS_DIR = "host-certs";
 
 /**
  * Longest suffix appended to a sanitized host when composing a cert cache
@@ -726,12 +1036,9 @@ async function generateHostCertAsync(
   // Generate CSR
   await opensslAsync(["req", "-new", "-key", keyPath, "-out", csrPath, "-subj", `/CN=${cn}`]);
 
-  // Build SAN list: include the exact hostname plus a wildcard at the same level
-  // e.g., for "chat.json-render2.localhost" -> also add "*.json-render2.localhost"
   const sans = [`DNS:${hostname}`];
   const parts = hostname.split(".");
-  if (parts.length >= 2) {
-    // Add a wildcard for sibling subdomains at the same level
+  if (parts.length >= 3) {
     sans.push(`DNS:*.${parts.slice(1).join(".")}`);
   }
 
@@ -769,6 +1076,7 @@ async function generateHostCertAsync(
     srlPath,
     "-out",
     certPath,
+    ...(await backdatedNotBeforeArgsAsync()),
     "-days",
     SERVER_VALIDITY_DAYS.toString(),
     "-extfile",
@@ -832,8 +1140,14 @@ export function createSNICallback(
     // For .localhost: RFC 2606 §2 designates it as a reserved TLD, so
     // "*.localhost" sits at the public-suffix boundary and TLS specs do
     // not permit wildcard certificates at that level.
-    if (servername === "localhost" && configuredTlds.includes("localhost")) {
+    if (servername === "localhost") {
       cb(null, defaultCtx);
+      return;
+    }
+
+    const name = servername.toLowerCase();
+    if (!/^[a-z0-9.-]+$/.test(name) || !configuredTlds.some((tld) => name.endsWith(`.${tld}`))) {
+      cb(new Error(`Refusing certificate for ${servername}: not under a configured TLD`));
       return;
     }
 
@@ -854,7 +1168,8 @@ export function createSNICallback(
       fileExists(certPath) &&
       fileExists(keyPath) &&
       isCertValid(certPath) &&
-      isCertSignatureStrong(certPath)
+      isCertSignatureStrong(certPath) &&
+      !hasTldWildcardSan(certPath)
     ) {
       try {
         const hostCert = fs.readFileSync(certPath);
@@ -911,8 +1226,10 @@ export function createSNICallback(
  *
  * On macOS, adds to the login keychain (no sudo required; the OS shows a
  * GUI authorization prompt to confirm). On Linux, copies to the distro-specific
- * CA directory and runs the appropriate update command (requires sudo). WSL
- * also adds the CA to the Windows current-user Root store.
+ * CA directory and runs the appropriate update command (requires sudo), then
+ * adds the CA to the invoking user's existing Chrome/Chromium NSS database
+ * (never creating one). WSL also adds the CA to the Windows current-user Root
+ * store. A failed NSS update is a `warning` on a successful result.
  *
  * Supported Linux distros: Debian/Ubuntu, Arch, Fedora/RHEL/CentOS, openSUSE.
  */
@@ -1003,6 +1320,13 @@ export function trustCA(stateDir: string): TrustCAResult {
     }
 
     if (trustedWindows || trustedLinux) {
+      // Browsers inside WSL (WSLg) read the Linux user's NSS database, which
+      // has no relation to which of the two stores above succeeded.
+      try {
+        updateCATrustNSS(caCertPath);
+      } catch (err: unknown) {
+        warnings.push(nssWarning(err));
+      }
       writeTrustMarker(stateDir);
       return warnings.length > 0
         ? { trusted: true, warning: warnings.join(" ") }
@@ -1023,6 +1347,8 @@ export function trustCA(stateDir: string): TrustCAResult {
             "-d",
             "-r",
             "trustRoot",
+            "-p",
+            "ssl",
             "-k",
             "/Library/Keychains/System.keychain",
             caCertPath,
@@ -1033,7 +1359,7 @@ export function trustCA(stateDir: string): TrustCAResult {
         const keychain = loginKeychainPath();
         execFileSync(
           "security",
-          ["add-trusted-cert", "-r", "trustRoot", "-k", keychain, caCertPath],
+          ["add-trusted-cert", "-r", "trustRoot", "-p", "ssl", "-k", keychain, caCertPath],
           { stdio: "pipe", timeout: MACOS_SECURITY_AUTH_TIMEOUT_MS }
         );
       }
@@ -1050,11 +1376,17 @@ export function trustCA(stateDir: string): TrustCAResult {
       const dest = path.join(config.certDir, "portless-ca.crt");
       fs.copyFileSync(caCertPath, dest);
       execFileSync(config.updateCommand, [], { stdio: "pipe", timeout: 30_000 });
+      let warning: string | undefined;
+      try {
+        updateCATrustNSS(caCertPath);
+      } catch (err: unknown) {
+        warning = nssWarning(err);
+      }
       if (isWSL()) {
         trustWindowsCA(caCertPath, wslWindowsCAStoreOptions());
       }
       writeTrustMarker(stateDir);
-      return { trusted: true };
+      return warning ? { trusted: true, warning } : { trusted: true };
     } else if (process.platform === "win32") {
       trustWindowsCA(caCertPath);
       writeTrustMarker(stateDir);
@@ -1084,6 +1416,12 @@ export function untrustCA(stateDir: string): { removed: boolean; error?: string 
       result = untrustCAMacOS(caCertPath);
     } else if (process.platform === "linux") {
       result = runningInWSL ? untrustCAWSL(stateDir, caCertPath) : untrustCALinux(stateDir);
+      try {
+        updateCATrustNSS(caCertPath, true);
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        result = { removed: false, error: [result.error, message].filter(Boolean).join("; ") };
+      }
     } else if (process.platform === "win32") {
       result = untrustWindowsCA(caCertPath);
     } else {

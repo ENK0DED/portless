@@ -1,5 +1,5 @@
 import type { RouteInfo } from "./types.js";
-import { escapeHtml, formatUrl, normalizePathPrefix } from "./utils.js";
+import { escapeHtml, formatUptime, formatUrl, normalizePathPrefix } from "./utils.js";
 import {
   APP_SCRIPT,
   ARROW_SVG,
@@ -71,6 +71,8 @@ function exposureTitle(kind: string): string {
       return "Public on the internet via Tailscale Funnel";
     case "Tailscale":
       return "Shared on your Tailscale network (tailnet)";
+    case "Tailscale (HTTP)":
+      return "Shared on your Tailscale network (tailnet) over plain HTTP";
     case "Tailscale Service":
       return "Shared as a stable Tailscale Service";
     case "ngrok":
@@ -85,7 +87,12 @@ function exposureTitle(kind: string): string {
 function routeExposures(route: RouteInfo): Exposure[] {
   const out: Exposure[] = [];
   if (route.tailscaleFunnel) out.push({ kind: "Funnel", url: route.tailscaleUrl });
-  else if (route.tailscaleUrl) out.push({ kind: "Tailscale", url: route.tailscaleUrl });
+  else if (route.tailscaleUrl) {
+    out.push({
+      kind: route.tailscaleHttp ? "Tailscale (HTTP)" : "Tailscale",
+      url: route.tailscaleUrl,
+    });
+  }
   if (route.tailscaleServiceUrl)
     out.push({ kind: "Tailscale Service", url: route.tailscaleServiceUrl });
   if (route.ngrokUrl) out.push({ kind: "ngrok", url: route.ngrokUrl });
@@ -105,6 +112,8 @@ function routeExposures(route: RouteInfo): Exposure[] {
 
 export interface DashboardData {
   routes: RouteInfo[];
+  /** Routes whose owner exited but whose dev server still runs (not routable). */
+  orphaned?: RouteInfo[];
   proxyPort: number;
   tls: boolean;
   suffix: string;
@@ -122,9 +131,24 @@ export interface DashboardData {
  */
 export function renderRouteRow(
   route: RouteInfo,
-  opts: { url: string; copyUrl?: string; status?: "active" | "inactive"; newTab?: boolean }
+  opts: {
+    url: string;
+    copyUrl?: string;
+    status?: "active" | "inactive";
+    newTab?: boolean;
+    /** Clock used for the uptime badge; defaults to the current time. */
+    now?: number;
+  }
 ): string {
   const badges: AppRowBadge[] = [];
+  const uptime = route.pid === 0 ? null : formatUptime(route.registeredAt, opts.now ?? Date.now());
+  if (uptime) {
+    badges.push({
+      variant: "muted",
+      label: `up ${uptime}`,
+      title: "Time since this app registered with portless",
+    });
+  }
   if (route.label) {
     badges.push({
       variant: "muted",
@@ -156,6 +180,7 @@ export function renderRouteRow(
     newTab: opts.newTab,
     status: opts.status,
     badges,
+    ...(route.registeredAt !== undefined ? { registeredAt: route.registeredAt } : {}),
     ...(opts.copyUrl ? { copyUrl: opts.copyUrl } : {}),
   });
 }
@@ -177,6 +202,40 @@ function dashboardAppRows(data: DashboardData): string {
       return renderRouteRow(route, { url, copyUrl: url, status: "active", newTab: true });
     });
   return appList(rows);
+}
+
+/**
+ * Routes whose portless session died while its dev server kept running. They
+ * are not served; listing them shows what `portless prune` or the next `run`
+ * will stop.
+ */
+function orphanedSection(data: DashboardData): string {
+  const orphaned = data.orphaned ?? [];
+  if (orphaned.length === 0) return "";
+  const rows = orphaned
+    .slice()
+    .sort((a, b) => routeName(a).localeCompare(routeName(b)))
+    .map((route) =>
+      appRow({
+        name: routeName(route),
+        sub: `127.0.0.1:${route.port}`,
+        href: "#",
+        status: "inactive",
+        badges: [
+          {
+            variant: "warn",
+            label: "Orphaned",
+            title:
+              "The portless session that owned this app exited, but the dev server is still running",
+          },
+        ],
+      })
+    );
+  return `<div class="section">
+  <p class="label">Orphaned <span class="count">${orphaned.length}</span></p>
+  <p class="desc">The portless session for these apps exited but their dev servers are still running. Run <code>portless prune</code> to stop them, or start the app again.</p>
+  ${appList(rows)}
+</div>`;
 }
 
 /** Shared proxy/suffix/certificate info box, used by the dashboard and picker. */
@@ -279,9 +338,10 @@ export function renderDashboard(data: DashboardData): string {
   ${proxySection}
   ${multiplexSection(data)}
   ${appsSection}
+  ${orphanedSection(data)}
 </div>`;
 
-  const footerLinks = `<a href="https://portless.sh/commands">docs</a>`;
+  const footerLinks = `<a href="https://github.com/ENK0DED/portless#commands">docs</a>`;
 
   return renderShell({
     title: "portless · dashboard",
@@ -294,9 +354,12 @@ export function renderDashboard(data: DashboardData): string {
 }
 
 /** Read-only JSON snapshot for the dashboard's live refresh. */
-export function dashboardStateJson(data: Pick<DashboardData, "routes" | "signature">): string {
+export function dashboardStateJson(
+  data: Pick<DashboardData, "routes" | "orphaned" | "signature">
+): string {
   return JSON.stringify({
     signature: data.signature,
+    ...((data.orphaned?.length ?? 0) > 0 ? { orphaned: data.orphaned!.map(routeName) } : {}),
     apps: data.routes.map((r) => ({
       name: routeName(r),
       port: r.port,
@@ -413,7 +476,7 @@ export function renderCertPage(data: CertPageData): string {
     hero: renderWordmarkHero("Certificate authority"),
     body,
     top: true,
-    footerLinks: `<a href="https://portless.sh/https">about HTTPS</a>`,
+    footerLinks: `<a href="https://github.com/ENK0DED/portless#http2--https">about HTTPS</a>`,
   });
 }
 
