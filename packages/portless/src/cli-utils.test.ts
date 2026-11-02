@@ -208,23 +208,23 @@ describe("findFreePort", () => {
     }
   });
 
-  it("treats ports occupied on 127.0.0.1 as unavailable", async () => {
-    const server = net.createServer();
-    const port = await new Promise<number>((resolve) => {
-      server.listen(0, "127.0.0.1", () => {
-        const addr = server.address();
-        if (addr && typeof addr !== "string") {
-          resolve(addr.port);
-        }
+  it.for(["127.0.0.1", "::1", "0.0.0.0", "::"])(
+    "skips a port held on %s (issue #288)",
+    async (host, { skip }) => {
+      const server = net.createServer();
+      const port = await new Promise<number | null>((resolve) => {
+        // Only a missing address family fails here: port 0 is always available.
+        server.once("error", () => resolve(null));
+        server.listen(0, host, () => resolve((server.address() as net.AddressInfo).port));
       });
-    });
-
-    try {
-      await expect(findFreePort(port, port)).rejects.toThrow("No free port found");
-    } finally {
-      server.close();
+      if (port === null) return skip();
+      try {
+        await expect(findFreePort(port, port)).rejects.toThrow("No free port found");
+      } finally {
+        await new Promise((resolve) => server.close(resolve));
+      }
     }
-  });
+  );
 
   it("throws when minPort > maxPort", async () => {
     await expect(findFreePort(5000, 4000)).rejects.toThrow("minPort");
