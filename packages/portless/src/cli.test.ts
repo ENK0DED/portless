@@ -420,7 +420,10 @@ function getShimPidDir(): string {
 
 function isCloudflaredShimProcess(pid: number): boolean {
   const result = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" });
-  return result.status === 0 && result.stdout.includes("cloudflared-shim.js");
+  return (
+    result.status === 0 &&
+    (result.stdout.includes("cloudflared-shim.js") || result.stdout.includes("ngrok-shim.js"))
+  );
 }
 
 /** SIGKILL every recorded shim that is still running and wait for it to exit. */
@@ -456,19 +459,26 @@ async function reapCloudflaredShims(): Promise<void> {
 }
 
 function writeCloudflaredShim(dir: string, url = "https://abc.trycloudflare.com"): void {
-  const scriptPath = path.join(dir, "cloudflared-shim.js");
+  writeTunnelShim(dir, "cloudflared", [url, "Registered tunnel connection"]);
+}
+
+function writeNgrokShim(dir: string, url = "https://abc.ngrok-free.app"): void {
+  writeTunnelShim(dir, "ngrok", [`msg="started tunnel" url=${url}`]);
+}
+
+function writeTunnelShim(dir: string, binary: string, outputLines: string[]): void {
+  const scriptPath = path.join(dir, `${binary}-shim.js`);
   const pidDir = getShimPidDir();
   fs.writeFileSync(
     scriptPath,
     [
-      "if (process.argv.includes('version') || process.argv.includes('--version')) { console.log('cloudflared version test'); process.exit(0); }",
+      `if (process.argv.includes('version') || process.argv.includes('--version')) { console.log('${binary} version test'); process.exit(0); }`,
       "const fs = require('node:fs');",
       `const pidFile = require('node:path').join(${JSON.stringify(pidDir)}, String(process.pid));`,
       "fs.writeFileSync(pidFile, '');",
       "process.on('exit', () => { try { fs.unlinkSync(pidFile); } catch {} });",
       "if (process.env.PORTLESS_TEST_TUNNEL_ARGS) fs.writeFileSync(process.env.PORTLESS_TEST_TUNNEL_ARGS, JSON.stringify(process.argv.slice(2)));",
-      `console.log(${JSON.stringify(url)});`,
-      "console.log('Registered tunnel connection');",
+      ...outputLines.map((line) => `console.log(${JSON.stringify(line)});`),
       "setInterval(() => {}, 1000);",
       "process.on('SIGTERM', () => process.exit(0));",
     ].join("\n") + "\n"
@@ -476,7 +486,7 @@ function writeCloudflaredShim(dir: string, url = "https://abc.trycloudflare.com"
 
   if (process.platform === "win32") {
     fs.writeFileSync(
-      path.join(dir, "cloudflared.cmd"),
+      path.join(dir, `${binary}.cmd`),
       `@echo off\r\n"${process.execPath}" "${scriptPath}" %*\r\n`
     );
     return;
@@ -485,7 +495,7 @@ function writeCloudflaredShim(dir: string, url = "https://abc.trycloudflare.com"
   // exec so the node process is the child portless spawns and signals, like the
   // single cloudflared binary. Without it, SIGTERM stops only the shell and
   // leaves the node shim running as an orphan.
-  const shimPath = path.join(dir, "cloudflared");
+  const shimPath = path.join(dir, binary);
   fs.writeFileSync(shimPath, `#!/bin/sh\nexec "${process.execPath}" "${scriptPath}" "$@"\n`);
   fs.chmodSync(shimPath, 0o755);
 }
@@ -682,6 +692,8 @@ describe("CLI", () => {
       expect(stdout).toContain("service");
       expect(stdout).toContain("clean");
       expect(stdout).toContain("prune");
+      expect(stdout).toContain("mcp)");
+      expect(stdout).toContain("--tools");
       expect(stdout).toContain("--suffix");
       expect(stdout).toContain("--wildcard");
       expect(stdout).toContain("--lan");
@@ -697,6 +709,7 @@ describe("CLI", () => {
       expect(stdout).toContain("_portless");
       expect(stdout).toContain("service:Manage startup service");
       expect(stdout).toContain("doctor:Check local portless health");
+      expect(stdout).toContain("mcp:Start a stdio MCP server for agents");
       expect(stdout).toContain("--netbird-groups");
       expect(stdout).toContain("--suffix");
       expect(stdout).toContain("--routes-cleanup-interval");
@@ -709,6 +722,8 @@ describe("CLI", () => {
       expect(stdout).toContain('complete -c portless -n "__fish_is_nth_token 1" -f');
       expect(stdout).toContain('-a "service"');
       expect(stdout).toContain('-a "doctor"');
+      expect(stdout).toContain('-a "mcp"');
+      expect(stdout).toContain("-l tools");
       expect(stdout).toContain("-l netbird-groups");
       expect(stdout).toContain("-l suffix");
       expect(stdout).toContain("-l routes-cleanup-interval");
@@ -4709,6 +4724,11 @@ describe("CLI", () => {
           expect(sudoArgs).toContain("--skip-trust");
           expect(start.stderr).toContain("sudo failed");
           expect(start.stdout).not.toContain("Falling back");
+          // Hosts sync, not the port, is why root is needed: say so and do not suggest -p.
+          expect(start.stdout).toContain("Syncing /etc/hosts entries for .test requires elevated");
+          expect(start.stdout).not.toContain(`Port ${port} requires`);
+          expect(start.stdout).toContain("PORTLESS_SYNC_HOSTS=0");
+          expect(start.stdout).toContain("--unprivileged");
           expect(fs.existsSync(path.join(tmpDir, "proxy.port"))).toBe(false);
         } finally {
           fs.rmSync(shimDir, { recursive: true, force: true });
@@ -5977,6 +5997,56 @@ server.listen(Number(process.env.PORT), "127.0.0.1", () => {
       } finally {
         run(["proxy", "stop"], { env });
         fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it("warns that the legacy --ngrok flag exposes the whole app on a path-prefixed route", async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-cli-ngrok-notice-"));
+      const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-ngrok-bin-"));
+      const server = http.createServer((_req, res) => {
+        res.setHeader("X-Portless", "1");
+        res.end("ok");
+      });
+      try {
+        const proxyPort = await new Promise<number>((resolve) => {
+          server.listen(0, "127.0.0.1", () => {
+            const addr = server.address();
+            if (addr && typeof addr !== "string") resolve(addr.port);
+          });
+        });
+        fs.writeFileSync(path.join(tmpDir, "proxy.port"), proxyPort.toString());
+        writeNgrokShim(binDir);
+
+        const { status, stdout, stderr } = run(
+          [
+            "run",
+            "--name",
+            "myapp",
+            "--app-port",
+            "4568",
+            "--path",
+            "/api",
+            "--ngrok",
+            process.execPath,
+            "-e",
+            "0",
+          ],
+          {
+            env: {
+              PATH: prependPath(binDir),
+              PORTLESS_STATE_DIR: tmpDir,
+              PORTLESS_HTTPS: "0",
+            },
+          }
+        );
+
+        expect({ status, stdout, stderr }).toMatchObject({ status: 0 });
+        expect(stdout).toContain("ngrok -> https://abc.ngrok-free.app/api");
+        expect(stdout).toContain("tunnel exposes the whole app");
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+        fs.rmSync(binDir, { recursive: true, force: true });
       }
     });
 

@@ -303,6 +303,8 @@ The proxy periodically removes route records whose owning process is dead. The s
 | `PORTLESS_NGROK`                  | Set to `1` to share apps publicly via ngrok (same as `--ngrok`)             |
 | `PORTLESS_TUNNEL`                 | Managed public tunnel provider selector (`cloudflare` or `ngrok`)           |
 | `PORTLESS_TUNNEL_HOSTNAME`        | Request a provider-specific stable tunnel hostname                          |
+| `PORTLESS_CLOUDFLARE`             | Set to `1` to share via a Cloudflare tunnel (same as `--cloudflare`)        |
+| `PORTLESS_UNPRIVILEGED`           | Set to `1` to bind without sudo (`0` switches back); see Unprivileged mode  |
 | `PORTLESS_NETBIRD`                | Set to `1` to share apps publicly via NetBird (same as `--netbird`)         |
 | `PORTLESS_NETBIRD_PASSWORD`       | Require a password for the NetBird public URL                               |
 | `PORTLESS_NETBIRD_PIN`            | Require a PIN for the NetBird public URL                                    |
@@ -588,7 +590,7 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 | `portless run --help`                            | Show help for a subcommand (also: alias, hosts, doctor, clean) |
 | `portless --version` / `-v`                      | Show version                                                   |
 
-**Reserved names:** `run`, `get`, `url`, `alias`, `tunnel`, `hosts`, `list`, `ls`, `status`, `doctor`, `trust`, `clean`, `prune`, `proxy`, `bg`, `service`, and `completion` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name, or `portless --name <name> <cmd>` to force any name including reserved ones.
+**Reserved names:** `run`, `get`, `url`, `alias`, `tunnel`, `hosts`, `list`, `ls`, `status`, `doctor`, `trust`, `clean`, `prune`, `proxy`, `bg`, `service`, `mcp`, and `completion` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name, or `portless --name <name> <cmd>` to force any name including reserved ones.
 
 ### Shell completion
 
@@ -609,7 +611,7 @@ Generate completions from the installed portless binary so agents and humans get
 - `proxy`: `proxy_start` (`suffix`, `unprivileged`, `skipTrust`, `routesCleanupInterval`, `wildcard`, `lan`, `noTls`, `port`), `proxy_stop`, `proxy_status` (also in `core`).
 - `diagnostics`: `doctor`, `prune`, `version`. `all` enables everything.
 
-`list`, `get`, and the `bg` tools take `json`; `get`, `alias_add`, and the `bg` tools take `path`. `list --json` marks routes whose owner died but whose dev server still runs as `kind: "orphan"`; `prune` stops them. Not exposed: foreground `run`, `trust`, `clean`, `hosts`, `service`, `bg clean`, `bg logs --follow`, and every sharing mode (tunnels, Tailscale including `--tailscale-http`, ngrok, NetBird). Start shared apps from a shell.
+`list`, `get`, and the `bg` tools take `json`; `get`, `alias_add`, and the `bg` tools take `path`; `get` and `bg_start` take `worktreePrefix` (same as `--worktree-prefix`) and `noWorktree` (same as `--no-worktree`). `extraArgs` rejects the sharing flags, so an MCP agent cannot open a public URL. `list --json` marks routes whose owner died but whose dev server still runs as `kind: "orphan"`; `prune` stops them. Not exposed: foreground `run`, `trust`, `clean`, `hosts`, `service`, `bg clean`, `bg logs --follow`, and every sharing mode (tunnels, Tailscale including `--tailscale-http`, ngrok, NetBird). Start shared apps from a shell.
 
 ## Programmatic API
 
@@ -725,11 +727,11 @@ For other frameworks that don't read `PORT`, pass the assigned values with place
 
 ### Permission errors
 
-Portless probes the default ports (80 for HTTP, 443 for HTTPS) and auto-elevates only when binding needs permission or enabled hosts sync needs root for a configured suffix. A failed sudo exits without changing the port. On Windows, no elevation is required.
+Portless probes the default ports (80 for HTTP, 443 for HTTPS) and auto-elevates only when binding needs permission or enabled hosts sync needs root for a configured suffix. A failed sudo exits without changing the port. On Windows, no elevation is required. `-p 1355` removes the port reason only: with a custom suffix and hosts sync on, the proxy still asks for sudo to write `/etc/hosts`. To skip it, set `PORTLESS_SYNC_HOSTS=0`, pass `--unprivileged`, or keep the default `.localhost` suffix.
 
 ```bash
 portless proxy start --https           # Auto-elevates with sudo for port 443
-portless proxy start -p 1355 --https   # No sudo needed (URLs include :1355)
+portless proxy start -p 1355 --https   # No port sudo (URLs include :1355)
 portless proxy start --unprivileged    # Plain HTTP on port 80, no sudo, clean URLs
 portless proxy stop                    # Stop (use sudo if started with sudo)
 ```
