@@ -170,8 +170,31 @@ describe("buildArgv", () => {
 
   it("keeps bg_start extraArgs ahead of the command so they never reach the child", () => {
     expect(
-      buildArgv("bg_start", { command: ["node", "server.js"], extraArgs: ["--cloudflare"] })
-    ).toEqual(["bg", "start", "--cloudflare", "--", "node", "server.js"]);
+      buildArgv("bg_start", { command: ["node", "server.js"], extraArgs: ["--keep"] })
+    ).toEqual(["bg", "start", "--keep", "--", "node", "server.js"]);
+  });
+
+  it.each([
+    "--cloudflare",
+    "--tunnel",
+    "--tunnel=cloudflare",
+    "--tunnel-hostname",
+    "--tailscale",
+    "--tailscale-http",
+    "--tailscale-service",
+    "--tailscale-service-name=web",
+    "--funnel",
+    "--ngrok",
+    "--netbird",
+    "--netbird-password",
+    "--netbird-pin",
+    "--netbird-groups=dev",
+  ])("rejects the sharing flag %s in extraArgs with -32602", (flag) => {
+    for (const tool of ["bg_start", "bg_restart", "get"]) {
+      expect(() =>
+        buildArgv(tool, { name: "web", command: ["node", "server.js"], extraArgs: [flag] })
+      ).toThrow(expect.objectContaining({ code: -32602 }));
+    }
   });
 
   it("maps the worktree prefix options for get and bg_start", () => {

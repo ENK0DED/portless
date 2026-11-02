@@ -419,7 +419,7 @@ On first run, portless generates a local CA and adds it to your system trust sto
 
 ## Unprivileged mode
 
-Portless probes its listener addresses before elevating with `sudo` for bind permissions. It also elevates when automatic hosts sync is enabled and a configured suffix needs hosts entries. If sudo fails, startup exits without falling back to another port. On a machine where that is not an option, such as a managed laptop, a CI runner, or an agent session with no terminal to type a password into, start the proxy with `--unprivileged`:
+Portless probes its listener addresses before elevating with `sudo` for bind permissions. It also elevates when automatic hosts sync is enabled and a configured suffix needs hosts entries, so `-p 1355` with a custom suffix still asks for sudo; set `PORTLESS_SYNC_HOSTS=0`, pass `--unprivileged`, or keep the default `.localhost` suffix to avoid it. If sudo fails, startup exits without falling back to another port. On a machine where that is not an option, such as a managed laptop, a CI runner, or an agent session with no terminal to type a password into, start the proxy with `--unprivileged`:
 
 ```bash
 portless proxy start --unprivileged
@@ -774,7 +774,7 @@ portless myapp --tunnel cloudflare bun dev # Public Quick Tunnel URL
 portless proxy start             # Start the HTTPS proxy (port 443, daemon)
 portless proxy start --no-tls    # Start without HTTPS (port 80)
 portless proxy start --lan       # Start in LAN mode (mDNS .local for devices)
-portless proxy start -p 1355     # Start on a custom port (no sudo)
+portless proxy start -p 1355     # Start on a custom port (no sudo with the default suffix)
 portless proxy start --suffix test  # Use .test instead of .localhost
 portless proxy start --suffix test --suffix local.example.com  # Use multiple suffixes
 portless proxy start --tld test  # Compatibility alias for --suffix
@@ -875,6 +875,8 @@ PORTLESS_DASHBOARD=0             Disable the dashboard at portless.<suffix>
 PORTLESS_PATH=<prefix>           Scope app routes to a path prefix
 PORTLESS_TUNNEL=<provider>       Share publicly via a managed tunnel provider
 PORTLESS_TUNNEL_HOSTNAME=<host>  Request a provider-specific stable tunnel hostname
+PORTLESS_CLOUDFLARE=1            Share via a Cloudflare tunnel (same as --cloudflare)
+PORTLESS_UNPRIVILEGED=1          Bind without sudo (0 switches back); LAN mode permits remote peers
 PORTLESS_HTTPS=0                 Disable HTTPS (same as --no-tls)
 PORTLESS_LAN=1                   Enable LAN mode when set to 1 (auto-detects LAN IP)
 PORTLESS_LAN_IP=<address>        Pin a specific LAN IP for LAN mode
@@ -917,7 +919,7 @@ Command args can use exact placeholders `{PORT}`, `{HOST}`, and `{PORTLESS_URL}`
 
 Prefer `PORTLESS_SUFFIX` for new configuration. It accepts comma-separated single-label and dotted suffixes, preserves order, and removes duplicates. `PORTLESS_TLD` is only a compatibility alias and is ignored when `PORTLESS_SUFFIX` is set.
 
-> **Reserved names:** `run`, `get`, `url`, `alias`, `tunnel`, `hosts`, `list`, `ls`, `status`, `doctor`, `trust`, `clean`, `prune`, `proxy`, `bg`, `service`, and `completion` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name from your project, or `portless --name <name> <cmd>` to force any name including reserved ones.
+> **Reserved names:** `run`, `get`, `url`, `alias`, `tunnel`, `hosts`, `list`, `ls`, `status`, `doctor`, `trust`, `clean`, `prune`, `proxy`, `bg`, `service`, `mcp`, and `completion` are subcommands and cannot be used as app names directly. Use `portless run <cmd>` to infer the name from your project, or `portless --name <name> <cmd>` to force any name including reserved ones.
 
 ## Shell completion
 
@@ -951,7 +953,7 @@ Tools are grouped into profiles. Pass a comma separated list with `--tools`; the
 | `diagnostics` | `doctor`, `prune`, `version`                                                                                                                                      |
 | `all`         | Every tool. `default` aliases `core` and `full` aliases `all`.                                                                                                    |
 
-The app port strategy has no typed argument: the CLI each tool runs reads `PORTLESS_APP_PORT_STRATEGY` and `PORTLESS_APP_PORT_RANGE` from the MCP server's environment, `bg_start` saves them, and the `appPortStrategy` and `appPortRange` config keys apply as usual. Tool arguments follow the CLI: `proxy_start` takes `suffix` (repeatable, like `--suffix`), `unprivileged`, `skipTrust`, and `routesCleanupInterval`; `list`, `get`, and the `bg` tools take `json`; `get`, `alias_add`, and the `bg` tools take `path`. `prune` stops the verified process group of an orphaned dev server, and `bg_stop` with `force` kills the recorded group. Every tool also accepts `cwd`, `extraArgs` (appended to the command), and `timeoutMs`.
+The app port strategy has no typed argument: the CLI each tool runs reads `PORTLESS_APP_PORT_STRATEGY` and `PORTLESS_APP_PORT_RANGE` from the MCP server's environment, `bg_start` saves them, and the `appPortStrategy` and `appPortRange` config keys apply as usual. Tool arguments follow the CLI: `proxy_start` takes `suffix` (repeatable, like `--suffix`), `unprivileged`, `skipTrust`, and `routesCleanupInterval`; `list`, `get`, and the `bg` tools take `json`; `get`, `alias_add`, and the `bg` tools take `path`; `get` and `bg_start` take `worktreePrefix` (same as `--worktree-prefix`) and `noWorktree` (same as `--no-worktree`). `prune` stops the verified process group of an orphaned dev server, and `bg_stop` with `force` kills the recorded group. Every tool also accepts `cwd`, `extraArgs` (appended to the command), and `timeoutMs`. `extraArgs` rejects the sharing flags listed below, so an MCP agent cannot open a public URL.
 
 Left out on purpose: foreground dev servers (`run`), commands that may prompt for sudo or a TTY (`trust`, `clean`, `hosts`, `service`), `bg clean`, and every sharing mode (`--tunnel`, `--cloudflare`, `--tailscale`, `--tailscale-http`, `--funnel`, `--ngrok`, `--netbird`, and `tunnel map`). Start shared apps from a shell.
 

@@ -1,12 +1,4 @@
-import { writeFileSync } from "node:fs";
-import {
-  ensureTunnelAvailable,
-  normalizeSpace,
-  startTunnel,
-  type StartNgrokOptions,
-  type TunnelCommandRunner,
-  type TunnelProvider,
-} from "./tunnel-runner.js";
+import { normalizeSpace, type TunnelProvider } from "./tunnel-runner.js";
 
 export function buildCloudflareArgs(port: number, host: string, config: string) {
   const flags = ["--no-autoupdate", "--grace-period", "1s", "--config", config];
@@ -33,15 +25,3 @@ export const cloudflare = (host = "", config = ""): TunnelProvider => ({
   timeout:
     "Timed out waiting for cloudflared to connect. Check that outbound UDP port 7844 is open, or set TUNNEL_TRANSPORT_PROTOCOL=http2 and try again.",
 });
-
-export function ensureCloudflaredAvailable(runner?: TunnelCommandRunner): void {
-  ensureTunnelAvailable(cloudflare(), runner);
-}
-
-export async function startCloudflare(
-  port: number,
-  options: StartNgrokOptions & { configPath: string }
-) {
-  writeFileSync(options.configPath, "{}", { mode: 0o600 });
-  return startTunnel(cloudflare(options.hostHeader || "", options.configPath), port, options);
-}

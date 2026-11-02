@@ -22,6 +22,7 @@ import {
   formatUptime,
   formatUrl,
   isErrnoException,
+  isProcessAlive,
   normalizePathPrefix,
   parseHostname,
   parseHostnames,
@@ -224,6 +225,8 @@ type LoadedAppConfig = {
 // ---------------------------------------------------------------------------
 
 /** Display-friendly hosts file path. */
+const WHOLE_APP_TUNNEL_NOTICE =
+  "  Notice: the tunnel exposes the whole app, including paths outside the route prefix.";
 const HOSTS_DISPLAY = isWindows ? "hosts file" : "/etc/hosts";
 
 /** Debounce delay (ms) for reloading routes after a file change. */
@@ -480,6 +483,11 @@ function needsHostsPrivileges(config: ProxyConfig): boolean {
     shouldAutoSyncHosts(process.env.PORTLESS_SYNC_HOSTS) &&
     config.tlds.some((suffix) => suffix !== DEFAULT_TLD && !(config.lanMode && suffix === "local"))
   );
+}
+
+/** How to avoid sudo when only the file sync needs root, not the port. */
+function formatRootSkipHint(proxyPort: number): string {
+  return `(Port ${proxyPort} does not need root, so a different port will not skip sudo. To skip it, set PORTLESS_SYNC_HOSTS=0, pass --unprivileged, or use the default .${DEFAULT_TLD} suffix)`;
 }
 
 function formatProxyStartCommand(proxyPort: number, config: ProxyConfig): string {
@@ -1347,16 +1355,6 @@ function readProxyPid(pidPath: string): number | null {
     return isNaN(pid) ? null : pid;
   } catch {
     return null;
-  }
-}
-
-/** True when the process exists, including one owned by another user (EPERM). */
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err: unknown) {
-    return isErrnoException(err) && err.code === "EPERM";
   }
 }
 
@@ -2404,6 +2402,7 @@ async function runApp(
         onExit: handleNgrokExit,
       });
       ngrokUrl = ngrokProcess.url;
+      if (routePathPrefix !== "/") console.log(colors.yellow(WHOLE_APP_TUNNEL_NOTICE));
       console.log(chalk.green(`  ngrok -> ${formatSharedUrl(ngrokUrl, routePathPrefix)}`));
       console.log(chalk.gray("  (accessible from the public internet via ngrok)\n"));
 
@@ -2465,12 +2464,7 @@ async function runApp(
         onExit: handleTunnelExit,
       });
       tunnelUrl = managedTunnel.url;
-      if (routePathPrefix !== "/")
-        console.log(
-          colors.yellow(
-            "  Notice: the tunnel exposes the whole app, including paths outside the route prefix."
-          )
-        );
+      if (routePathPrefix !== "/") console.log(colors.yellow(WHOLE_APP_TUNNEL_NOTICE));
       const label = managedTunnel.provider === "cloudflare" ? "Cloudflare Tunnel" : "ngrok tunnel";
       console.log(chalk.green(`  ${label} -> ${formatSharedUrl(tunnelUrl, routePathPrefix)}`));
       console.log(chalk.gray("  (accessible from the public internet directly at the app)\n"));
@@ -3105,7 +3099,7 @@ ${colors.bold("Options:")}
   --path <prefix>        Scope the route to a path prefix, e.g. /api
   --worktree-prefix <p>  Use this worktree prefix instead of the branch name
   --no-worktree          Skip the worktree prefix
-  --cloudflare                 Alias of --tunnel cloudflare
+  --cloudflare           Alias of --tunnel cloudflare
   --tunnel <provider>    Share publicly via a managed tunnel: cloudflare or ngrok
   --tunnel-hostname <h>  Request a provider-specific stable tunnel hostname
   --tailscale            Share the app on your Tailscale network (tailnet)
@@ -3422,6 +3416,7 @@ const TOP_LEVEL_COMPLETION_COMMANDS: CompletionCommand[] = [
   { name: "proxy", description: "Manage proxy lifecycle" },
   { name: "bg", description: "Manage portless apps running in the background" },
   { name: "service", description: "Manage startup service" },
+  { name: "mcp", description: "Start a stdio MCP server for agents" },
   { name: "completion", description: "Generate shell completion script" },
 ];
 
@@ -3667,6 +3662,9 @@ _portless_completions() {
     doctor|clean)
       COMPREPLY=( $(compgen -W "--help -h" -- "$cur") )
       ;;
+    mcp)
+      COMPREPLY=( $(compgen -W "--tools --help -h" -- "$cur") )
+      ;;
     prune)
       COMPREPLY=( $(compgen -W "--force --help -h" -- "$cur") )
       ;;
@@ -3760,6 +3758,9 @@ _portless() {
         doctor|clean)
           _arguments '--help[Show help]' '-h[Show help]'
           ;;
+        mcp)
+          _arguments '--tools[Tool profiles to expose]:profiles:' '--help[Show help]' '-h[Show help]'
+          ;;
         prune)
           _arguments '--force[Send SIGKILL]' '--help[Show help]' '-h[Show help]'
           ;;
@@ -3817,7 +3818,7 @@ ${commandLines}
 
 ${fishFlagLines(GLOBAL_COMPLETION_FLAGS)}
 ${fishFlagLines(RUN_COMPLETION_FLAGS, "__fish_seen_subcommand_from run")}
-${fishFlagLines(APP_COMPLETION_FLAGS, "not __fish_seen_subcommand_from run get url list ls status doctor alias tunnel hosts clean prune proxy bg service completion")}
+${fishFlagLines(APP_COMPLETION_FLAGS, "not __fish_seen_subcommand_from run get url list ls status doctor alias tunnel hosts clean prune proxy bg service mcp completion")}
 complete -c portless -n "__fish_seen_subcommand_from get url list ls status" -l json -d "Print JSON"
 complete -c portless -n "__fish_seen_subcommand_from get url" -l path -d "Scope URL to path prefix" -r
 complete -c portless -n "__fish_seen_subcommand_from get url" -l worktree-prefix -d "Use this worktree prefix" -r
@@ -3834,6 +3835,8 @@ complete -c portless -n "__fish_seen_subcommand_from doctor" -l help -s h -d "Sh
 complete -c portless -n "__fish_seen_subcommand_from clean" -l help -s h -d "Show help"
 complete -c portless -n "__fish_seen_subcommand_from prune" -l force -d "Send SIGKILL"
 complete -c portless -n "__fish_seen_subcommand_from prune" -l help -s h -d "Show help"
+complete -c portless -n "__fish_seen_subcommand_from mcp" -l tools -d "Tool profiles to expose" -r
+complete -c portless -n "__fish_seen_subcommand_from mcp" -l help -s h -d "Show help"
 complete -c portless -n "__fish_seen_subcommand_from proxy; and __fish_is_nth_token 2" -a "start stop status"
 ${fishFlagLines(PROXY_START_COMPLETION_FLAGS, "__fish_seen_subcommand_from proxy")}
 complete -c portless -n "__fish_seen_subcommand_from proxy; and __fish_seen_subcommand_from status" -l json -d "Print JSON"
@@ -4157,7 +4160,7 @@ ${colors.bold("Options:")}
   --worktree-prefix <prefix>    Use this worktree prefix, in a linked worktree or not
                                 Works with run, get, bg start, and bare portless
   --no-worktree                 Skip the worktree prefix (run, get, bg start, bare portless)
-  --cloudflare                 Alias of --tunnel cloudflare
+  --cloudflare                  Alias of --tunnel cloudflare
   --tunnel <provider>           Share publicly via a managed tunnel: cloudflare or ngrok
   --tunnel-hostname <hostname>  Request a provider-specific stable tunnel hostname
   --tailscale                   Share the app on your Tailscale network (tailnet)
@@ -4174,7 +4177,7 @@ ${colors.bold("Options:")}
   bg start --no-wait            Return after spawning a background app
   bg start --keep               Keep a timed-out background app running
   bg logs --tail <lines>        Print the last N background log lines
-  bg stop --force               Force-stop the exact registered background app
+  bg stop --force               Force-stop the registered app and kill its recorded command group
   --force                       Kill the existing process and take over its route
   --name <name>                 Use <name> as the app name (bypasses subcommand dispatch)
   --                            Stop flag parsing; everything after is passed to the child
@@ -4295,7 +4298,7 @@ ${colors.bold("Skip portless:")}
   PORTLESS=0 bun dev            # Runs command directly without proxy
 
 ${colors.bold("Reserved names:")}
-  run, get, url, alias, tunnel, hosts, list, ls, status, doctor, trust, clean, prune, proxy, bg, service, completion are subcommands and
+  run, get, url, alias, tunnel, hosts, list, ls, status, doctor, trust, clean, prune, proxy, bg, service, mcp, completion are subcommands and
   cannot be used as app names directly. Use "portless run" to infer the name,
   or "portless --name <name>" to force any name including reserved ones.
 `);
@@ -5786,13 +5789,11 @@ ${colors.bold("LAN mode (--lan):")}
   };
 
   // Probe the selected listeners; hosts synchronization can also require root.
-  if (
-    !unprivileged &&
-    !isWindows &&
-    (process.getuid?.() ?? -1) !== 0 &&
-    (needsHostsPrivileges(resolvedConfig) ||
-      !(await canBindProxyPort(proxyPort, getProxyBindTargets(lanMode))))
-  ) {
+  const canElevate = !unprivileged && !isWindows && (process.getuid?.() ?? -1) !== 0;
+  const hostsNeedRoot = canElevate && needsHostsPrivileges(resolvedConfig);
+  const portNeedsRoot =
+    canElevate && !(await canBindProxyPort(proxyPort, getProxyBindTargets(lanMode)));
+  if (hostsNeedRoot || portNeedsRoot) {
     const startArgs = [
       process.execPath,
       getEntryScript(),
@@ -5820,11 +5821,28 @@ ${colors.bold("LAN mode (--lan):")}
     const fallbackCommand = formatProxyStartCommand(FALLBACK_PROXY_PORT, resolvedConfig);
     const currentCommand = formatProxyStartCommand(proxyPort, resolvedConfig);
 
-    console.log(
-      colors.yellow(`Port ${proxyPort} requires elevated privileges. Requesting sudo...`)
-    );
-    if (!hasExplicitPort) {
-      console.log(colors.gray(`(To skip sudo, use an unprivileged port: ${fallbackCommand})`));
+    if (portNeedsRoot) {
+      console.log(
+        colors.yellow(`Port ${proxyPort} requires elevated privileges. Requesting sudo...`)
+      );
+      if (!hasExplicitPort) {
+        console.log(
+          colors.gray(
+            `(To skip sudo, use an unprivileged port: ${fallbackCommand}, or pass --unprivileged)`
+          )
+        );
+      }
+    } else {
+      const hostsSuffixes = resolvedConfig.tlds
+        .filter((suffix) => suffix !== DEFAULT_TLD && !(lanMode && suffix === "local"))
+        .map((suffix) => `.${suffix}`)
+        .join(", ");
+      console.log(
+        colors.yellow(
+          `Syncing ${HOSTS_DISPLAY} entries for ${hostsSuffixes} requires elevated privileges. Requesting sudo...`
+        )
+      );
+      console.log(colors.gray(formatRootSkipHint(proxyPort)));
     }
     const result = spawnSync(
       "sudo",
