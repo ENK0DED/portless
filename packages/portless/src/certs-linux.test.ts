@@ -4,7 +4,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
 import * as childProcess from "node:child_process";
-import { ensureCerts, isCATrusted, trustCA, untrustCA } from "./certs.js";
+import {
+  ensureCerts,
+  isCATrusted,
+  nssCertutilMissingWarning,
+  trustCA,
+  untrustCA,
+} from "./certs.js";
 import type * as windowsCA from "./windows-ca.js";
 
 const store = vi.hoisted(() => ({ wsl: false, windows: false }));
@@ -183,10 +189,34 @@ describe.skipIf(process.platform !== "linux")("Linux browser CA trust", () => {
     expect(result.trusted).toBe(true);
     expect(result.warning).toContain("libnss3-tools");
     expect(result.error).toBeUndefined();
-    expect(isCATrusted(stateDir)).toBe(false);
+    // Warning-only: with certutil missing the NSS part cannot be checked, so it
+    // never counts as incomplete trust (the `trust` skip and `proxy start`
+    // would otherwise retry, and ask for sudo, every time).
+    expect(isCATrusted(stateDir)).toBe(true);
+    expect(isCATrusted(stateDir, { useMarker: false, everyStore: true })).toBe(true);
     certutilError = undefined;
+    // Once certutil is back, the missing NSS entry is noticed and repaired.
+    expect(isCATrusted(stateDir)).toBe(false);
     expect(trustCA(stateDir)).toEqual({ trusted: true });
     expect(isCATrusted(stateDir)).toBe(true);
+  });
+
+  it("warns about a missing certutil only when an NSS database exists", () => {
+    expect(nssCertutilMissingWarning()).toBeUndefined();
+    createDB();
+    certutilError = Object.assign(new Error("spawnSync certutil ENOENT"), { code: "ENOENT" });
+    const warning = nssCertutilMissingWarning();
+    expect(warning).toContain("`certutil`");
+    expect(warning).toContain("portless trust");
+    certutilError = undefined;
+    expect(nssCertutilMissingWarning()).toBeUndefined();
+  });
+
+  it("does not hide other NSS failures behind the missing-certutil rule", () => {
+    createDB();
+    certutilError = new Error("NSS database unavailable");
+    expect(nssCertutilMissingWarning()).toBeUndefined();
+    expect(isCATrusted(stateDir)).toBe(false);
   });
 
   it("still fails when the system trust update fails", () => {

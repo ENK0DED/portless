@@ -24,6 +24,7 @@ import {
   USER_STATE_DIR,
   discoverState,
   isExplicitStateDirEmpty,
+  isStateDirProxyRunning,
   appPortKey,
   findFreePort,
   parseAppPortRange,
@@ -2443,6 +2444,30 @@ describe("discoverState with an explicit, empty state dir", () => {
     expect(isExplicitStateDirEmpty()).toBe(true);
     await expect(discoverState()).resolves.toMatchObject({ dir: tmpDir, port: stubPort });
     expect(connections).toBe(0);
+  });
+
+  it("does not probe the default port for the trust restart hint", async () => {
+    let connections = 0;
+    stub = http.createServer((_req, res) => {
+      res.setHeader(PORTLESS_HEADER, "1");
+      res.end();
+    });
+    stub.on("connection", () => {
+      connections += 1;
+    });
+    await new Promise<void>((resolve) => stub!.listen(0, "127.0.0.1", resolve));
+    const stubPort = (stub.address() as net.AddressInfo).port;
+
+    process.env.PORTLESS_STATE_DIR = tmpDir;
+    process.env.PORTLESS_PORT = String(stubPort);
+
+    await expect(isStateDirProxyRunning(stubPort)).resolves.toBe(false);
+    expect(connections).toBe(0);
+
+    // With a port file the same call does probe, so the guard is not a no-op.
+    fs.writeFileSync(path.join(tmpDir, "proxy.port"), String(stubPort));
+    await expect(isStateDirProxyRunning(stubPort)).resolves.toBe(true);
+    expect(connections).toBeGreaterThan(0);
   });
 
   it("still probes the port recorded in the state dir", async () => {

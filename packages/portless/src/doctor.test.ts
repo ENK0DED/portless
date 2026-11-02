@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import * as fs from "node:fs";
+import * as http from "node:http";
+import type * as net from "node:net";
 import * as https from "node:https";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -565,6 +567,84 @@ describe("collectDoctorSnapshot", () => {
     }
   });
 
+  it("never probes the default port from an explicit state dir without a port file", async () => {
+    // A stub that answers like a portless proxy, on a free non-default port
+    // that stands in for the default port through PORTLESS_PORT.
+    let connections = 0;
+    const stub = http.createServer((_req, res) => {
+      res.setHeader("X-Portless", "1");
+      res.end();
+    });
+    stub.on("connection", () => {
+      connections += 1;
+    });
+    await new Promise<void>((resolve) => stub.listen(0, "127.0.0.1", resolve));
+    const stubPort = (stub.address() as net.AddressInfo).port;
+    const stateDir = makeTempDir();
+    const saved = {
+      dir: process.env.PORTLESS_STATE_DIR,
+      port: process.env.PORTLESS_PORT,
+      https: process.env.PORTLESS_HTTPS,
+    };
+    process.env.PORTLESS_STATE_DIR = stateDir;
+    process.env.PORTLESS_PORT = String(stubPort);
+    delete process.env.PORTLESS_HTTPS;
+    try {
+      // The real discoverState and probes run: only the unrelated lookups are
+      // stubbed, so any probe of the stub port would be counted.
+      const snapshot = await collectDoctorSnapshot({
+        version: "0.15.6000",
+        dependencies: {
+          managedHostnames: () => [],
+          mdnsSupport: () => ({ supported: false }),
+          probeTool: () => ({ status: "unavailable" }),
+          nssCertutilMissingWarning: () => undefined,
+        },
+      });
+      expect(snapshot.proxy).toMatchObject({ running: false, portListening: false });
+      expect(snapshot.proxy.portPid).toBeNull();
+      expect(connections).toBe(0);
+    } finally {
+      for (const [key, value] of [
+        ["PORTLESS_STATE_DIR", saved.dir],
+        ["PORTLESS_PORT", saved.port],
+        ["PORTLESS_HTTPS", saved.https],
+      ] as const) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      await new Promise<void>((resolve) => stub.close(() => resolve()));
+    }
+  });
+
+  it("warns, without marking trust incomplete, when an NSS database has no certutil", async () => {
+    const stateDir = makeTempDir();
+    fs.writeFileSync(path.join(stateDir, "ca.pem"), "public ca\n");
+    const snapshot = await collectDoctorSnapshot({
+      version: "0.15.6000",
+      state: {
+        dir: stateDir,
+        port: 1355,
+        tls: false,
+        tld: "localhost",
+        tlds: ["localhost"],
+        lanMode: false,
+        lanIp: null,
+      },
+      dependencies: {
+        isProxyRunning: async () => false,
+        isPortListening: async () => false,
+        managedHostnames: () => [],
+        mdnsSupport: () => ({ supported: false }),
+        probeTool: () => ({ status: "unavailable" }),
+        isCATrusted: () => true,
+        nssCertutilMissingWarning: () => "Chrome needs certutil to trust the portless CA.",
+      },
+    });
+    expect(snapshot.certificates.trusted).toBe(true);
+    expect(snapshot.warnings).toContain("Chrome needs certutil to trust the portless CA.");
+  });
+
   it("records the installed service's pinned Node binary when one is installed", async () => {
     const stateDir = makeTempDir();
     const base = {
@@ -694,6 +774,7 @@ describe("collectDoctorSnapshot", () => {
         managedHostnames: () => ["app.server01.acme.com"],
         resolvesHostname: async () => true,
         isCATrusted: () => true,
+        nssCertutilMissingWarning: () => undefined,
         certPageResponds: async (_port, _tls, suffix) => suffix === "localhost",
         mdnsSupport: () => ({ supported: false, reason: "not needed" }),
         probeTool: (name) => ({

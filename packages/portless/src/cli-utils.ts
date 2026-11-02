@@ -1124,6 +1124,16 @@ export function isExplicitStateDirEmpty(): boolean {
 }
 
 /**
+ * Like {@link isProxyRunning}, but for the proxy of the current state dir: an
+ * explicit state dir without a port file has no proxy, so this answers false
+ * without opening a connection to the default port.
+ */
+export async function isStateDirProxyRunning(port: number, tls = false): Promise<boolean> {
+  if (isExplicitStateDirEmpty()) return false;
+  return isProxyRunning(port, tls);
+}
+
+/**
  * Discover the active proxy's state directory, port, TLS mode, TLD, LAN mode,
  * and current LAN IP when available.
  * Checks the user-level dir first, then the legacy /tmp/portless dir as a

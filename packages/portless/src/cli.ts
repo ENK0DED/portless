@@ -7,7 +7,14 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
-import { createSNICallback, ensureCerts, isCATrusted, trustCA, untrustCA } from "./certs.js";
+import {
+  createSNICallback,
+  ensureCerts,
+  isCATrusted,
+  nssCertutilMissingWarning,
+  trustCA,
+  untrustCA,
+} from "./certs.js";
 import { createHttpRedirectServer, createProxyServer } from "./proxy.js";
 import type { RouteProtocol, TunnelAlias, TunnelProviderName } from "./types.js";
 import {
@@ -119,6 +126,7 @@ import {
   isWildcardEnvEnabled,
   isLanEnvEnabled,
   isProxyRunning,
+  isStateDirProxyRunning,
   isExplicitStateDirEmpty,
   isWindows,
   killTree,
@@ -193,7 +201,7 @@ import { formatViteAllowedHosts } from "./vite.js";
 import { buildServiceUninstallSudoArgs, handleService, tryUninstallService } from "./service.js";
 import { runMcp } from "./mcp.js";
 import { handleBg, pruneBgEntriesForState, stopBgEntriesForState } from "./bg.js";
-import { cleanupRouteSharing } from "./route-cleanup.js";
+import { DeadOwnerSharingStopper, cleanupRouteSharing } from "./route-cleanup.js";
 import { PORTLESS_BG_ID_ENV, PORTLESS_BG_READY_PATH_ENV, writeBgReadyFile } from "./bg-ready.js";
 import {
   collectDoctorSnapshot,
@@ -1052,12 +1060,20 @@ function startProxyServer(
 
   // A SIGKILLed owner never touches the routes file, so no watcher event fires
   // and the cache would keep serving its route. Probe each cached owner with
-  // signal 0 and reload the in-memory routes when one has died. This writes
-  // nothing and kills nothing, so the sweep below stays the only writer and the
-  // never-kill rule holds. loadRoutes drops the dead owner from the routable
-  // set, and loadOrphanedRoutes moves it to the dashboard's orphan list.
+  // signal 0 and reload the in-memory routes when one has died. loadRoutes
+  // drops the dead owner from the routable set, and loadOrphanedRoutes moves it
+  // to the dashboard's orphan list. An owner that exited cleanly took its
+  // sharing down itself; after a SIGKILL its tunnel, Tailscale serve and
+  // NetBird helpers would keep the route public, so stop them once per death.
+  // That signals sharing helpers only, never the dev server (the never-kill
+  // rule), and writes nothing, so the sweep below stays the only writer.
+  const deadOwnerSharing = new DeadOwnerSharingStopper((route) =>
+    cleanupRouteSharing(route, { tunnelAliasStore })
+  );
   ownerCheckInterval = setInterval(() => {
-    if (hasDeadRouteOwner(cachedRoutes)) reloadRoutes();
+    if (!hasDeadRouteOwner(cachedRoutes)) return;
+    deadOwnerSharing.stopForDeadOwners(cachedRoutes);
+    reloadRoutes();
   }, OWNER_CHECK_INTERVAL_MS).unref();
 
   if (routesCleanupIntervalSeconds > 0) {
@@ -1067,6 +1083,9 @@ function startProxyServer(
         // runs stays on file, marked orphaned, until the next run or prune.
         const staleRoutes = store.pruneStaleRoutes({ keepOrphaned: true });
         for (const route of staleRoutes) {
+          // The owner check already stopped this route's sharing; its pids may
+          // have been reused since, so do not signal them a second time.
+          if (deadOwnerSharing.consume(route)) continue;
           try {
             cleanupRouteSharing(route, { tunnelAliasStore });
           } catch {
@@ -4298,7 +4317,9 @@ async function handleTrust(): Promise<void> {
     console.log(colors.gray("Generated local CA certificate."));
     // A running proxy keeps the previous CA and the TLS contexts it already
     // built in memory, so it presents the old chain until it restarts.
-    if (await isProxyRunning(port, tls)) {
+    // An isolated state dir without a port file has no proxy to restart; never
+    // probe the default port on its behalf.
+    if (await isStateDirProxyRunning(port, tls)) {
       const [notice, restart] = caRegeneratedRestartHint(port, tls);
       console.log(colors.yellow(notice));
       console.log(colors.blue(restart));
@@ -4311,6 +4332,10 @@ async function handleTrust(): Promise<void> {
   // Linux and the Windows store must have it, plus the NSS database on Linux.
   if (isCATrusted(dir, { useMarker: false, everyStore: true })) {
     console.log(colors.green("Local CA is already in the system trust store."));
+    // A Chrome NSS database without certutil counts as trusted (so this skip
+    // and `proxy start` do not retry every time) but is worth one warning.
+    const nssWarning = nssCertutilMissingWarning();
+    if (nssWarning) console.warn(colors.yellow(nssWarning));
     return;
   }
   const result = trustCA(dir);
@@ -5400,6 +5425,11 @@ ${colors.bold("Options:")}
         onWarning: (msg) => console.warn(colors.yellow(msg)),
       });
       await stopProxy(store, explicitPort, false);
+    } else if (isExplicitStateDirEmpty()) {
+      // An isolated state dir without a port file has no proxy of its own.
+      // Probing the default port would reach (and could stop) another proxy
+      // on this machine, so report it as not running.
+      console.log(colors.yellow("Proxy is not running."));
     } else {
       const { dir, port, tls } = await discoverState();
       const store = new RouteStore(dir, {
@@ -5871,11 +5901,13 @@ ${colors.bold("LAN mode (--lan):")}
         console.log(colors.yellow("Adding CA to system trust store..."));
         const trustResult = trustCA(stateDir);
         if (trustResult.trusted) {
-          console.log(
-            colors.green("CA added to system trust store. Browsers will trust portless certs.")
-          );
           if (trustResult.warning) {
+            console.log(colors.green("CA added to system trust store."));
             console.warn(colors.yellow(trustResult.warning));
+          } else {
+            console.log(
+              colors.green("CA added to system trust store. Browsers will trust portless certs.")
+            );
           }
         } else {
           console.warn(colors.yellow("Could not add CA to system trust store."));
